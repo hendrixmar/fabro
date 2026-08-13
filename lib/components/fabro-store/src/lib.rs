@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
 mod artifact_store;
+mod blob_store;
 mod error;
 mod keyed_mutex;
 mod keys;
@@ -18,6 +19,7 @@ pub use artifact_store::{
     ArtifactKey, ArtifactStore, NodeArtifact, StageArtifactEntry, retry_storage_segment,
     stage_storage_segment,
 };
+pub use blob_store::{Blob, BlobStore};
 pub use error::{Error, Result};
 pub use fabro_types::{
     BlobHash, EventEnvelope, PendingInterviewRecord, Run, RunProjection, StageId, StageProjection,
@@ -34,8 +36,8 @@ pub use run_summary_store::{
 };
 pub use serializable_projection::SerializableProjection;
 pub use slate::{
-    AuthCode, AuthCodeStore, Blob, BlobStore, CachedRunProjection, ConsumeOutcome, Database,
-    RefreshToken, RefreshTokenStore, RunCatalogIndex, RunDatabase, Runs, UnreadableRun,
+    AuthCode, AuthCodeStore, CachedRunProjection, ConsumeOutcome, Database, RefreshToken,
+    RefreshTokenStore, RunCatalogIndex, RunDatabase, Runs, UnreadableRun,
 };
 pub use types::EventPayload;
 

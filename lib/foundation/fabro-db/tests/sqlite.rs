@@ -73,6 +73,13 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
     .await?;
     assert_eq!(runs_table_count, 1);
 
+    let blobs_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'blobs'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(blobs_table_count, 1);
+
     let legacy_import_table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'legacy_imports'",
     )
@@ -85,6 +92,93 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
         .await?
         .get(0);
     assert_eq!(foreign_keys, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn blobs_schema_enforces_canonical_hashes_and_required_data() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let database = fabro_db::Database::connect(dir.path().join("fabro.sqlite3")).await?;
+    database.migrate().await?;
+
+    let columns = sqlx::query("PRAGMA table_info(blobs)")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(columns.len(), 2);
+
+    assert_eq!(columns[0].get::<String, _>("name"), "hash");
+    assert_eq!(columns[0].get::<String, _>("type"), "TEXT");
+    assert_eq!(columns[0].get::<i64, _>("notnull"), 1);
+    assert_eq!(columns[0].get::<i64, _>("pk"), 1);
+    assert_eq!(columns[0].get::<Option<String>, _>("dflt_value"), None);
+
+    assert_eq!(columns[1].get::<String, _>("name"), "data");
+    assert_eq!(columns[1].get::<String, _>("type"), "BLOB");
+    assert_eq!(columns[1].get::<i64, _>("notnull"), 1);
+    assert_eq!(columns[1].get::<i64, _>("pk"), 0);
+    assert_eq!(columns[1].get::<Option<String>, _>("dflt_value"), None);
+
+    let binary_hash = "0".repeat(64);
+    let binary_data = vec![0, 0xff, 0x80, b'a'];
+    sqlx::query("INSERT INTO blobs (hash, data) VALUES (?, ?)")
+        .bind(&binary_hash)
+        .bind(&binary_data)
+        .execute(database.pool())
+        .await?;
+    let stored_binary: Vec<u8> = sqlx::query_scalar("SELECT data FROM blobs WHERE hash = ?")
+        .bind(&binary_hash)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(stored_binary, binary_data);
+
+    let empty_hash = "1".repeat(64);
+    sqlx::query("INSERT INTO blobs (hash, data) VALUES (?, ?)")
+        .bind(&empty_hash)
+        .bind(Vec::<u8>::new())
+        .execute(database.pool())
+        .await?;
+    let stored_empty: Vec<u8> = sqlx::query_scalar("SELECT data FROM blobs WHERE hash = ?")
+        .bind(&empty_hash)
+        .fetch_one(database.pool())
+        .await?;
+    assert!(stored_empty.is_empty());
+
+    for invalid_hash in [
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+    ] {
+        let result = sqlx::query("INSERT INTO blobs (hash, data) VALUES (?, ?)")
+            .bind(&invalid_hash)
+            .bind(Vec::<u8>::new())
+            .execute(database.pool())
+            .await;
+        assert!(
+            result.is_err(),
+            "invalid blob hash should be rejected: {invalid_hash:?}"
+        );
+    }
+
+    let null_hash = sqlx::query("INSERT INTO blobs (hash, data) VALUES (NULL, ?)")
+        .bind(Vec::<u8>::new())
+        .execute(database.pool())
+        .await;
+    assert!(null_hash.is_err());
+
+    let null_data = sqlx::query("INSERT INTO blobs (hash, data) VALUES (?, NULL)")
+        .bind("2".repeat(64))
+        .execute(database.pool())
+        .await;
+    assert!(null_data.is_err());
+
+    let duplicate_hash = sqlx::query("INSERT INTO blobs (hash, data) VALUES (?, ?)")
+        .bind(&binary_hash)
+        .bind(vec![1_u8])
+        .execute(database.pool())
+        .await;
+    assert!(duplicate_hash.is_err());
 
     Ok(())
 }

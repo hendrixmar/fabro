@@ -11,11 +11,11 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
-use super::blob_store::BlobStore;
 use super::projection_cache::{CachedRunProjection, RunProjectionCache};
 use crate::run_state::{EventProjectionCache, RunProjectionReducer};
 use crate::{
-    Error, EventEnvelope, EventPayload, Result, RunProjection, RunSummaryStore, StageId, keys,
+    BlobStore, Error, EventEnvelope, EventPayload, Result, RunProjection, RunSummaryStore, StageId,
+    keys,
 };
 
 const DEFAULT_EVENT_TAIL_LIMIT: usize = 1024;

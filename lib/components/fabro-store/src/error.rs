@@ -1,3 +1,5 @@
+use fabro_types::BlobHash;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
@@ -10,6 +12,10 @@ pub enum Error {
     Serde(#[from] serde_json::Error),
     #[error("SQLite error: {0}")]
     Sqlite(#[from] sqlx::Error),
+    #[error("stored blob {blob_hash} has bytes that conflict with its hash")]
+    BlobHashConflict { blob_hash: BlobHash },
+    #[error("stored blob data does not match requested hash {blob_hash}")]
+    BlobIntegrity { blob_hash: BlobHash },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Invalid event payload: {0}")]
