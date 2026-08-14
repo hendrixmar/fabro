@@ -484,24 +484,25 @@ mod tests {
 
     fn sample_run_spec() -> RunSpec {
         RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         WorkflowSettings::default(),
-            graph:            Graph::new("ship"),
-            graph_source:     Some("digraph Ship {}".to_string()),
-            workflow_slug:    Some("demo".to_string()),
-            automation:       None,
-            source_directory: Some("/tmp/project".to_string()),
-            git:              Some(fabro_types::GitContext {
+            run_id:              fixtures::RUN_1,
+            settings:            WorkflowSettings::default(),
+            graph:               Graph::new("ship"),
+            graph_source:        Some("digraph Ship {}".to_string()),
+            workflow_slug:       Some("demo".to_string()),
+            workflow_version_id: None,
+            automation:          None,
+            source_directory:    Some("/tmp/project".to_string()),
+            git:                 Some(fabro_types::GitContext {
                 origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
                 branch:     "main".to_string(),
                 sha:        None,
                 dirty:      fabro_types::DirtyStatus::Clean,
             }),
-            labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            fork_source_ref:  None,
+            labels:              HashMap::from([("team".to_string(), "platform".to_string())]),
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            definition_blob:     None,
+            fork_source_ref:     None,
         }
     }
 

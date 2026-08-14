@@ -352,23 +352,24 @@ mod tests {
         let store = test_store();
         let run = store.create_run(&fixtures::RUN_1).await.unwrap();
         append_event(&run, &fixtures::RUN_1, &Event::RunCreated {
-            run_id:           fixtures::RUN_1,
-            title:            None,
-            settings:         serde_json::to_value(fabro_types::WorkflowSettings::default())
+            run_id:              fixtures::RUN_1,
+            title:               None,
+            settings:            serde_json::to_value(fabro_types::WorkflowSettings::default())
                 .unwrap(),
-            graph:            serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
-            workflow_source:  None,
-            labels:           std::collections::BTreeMap::default(),
-            source_directory: None,
-            workflow_slug:    None,
-            automation:       None,
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            git:              None,
-            fork_source_ref:  None,
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            graph:               serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
+            workflow_source:     None,
+            labels:              std::collections::BTreeMap::default(),
+            source_directory:    None,
+            workflow_slug:       None,
+            workflow_version_id: None,
+            automation:          None,
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            git:                 None,
+            fork_source_ref:     None,
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .unwrap();

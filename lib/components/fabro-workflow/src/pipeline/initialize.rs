@@ -858,6 +858,7 @@ mod tests {
                 graph,
                 graph_source: None,
                 workflow_slug: Some("test".to_string()),
+                workflow_version_id: None,
                 automation: None,
                 source_directory: Some(std::env::current_dir().unwrap().display().to_string()),
                 git: Some(fabro_types::GitContext {
@@ -1042,22 +1043,23 @@ mod tests {
         run_options.settings = settings;
         run_options.fork_source_ref = fork_source_ref;
         crate::event::append_event(&run_store, &test_run_id(), &Event::RunCreated {
-            run_id:           test_run_id(),
-            title:            None,
-            settings:         serde_json::to_value(&run_options.settings).unwrap(),
-            graph:            serde_json::to_value(&graph).unwrap(),
-            workflow_source:  None,
-            labels:           BTreeMap::new(),
-            source_directory: Some(workspace.display().to_string()),
-            workflow_slug:    Some("test".to_string()),
-            automation:       None,
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            git:              None,
-            fork_source_ref:  run_options.fork_source_ref.clone(),
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            run_id:              test_run_id(),
+            title:               None,
+            settings:            serde_json::to_value(&run_options.settings).unwrap(),
+            graph:               serde_json::to_value(&graph).unwrap(),
+            workflow_source:     None,
+            labels:              BTreeMap::new(),
+            source_directory:    Some(workspace.display().to_string()),
+            workflow_slug:       Some("test".to_string()),
+            workflow_version_id: None,
+            automation:          None,
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            git:                 None,
+            fork_source_ref:     run_options.fork_source_ref.clone(),
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .unwrap();

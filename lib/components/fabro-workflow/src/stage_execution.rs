@@ -198,19 +198,20 @@ mod tests {
 
     fn projection_with_stages(stages: &[(&str, u32, u32)]) -> RunProjection {
         let spec = RunSpec {
-            run_id:           RunId::new(),
-            settings:         WorkflowSettings::default(),
-            graph:            Graph::new("test"),
-            graph_source:     None,
-            workflow_slug:    None,
-            automation:       None,
-            source_directory: None,
-            labels:           std::collections::HashMap::new(),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            git:              None,
-            fork_source_ref:  None,
+            run_id:              RunId::new(),
+            settings:            WorkflowSettings::default(),
+            graph:               Graph::new("test"),
+            graph_source:        None,
+            workflow_slug:       None,
+            workflow_version_id: None,
+            automation:          None,
+            source_directory:    None,
+            labels:              std::collections::HashMap::new(),
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            definition_blob:     None,
+            git:                 None,
+            fork_source_ref:     None,
         };
         let mut projection = RunProjection::new(String::new(), spec, Utc::now());
         for (node_id, visit, seq) in stages {

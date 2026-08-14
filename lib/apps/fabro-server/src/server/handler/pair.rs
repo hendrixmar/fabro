@@ -1024,6 +1024,7 @@ mod tests {
             labels: std::collections::BTreeMap::new(),
             source_directory: None,
             workflow_slug: None,
+            workflow_version_id: None,
             automation: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,

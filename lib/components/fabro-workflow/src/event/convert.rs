@@ -33,6 +33,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             labels,
             source_directory,
             workflow_slug,
+            workflow_version_id,
             automation,
             provenance,
             manifest_blob,
@@ -51,6 +52,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             labels:           labels.clone(),
             source_directory: source_directory.clone(),
             workflow_slug:    workflow_slug.clone(),
+            workflow_version_id: *workflow_version_id,
             automation:       automation.clone(),
             provenance:       provenance.clone(),
             manifest_blob:    *manifest_blob,
@@ -1401,9 +1403,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use ::fabro_types::{
-        AutomationRef, EventBody, FailureReason, ParallelBranchId, Principal, RunNoticeCode,
-        RunNoticeLevel, RunProvenance, StageId, SystemActorKind, fixtures,
-        run_event as fabro_types,
+        AutomationRef, BlobHash, EventBody, FailureReason, ParallelBranchId, Principal,
+        RunNoticeCode, RunNoticeLevel, RunProvenance, StageId, SystemActorKind, WorkflowVersionId,
+        fixtures, run_event as fabro_types,
     };
     use chrono::Utc;
     use fabro_agent::{
@@ -2656,6 +2658,7 @@ mod tests {
             name:       Some("Nightly".to_string()),
             trigger_id: Some("schedule_1".to_string()),
         };
+        let workflow_version_id = WorkflowVersionId::from(BlobHash::new(b"workflow"));
 
         let stored = to_run_event(&fixtures::RUN_1, &Event::RunCreated {
             run_id: fixtures::RUN_1,
@@ -2666,6 +2669,7 @@ mod tests {
             labels: BTreeMap::default(),
             source_directory: Some("/tmp/run".to_string()),
             workflow_slug: None,
+            workflow_version_id: Some(workflow_version_id),
             automation: Some(automation.clone()),
             provenance,
             manifest_blob: None,
@@ -2681,6 +2685,42 @@ mod tests {
             panic!("expected run.created body");
         };
         assert_eq!(props.automation, Some(automation));
+        assert_eq!(props.workflow_version_id, Some(workflow_version_id));
+    }
+
+    #[test]
+    fn run_created_omits_absent_workflow_version_id() {
+        use ::fabro_types::{Graph, WorkflowSettings, fixtures};
+
+        let stored = to_run_event(&fixtures::RUN_1, &Event::RunCreated {
+            run_id:              fixtures::RUN_1,
+            title:               None,
+            settings:            serde_json::to_value(WorkflowSettings::default()).unwrap(),
+            graph:               serde_json::to_value(Graph::new("test")).unwrap(),
+            workflow_source:     None,
+            labels:              BTreeMap::default(),
+            source_directory:    None,
+            workflow_slug:       None,
+            workflow_version_id: None,
+            automation:          None,
+            provenance:          RunProvenance {
+                server:  None,
+                client:  None,
+                subject: user_principal("alice"),
+            },
+            manifest_blob:       None,
+            git:                 None,
+            fork_source_ref:     None,
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
+        });
+        let EventBody::RunCreated(props) = stored.body else {
+            panic!("expected run.created body");
+        };
+
+        let json = serde_json::to_value(props).expect("run.created props should serialize");
+        assert!(json.get("workflow_version_id").is_none());
     }
 
     #[test]

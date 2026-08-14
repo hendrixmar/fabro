@@ -135,6 +135,7 @@ mod tests {
             graph,
             graph_source: None,
             workflow_slug: Some("ship".to_string()),
+            workflow_version_id: None,
             automation: None,
             source_directory: Some("/tmp/project".to_string()),
             git: Some(fabro_types::GitContext {
@@ -158,22 +159,23 @@ mod tests {
         let store = memory_store();
         let run_store = store.create_run(&record.run_id).await.unwrap();
         append_event(&run_store, &record.run_id, &Event::RunCreated {
-            run_id:           record.run_id,
-            title:            None,
-            settings:         serde_json::to_value(&record.settings).unwrap(),
-            graph:            serde_json::to_value(&record.graph).unwrap(),
-            workflow_source:  source.map(ToOwned::to_owned),
-            labels:           record.labels.clone().into_iter().collect(),
-            source_directory: record.source_directory.clone(),
-            workflow_slug:    record.workflow_slug.clone(),
-            automation:       record.automation.clone(),
-            provenance:       record.provenance.clone(),
-            manifest_blob:    None,
-            git:              record.git.clone(),
-            fork_source_ref:  record.fork_source_ref.clone(),
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            run_id:              record.run_id,
+            title:               None,
+            settings:            serde_json::to_value(&record.settings).unwrap(),
+            graph:               serde_json::to_value(&record.graph).unwrap(),
+            workflow_source:     source.map(ToOwned::to_owned),
+            labels:              record.labels.clone().into_iter().collect(),
+            source_directory:    record.source_directory.clone(),
+            workflow_slug:       record.workflow_slug.clone(),
+            workflow_version_id: None,
+            automation:          record.automation.clone(),
+            provenance:          record.provenance.clone(),
+            manifest_blob:       None,
+            git:                 record.git.clone(),
+            fork_source_ref:     record.fork_source_ref.clone(),
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .unwrap();

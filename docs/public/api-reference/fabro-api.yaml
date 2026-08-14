@@ -11418,6 +11418,11 @@ components:
           type: ["string", "null"]
         workflow_slug:
           type: ["string", "null"]
+        workflow_version_id:
+          description: Exact immutable root workflow version from which the run was admitted, when applicable.
+          oneOf:
+            - $ref: "#/components/schemas/WorkflowVersionId"
+            - type: "null"
         automation:
           oneOf:
             - $ref: "#/components/schemas/AutomationRef"

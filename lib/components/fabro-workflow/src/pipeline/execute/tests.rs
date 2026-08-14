@@ -156,6 +156,7 @@ fn persisted_workflow(graph: Graph, source: String, run_dir: &Path, run_id: RunI
             graph,
             graph_source: None,
             workflow_slug: Some("test".to_string()),
+            workflow_version_id: None,
             automation: None,
             source_directory: Some(
                 std::env::current_dir()
@@ -207,22 +208,23 @@ async fn seed_created_and_starting(
     graph: &Graph,
 ) {
     append_event(run_store, &run_options.run_id, &Event::RunCreated {
-        run_id:           run_options.run_id,
-        title:            None,
-        settings:         serde_json::to_value(&run_options.settings).unwrap(),
-        graph:            serde_json::to_value(graph).unwrap(),
-        workflow_source:  None,
-        labels:           run_options.labels.clone().into_iter().collect(),
-        source_directory: Some(std::env::current_dir().unwrap().display().to_string()),
-        workflow_slug:    run_options.workflow_slug.clone(),
-        automation:       None,
-        provenance:       test_support::test_run_provenance(),
-        manifest_blob:    None,
-        git:              run_options.pre_run_git.clone(),
-        fork_source_ref:  run_options.fork_source_ref.clone(),
-        retried_from:     None,
-        parent_id:        None,
-        web_url:          None,
+        run_id:              run_options.run_id,
+        title:               None,
+        settings:            serde_json::to_value(&run_options.settings).unwrap(),
+        graph:               serde_json::to_value(graph).unwrap(),
+        workflow_source:     None,
+        labels:              run_options.labels.clone().into_iter().collect(),
+        source_directory:    Some(std::env::current_dir().unwrap().display().to_string()),
+        workflow_slug:       run_options.workflow_slug.clone(),
+        workflow_version_id: None,
+        automation:          None,
+        provenance:          test_support::test_run_provenance(),
+        manifest_blob:       None,
+        git:                 run_options.pre_run_git.clone(),
+        fork_source_ref:     run_options.fork_source_ref.clone(),
+        retried_from:        None,
+        parent_id:           None,
+        web_url:             None,
     })
     .await
     .unwrap();

@@ -316,6 +316,7 @@ mod tests {
             graph,
             graph_source: None,
             workflow_slug: None,
+            workflow_version_id: None,
             automation: None,
             source_directory: None,
             labels: HashMap::new(),

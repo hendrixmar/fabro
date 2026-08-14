@@ -730,6 +730,7 @@ pub(crate) async fn create_run_from_manifest(
         git: manifest.git.clone(),
         storage_root: state.server_storage_dir(),
         workflow_slug: None,
+        workflow_version_id: None,
         provenance: run_provenance(&headers, &actor),
         web_url: None,
         submitted_manifest_bytes: Some(submitted_manifest_bytes),

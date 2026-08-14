@@ -48,6 +48,7 @@ pub async fn retry_run(
         graph,
         graph_source,
         workflow_slug,
+        workflow_version_id,
         automation,
         source_directory,
         labels,
@@ -75,6 +76,7 @@ pub async fn retry_run(
         labels: labels.into_iter().collect::<BTreeMap<_, _>>(),
         source_directory,
         workflow_slug,
+        workflow_version_id,
         automation,
         provenance: input.provenance.clone(),
         manifest_blob,
@@ -119,7 +121,7 @@ mod tests {
     use fabro_types::{
         AuthMethod, BlobHash, DirtyStatus, FailureReason, ForkSourceRef, GitContext, Graph,
         IdpIdentity, Principal, PullRequestLink, RunRunnableSource, RunServerProvenance, RunTiming,
-        WorkflowSettings, fixtures,
+        WorkflowSettings, WorkflowVersionId, fixtures,
     };
     use object_store::memory::InMemory;
 
@@ -161,6 +163,10 @@ mod tests {
         }
     }
 
+    fn workflow_version_id() -> WorkflowVersionId {
+        WorkflowVersionId::from(BlobHash::new(b"workflow"))
+    }
+
     async fn append_created(
         store: &fabro_store::RunDatabase,
         run_id: RunId,
@@ -182,6 +188,7 @@ mod tests {
             labels: labels.into_iter().collect(),
             source_directory: Some("/workspace/source".to_string()),
             workflow_slug: Some("retry-source".to_string()),
+            workflow_version_id: Some(workflow_version_id()),
             automation: None,
             provenance: provenance("source-user"),
             manifest_blob,
@@ -388,6 +395,10 @@ mod tests {
             Some(&"test".to_string())
         );
         assert_eq!(retry_state.spec.graph.name, "retry_source");
+        assert_eq!(
+            retry_state.spec.workflow_version_id,
+            Some(workflow_version_id())
+        );
         assert_eq!(
             retry_state.spec.graph_source.as_deref(),
             Some("digraph retry_source { start -> exit }")

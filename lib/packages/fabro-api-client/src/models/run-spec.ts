@@ -38,6 +38,10 @@ export interface RunSpec {
     'graph': { [key: string]: any; };
     'graph_source'?: string | null;
     'workflow_slug'?: string | null;
+    /**
+     * SHA-256 identity of validated canonical workflow-version bytes.
+     */
+    'workflow_version_id'?: string | null;
     'automation'?: AutomationRef | null;
     'source_directory'?: string | null;
     'labels'?: { [key: string]: string; };

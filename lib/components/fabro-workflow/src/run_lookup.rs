@@ -470,24 +470,25 @@ mod tests {
 
     fn sample_run_spec() -> RunSpec {
         RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         WorkflowSettings::default(),
-            graph:            Graph::new("test"),
-            graph_source:     None,
-            workflow_slug:    Some("test".to_string()),
-            automation:       None,
-            source_directory: Some("/tmp/project".to_string()),
-            git:              Some(fabro_types::GitContext {
+            run_id:              fixtures::RUN_1,
+            settings:            WorkflowSettings::default(),
+            graph:               Graph::new("test"),
+            graph_source:        None,
+            workflow_slug:       Some("test".to_string()),
+            workflow_version_id: None,
+            automation:          None,
+            source_directory:    Some("/tmp/project".to_string()),
+            git:                 Some(fabro_types::GitContext {
                 origin_url: String::new(),
                 branch:     "main".to_string(),
                 sha:        None,
                 dirty:      fabro_types::DirtyStatus::Clean,
             }),
-            labels:           HashMap::new(),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            fork_source_ref:  None,
+            labels:              HashMap::new(),
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            definition_blob:     None,
+            fork_source_ref:     None,
         }
     }
 
@@ -501,22 +502,23 @@ mod tests {
         let run_spec = sample_run_spec();
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
         append_event(&run_store, &fixtures::RUN_1, &Event::RunCreated {
-            run_id:           fixtures::RUN_1,
-            title:            None,
-            settings:         serde_json::to_value(&run_spec.settings).unwrap(),
-            graph:            serde_json::to_value(&run_spec.graph).unwrap(),
-            workflow_source:  None,
-            labels:           run_spec.labels.clone().into_iter().collect(),
-            source_directory: run_spec.source_directory.clone(),
-            workflow_slug:    run_spec.workflow_slug.clone(),
-            automation:       None,
-            provenance:       run_spec.provenance.clone(),
-            manifest_blob:    None,
-            git:              run_spec.git.clone(),
-            fork_source_ref:  run_spec.fork_source_ref.clone(),
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            run_id:              fixtures::RUN_1,
+            title:               None,
+            settings:            serde_json::to_value(&run_spec.settings).unwrap(),
+            graph:               serde_json::to_value(&run_spec.graph).unwrap(),
+            workflow_source:     None,
+            labels:              run_spec.labels.clone().into_iter().collect(),
+            source_directory:    run_spec.source_directory.clone(),
+            workflow_slug:       run_spec.workflow_slug.clone(),
+            workflow_version_id: None,
+            automation:          None,
+            provenance:          run_spec.provenance.clone(),
+            manifest_blob:       None,
+            git:                 run_spec.git.clone(),
+            fork_source_ref:     run_spec.fork_source_ref.clone(),
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .unwrap();

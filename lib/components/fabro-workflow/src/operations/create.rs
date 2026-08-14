@@ -17,6 +17,7 @@ use fabro_store::Database;
 use fabro_template::TemplateContext;
 use fabro_types::{
     AutomationRef, ForkSourceRef, GitContext, ManifestPath, RunId, RunProvenance, WorkflowSettings,
+    WorkflowVersionId,
 };
 use fabro_util::json::normalize_json_value;
 use tokio::task::spawn_blocking;
@@ -99,6 +100,7 @@ impl CreateRunInput {
                 run_id,
                 storage_root,
                 workflow_slug,
+                workflow_version_id: None,
                 submitted_manifest_bytes,
                 title,
                 automation,
@@ -132,6 +134,7 @@ pub struct CreateRunPersistenceMetadata {
     pub run_id: RunId,
     pub storage_root: PathBuf,
     pub workflow_slug: Option<String>,
+    pub workflow_version_id: Option<WorkflowVersionId>,
     pub submitted_manifest_bytes: Option<Vec<u8>>,
     pub title: Option<String>,
     pub automation: Option<AutomationRef>,
@@ -201,6 +204,7 @@ pub struct CreateRunPersistenceInput {
     run_id: RunId,
     run_dir: PathBuf,
     workflow_slug: Option<String>,
+    workflow_version_id: Option<WorkflowVersionId>,
     submitted_manifest_bytes: Option<Vec<u8>>,
     title: Option<String>,
     automation: Option<AutomationRef>,
@@ -226,6 +230,10 @@ impl CreateRunPersistenceInput {
 
     pub fn workflow_slug(&self) -> Option<&str> {
         self.workflow_slug.as_deref()
+    }
+
+    pub fn workflow_version_id(&self) -> Option<WorkflowVersionId> {
+        self.workflow_version_id
     }
 
     pub fn submitted_manifest_bytes(&self) -> Option<&[u8]> {
@@ -396,6 +404,7 @@ pub fn assemble_create_run_persistence_input(
         run_id,
         storage_root,
         workflow_slug,
+        workflow_version_id,
         submitted_manifest_bytes,
         title,
         automation,
@@ -416,6 +425,7 @@ pub fn assemble_create_run_persistence_input(
         run_id,
         run_dir,
         workflow_slug,
+        workflow_version_id,
         submitted_manifest_bytes,
         title,
         automation,
@@ -437,6 +447,7 @@ pub async fn persist_create_run(
         run_id,
         run_dir,
         workflow_slug,
+        workflow_version_id,
         submitted_manifest_bytes,
         title,
         automation,
@@ -464,6 +475,7 @@ pub async fn persist_create_run(
             graph: validated.graph().clone(),
             graph_source: Some(validated.source().to_string()),
             workflow_slug,
+            workflow_version_id,
             automation,
             source_directory: Some(source_directory),
             labels,
@@ -551,6 +563,7 @@ async fn persist_created_run(
                 .collect::<BTreeMap<_, _>>(),
             source_directory: record.source_directory.clone(),
             workflow_slug: record.workflow_slug.clone(),
+            workflow_version_id: record.workflow_version_id,
             automation: record.automation.clone(),
             provenance: record.provenance.clone(),
             manifest_blob,
@@ -661,7 +674,9 @@ mod tests {
     use fabro_store::Database;
     use fabro_types::settings::InterpString;
     use fabro_types::settings::run::RunMode;
-    use fabro_types::{EventBody, WorkflowSettings, fixtures, test_support};
+    use fabro_types::{
+        BlobHash, EventBody, WorkflowSettings, WorkflowVersionId, fixtures, test_support,
+    };
     use fabro_util::error::collect_chain;
     use fabro_validate::Severity;
     use object_store::local::LocalFileSystem;
@@ -1693,6 +1708,7 @@ reasoning = false
                 run_id: fixtures::RUN_1,
                 storage_root: PathBuf::from("/tmp/storage"),
                 workflow_slug: None,
+                workflow_version_id: None,
                 submitted_manifest_bytes: None,
                 title: None,
                 automation: None,
@@ -1745,7 +1761,9 @@ reasoning = false
         std::fs::write(&dot_path, "this is no longer a graph").unwrap();
 
         let materialized = materialize_create_run(compiled, catalog.as_ref()).unwrap();
-        let metadata = persistence_metadata(&request, fixtures::RUN_2, &storage_root);
+        let workflow_version_id = WorkflowVersionId::from(BlobHash::new(b"workflow"));
+        let mut metadata = persistence_metadata(&request, fixtures::RUN_2, &storage_root);
+        metadata.workflow_version_id = Some(workflow_version_id);
         let input = assemble_create_run_persistence_input(materialized, metadata);
         let store = memory_store();
         let created = persist_create_run(store.as_ref(), input).await.unwrap();
@@ -1759,6 +1777,7 @@ reasoning = false
         let state = run_store.state().await.unwrap();
         assert_eq!(state.spec.graph.goal(), "Compiled goal");
         assert_eq!(state.spec.automation, Some(automation));
+        assert_eq!(state.spec.workflow_version_id, Some(workflow_version_id));
         let events = run_store.list_events().await.unwrap();
         assert_eq!(
             events
@@ -1774,6 +1793,7 @@ reasoning = false
             created.workflow_source.as_deref(),
             Some(compiled_source.as_str())
         );
+        assert_eq!(created.workflow_version_id, Some(workflow_version_id));
         let manifest_blob = created
             .manifest_blob
             .as_ref()
@@ -1787,6 +1807,55 @@ reasoning = false
                 .as_ref(),
             b"submitted manifest"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_create_input_persists_without_workflow_version_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let run_id = fixtures::RUN_64;
+        let request = CreateRunInput {
+            workflow: WorkflowInput::DotSource {
+                source:   MINIMAL_DOT.to_string(),
+                base_dir: None,
+            },
+            settings: test_default_settings(),
+            vars: HashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            workflow_slug: Some("legacy-create".to_string()),
+            workflow_path: None,
+            workflow_bundle: None,
+            submitted_manifest_bytes: None,
+            run_id: Some(run_id),
+            title: None,
+            automation: None,
+            git: None,
+            fork_source_ref: None,
+            parent_id: None,
+            provenance: test_support::test_run_provenance(),
+            configured_providers: test_provider_ids(),
+            web_url: None,
+        };
+
+        create(
+            store.as_ref(),
+            request,
+            dir.path().join("storage"),
+            test_catalog(),
+        )
+        .await
+        .unwrap();
+
+        let run_store = store.open_run_reader(&run_id).await.unwrap();
+        let state = run_store.state().await.unwrap();
+        assert_eq!(state.spec.workflow_version_id, None);
+        let events = run_store.list_events().await.unwrap();
+        let EventBody::RunCreated(created) = &events[0].event.body else {
+            panic!("first durable event should be run.created");
+        };
+        assert_eq!(created.workflow_version_id, None);
+        let json = serde_json::to_value(created).unwrap();
+        assert!(json.get("workflow_version_id").is_none());
     }
 
     #[tokio::test]

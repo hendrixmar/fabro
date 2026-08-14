@@ -38,6 +38,7 @@ use fabro_types::settings::interp::{InterpString, ResolveError};
 use fabro_types::settings::run::{McpServerSettings, RunGoal};
 use fabro_types::{
     AutomationRef, GitContext, ManifestPath, RunId, RunProvenance, WorkflowSettings,
+    WorkflowVersionId,
 };
 use fabro_util::workspace_glob::{WorkspaceGlob, WorkspaceGlobError};
 use fabro_workflow::Error as WorkflowError;
@@ -91,6 +92,7 @@ pub(crate) struct RawRunCompilerInput {
     pub(crate) git: Option<GitContext>,
     pub(crate) storage_root: PathBuf,
     pub(crate) workflow_slug: Option<String>,
+    pub(crate) workflow_version_id: Option<WorkflowVersionId>,
     pub(crate) provenance: RunProvenance,
     pub(crate) web_url: Option<String>,
     pub(crate) submitted_manifest_bytes: Option<Vec<u8>>,
@@ -121,6 +123,7 @@ struct RunMetadata {
     run_id: Option<RunId>,
     storage_root: PathBuf,
     workflow_slug: Option<String>,
+    workflow_version_id: Option<WorkflowVersionId>,
     submitted_manifest_bytes: Option<Vec<u8>>,
     title: Option<String>,
     automation: Option<AutomationRef>,
@@ -314,6 +317,7 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
         git,
         storage_root,
         workflow_slug,
+        workflow_version_id,
         provenance,
         web_url,
         submitted_manifest_bytes,
@@ -373,6 +377,7 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
             run_id,
             storage_root,
             workflow_slug,
+            workflow_version_id,
             submitted_manifest_bytes,
             title,
             automation,
@@ -533,6 +538,7 @@ pub(crate) fn assemble_run(pinned: PinnedRun) -> CreateRunPersistenceInput {
         run_id,
         storage_root,
         workflow_slug,
+        workflow_version_id,
         submitted_manifest_bytes,
         title,
         automation,
@@ -545,6 +551,7 @@ pub(crate) fn assemble_run(pinned: PinnedRun) -> CreateRunPersistenceInput {
         run_id: run_id.expect("run ID should be resolved before compilation"),
         storage_root,
         workflow_slug,
+        workflow_version_id,
         submitted_manifest_bytes,
         title,
         automation,
@@ -643,7 +650,9 @@ mod tests {
     use fabro_model::Catalog;
     use fabro_types::settings::interp::ResolveCtx;
     use fabro_types::settings::run::RunGoal;
-    use fabro_types::{AutomationRef, Principal, RunProvenance, SystemActorKind};
+    use fabro_types::{
+        AutomationRef, BlobHash, Principal, RunProvenance, SystemActorKind, WorkflowVersionId,
+    };
     use fabro_workflow::workflow_bundle::ParsedWorkflowConfig;
 
     use super::*;
@@ -711,6 +720,7 @@ mod tests {
             git: None,
             storage_root: PathBuf::from("/tmp/fabro-storage"),
             workflow_slug: None,
+            workflow_version_id: None,
             provenance: provenance(),
             web_url: None,
             submitted_manifest_bytes: None,
@@ -978,11 +988,13 @@ include = ["reports/{{ vars.path }}/*.json"]
             trigger_id: Some("schedule".to_string()),
         };
         let submitted = b"submitted manifest".to_vec();
+        let workflow_version_id = WorkflowVersionId::from(BlobHash::new(b"workflow"));
         let mut input = raw_input(None, HashMap::new());
         input.run_id = Some(run_id);
         input.parent_id = Some(parent_id);
         input.title = Some("Compiler boundary".to_string());
         input.workflow_slug = Some("compiler-boundary".to_string());
+        input.workflow_version_id = Some(workflow_version_id);
         input.web_url = Some(format!("https://fabro.test/runs/{run_id}"));
         input.submitted_manifest_bytes = Some(submitted.clone());
         input.automation = Some(automation.clone());
@@ -1005,6 +1017,7 @@ include = ["reports/{{ vars.path }}/*.json"]
 
         assert_eq!(persistence.run_id(), run_id);
         assert_eq!(persistence.workflow_slug(), Some("compiler-boundary"));
+        assert_eq!(persistence.workflow_version_id(), Some(workflow_version_id));
         assert_eq!(
             persistence.submitted_manifest_bytes(),
             Some(submitted.as_slice())

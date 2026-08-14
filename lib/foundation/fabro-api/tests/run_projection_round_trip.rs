@@ -1,7 +1,9 @@
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::RunProjection as ApiRunProjection;
-use fabro_types::{Graph, RunProjection, RunSpec, WorkflowSettings, test_support};
+use fabro_types::{
+    BlobHash, Graph, RunProjection, RunSpec, WorkflowSettings, WorkflowVersionId, test_support,
+};
 use serde_json::json;
 #[test]
 fn run_projection_reuses_canonical_type() {
@@ -12,7 +14,7 @@ fn run_projection_reuses_canonical_type() {
 fn run_projection_round_trips_populated_projection() {
     let value = json!({
         "title": "Test run",
-        "spec": run_spec_json(),
+        "spec": run_spec_json(Some(WorkflowVersionId::from(BlobHash::new(b"workflow")))),
         "start": null,
         "status": { "kind": "submitted" },
         "status_updated_at": "2026-04-29T12:34:00Z",
@@ -108,7 +110,7 @@ fn run_projection_round_trips_populated_projection() {
 fn run_projection_round_trips_with_pending_control_unset() {
     let value = json!({
         "title": "Test run",
-        "spec": run_spec_json(),
+        "spec": run_spec_json(None),
         "start": null,
         "status": { "kind": "submitted" },
         "status_updated_at": "2026-04-29T12:34:00Z",
@@ -127,21 +129,22 @@ fn run_projection_round_trips_with_pending_control_unset() {
     assert_eq!(serde_json::to_value(projection).unwrap(), value);
 }
 
-fn run_spec_json() -> serde_json::Value {
+fn run_spec_json(workflow_version_id: Option<WorkflowVersionId>) -> serde_json::Value {
     serde_json::to_value(RunSpec {
-        run_id:           fabro_types::fixtures::RUN_1,
-        settings:         WorkflowSettings::default(),
-        graph:            Graph::new("test"),
-        graph_source:     Some("digraph test {}".to_string()),
-        workflow_slug:    None,
-        automation:       None,
+        run_id: fabro_types::fixtures::RUN_1,
+        settings: WorkflowSettings::default(),
+        graph: Graph::new("test"),
+        graph_source: Some("digraph test {}".to_string()),
+        workflow_slug: None,
+        workflow_version_id,
+        automation: None,
         source_directory: None,
-        labels:           std::collections::HashMap::new(),
-        provenance:       test_support::test_run_provenance(),
-        manifest_blob:    None,
-        definition_blob:  None,
-        git:              None,
-        fork_source_ref:  None,
+        labels: std::collections::HashMap::new(),
+        provenance: test_support::test_run_provenance(),
+        manifest_blob: None,
+        definition_blob: None,
+        git: None,
+        fork_source_ref: None,
     })
     .unwrap()
 }
