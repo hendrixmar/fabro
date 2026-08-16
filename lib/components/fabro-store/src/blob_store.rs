@@ -33,6 +33,14 @@ impl Record for Blob {
     }
 }
 
+/// Which storage engine holds the blobs.
+///
+/// This enum is a transition vehicle, not a permanent abstraction: `Slate`
+/// preserves current production behavior while the SQLite backend rolls out.
+/// Once runtime blob storage switches to SQLite and legacy blobs are
+/// imported, delete the `Slate` arm (and this enum) and inline the SQLite
+/// implementation into [`BlobStore`]. The SQLite arm's semantics — verified
+/// reads and loud failure on hash conflicts — are the intended end state.
 enum BlobBackend {
     Slate(Repository<Blob>),
     Sqlite(SqlitePool),
@@ -138,7 +146,6 @@ impl BlobStore {
             }
         }
     }
-
 }
 
 #[cfg(test)]
