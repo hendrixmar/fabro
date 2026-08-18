@@ -1,14 +1,14 @@
 use std::str::FromStr as _;
 
 use fabro_db::DbPool;
-use fabro_types::{GitRunTarget, RunTarget};
+use fabro_types::{ExternalAgentHarness, GitRunTarget, RunTarget};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, Transaction};
 
 use crate::{
     ApiTrigger, Automation, AutomationDraft, AutomationGitWorkflowSource, AutomationId,
     AutomationReplace, AutomationRevision, AutomationStoreError, AutomationTrigger,
-    AutomationTriggerId, ScheduleTrigger,
+    AutomationTriggerId, PlaneTrigger, ProjectId, ScheduleTrigger,
 };
 
 /// Shared projection for loading automations with their schedule triggers.
@@ -28,15 +28,27 @@ macro_rules! select_automations_sql {
                 a.target_branch,
                 a.target_tag,
                 a.target_sha,
-                a.target_workflow,
-                a.workflow_source_repository,
-                a.workflow_source_branch,
-                a.workflow_source_tag,
-                a.workflow_source_sha,
+                COALESCE(src.target_workflow, a.target_workflow) AS target_workflow,
+                CASE WHEN src.id IS NULL THEN a.workflow_source_repository
+                     WHEN src.workflow_source_repository IS NOT NULL THEN src.workflow_source_repository
+                     ELSE src.target_repository END AS workflow_source_repository,
+                CASE WHEN src.id IS NULL THEN a.workflow_source_branch
+                     WHEN src.workflow_source_repository IS NOT NULL THEN src.workflow_source_branch
+                     ELSE src.target_branch END AS workflow_source_branch,
+                CASE WHEN src.id IS NULL THEN a.workflow_source_tag
+                     WHEN src.workflow_source_repository IS NOT NULL THEN src.workflow_source_tag
+                     ELSE src.target_tag END AS workflow_source_tag,
+                CASE WHEN src.id IS NULL THEN a.workflow_source_sha
+                     WHEN src.workflow_source_repository IS NOT NULL THEN src.workflow_source_sha
+                     ELSE src.target_sha END AS workflow_source_sha,
+                a.project_id,
+                a.available_to_projects,
+                a.source_automation_id,
                 t.id AS trigger_id,
                 t.enabled AS trigger_enabled,
                 t.expression AS trigger_expression
             FROM automations AS a
+            LEFT JOIN automations AS src ON src.id = a.source_automation_id
             LEFT JOIN automation_triggers AS t ON t.automation_id = a.id
             ",
             $suffix
@@ -62,10 +74,59 @@ impl AutomationStore {
     }
 
     pub async fn list(&self) -> Result<Vec<Automation>, AutomationStoreError> {
-        let rows = sqlx::query(select_automations_sql!("ORDER BY a.id, t.id"))
-            .fetch_all(&self.pool)
-            .await?;
-        automations_from_rows(&rows)
+        self.list_filtered(&AutomationListFilter::default()).await
+    }
+
+    /// List automations under an ownership filter. Defaults reproduce the
+    /// unfiltered API behavior: every definition, global and project-owned.
+    pub async fn list_filtered(
+        &self,
+        filter: &AutomationListFilter,
+    ) -> Result<Vec<Automation>, AutomationStoreError> {
+        let scope = filter.scope.code();
+        let project_id = filter.project_id.as_ref().map(ProjectId::as_str);
+        let available_only = i64::from(filter.available_to_projects);
+
+        let rows = sqlx::query(select_automations_sql!(
+            "WHERE
+                CASE ?
+                    WHEN 0 THEN 1
+                    WHEN 1 THEN a.project_id IS NULL
+                    ELSE a.project_id = ?
+                END
+                AND (? = 0 OR (a.project_id IS NULL AND a.available_to_projects = 1))
+            ORDER BY a.id, t.id"
+        ))
+        .bind(scope)
+        .bind(project_id)
+        .bind(available_only)
+        .fetch_all(&self.pool)
+        .await?;
+        let plane_rows = sqlx::query(
+            r"
+            SELECT automation_id, id, enabled, project_id, ready_state_id, in_progress_state_id,
+                   done_state_id, cancelled_state_id, failure_label_id, default_harness,
+                   codex_label_id, omp_label_id, poll_interval_seconds, max_concurrency, max_retries
+            FROM automation_plane_triggers
+            WHERE automation_id IN (
+                SELECT a.id FROM automations AS a
+                WHERE
+                    CASE ?
+                        WHEN 0 THEN 1
+                        WHEN 1 THEN a.project_id IS NULL
+                        ELSE a.project_id = ?
+                    END
+                    AND (? = 0 OR (a.project_id IS NULL AND a.available_to_projects = 1))
+            )
+            ORDER BY automation_id, id
+            ",
+        )
+        .bind(scope)
+        .bind(project_id)
+        .bind(available_only)
+        .fetch_all(&self.pool)
+        .await?;
+        automations_from_rows(&rows, &plane_rows)
     }
 
     pub async fn get(&self, id: &AutomationId) -> Result<Option<Automation>, AutomationStoreError> {
@@ -73,7 +134,22 @@ impl AutomationStore {
             .bind(id.as_str())
             .fetch_all(&self.pool)
             .await?;
-        Ok(automations_from_rows(&rows)?.into_iter().next())
+        let plane_rows = sqlx::query(
+            r"
+            SELECT automation_id, id, enabled, project_id, ready_state_id, in_progress_state_id,
+                   done_state_id, cancelled_state_id, failure_label_id, default_harness,
+                   codex_label_id, omp_label_id, poll_interval_seconds, max_concurrency, max_retries
+            FROM automation_plane_triggers
+            WHERE automation_id = ?
+            ORDER BY id
+            ",
+        )
+        .bind(id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(automations_from_rows(&rows, &plane_rows)?
+            .into_iter()
+            .next())
     }
 
     pub async fn exists(&self, id: &AutomationId) -> Result<bool, AutomationStoreError> {
@@ -112,8 +188,10 @@ impl AutomationStore {
     }
 
     pub async fn create(&self, draft: AutomationDraft) -> Result<Automation, AutomationStoreError> {
+        let source_automation_id = draft.source_automation_id.clone();
         let (id, replace) = draft.into();
-        let (automation, _) = Automation::from_replace(id.clone(), replace)?;
+        let (mut automation, _) = Automation::from_replace(id.clone(), replace)?;
+        automation.source_automation_id = source_automation_id;
         let mut transaction = self.pool.begin().await?;
         if !insert_automation_ignoring_conflict(&mut transaction, &automation).await? {
             return Err(AutomationStoreError::AlreadyExists { id });
@@ -131,7 +209,29 @@ impl AutomationStore {
         let (automation, _) = Automation::from_replace(id.clone(), draft)?;
         let target = stored_git_target(&automation);
         let workflow_source = automation.workflow_source.as_ref();
-        let mut transaction = self.pool.begin().await?;
+        // IMMEDIATE: the link checks below read before writing, and a
+        // deferred read transaction cannot wait to upgrade to a writer.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // A link must stay project-owned (its source is only meaningful
+        // there), and a linked global must stay global so every link keeps
+        // following a global definition.
+        let links = sqlx::query_as::<_, (bool, bool)>(
+            "SELECT a.source_automation_id IS NOT NULL, \
+             EXISTS(SELECT 1 FROM automations WHERE source_automation_id = a.id) \
+             FROM automations AS a WHERE a.id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        match (links, &automation.project_id) {
+            (Some((true, _)), None) => {
+                return Err(AutomationStoreError::LinkRequiresProject { id: id.clone() });
+            }
+            (Some((_, true)), Some(_)) => {
+                return Err(AutomationStoreError::InUse { id: id.clone() });
+            }
+            _ => {}
+        }
         let result = sqlx::query(
             r"
             UPDATE automations SET
@@ -149,7 +249,9 @@ impl AutomationStore {
                 workflow_source_repository = ?,
                 workflow_source_branch = ?,
                 workflow_source_tag = ?,
-                workflow_source_sha = ?
+                workflow_source_sha = ?,
+                project_id = ?,
+                available_to_projects = ?
             WHERE id = ? AND revision = ?
             ",
         )
@@ -167,6 +269,8 @@ impl AutomationStore {
         .bind(workflow_source.map(|source| source.branch.as_str()))
         .bind(workflow_source.and_then(|source| source.tag.as_deref()))
         .bind(workflow_source.and_then(|source| source.sha.as_deref()))
+        .bind(automation.project_id.as_ref().map(ProjectId::as_str))
+        .bind(automation.available_to_projects)
         .bind(id.as_str())
         .bind(expected.as_str())
         .execute(&mut *transaction)
@@ -179,9 +283,17 @@ impl AutomationStore {
             .bind(id.as_str())
             .execute(&mut *transaction)
             .await?;
+        sqlx::query("DELETE FROM automation_plane_triggers WHERE automation_id = ?")
+            .bind(id.as_str())
+            .execute(&mut *transaction)
+            .await?;
         insert_schedule_triggers(&mut transaction, &automation).await?;
+        insert_plane_triggers(&mut transaction, &automation).await?;
         transaction.commit().await?;
-        Ok(automation)
+        // The stored view: a link's workflow and source come from its global.
+        self.get(id)
+            .await?
+            .ok_or_else(|| AutomationStoreError::NotFound { id: id.clone() })
     }
 
     pub async fn delete(
@@ -189,7 +301,16 @@ impl AutomationStore {
         id: &AutomationId,
         expected: &AutomationRevision,
     ) -> Result<(), AutomationStoreError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let in_use = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM automations WHERE source_automation_id = ?)",
+        )
+        .bind(id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if in_use {
+            return Err(AutomationStoreError::InUse { id: id.clone() });
+        }
         let result = sqlx::query("DELETE FROM automations WHERE id = ? AND revision = ?")
             .bind(id.as_str())
             .bind(expected.as_str())
@@ -203,18 +324,52 @@ impl AutomationStore {
     }
 }
 
+/// Which ownership slice of the automation table a listing asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutomationScope {
+    #[default]
+    All,
+    Global,
+    Project,
+}
+
+impl AutomationScope {
+    /// SQL bind value: 0 = all, 1 = global, 2 = one project.
+    fn code(self) -> i64 {
+        match self {
+            Self::All => 0,
+            Self::Global => 1,
+            Self::Project => 2,
+        }
+    }
+}
+
+/// Ownership filter for automation listings. `available_to_projects` keeps
+/// only global definitions marked shareable, which is the project automation
+/// catalog.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutomationListFilter {
+    pub scope:                 AutomationScope,
+    pub project_id:            Option<ProjectId>,
+    pub available_to_projects: bool,
+}
+
 struct StoredAutomation {
-    id:                AutomationId,
-    revision:          AutomationRevision,
-    name:              String,
-    description:       Option<String>,
-    environment_id:    Option<String>,
-    last_error:        Option<String>,
-    api_enabled:       bool,
-    target:            RunTarget,
-    workflow:          String,
-    workflow_source:   Option<AutomationGitWorkflowSource>,
-    schedule_triggers: Vec<ScheduleTrigger>,
+    id:                    AutomationId,
+    revision:              AutomationRevision,
+    name:                  String,
+    description:           Option<String>,
+    environment_id:        Option<String>,
+    last_error:            Option<String>,
+    api_enabled:           bool,
+    target:                RunTarget,
+    workflow:              String,
+    workflow_source:       Option<AutomationGitWorkflowSource>,
+    project_id:            Option<ProjectId>,
+    available_to_projects: bool,
+    source_automation_id:  Option<AutomationId>,
+    schedule_triggers:     Vec<ScheduleTrigger>,
+    plane_triggers:        Vec<PlaneTrigger>,
 }
 
 impl StoredAutomation {
@@ -232,6 +387,14 @@ impl StoredAutomation {
                 source,
             })?;
         let workflow_source = stored_workflow_source(row, &id)?;
+        let project_id = stored_project_id(row, &id)?;
+        let source_automation_id = row
+            .try_get::<Option<String>, _>("source_automation_id")?
+            .map(|value| {
+                AutomationId::new(value.clone())
+                    .map_err(|source| AutomationStoreError::StoredId { value, source })
+            })
+            .transpose()?;
         Ok(Self {
             id,
             revision,
@@ -248,7 +411,11 @@ impl StoredAutomation {
             }),
             workflow: row.try_get("target_workflow")?,
             workflow_source,
+            project_id,
+            available_to_projects: row.try_get("available_to_projects")?,
+            source_automation_id,
             schedule_triggers: Vec::new(),
+            plane_triggers: Vec::new(),
         })
     }
 
@@ -285,6 +452,11 @@ impl StoredAutomation {
             .into_iter()
             .map(AutomationTrigger::Schedule)
             .collect::<Vec<_>>();
+        triggers.extend(
+            self.plane_triggers
+                .into_iter()
+                .map(AutomationTrigger::Plane),
+        );
         if self.api_enabled {
             triggers.push(AutomationTrigger::Api(ApiTrigger::manual()));
         }
@@ -297,15 +469,21 @@ impl StoredAutomation {
                 target: self.target,
                 workflow: self.workflow,
                 workflow_source: self.workflow_source,
+                project_id: self.project_id,
+                available_to_projects: self.available_to_projects,
                 triggers,
             })
             .map_err(|source| AutomationStoreError::StoredValidation { id, source })?;
         automation.last_error = self.last_error;
+        automation.source_automation_id = self.source_automation_id;
         Ok(automation)
     }
 }
 
-fn automations_from_rows(rows: &[SqliteRow]) -> Result<Vec<Automation>, AutomationStoreError> {
+fn automations_from_rows(
+    rows: &[SqliteRow],
+    plane_rows: &[SqliteRow],
+) -> Result<Vec<Automation>, AutomationStoreError> {
     let mut automations = Vec::new();
     let mut current: Option<StoredAutomation> = None;
 
@@ -334,7 +512,93 @@ fn automations_from_rows(rows: &[SqliteRow]) -> Result<Vec<Automation>, Automati
     if let Some(automation) = current {
         automations.push(automation.finish()?);
     }
-    Ok(automations)
+
+    let mut by_id = automations
+        .into_iter()
+        .map(|automation| (automation.id.clone(), automation))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for row in plane_rows {
+        let automation_id_value = row.try_get::<String, _>("automation_id")?;
+        let automation_id = AutomationId::new(automation_id_value.clone()).map_err(|source| {
+            AutomationStoreError::StoredId {
+                value: automation_id_value,
+                source,
+            }
+        })?;
+        let Some(automation) = by_id.remove(&automation_id) else {
+            continue;
+        };
+        let trigger = plane_trigger_from_row(row, &automation_id)?;
+        let mut replace = AutomationReplace {
+            name:                  automation.name,
+            description:           automation.description,
+            environment_id:        automation.environment_id,
+            target:                automation.target,
+            workflow:              automation.workflow,
+            workflow_source:       automation.workflow_source,
+            project_id:            automation.project_id,
+            available_to_projects: automation.available_to_projects,
+            triggers:              automation.triggers,
+        };
+        replace.triggers.push(AutomationTrigger::Plane(trigger));
+        let mut rebuilt =
+            Automation::from_stored(automation_id.clone(), automation.revision, replace)
+                .map_err(|source| AutomationStoreError::StoredValidation {
+                    id: automation_id.clone(),
+                    source,
+                })?;
+        rebuilt.source_automation_id = automation.source_automation_id;
+        by_id.insert(automation_id, rebuilt);
+    }
+
+    Ok(by_id.into_values().collect())
+}
+
+fn plane_trigger_from_row(
+    row: &SqliteRow,
+    automation_id: &AutomationId,
+) -> Result<PlaneTrigger, AutomationStoreError> {
+    let id_value = row.try_get::<String, _>("id")?;
+    let id = AutomationTriggerId::new(id_value).map_err(|source| {
+        AutomationStoreError::StoredValidation {
+            id: automation_id.clone(),
+            source,
+        }
+    })?;
+    let harness = row.try_get::<String, _>("default_harness")?;
+    let default_harness = harness.parse::<ExternalAgentHarness>().map_err(|_| {
+        AutomationStoreError::StoredTriggerShape {
+            id: automation_id.clone(),
+        }
+    })?;
+    Ok(PlaneTrigger {
+        id,
+        enabled: row.try_get("enabled")?,
+        project_id: row.try_get("project_id")?,
+        ready_state_id: row.try_get("ready_state_id")?,
+        in_progress_state_id: row.try_get("in_progress_state_id")?,
+        done_state_id: row.try_get("done_state_id")?,
+        cancelled_state_id: row.try_get("cancelled_state_id")?,
+        failure_label_id: row.try_get("failure_label_id")?,
+        default_harness,
+        codex_label_id: row.try_get("codex_label_id")?,
+        omp_label_id: row.try_get("omp_label_id")?,
+        poll_interval_seconds: u64::try_from(row.try_get::<i64, _>("poll_interval_seconds")?)
+            .map_err(|_| AutomationStoreError::StoredTriggerShape {
+                id: automation_id.clone(),
+            })?,
+        max_concurrency: usize::try_from(row.try_get::<i64, _>("max_concurrency")?).map_err(
+            |_| AutomationStoreError::StoredTriggerShape {
+                id: automation_id.clone(),
+            },
+        )?,
+        max_retries: usize::try_from(row.try_get::<i64, _>("max_retries")?).map_err(|_| {
+            AutomationStoreError::StoredTriggerShape {
+                id: automation_id.clone(),
+            }
+        })?,
+    })
 }
 
 pub(crate) async fn insert_automation_ignoring_conflict(
@@ -360,8 +624,11 @@ pub(crate) async fn insert_automation_ignoring_conflict(
             workflow_source_repository,
             workflow_source_branch,
             workflow_source_tag,
-            workflow_source_sha
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            workflow_source_sha,
+            project_id,
+            available_to_projects,
+            source_automation_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO NOTHING
         ",
     )
@@ -380,13 +647,67 @@ pub(crate) async fn insert_automation_ignoring_conflict(
     .bind(workflow_source.map(|source| source.branch.as_str()))
     .bind(workflow_source.and_then(|source| source.tag.as_deref()))
     .bind(workflow_source.and_then(|source| source.sha.as_deref()))
+    .bind(automation.project_id.as_ref().map(ProjectId::as_str))
+    .bind(automation.available_to_projects)
+    .bind(automation.source_automation_id.as_ref().map(AutomationId::as_str))
     .execute(&mut **transaction)
     .await?;
     if result.rows_affected() == 0 {
         return Ok(false);
     }
     insert_schedule_triggers(transaction, automation).await?;
+    insert_plane_triggers(transaction, automation).await?;
     Ok(true)
+}
+
+async fn insert_plane_triggers(
+    transaction: &mut Transaction<'_, Sqlite>,
+    automation: &Automation,
+) -> Result<(), AutomationStoreError> {
+    for trigger in automation.plane_triggers() {
+        sqlx::query(
+            r"
+            INSERT INTO automation_plane_triggers (
+                automation_id, id, enabled, project_id, ready_state_id, in_progress_state_id,
+                done_state_id, cancelled_state_id, failure_label_id, default_harness,
+                codex_label_id, omp_label_id, poll_interval_seconds, max_concurrency, max_retries
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(automation.id.as_str())
+        .bind(trigger.id.as_str())
+        .bind(trigger.enabled)
+        .bind(&trigger.project_id)
+        .bind(&trigger.ready_state_id)
+        .bind(&trigger.in_progress_state_id)
+        .bind(&trigger.done_state_id)
+        .bind(&trigger.cancelled_state_id)
+        .bind(trigger.failure_label_id.as_deref())
+        .bind(trigger.default_harness.as_str())
+        .bind(trigger.codex_label_id.as_deref())
+        .bind(trigger.omp_label_id.as_deref())
+        .bind(i64::try_from(trigger.poll_interval_seconds).unwrap_or(i64::MAX))
+        .bind(i64::try_from(trigger.max_concurrency).unwrap_or(i64::MAX))
+        .bind(i64::try_from(trigger.max_retries).unwrap_or(i64::MAX))
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+fn stored_project_id(
+    row: &SqliteRow,
+    id: &AutomationId,
+) -> Result<Option<ProjectId>, AutomationStoreError> {
+    let Some(value) = row.try_get::<Option<String>, _>("project_id")? else {
+        return Ok(None);
+    };
+    match ProjectId::new(value.clone()) {
+        Ok(project_id) => Ok(Some(project_id)),
+        Err(_) => Err(AutomationStoreError::StoredProjectId {
+            id: id.clone(),
+            value,
+        }),
+    }
 }
 
 fn stored_workflow_source(

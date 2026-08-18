@@ -5,7 +5,6 @@
 //! scheduler, logging, integrations). Same-host and split-host deployments
 //! use the same schema.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration as StdDuration;
 
@@ -13,8 +12,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::duration::Duration;
-use crate::SandboxProviderKind;
-
+use crate::external_agent::ExternalAgentsSettings;
 /// A structurally resolved `[server]` view for consumers.
 ///
 /// `Default` is intentionally not derived: any "default" `ServerNamespace`
@@ -24,17 +22,19 @@ use crate::SandboxProviderKind;
 /// (tests).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerNamespace {
-    pub listen:       ServerListenSettings,
-    pub api:          ServerApiSettings,
-    pub web:          ServerWebSettings,
-    pub auth:         ServerAuthSettings,
-    pub sandbox:      ServerSandboxSettings,
-    pub storage:      ServerStorageSettings,
-    pub artifacts:    ServerArtifactsSettings,
-    pub slatedb:      ServerSlateDbSettings,
-    pub scheduler:    ServerSchedulerSettings,
-    pub logging:      ServerLoggingSettings,
-    pub integrations: ServerIntegrationsSettings,
+    pub listen:          ServerListenSettings,
+    pub api:             ServerApiSettings,
+    pub web:             ServerWebSettings,
+    pub auth:            ServerAuthSettings,
+    pub sandbox:         ServerSandboxSettings,
+    pub storage:         ServerStorageSettings,
+    pub artifacts:       ServerArtifactsSettings,
+    pub slatedb:         ServerSlateDbSettings,
+    pub scheduler:       ServerSchedulerSettings,
+    pub logging:         ServerLoggingSettings,
+    pub integrations:    ServerIntegrationsSettings,
+    #[serde(default)]
+    pub external_agents: ExternalAgentsSettings,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -45,17 +45,18 @@ impl ServerNamespace {
     #[must_use]
     pub fn test_default() -> Self {
         Self {
-            listen:       ServerListenSettings::default(),
-            api:          ServerApiSettings::default(),
-            web:          ServerWebSettings::default(),
-            auth:         ServerAuthSettings::default(),
-            sandbox:      ServerSandboxSettings::default(),
-            storage:      ServerStorageSettings::default(),
-            artifacts:    ServerArtifactsSettings::default(),
-            slatedb:      ServerSlateDbSettings::default(),
-            scheduler:    ServerSchedulerSettings::default(),
-            logging:      ServerLoggingSettings::default(),
-            integrations: ServerIntegrationsSettings::default(),
+            listen:          ServerListenSettings::default(),
+            api:             ServerApiSettings::default(),
+            web:             ServerWebSettings::default(),
+            auth:            ServerAuthSettings::default(),
+            sandbox:         ServerSandboxSettings::default(),
+            storage:         ServerStorageSettings::default(),
+            artifacts:       ServerArtifactsSettings::default(),
+            slatedb:         ServerSlateDbSettings::default(),
+            scheduler:       ServerSchedulerSettings::default(),
+            logging:         ServerLoggingSettings::default(),
+            integrations:    ServerIntegrationsSettings::default(),
+            external_agents: ExternalAgentsSettings::default(),
         }
     }
 }
@@ -112,101 +113,44 @@ pub struct ServerAuthGithubSettings {
     pub allowed_usernames: Vec<String>,
 }
 
-/// `[server.sandbox]` — which sandbox providers this server may launch.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSandboxSettings {
     pub providers: ServerSandboxProvidersSettings,
 }
 
-/// Per-provider policy keyed by provider kind.
-///
-/// The resolver always materializes the bundled kinds (`local`, `docker`,
-/// `daytona`). Any other key names a sandbox-driver plugin executable and
-/// carries its launch settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
 pub struct ServerSandboxProvidersSettings {
-    pub entries: BTreeMap<SandboxProviderKind, ServerSandboxProviderSettings>,
+    pub local:   ServerSandboxProviderSettings,
+    pub docker:  ServerSandboxProviderSettings,
+    pub daytona: ServerSandboxProviderSettings,
 }
 
 impl ServerSandboxProvidersSettings {
-    /// Policy for one provider kind, when the server knows the kind.
+    /// Per-provider policy entry.
     #[must_use]
-    pub fn get(&self, provider: &SandboxProviderKind) -> Option<&ServerSandboxProviderSettings> {
-        self.entries.get(provider)
-    }
-
-    /// Whether the server may launch this provider. A kind without an entry
-    /// is disabled: nothing configured it.
-    #[must_use]
-    pub fn is_enabled(&self, provider: &SandboxProviderKind) -> bool {
-        self.get(provider).is_some_and(|entry| entry.enabled)
-    }
-
-    /// Kinds the server may launch, in key order.
-    pub fn enabled_kinds(&self) -> impl Iterator<Item = &SandboxProviderKind> {
-        self.entries
-            .iter()
-            .filter(|(_, entry)| entry.enabled)
-            .map(|(kind, _)| kind)
-    }
-
-    /// Enabled kinds that are served by a plugin executable.
-    pub fn enabled_plugins(
+    pub fn for_provider(
         &self,
-    ) -> impl Iterator<Item = (&SandboxProviderKind, &SandboxPluginSettings)> {
-        self.entries.iter().filter_map(|(kind, entry)| {
-            (entry.enabled)
-                .then_some(entry.plugin.as_ref())
-                .flatten()
-                .map(|plugin| (kind, plugin))
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerSandboxProviderSettings {
-    pub enabled: bool,
-    /// Launch settings for a plugin provider. Absent for bundled kinds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin:  Option<SandboxPluginSettings>,
-}
-
-impl Default for ServerSandboxProviderSettings {
-    // The resolver defaults each bundled provider to enabled; keep the struct
-    // default aligned with that so callers that bypass the resolver behave
-    // identically.
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            plugin:  None,
+        provider: crate::SandboxProviderKind,
+    ) -> &ServerSandboxProviderSettings {
+        match provider {
+            crate::SandboxProviderKind::Local => &self.local,
+            crate::SandboxProviderKind::Docker => &self.docker,
+            crate::SandboxProviderKind::Daytona => &self.daytona,
         }
     }
 }
 
-/// How the server launches a sandbox-driver plugin executable.
-///
-/// The executable speaks the sandbox-driver JSON-RPC protocol on stdio. It
-/// starts with a scrubbed environment: only `env` and the ambient variables
-/// named in `inherit_env` reach it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SandboxPluginSettings {
-    /// Executable path. When absent the server searches `PATH` for
-    /// `fabro-sandbox-<kind>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path:        Option<String>,
-    /// Pinned SHA-256 of the executable, hex.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256:      Option<String>,
-    /// Allow launching without a checksum.
-    #[serde(default)]
-    pub dev:         bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args:        Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env:         BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inherit_env: Vec<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerSandboxProviderSettings {
+    pub enabled: bool,
+}
+
+impl Default for ServerSandboxProviderSettings {
+    // The resolver defaults each provider to enabled; keep the struct default
+    // aligned with that so callers that bypass the resolver behave identically.
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,8 +243,14 @@ pub struct ServerLoggingSettings {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerIntegrationsSettings {
-    pub github: GithubIntegrationSettings,
-    pub slack:  SlackIntegrationSettings,
+    pub github:  GithubIntegrationSettings,
+    pub slack:   SlackIntegrationSettings,
+    #[serde(default)]
+    pub plane:   PlaneIntegrationSettings,
+    #[serde(default)]
+    pub bugsink: BugsinkIntegrationSettings,
+    #[serde(default)]
+    pub intake:  IntakeIntegrationSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +276,45 @@ impl Default for SlackIntegrationSettings {
             default_channel: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaneIntegrationSettings {
+    #[serde(default)]
+    pub enabled:   bool,
+    pub api_base:  Option<String>,
+    pub workspace: Option<String>,
+}
+
+/// Private feature-intake bridge. The bridge listens on a Unix-domain socket
+/// owned by the same OS user as the server; no browser traffic reaches it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeIntegrationSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Absolute path of the bridge socket. Required when enabled.
+    pub socket:  Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BugsinkIntegrationSettings {
+    #[serde(default)]
+    pub enabled:          bool,
+    #[serde(default)]
+    pub dispatch_enabled: bool,
+    pub origin:           Option<String>,
+    /// Vault entry name, never the API token itself.
+    pub api_token_secret: Option<String>,
+    #[serde(default)]
+    pub projects:         Vec<BugsinkProjectSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BugsinkProjectSettings {
+    pub project_id:     u64,
+    pub automation_id:  String,
+    /// Project-specific vault entry name, never signing material.
+    pub signing_secret: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

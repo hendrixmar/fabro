@@ -13,6 +13,7 @@ import type {
 
 import {
   findApiTrigger,
+  findPlaneTrigger,
   findScheduleTrigger,
   gitTarget,
   type GitRunTarget,
@@ -21,12 +22,16 @@ import { Panel, Row } from "./settings-panel";
 import { INPUT_CLASS } from "./ui";
 import { isCloneBasedEnvironment, providerLabel } from "../lib/environment-providers";
 import { sandboxRuntime } from "../lib/run-sandbox-lifecycle";
+import { usePlaneProjectMetadata, usePlaneProjects } from "../lib/queries";
 
 export interface AutomationFormValues {
   id: string;
   name: string;
   description: string;
   environmentId: string;
+  projectId: string;
+  sourceAutomationId: string;
+  availableToProjects: boolean;
   targetRepository: string;
   targetBranch: string;
   targetTag: string;
@@ -40,6 +45,18 @@ export interface AutomationFormValues {
   manualEnabled: boolean;
   scheduleEnabled: boolean;
   cron: string;
+  planeEnabled: boolean;
+  planeProjectId: string;
+  planeReadyStateId: string;
+  planeInProgressStateId: string;
+  planeDoneStateId: string;
+  planeCancelledStateId: string;
+  planeFailureLabelId: string;
+  planeDefaultHarness: "codex" | "omp";
+  planeCodexLabelId: string;
+  planeOmpLabelId: string;
+  planePollIntervalSeconds: string;
+  planeMaxConcurrency: string;
 }
 
 export const EMPTY_AUTOMATION_FORM: AutomationFormValues = {
@@ -47,6 +64,9 @@ export const EMPTY_AUTOMATION_FORM: AutomationFormValues = {
   name:                       "",
   description:                "",
   environmentId:   "",
+  projectId:                 "",
+  sourceAutomationId:        "",
+  availableToProjects:       false,
   targetRepository:           "",
   targetBranch:               "main",
   targetTag:                  "",
@@ -60,6 +80,18 @@ export const EMPTY_AUTOMATION_FORM: AutomationFormValues = {
   manualEnabled:             true,
   scheduleEnabled:           false,
   cron:                      "0 9 * * 1-5",
+  planeEnabled:              false,
+  planeProjectId:            "",
+  planeReadyStateId:         "",
+  planeInProgressStateId:    "",
+  planeDoneStateId:          "",
+  planeCancelledStateId:     "",
+  planeFailureLabelId:       "",
+  planeDefaultHarness:       "codex",
+  planeCodexLabelId:         "",
+  planeOmpLabelId:           "",
+  planePollIntervalSeconds:  "60",
+  planeMaxConcurrency:       "3",
 };
 
 const CRON_PRESETS: ReadonlyArray<{ label: string; value: string }> = [
@@ -72,6 +104,7 @@ const CRON_PRESETS: ReadonlyArray<{ label: string; value: string }> = [
 export function automationToFormValues(automation: Automation): AutomationFormValues {
   const apiTrigger = findApiTrigger(automation);
   const scheduleTrigger = findScheduleTrigger(automation);
+  const planeTrigger = findPlaneTrigger(automation);
   const target = gitTarget(automation.target);
   const workflowSource = automation.workflow_source;
   return {
@@ -79,6 +112,9 @@ export function automationToFormValues(automation: Automation): AutomationFormVa
     name:                       automation.name,
     description:                automation.description ?? "",
     environmentId:   automation.environment_id ?? "",
+    projectId:                 automation.project_id ?? "",
+    sourceAutomationId:        automation.source_automation_id ?? "",
+    availableToProjects:       automation.available_to_projects ?? false,
     targetRepository:           target?.repo ?? "",
     targetBranch:               target?.branch ?? EMPTY_AUTOMATION_FORM.targetBranch,
     targetTag:                  target?.tag ?? "",
@@ -92,6 +128,18 @@ export function automationToFormValues(automation: Automation): AutomationFormVa
     manualEnabled:             apiTrigger?.enabled ?? false,
     scheduleEnabled:           scheduleTrigger?.enabled ?? false,
     cron:                      scheduleTrigger?.expression ?? "0 9 * * 1-5",
+    planeEnabled:             planeTrigger?.enabled ?? false,
+    planeProjectId:           planeTrigger?.project_id ?? "",
+    planeReadyStateId:        planeTrigger?.ready_state_id ?? "",
+    planeInProgressStateId:   planeTrigger?.in_progress_state_id ?? "",
+    planeDoneStateId:         planeTrigger?.done_state_id ?? "",
+    planeCancelledStateId:    planeTrigger?.cancelled_state_id ?? "",
+    planeFailureLabelId:      planeTrigger?.failure_label_id ?? "",
+    planeDefaultHarness:      planeTrigger?.default_harness === "omp" ? "omp" : "codex",
+    planeCodexLabelId:        planeTrigger?.codex_label_id ?? "",
+    planeOmpLabelId:          planeTrigger?.omp_label_id ?? "",
+    planePollIntervalSeconds: String(planeTrigger?.poll_interval_seconds ?? 60),
+    planeMaxConcurrency:      String(planeTrigger?.max_concurrency ?? 3),
   };
 }
 
@@ -155,11 +203,47 @@ export function triggersFromFormValues(values: AutomationFormValues): Automation
       expression: values.cron.trim(),
     });
   }
+  if (values.planeEnabled) {
+    triggers.push({
+      id:                    "plane-tickets",
+      type:                  "plane",
+      enabled:               true,
+      project_id:            values.planeProjectId.trim(),
+      ready_state_id:        values.planeReadyStateId.trim(),
+      in_progress_state_id:  values.planeInProgressStateId.trim(),
+      done_state_id:         values.planeDoneStateId.trim(),
+      cancelled_state_id:    values.planeCancelledStateId.trim(),
+      failure_label_id:      values.planeFailureLabelId.trim() || null,
+      default_harness:       values.planeDefaultHarness,
+      codex_label_id:        values.planeCodexLabelId.trim() || null,
+      omp_label_id:          values.planeOmpLabelId.trim() || null,
+      poll_interval_seconds: Number(values.planePollIntervalSeconds) || 60,
+      max_concurrency:       Number(values.planeMaxConcurrency) || 3,
+      max_retries:           1,
+    });
+  }
   return triggers;
 }
 
+/** Canonical create/replace payload fields shared by every automation form. */
+export function automationPayloadFromFormValues(values: AutomationFormValues) {
+  return {
+    name:                  values.name.trim(),
+    description:           values.description.trim() || null,
+    environment_id:        values.environmentId.trim(),
+    target:                targetFromFormValues(values),
+    workflow:              values.workflow.trim(),
+    workflow_source:       workflowSourceFromFormValues(values),
+    project_id:            values.projectId.trim() || undefined,
+    available_to_projects: values.projectId.trim()
+      ? false
+      : values.availableToProjects,
+    triggers: triggersFromFormValues(values),
+  };
+}
+
 export function isFormValid(values: AutomationFormValues): boolean {
-  return (
+  const baseValid =
     values.id.trim() !== "" &&
     values.name.trim() !== "" &&
     values.environmentId.trim() !== "" &&
@@ -167,7 +251,15 @@ export function isFormValid(values: AutomationFormValues): boolean {
     values.targetBranch.trim() !== "" &&
     isOptionalShaValid(values.targetSha) &&
     values.workflow.trim() !== "" &&
-    isWorkflowSourceValid(values)
+    isWorkflowSourceValid(values);
+  if (!values.planeEnabled) return baseValid;
+  return (
+    baseValid &&
+    values.planeProjectId.trim() !== "" &&
+    values.planeReadyStateId.trim() !== "" &&
+    values.planeInProgressStateId.trim() !== "" &&
+    values.planeDoneStateId.trim() !== "" &&
+    values.planeCancelledStateId.trim() !== ""
   );
 }
 
@@ -281,6 +373,7 @@ interface AutomationFormFieldsProps {
   values: AutomationFormValues;
   onChange: (values: AutomationFormValues) => void;
   lockIdAndTarget?: boolean;
+  lockTargetRepoAndBranch?: boolean;
   environments?: Environment[];
   environmentsLoading?: boolean;
   environmentsError?: boolean;
@@ -290,6 +383,7 @@ export function AutomationFormFields({
   values,
   onChange,
   lockIdAndTarget = false,
+  lockTargetRepoAndBranch = false,
   environments = [],
   environmentsLoading = false,
   environmentsError = false,
@@ -423,7 +517,13 @@ export function AutomationFormFields({
       <Panel title="Run target">
         <Row
           title={<Label required>Repository</Label>}
-          help="GitHub repository whose workspace the run changes, in owner/repo form."
+          help={
+            lockTargetRepoAndBranch
+              ? "Fixed to this project's canonical repository. Every automation owned by the project runs against it."
+              : values.projectId
+                ? "GitHub repository whose workspace the run changes, in owner/repo form. Must match this project's canonical repository."
+                : "GitHub repository whose workspace the run changes, in owner/repo form."
+          }
         >
           <input
             type="text"
@@ -431,6 +531,7 @@ export function AutomationFormFields({
             aria-label="Run target repository"
             value={values.targetRepository}
             onChange={(e) => patch({ targetRepository: e.target.value })}
+            disabled={lockTargetRepoAndBranch}
             placeholder="acme/orders-api"
             autoComplete="off"
             spellCheck={false}
@@ -439,7 +540,11 @@ export function AutomationFormFields({
         </Row>
         <Row
           title={<Label required>Working branch</Label>}
-          help="Attached branch retained with the run, including when a tag or exact commit is selected."
+          help={
+            lockTargetRepoAndBranch
+              ? "Fixed to this project's default branch."
+              : "Attached branch retained with the run, including when a tag or exact commit is selected."
+          }
         >
           <input
             type="text"
@@ -447,6 +552,7 @@ export function AutomationFormFields({
             aria-label="Working branch"
             value={values.targetBranch}
             onChange={(e) => patch({ targetBranch: e.target.value })}
+            disabled={lockTargetRepoAndBranch}
             placeholder="main"
             autoComplete="off"
             spellCheck={false}
@@ -493,109 +599,154 @@ export function AutomationFormFields({
       </Panel>
 
       <Panel title="Workflow">
-        <Row
-          title={<Label required>Workflow slug</Label>}
-          help={
-            values.usesRemoteWorkflow
-              ? "Dash-separated identifier resolved in the remote workflow checkout."
-              : "Dash-separated identifier resolved in the run target checkout."
-          }
-        >
-          <input
-            type="text"
-            name="workflow_slug"
-            aria-label="Workflow slug"
-            value={values.workflow}
-            onChange={(e) => patch({ workflow: kebabify(e.target.value) })}
-            placeholder="patch-cves"
-            autoComplete="off"
-            spellCheck={false}
-            className={`${INPUT_CLASS} font-mono`}
-          />
-        </Row>
-        <Row
-          title="Remote workflow"
-          help="Load workflow files from a GitHub repository and revision instead of the run target checkout. The repository may match the run target."
-        >
-          <ToggleSwitch
-            checked={values.usesRemoteWorkflow}
-            onChange={(usesRemoteWorkflow) => patch({ usesRemoteWorkflow })}
-            label="Use a remote workflow"
-          />
-        </Row>
-        {values.usesRemoteWorkflow ? (
+        {values.sourceAutomationId ? (
+          <Row title="Workflow" help="A linked automation always runs the global definition's current workflow.">
+            <p className="text-sm text-fg-3">
+              Runs the global{" "}
+              <Link to={`/automations/${encodeURIComponent(values.sourceAutomationId)}`} className="font-mono underline">
+                {values.sourceAutomationId}
+              </Link>{" "}
+              workflow
+            </p>
+          </Row>
+        ) : (
           <>
             <Row
-              title={<Label required>Workflow repository</Label>}
-              help="GitHub owner/repo containing the workflow files."
-            >
-              <input
-                type="text"
-                name="workflow_source_repository"
-                aria-label="Remote workflow repository"
-                value={values.workflowSourceRepository}
-                onChange={(e) => patch({ workflowSourceRepository: e.target.value })}
-                placeholder="acme/automation-workflows"
-                autoComplete="off"
-                spellCheck={false}
-                className={`${INPUT_CLASS} font-mono`}
-              />
-            </Row>
-            <Row
-              title={<Label required>Branch</Label>}
-              help="Fallback revision and audit context. An exact SHA does not need to be reachable from this branch."
-            >
-              <input
-                type="text"
-                name="workflow_source_branch"
-                aria-label="Remote workflow branch"
-                value={values.workflowSourceBranch}
-                onChange={(e) => patch({ workflowSourceBranch: e.target.value })}
-                placeholder="main"
-                autoComplete="off"
-                spellCheck={false}
-                className={`${INPUT_CLASS} font-mono`}
-              />
-            </Row>
-            <Row
-              title={<Label optional>Tag</Label>}
-              help="Bare tag name resolved when the automation fires. Used only when exact SHA is empty."
-            >
-              <input
-                type="text"
-                name="workflow_source_tag"
-                aria-label="Remote workflow tag"
-                value={values.workflowSourceTag}
-                onChange={(e) => patch({ workflowSourceTag: e.target.value })}
-                placeholder="v1.2.3"
-                autoComplete="off"
-                spellCheck={false}
-                className={`${INPUT_CLASS} font-mono`}
-              />
-            </Row>
-            <Row
-              title={<Label optional>Exact SHA</Label>}
+              title={<Label required>Workflow slug</Label>}
               help={
-                workflowSourceShaValid
-                  ? "A 40-character commit SHA takes precedence over tag and branch. It is fetched directly and need not be reachable from the named branch."
-                  : <span className="text-coral">Enter exactly 40 hexadecimal characters.</span>
+                values.usesRemoteWorkflow
+                  ? "Dash-separated identifier resolved in the remote workflow checkout."
+                  : "Dash-separated identifier resolved in the run target checkout."
               }
             >
               <input
                 type="text"
-                name="workflow_source_sha"
-                aria-label="Remote workflow exact commit SHA"
-                aria-invalid={!workflowSourceShaValid}
-                value={values.workflowSourceSha}
-                onChange={(e) => patch({ workflowSourceSha: e.target.value })}
-                placeholder="0123456789abcdef0123456789abcdef01234567"
+                name="workflow_slug"
+                aria-label="Workflow slug"
+                value={values.workflow}
+                onChange={(e) => patch({ workflow: kebabify(e.target.value) })}
+                placeholder="patch-cves"
                 autoComplete="off"
                 spellCheck={false}
                 className={`${INPUT_CLASS} font-mono`}
               />
             </Row>
+            <Row
+              title="Remote workflow"
+              help="Load workflow files from a GitHub repository and revision instead of the run target checkout. The repository may match the run target."
+            >
+              <ToggleSwitch
+                checked={values.usesRemoteWorkflow}
+                onChange={(usesRemoteWorkflow) => patch({ usesRemoteWorkflow })}
+                label="Use a remote workflow"
+              />
+            </Row>
+            {values.usesRemoteWorkflow ? (
+              <>
+                <Row
+                  title={<Label required>Workflow repository</Label>}
+                  help="GitHub owner/repo containing the workflow files."
+                >
+                  <input
+                    type="text"
+                    name="workflow_source_repository"
+                    aria-label="Remote workflow repository"
+                    value={values.workflowSourceRepository}
+                    onChange={(e) => patch({ workflowSourceRepository: e.target.value })}
+                    placeholder="acme/automation-workflows"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </Row>
+                <Row
+                  title={<Label required>Branch</Label>}
+                  help="Fallback revision and audit context. An exact SHA does not need to be reachable from this branch."
+                >
+                  <input
+                    type="text"
+                    name="workflow_source_branch"
+                    aria-label="Remote workflow branch"
+                    value={values.workflowSourceBranch}
+                    onChange={(e) => patch({ workflowSourceBranch: e.target.value })}
+                    placeholder="main"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </Row>
+                <Row
+                  title={<Label optional>Tag</Label>}
+                  help="Bare tag name resolved when the automation fires. Used only when exact SHA is empty."
+                >
+                  <input
+                    type="text"
+                    name="workflow_source_tag"
+                    aria-label="Remote workflow tag"
+                    value={values.workflowSourceTag}
+                    onChange={(e) => patch({ workflowSourceTag: e.target.value })}
+                    placeholder="v1.2.3"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </Row>
+                <Row
+                  title={<Label optional>Exact SHA</Label>}
+                  help={
+                    workflowSourceShaValid
+                      ? "A 40-character commit SHA takes precedence over tag and branch. It is fetched directly and need not be reachable from the named branch."
+                      : <span className="text-coral">Enter exactly 40 hexadecimal characters.</span>
+                  }
+                >
+                  <input
+                    type="text"
+                    name="workflow_source_sha"
+                    aria-label="Remote workflow exact commit SHA"
+                    aria-invalid={!workflowSourceShaValid}
+                    value={values.workflowSourceSha}
+                    onChange={(e) => patch({ workflowSourceSha: e.target.value })}
+                    placeholder="0123456789abcdef0123456789abcdef01234567"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </Row>
+              </>
+            ) : null}
           </>
-        ) : null}
+        )}
+      </Panel>
+
+      <Panel title="Projects">
+        {values.projectId ? (
+          <Row
+            title="Owned by this project"
+            help={
+              values.sourceAutomationId
+                ? `This project automation links the global definition ${values.sourceAutomationId}: its workflow always comes from that definition. Its trigger and environment are this project's.`
+                : "This automation belongs to this project. Its workflow, trigger and environment are this project's."
+            }
+          >
+            <Link
+              to={`/projects/${encodeURIComponent(values.projectId)}`}
+              className="font-mono text-xs text-mint hover:text-fg"
+            >
+              {values.projectId}
+            </Link>
+          </Row>
+        ) : (
+          <Row
+            title="Available to projects"
+            help="Global definitions only. Projects link this automation: edits to its workflow reach every project that uses it. Linking never enables a trigger. Each project instance targets that project's repository and starts with every trigger disabled."
+          >
+            <ToggleSwitch
+              checked={values.availableToProjects}
+              onChange={(availableToProjects) => patch({ availableToProjects })}
+              label="Make available to projects"
+            />
+          </Row>
+        )}
       </Panel>
 
       <Panel title="Triggers">
@@ -658,7 +809,121 @@ export function AutomationFormFields({
             </div>
           </Row>
         ) : null}
+        <Row title="Plane tickets" help="Poll a Plane project for ready tickets and start runs automatically.">
+          <ToggleSwitch
+            checked={values.planeEnabled}
+            onChange={(planeEnabled) => patch({ planeEnabled })}
+            label="Enable Plane ticket trigger"
+          />
+        </Row>
+        {values.planeEnabled ? (
+          <PlaneTriggerFields values={values} patch={patch} />
+        ) : null}
       </Panel>
+    </>
+  );
+}
+
+function PlaneTriggerFields({
+  values,
+  patch,
+}: {
+  values: AutomationFormValues;
+  patch: (next: Partial<AutomationFormValues>) => void;
+}) {
+  const projectsQuery = usePlaneProjects(true);
+  const metadataQuery = usePlaneProjectMetadata(values.planeProjectId || undefined);
+  const projects = projectsQuery.data?.data ?? [];
+  const states = metadataQuery.data?.states ?? [];
+  const labels = metadataQuery.data?.labels ?? [];
+  const loadError =
+    projectsQuery.error instanceof Error
+      ? projectsQuery.error.message
+      : metadataQuery.error instanceof Error
+        ? metadataQuery.error.message
+        : null;
+
+  return (
+    <>
+      {loadError ? (
+        <Row title="Plane status" help="Fix the Plane integration before enabling this trigger.">
+          <p className="text-sm text-coral">{loadError}</p>
+        </Row>
+      ) : null}
+      <Row title="Project" help="Plane project to poll for ready tickets.">
+        <select
+          aria-label="Plane project"
+          value={values.planeProjectId}
+          onChange={(event) => patch({
+            planeProjectId: event.target.value,
+            planeReadyStateId: "",
+            planeInProgressStateId: "",
+            planeDoneStateId: "",
+            planeCancelledStateId: "",
+          })}
+          className={INPUT_CLASS}
+        >
+          <option value="">Select a project</option>
+          {projects.map((project) => (
+            <option key={project.id} value={project.id}>
+              {project.identifier ? `${project.identifier} — ${project.name}` : project.name}
+            </option>
+          ))}
+        </select>
+      </Row>
+      <Row title="Lifecycle states" help="Exact Ready, In Progress, Done, and Cancelled state IDs.">
+        <div className="grid gap-2 sm:grid-cols-2">
+          <select aria-label="Ready state" value={values.planeReadyStateId} onChange={(event) => patch({ planeReadyStateId: event.target.value })} className={INPUT_CLASS}>
+            <option value="">Ready</option>
+            {states.map((state) => <option key={state.id} value={state.id}>{state.name}</option>)}
+          </select>
+          <select aria-label="In Progress state" value={values.planeInProgressStateId} onChange={(event) => patch({ planeInProgressStateId: event.target.value })} className={INPUT_CLASS}>
+            <option value="">In Progress</option>
+            {states.map((state) => <option key={state.id} value={state.id}>{state.name}</option>)}
+          </select>
+          <select aria-label="Done state" value={values.planeDoneStateId} onChange={(event) => patch({ planeDoneStateId: event.target.value })} className={INPUT_CLASS}>
+            <option value="">Done</option>
+            {states.map((state) => <option key={state.id} value={state.id}>{state.name}</option>)}
+          </select>
+          <select aria-label="Cancelled state" value={values.planeCancelledStateId} onChange={(event) => patch({ planeCancelledStateId: event.target.value })} className={INPUT_CLASS}>
+            <option value="">Cancelled</option>
+            {states.map((state) => <option key={state.id} value={state.id}>{state.name}</option>)}
+          </select>
+        </div>
+      </Row>
+      <Row title="Default harness" help="Used unless a ticket has a configured Codex or OMP override label.">
+        <select
+          aria-label="Default harness"
+          value={values.planeDefaultHarness}
+          onChange={(event) => patch({ planeDefaultHarness: event.target.value === "omp" ? "omp" : "codex" })}
+          className={INPUT_CLASS}
+        >
+          <option value="codex">Codex</option>
+          <option value="omp">OMP</option>
+        </select>
+      </Row>
+      <Row title="Harness labels" help="Optional labels that override the default harness. Leave empty to use the default only.">
+        <div className="grid gap-2 sm:grid-cols-2">
+          <select aria-label="Codex label" value={values.planeCodexLabelId} onChange={(event) => patch({ planeCodexLabelId: event.target.value })} className={INPUT_CLASS}>
+            <option value="">Codex label</option>
+            {labels.map((label) => <option key={label.id} value={label.id}>{label.name}</option>)}
+          </select>
+          <select aria-label="OMP label" value={values.planeOmpLabelId} onChange={(event) => patch({ planeOmpLabelId: event.target.value })} className={INPUT_CLASS}>
+            <option value="">OMP label</option>
+            {labels.map((label) => <option key={label.id} value={label.id}>{label.name}</option>)}
+          </select>
+        </div>
+      </Row>
+      <Row title="Polling" help="Interval 15–3600 seconds. Concurrency 1–10.">
+        <div className="grid gap-2 sm:grid-cols-3">
+          <input aria-label="Poll interval seconds" value={values.planePollIntervalSeconds} onChange={(event) => patch({ planePollIntervalSeconds: event.target.value })} className={INPUT_CLASS} />
+          <input aria-label="Max concurrency" value={values.planeMaxConcurrency} onChange={(event) => patch({ planeMaxConcurrency: event.target.value })} className={INPUT_CLASS} />
+          <select aria-label="Failure label" value={values.planeFailureLabelId} onChange={(event) => patch({ planeFailureLabelId: event.target.value })} className={INPUT_CLASS}>
+            <option value="">Failure label</option>
+            {labels.map((label) => <option key={label.id} value={label.id}>{label.name}</option>)}
+          </select>
+        </div>
+      </Row>
     </>
   );
 }

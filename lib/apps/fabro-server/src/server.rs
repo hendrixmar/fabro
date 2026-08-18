@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
 use base64::Engine as _;
@@ -28,10 +28,10 @@ pub use fabro_api::types::{
     BatchDeleteRunsResultOutcome, BatchDeleteRunsSummary, BatchRunLifecycleRequest,
     BatchRunLifecycleResponse, BatchRunLifecycleResult, BatchRunLifecycleResultOutcome,
     BatchRunLifecycleSummary, BillingByModel, BillingStageRef, CloseRunPullRequestResponse,
-    CompletionResponse, CompletionUsage, CreateCompletionRequest, CreateRunPullRequestRequest,
-    CreateSecretRequest, CreateVariableRequest, DeleteRunResponse, DeleteRunSandbox,
-    DeleteSecretRequest, DenyRunRequest, DiskUsageResponse, DiskUsageRunRow, DiskUsageSummaryRow,
-    ErrorResponseEntry, ForkRequest, ForkResponse, IntegrationConnectionKind,
+    CompletionResponse, CompletionToolChoiceMode, CompletionUsage, CreateCompletionRequest,
+    CreateRunPullRequestRequest, CreateSecretRequest, CreateVariableRequest, DeleteRunResponse,
+    DeleteRunSandbox, DeleteSecretRequest, DenyRunRequest, DiskUsageResponse, DiskUsageRunRow,
+    DiskUsageSummaryRow, ErrorResponseEntry, ForkRequest, ForkResponse, IntegrationConnectionKind,
     IntegrationConnectionState, IntegrationConnectionStatus, IntegrationProvider,
     IntegrationStatus, LinkRunPullRequestRequest, MergeRunPullRequestRequest,
     MergeRunPullRequestResponse, ModelReference, PaginatedEventList, PaginatedRunList,
@@ -48,24 +48,32 @@ pub use fabro_api::types::{
     SystemRepairRunsResponse, SystemResourcesResponse, SystemRunCounts, TimelineEntryResponse,
     UpdateVariableRequest, VariableListResponse, VncPreviewResponse, WriteBlobResponse,
 };
-use fabro_auth::SqlVaultCredentialSource;
-use fabro_automation::{self, AutomationStore};
+use fabro_auth::{CredentialSource, SqlVaultCredentialSource, auth_issue_message};
+use fabro_automation::{self, AutomationStore, PlaneDispatchStore, ProjectId, ProjectStore};
 use fabro_config::daemon::ServerDaemon;
-use fabro_config::{LlmLayer, RunLayer, Storage, WorkflowSettingsBuilder};
+use fabro_config::{RunLayer, Storage, WorkflowSettingsBuilder};
 use fabro_db::DbPool;
 use fabro_environment::EnvironmentStore;
 use fabro_interview::{
     Answer, AnswerSubmission, ControlInterviewer, Interviewer, Question, WorkerControlEnvelope,
 };
-use fabro_llm::credentials::CredentialProvider;
-use fabro_llm::lithos_catalog::Catalog;
-use fabro_llm::{ClientOptions, FabroClient};
+use fabro_llm::client::Client as LlmClient;
+use fabro_llm::generate::{GenerateParams, generate_object};
+use fabro_llm::model_test::run_model_test;
+use fabro_llm::types::{
+    FinishReason, Message as LlmMessage, Request as LlmRequest, ToolChoice, ToolDefinition,
+};
 use fabro_mcp_store::McpServerStore;
+use fabro_model::catalog::LlmCatalogSettings;
+use fabro_model::{BilledTokenCounts, Catalog, ModelRef, ModelTestMode, ProviderId};
 use fabro_redact::redact_jsonl_line;
+use fabro_sandbox::daytona::{self, DaytonaSandbox};
 use fabro_sandbox::details::sandbox_details;
-use fabro_sandbox::driver::{DaytonaCredentials, ProviderAccess, ProviderConnectOptions};
 use fabro_sandbox::reconnect::reconnect_for_run;
-use fabro_sandbox::{SandboxInventory, daytona};
+use fabro_sandbox::{
+    DaytonaSandboxProvider, DockerSandboxProvider, LocalSandboxProvider, Sandbox, SandboxProvider,
+    SandboxProviderRegistry,
+};
 use fabro_slack::client::{PostedMessage as SlackPostedMessage, SlackClient};
 use fabro_slack::config::{
     SlackCredentialResolution,
@@ -77,8 +85,8 @@ use fabro_slack::{blocks as slack_blocks, connection as slack_connection};
 use fabro_static::EnvVars;
 use fabro_store::{
     ArtifactKey, ArtifactStore, AuthCodeStore, AuthSessionStore, Database, EventEnvelope,
-    EventPayload, KeyedMutex, NodeArtifact, PendingInterviewRecord, RunSessionRecordStore,
-    RunSummaryStore, StageArtifactEntry, StageId,
+    EventPayload, KeyedMutex, NodeArtifact, PendingInterviewRecord, RunSummaryStore,
+    StageArtifactEntry, StageId,
 };
 #[cfg(test)]
 use fabro_types::BlockedReason;
@@ -88,10 +96,10 @@ use fabro_types::settings::server::{
     GithubIntegrationSettings, GithubIntegrationStrategy, LogDestination,
 };
 use fabro_types::{
-    AgentBackend, AskFabro, AskFabroUnavailableReason, BilledTokenCounts, BlobHash, EventBody,
-    InterviewQuestionRecord, ModelRef, ModelTestMode, PairId, PairMessageId, PairTarget,
-    PendingReason, Principal, PullRequestLink, QuestionType, RunControlAction, RunEvent, RunId,
-    RunRunnableSource, RunStatusKind, SandboxProviderKind, ServerSettings, SessionCapability,
+    AgentBackend, AskFabro, AskFabroUnavailableReason, BlobHash, EventBody,
+    InterviewQuestionRecord, PairId, PairMessageId, PairTarget, PendingReason, Principal,
+    PullRequestLink, QuestionType, RunControlAction, RunEvent, RunId, RunRunnableSource,
+    RunStatusKind, SandboxProviderKind, ServerSettings, SessionCapability,
 };
 use fabro_util::error::{
     SharedError, collect_causes, render_compact_with_causes, render_with_causes,
@@ -112,7 +120,6 @@ use fabro_workflow::run_lookup::{
 use fabro_workflow::run_status::{FailureReason, RunStatus, SuccessReason};
 use fabro_workflow::{Error as WorkflowError, operations, pull_request};
 use futures_util::future::join_all;
-use lithos_llm::catalog::ProviderId;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tokio::fs;
@@ -132,6 +139,7 @@ use tower::{ServiceExt, service_fn};
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tracing::{Instrument, debug, error, info, warn};
+use ulid::Ulid;
 
 use crate::auth::{self, GithubEndpoints, auth_translation_middleware, demo_routing_middleware};
 use crate::automation_materializer::{
@@ -144,6 +152,7 @@ use crate::git_checkout::GitRepoCache;
 use crate::github_webhooks::{
     WEBHOOK_ROUTE, WEBHOOK_SECRET_ENV, parse_event_metadata, verify_signature,
 };
+use crate::intake_bridge::IntakeBridge;
 use crate::jwt_auth::{self, AuthMode};
 use crate::principal_middleware::{
     AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunManagementTarget,
@@ -152,7 +161,7 @@ use crate::principal_middleware::{
 };
 use crate::request_id::{self, RequestId};
 use crate::run_files::{FilesInFlight, new_files_in_flight};
-use crate::server_secrets::ServerSecrets;
+use crate::server_secrets::{LlmClientResult, ServerSecrets};
 use crate::spawn_env::apply_render_graph_env;
 use crate::worker_control::{LocalWorkerControlBus, WorkerControlBus, WorkerControlBusError};
 use crate::worker_runtime::{
@@ -160,15 +169,19 @@ use crate::worker_runtime::{
 };
 use crate::worker_token::{WorkerScopeSet, WorkerTokenKeys, issue_worker_token_with_scopes};
 use crate::{
-    canonical_host, demo, diagnostics, run_manifest, security_headers, static_files, web_auth,
+    bugsink_webhooks, canonical_host, demo, diagnostics, run_manifest, security_headers,
+    static_files, web_auth,
 };
 
+mod automation_plane;
 mod automation_scheduler;
 mod handler;
+pub(crate) mod incident_intake;
 mod pull_request_supervisor;
 pub(crate) mod resource_sampler;
 mod session_runtime;
 
+pub(crate) use automation_plane::spawn_plane_dispatcher;
 pub(crate) use automation_scheduler::spawn_automation_scheduler;
 pub(crate) use handler::events::EventListParams;
 #[cfg(test)]
@@ -1124,7 +1137,7 @@ pub struct AppState {
     parent_link_lock: AsyncMutex<()>,
 
     pub(super) server_secrets: ServerSecrets,
-    pub(crate) llm_source: Arc<dyn CredentialProvider>,
+    pub(crate) llm_source: Arc<dyn CredentialSource>,
     manifest_run_defaults: RwLock<Arc<RunLayer>>,
     manifest_run_settings: RwLock<std::result::Result<RunNamespace, SharedError>>,
     pub(crate) server_settings: RwLock<Arc<ServerSettings>>,
@@ -1134,7 +1147,11 @@ pub struct AppState {
     pub(crate) github_api_base_url: String,
     active_config_path: PathBuf,
     http_client: Option<fabro_http::HttpClient>,
-    sandbox_inventory: SandboxInventory,
+    /// Private feature-intake bridge client, absent when the integration is
+    /// disabled or its socket could not be used. A missing client is a 503 on
+    /// intake routes only and never a server startup failure.
+    intake: Option<IntakeBridge>,
+    sandbox_provider_registry: SandboxProviderRegistry,
     shutdown: CancellationToken,
     shutting_down: AtomicBool,
     registry_factory_override: Option<Box<RegistryFactoryOverride>>,
@@ -1144,17 +1161,18 @@ pub struct AppState {
 }
 
 pub(crate) struct AppStores {
-    pub(crate) runs:            Arc<Database>,
-    pub(crate) run_summaries:   Arc<RunSummaryStore>,
-    /// Ask Fabro conversations, keyed by session id.
-    pub(crate) session_records: Arc<RunSessionRecordStore>,
-    pub(crate) auth_codes:      Arc<AuthCodeStore>,
-    pub(crate) auth_sessions:   Arc<AuthSessionStore>,
-    pub(crate) automations:     Arc<AutomationStore>,
-    pub(crate) environments:    Arc<EnvironmentStore>,
-    pub(crate) mcp_servers:     Arc<McpServerStore>,
-    pub(crate) vault:           Arc<SecretStore>,
-    pub(crate) variables:       Arc<VariableStore>,
+    pub(crate) runs:             Arc<Database>,
+    pub(crate) run_summaries:    Arc<RunSummaryStore>,
+    pub(crate) projects:         Arc<ProjectStore>,
+    pub(crate) auth_codes:       Arc<AuthCodeStore>,
+    pub(crate) auth_sessions:    Arc<AuthSessionStore>,
+    pub(crate) automations:      Arc<AutomationStore>,
+    pub(crate) plane_dispatches: Arc<PlaneDispatchStore>,
+    pub(crate) incidents:        Arc<incident_intake::IncidentStore>,
+    pub(crate) environments:     Arc<EnvironmentStore>,
+    pub(crate) mcp_servers:      Arc<McpServerStore>,
+    pub(crate) vault:            Arc<SecretStore>,
+    pub(crate) variables:        Arc<VariableStore>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1178,6 +1196,34 @@ impl AppState {
         &self.stores.automations
     }
 
+    pub(crate) fn project_store(&self) -> &ProjectStore {
+        &self.stores.projects
+    }
+
+    /// The configured feature-intake bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actionable 503 when the integration is disabled or its
+    /// socket could not be prepared; intake surfaces degrade alone.
+    pub(crate) fn intake_bridge(&self) -> Result<IntakeBridge, ApiError> {
+        self.intake.clone().ok_or_else(|| {
+            ApiError::with_code(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "feature intake is not configured on this server",
+                "intake_not_configured",
+            )
+        })
+    }
+
+    pub(crate) fn plane_dispatch_store(&self) -> &PlaneDispatchStore {
+        &self.stores.plane_dispatches
+    }
+
+    pub(crate) fn incident_store(&self) -> &incident_intake::IncidentStore {
+        &self.stores.incidents
+    }
+
     pub(crate) fn environment_store(&self) -> &EnvironmentStore {
         &self.stores.environments
     }
@@ -1186,7 +1232,61 @@ impl AppState {
         &self.stores.mcp_servers
     }
 
+    /// Validate a project-scoped automation's owner before any checkout: a
+    /// project that disappeared, or one whose repository no longer matches the
+    /// automation's application target, blocks materialization instead of
+    /// producing a mislabeled run.
+    pub(crate) async fn validate_automation_project(
+        &self,
+        project_id: &ProjectId,
+        target: &fabro_types::GitRunTarget,
+    ) -> Result<fabro_automation::Project, RunMaterializeError> {
+        let Some(project) = self.project_store().get(project_id).await? else {
+            return Err(RunMaterializeError::ProjectNotFound {
+                id: project_id.clone(),
+            });
+        };
+        let matches = fabro_types::GitHubRepositorySlug::try_new(&target.repo)
+            .zip(fabro_types::GitHubRepositorySlug::try_new(
+                &project.repository,
+            ))
+            .is_some_and(|(target_repo, project_repo)| target_repo == project_repo);
+        if !matches {
+            return Err(RunMaterializeError::ProjectTargetMismatch {
+                project_id:         project.id,
+                project_repository: project.repository,
+                target_repository:  target.repo.clone(),
+            });
+        }
+        Ok(project)
+    }
+
     pub(crate) async fn materialize_automation_run(
+        &self,
+        input: AutomationRunMaterializeInput,
+    ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
+        // A project automation runs its workflow for exactly one registered
+        // project. Without a registry binding there is no `inputs.project`,
+        // and running without it would act on every project: fail closed.
+        let project_input = match &input.project_id {
+            Some(project_id) => {
+                let project = self
+                    .validate_automation_project(project_id, &input.target)
+                    .await?;
+                Some(
+                    project
+                        .intake_binding_id
+                        .ok_or(RunMaterializeError::ProjectNotRegistered { id: project.id })?,
+                )
+            }
+            None => None,
+        };
+        let mut materialized = self.materialize_validated_automation_run(input).await?;
+        materialized.project_input = project_input;
+        Ok(materialized)
+    }
+
+    async fn materialize_validated_automation_run(
         &self,
         input: AutomationRunMaterializeInput,
     ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
@@ -1279,7 +1379,7 @@ pub(crate) struct AppStateConfig {
     pub(crate) github_api_base_url: Option<String>,
     pub(crate) active_config_path: PathBuf,
     pub(crate) http_client: Option<fabro_http::HttpClient>,
-    pub(crate) sandbox_inventory: Option<SandboxInventory>,
+    pub(crate) sandbox_provider_registry: Option<SandboxProviderRegistry>,
     pub(crate) shutdown: CancellationToken,
     #[cfg(test)]
     pub(crate) worker_control_bus: Option<Arc<dyn WorkerControlBus>>,
@@ -1293,7 +1393,7 @@ pub(crate) struct AppStateConfig {
 pub(crate) struct ResolvedAppStateSettings {
     pub(crate) server_settings:       ServerSettings,
     pub(crate) manifest_run_defaults: RunLayer,
-    pub(crate) llm_overlay:           LlmLayer,
+    pub(crate) llm_catalog_settings:  LlmCatalogSettings,
 }
 
 fn accumulate_billing_rollup(
@@ -1390,18 +1490,13 @@ impl AppState {
         Some(format!("{}/runs/{run_id}", base.trim_end_matches('/')))
     }
 
-    pub(crate) async fn resolve_llm_client(&self) -> anyhow::Result<FabroClient> {
-        resolve_llm_client_from_source(
-            Arc::clone(&self.llm_source),
-            self.catalog(),
-            self.http_client.clone(),
-        )
-        .await
+    pub(crate) async fn resolve_llm_client(&self) -> anyhow::Result<LlmClientResult> {
+        resolve_llm_client_from_source(self.llm_source.as_ref(), self.catalog()).await
     }
 
     pub(crate) async fn configured_llm_provider_ids(&self) -> Vec<ProviderId> {
         let catalog = self.catalog();
-        fabro_llm::configured_providers(catalog.as_ref(), self.llm_source.as_ref()).await
+        self.llm_source.configured_providers(catalog.as_ref()).await
     }
 
     /// Resolve the LLM client once and derive the ready provider IDs from it,
@@ -1410,14 +1505,14 @@ impl AppState {
     /// resolved twice.
     pub(crate) async fn resolve_llm_client_with_ready_ids(
         &self,
-    ) -> (anyhow::Result<FabroClient>, Vec<ProviderId>) {
+    ) -> (anyhow::Result<LlmClientResult>, Vec<ProviderId>) {
         let llm_result = self.resolve_llm_client().await;
         if let Err(err) = &llm_result {
             warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
         }
         let ready_provider_ids = llm_result
             .as_ref()
-            .map(FabroClient::provider_ids)
+            .map(LlmClientResult::provider_ids)
             .unwrap_or_default();
         (llm_result, ready_provider_ids)
     }
@@ -1445,9 +1540,12 @@ impl AppState {
         let default_model = if provider_ids.is_empty() {
             None
         } else {
-            self.catalog()
-                .default_offering_for(&provider_ids)
-                .map(|entry| entry.model.id().to_string())
+            Some(
+                self.catalog()
+                    .default_for_configured_ids(&provider_ids)
+                    .id
+                    .to_string(),
+            )
         };
         AskFabroReadiness { default_model }
     }
@@ -1467,28 +1565,6 @@ impl AppState {
         (self.env_lookup)(name)
     }
 
-    /// Daytona credentials for `api_key`: the key from the vault, the
-    /// control-plane URL and organization from server configuration, and
-    /// the server's HTTP client. The process environment is consulted only
-    /// through the configured lookup.
-    pub(crate) fn daytona_credentials(&self, api_key: String) -> DaytonaCredentials {
-        DaytonaCredentials::from_api_key(api_key, |name| self.config_env_lookup(name))
-            .with_http_client(self.http_client().ok())
-    }
-
-    /// Everything a reconnect needs to reach a run's provider: the server's
-    /// provider settings and the Daytona credentials from the vault (`None`
-    /// when no key is stored).
-    pub(crate) async fn provider_access(&self) -> Result<ProviderAccess, SecretStoreError> {
-        Ok(ProviderAccess {
-            providers: self.server_settings().server.sandbox.providers.clone(),
-            daytona:   self
-                .vault_secret(EnvVars::DAYTONA_API_KEY)
-                .await?
-                .map(|api_key| self.daytona_credentials(api_key)),
-        })
-    }
-
     pub(crate) async fn check_daytona_api_key(
         &self,
         api_key: String,
@@ -1502,7 +1578,21 @@ impl AppState {
         api_key: String,
         probe_timeout: Duration,
     ) -> anyhow::Result<daytona::DaytonaKeyCheck> {
-        daytona::check_daytona_api_key(&self.daytona_credentials(api_key), probe_timeout).await
+        let base_url = self
+            .config_env_lookup(EnvVars::DAYTONA_API_URL)
+            .or_else(|| self.config_env_lookup(EnvVars::DAYTONA_SERVER_URL))
+            .unwrap_or_else(|| daytona::DEFAULT_DAYTONA_API_URL.to_string());
+        let org_id = self.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
+
+        let http_client = fabro_http::http_client().context("failed to build HTTP client")?;
+        daytona::check_daytona_api_key_with_timeout(
+            &base_url,
+            org_id.as_deref(),
+            api_key,
+            http_client,
+            probe_timeout,
+        )
+        .await
     }
 
     /// Borrow the persistent store so sibling modules can open run readers
@@ -1530,8 +1620,8 @@ impl AppState {
         &self.session_runtimes
     }
 
-    pub(crate) fn sandbox_inventory(&self) -> &SandboxInventory {
-        &self.sandbox_inventory
+    pub(crate) fn sandbox_provider_registry(&self) -> &SandboxProviderRegistry {
+        &self.sandbox_provider_registry
     }
 
     pub(crate) fn server_secret(&self, name: &str) -> Option<String> {
@@ -1646,8 +1736,13 @@ impl AppState {
         let ResolvedAppStateSettings {
             server_settings,
             manifest_run_defaults,
-            llm_overlay,
+            llm_catalog_settings,
         } = resolved_settings;
+        anyhow::ensure!(
+            server_settings.server.integrations.bugsink
+                == self.server_settings().server.integrations.bugsink,
+            "Bugsink integration changes require a server restart and enablement validation"
+        );
         let server_settings = Arc::new(server_settings);
         let manifest_run_defaults = Arc::new(manifest_run_defaults);
         let effective_web_url =
@@ -1658,7 +1753,7 @@ impl AppState {
             &self.stores.mcp_servers,
         );
         let catalog = Arc::new(
-            fabro_llm::build_catalog(&llm_overlay, &|name| (self.env_lookup)(name))
+            Catalog::from_builtin_with_overrides(&llm_catalog_settings)
                 .context("building LLM model catalog")?,
         );
         canonical_origin_from_effective_web_url(&effective_web_url).map_err(anyhow::Error::msg)?;
@@ -1684,18 +1779,21 @@ impl AppState {
     }
 }
 
-/// Builds the server's LLM client: retries and attachment inlining on, the
-/// server's HTTP client for provider requests when one is configured.
 async fn resolve_llm_client_from_source(
-    source: Arc<dyn CredentialProvider>,
+    source: &dyn CredentialSource,
     catalog: Arc<Catalog>,
-    http_client: Option<fabro_http::HttpClient>,
-) -> anyhow::Result<FabroClient> {
-    let mut options = ClientOptions::standard();
-    options.http = http_client;
-    fabro_llm::build_client(Catalog::clone(&catalog), source, options)
+) -> anyhow::Result<LlmClientResult> {
+    let resolved = source
+        .resolve(catalog.as_ref())
         .await
-        .context("building the LLM client")
+        .context("resolving LLM credentials")?;
+    let report = LlmClient::from_credentials_report(resolved.credentials, catalog).await;
+
+    Ok(LlmClientResult {
+        client:              report.client,
+        auth_issues:         resolved.auth_issues,
+        registration_issues: report.registration_issues,
+    })
 }
 
 fn decode_secret_pem(name: &str, raw: &str) -> Result<String, String> {
@@ -1815,6 +1913,8 @@ pub fn build_router_with_options(
     let github_endpoints =
         github_endpoints.unwrap_or_else(|| Arc::new(GithubEndpoints::production_defaults()));
     let webhook_secret = state.github_webhook_secret.clone();
+    let bugsink_webhooks =
+        bugsink_webhooks::routes(Arc::clone(&state)).with_state(Arc::clone(&state));
     let principal_layer = middleware::from_fn_with_state(Arc::clone(&state), principal_middleware);
     let api_common = if web_enabled {
         Router::new()
@@ -1907,6 +2007,7 @@ pub fn build_router_with_options(
         let secret: Arc<[u8]> = Arc::from(secret.into_bytes().into_boxed_slice());
         router = github_webhook_routes(secret).merge(router);
     }
+    router = bugsink_webhooks.merge(router);
 
     router
         // Innermost of the outer layers so every response body — static SPA
@@ -2328,45 +2429,36 @@ fn worker_token_keys_from_server_secrets(
         .map_err(|err| jwt_auth::session_secret_key_error(&err))
 }
 
-fn build_sandbox_inventory(
+fn build_sandbox_provider_registry(
     server_settings: &ServerSettings,
     daytona_api_key: Option<String>,
     env_lookup: &EnvLookup,
     http_client: Option<fabro_http::HttpClient>,
-) -> SandboxInventory {
+) -> SandboxProviderRegistry {
     let provider_settings = &server_settings.server.sandbox.providers;
-    let mut inventory = SandboxInventory::empty();
+    let mut providers: Vec<Arc<dyn SandboxProvider>> = Vec::new();
 
-    if provider_settings.is_enabled(&SandboxProviderKind::LOCAL) {
-        inventory = inventory.with_host_directories(SandboxProviderKind::LOCAL);
+    if provider_settings.local.enabled {
+        providers.push(Arc::new(LocalSandboxProvider));
     }
 
-    if let Some(docker) = provider_settings.get(&SandboxProviderKind::DOCKER) {
-        if docker.enabled {
-            inventory = inventory.with_lazy(
-                SandboxProviderKind::DOCKER,
-                docker.clone(),
-                ProviderConnectOptions::default(),
-            );
-        }
+    if provider_settings.docker.enabled {
+        providers.push(Arc::new(DockerSandboxProvider::new()));
     }
 
-    if let Some(daytona) = provider_settings.get(&SandboxProviderKind::DAYTONA) {
-        if let Some(api_key) = daytona_api_key.filter(|_| daytona.enabled) {
-            let credentials = DaytonaCredentials::from_api_key(api_key, |name| env_lookup(name))
-                .with_http_client(http_client);
-            inventory = inventory.with_lazy(
-                SandboxProviderKind::DAYTONA,
-                daytona.clone(),
-                ProviderConnectOptions {
-                    host_registry_root: None,
-                    daytona:            Some(credentials),
-                },
-            );
-        }
+    if provider_settings.daytona.enabled && daytona_api_key.is_some() {
+        let api_url = env_lookup(EnvVars::DAYTONA_API_URL)
+            .or_else(|| env_lookup(EnvVars::DAYTONA_SERVER_URL));
+        let organization_id = env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
+        providers.push(Arc::new(DaytonaSandboxProvider::new(
+            daytona_api_key,
+            api_url,
+            organization_id,
+            http_client,
+        )));
     }
 
-    inventory
+    SandboxProviderRegistry::new(providers)
 }
 
 pub(crate) fn automation_dir_for_active_config(active_config_path: &std::path::Path) -> PathBuf {
@@ -2419,7 +2511,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         github_api_base_url,
         active_config_path,
         http_client,
-        sandbox_inventory,
+        sandbox_provider_registry,
         shutdown,
         #[cfg(test)]
         worker_control_bus,
@@ -2437,12 +2529,16 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
     })
     .context("backfill automation environment selectors")?;
     let automation_store = Arc::new(AutomationStore::new(db_pool.clone()));
+    let project_store = Arc::new(ProjectStore::new(db_pool.clone()));
+    let plane_dispatch_store = Arc::new(PlaneDispatchStore::new(db_pool.clone()));
+    let incident_store = Arc::new(incident_intake::IncidentStore::new(db_pool.clone()));
     let local_provider_enabled = resolved_settings
         .server_settings
         .server
         .sandbox
         .providers
-        .is_enabled(&SandboxProviderKind::LOCAL);
+        .local
+        .enabled;
     let environment_pool = db_pool.clone();
     let environment_store = Arc::new(
         load_store_blocking("environment store", move || async move {
@@ -2466,13 +2562,12 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         .context("load mcp servers")?,
     );
     let variables = Arc::new(VariableStore::new(db_pool.clone()));
-    let session_records = Arc::new(RunSessionRecordStore::new(db_pool.clone()));
     let secret_store = Arc::new(SecretStore::new(db_pool));
     let vault = preloaded_vault;
     // Read vault secrets needed for synchronous setup before we wrap the vault in
     // an async lock for the rest of AppState.
     let daytona_api_key = vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string);
-    let llm_source: Arc<dyn CredentialProvider> = Arc::new(SqlVaultCredentialSource::vault_only(
+    let llm_source: Arc<dyn CredentialSource> = Arc::new(SqlVaultCredentialSource::vault_only(
         Arc::clone(&secret_store),
     ));
     let (global_event_tx, _) = broadcast::channel(4096);
@@ -2486,11 +2581,11 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         &mcp_server_store,
     );
     let current_catalog = Arc::new(
-        fabro_llm::build_catalog(&resolved_settings.llm_overlay, &|name| env_lookup(name))
+        Catalog::from_builtin_with_overrides(&resolved_settings.llm_catalog_settings)
             .context("building LLM model catalog")?,
     );
-    let sandbox_inventory = sandbox_inventory.unwrap_or_else(|| {
-        build_sandbox_inventory(
+    let sandbox_provider_registry = sandbox_provider_registry.unwrap_or_else(|| {
+        build_sandbox_provider_registry(
             current_server_settings.as_ref(),
             daytona_api_key,
             &env_lookup,
@@ -2556,16 +2651,18 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
             Arc::new(LocalWorkerRuntime::new())
         }
     };
-    Ok(Arc::new(AppState {
+    let state = Arc::new(AppState {
         runs: Mutex::new(HashMap::new()),
         aggregate_billing: Mutex::new(BillingAccumulator::default()),
         stores: AppStores {
             runs: store,
             run_summaries,
-            session_records,
+            projects: project_store,
             auth_codes,
             auth_sessions,
             automations: automation_store,
+            plane_dispatches: plane_dispatch_store,
+            incidents: incident_store,
             environments: environment_store,
             mcp_servers: mcp_server_store,
             vault: secret_store,
@@ -2596,6 +2693,15 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         llm_source,
         manifest_run_defaults: RwLock::new(current_manifest_run_defaults),
         manifest_run_settings: RwLock::new(current_manifest_run_settings),
+        intake: match IntakeBridge::from_settings(
+            &current_server_settings.server.integrations.intake,
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                tracing::warn!(%error, "Feature-intake bridge is unavailable; intake routes will report 503");
+                None
+            }
+        },
         server_settings: RwLock::new(current_server_settings),
         effective_web_url: RwLock::new(current_effective_web_url),
         catalog: RwLock::new(current_catalog),
@@ -2603,7 +2709,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         github_api_base_url,
         active_config_path,
         http_client,
-        sandbox_inventory,
+        sandbox_provider_registry,
         shutdown,
         shutting_down: AtomicBool::new(false),
         registry_factory_override,
@@ -2612,7 +2718,21 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         // Startup snapshot for the sync router build; rotating the webhook
         // secret requires a server restart.
         github_webhook_secret: vault.get(WEBHOOK_SECRET_ENV).map(str::to_string),
-    }))
+    });
+    if state.server_settings().server.integrations.bugsink.enabled
+        || state
+            .server_settings()
+            .server
+            .integrations
+            .bugsink
+            .dispatch_enabled
+    {
+        let validation_state = Arc::clone(&state);
+        load_store_blocking("Bugsink integration validation", move || async move {
+            incident_intake::validate_enablement(&validation_state).await
+        })?;
+    }
+    Ok(state)
 }
 
 const MAX_PAGE_OFFSET: u32 = 1_000_000;
@@ -2775,11 +2895,11 @@ async fn delete_run_sandbox_resource(
         }));
     }
 
-    let access = state
-        .provider_access()
+    let daytona_api_key = state
+        .vault_secret(EnvVars::DAYTONA_API_KEY)
         .await
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let sandbox = match reconnect_for_run(&record, &access, Some(id), None).await {
+    let sandbox = match reconnect_for_run(&record, daytona_api_key, Some(id)).await {
         Ok(sandbox) => sandbox,
         Err(err) if force || delete_started => {
             tracing::warn!(
@@ -3302,8 +3422,7 @@ async fn reject_run_if_sandbox_provider_disabled(
     settings: &RunNamespace,
 ) -> bool {
     let provider = run_manifest::effective_sandbox_provider(settings);
-    let Some(error) = run_manifest::sandbox_provider_policy_error(server_settings, &provider)
-    else {
+    let Some(error) = run_manifest::sandbox_provider_policy_error(server_settings, provider) else {
         return false;
     };
     tracing::warn!(run_id = %run_id, error = %error, "Sandbox provider disabled by server policy");
@@ -3698,6 +3817,7 @@ fn worker_launch_spec(
     run_dir: &std::path::Path,
     agent_fabro_tools_enabled: bool,
     github_app_private_key: Option<String>,
+    external_agent_harness: Option<String>,
 ) -> anyhow::Result<WorkerLaunchSpec> {
     let current_exe = std::env::current_exe().context("reading current executable path")?;
     let executable =
@@ -3736,6 +3856,11 @@ fn worker_launch_spec(
         fabro_log,
         active_config_path: state.active_config_path().to_path_buf(),
         github_app_private_key,
+        external_agent_harness,
+        external_agents_json: serde_json::to_string(
+            &state.server_settings().server.external_agents,
+        )
+        .ok(),
     })
 }
 
@@ -4093,7 +4218,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         let run_spec = persisted.run_spec();
         let settings = &run_spec.settings.run;
         let clone_can_use_github_credentials = settings.execution.mode != RunMode::DryRun
-            && settings.environment.provider.clones_workspace()
+            && settings.environment.provider.is_clone_based()
             && run_spec
                 .repo_origin_url()
                 .is_some_and(|origin| !origin.trim().is_empty());
@@ -4187,7 +4312,6 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         github_app,
         github_integration,
         vault: Arc::new(AsyncRwLock::new(vault.into_vault())),
-        sandbox_providers: state.server_settings().server.sandbox.providers.clone(),
         catalog: state.catalog(),
         on_node: None,
         registry_override,
@@ -4233,7 +4357,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
                 .expect("aggregate_billing lock poisoned");
             accumulate_billing_rollup(
                 &mut agg,
-                &fabro_workflow::billing_rollup_from_projection(projection),
+                &fabro_workflow::billing_rollup_from_projection(projection, None),
             );
         }
     }
@@ -4365,6 +4489,13 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             return;
         }
     };
+    let external_agent_harness = run_state
+        .spec
+        .settings
+        .run
+        .metadata
+        .get("agent.harness")
+        .cloned();
     let state_for_build = Arc::clone(&state);
     let run_dir_for_build = run_dir.clone();
     let start_result = spawn_blocking(move || {
@@ -4375,6 +4506,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             &run_dir_for_build,
             agent_fabro_tools_enabled,
             github_app_private_key,
+            external_agent_harness,
         )
     })
     .await
@@ -4478,7 +4610,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             .expect("aggregate_billing lock poisoned");
         accumulate_billing_rollup(
             &mut agg,
-            &fabro_workflow::billing_rollup_from_projection(&final_state),
+            &fabro_workflow::billing_rollup_from_projection(&final_state, None),
         );
     }
 

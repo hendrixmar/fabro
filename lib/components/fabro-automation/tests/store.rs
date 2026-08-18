@@ -8,10 +8,10 @@ use std::path::Path;
 use fabro_automation::{
     ApiTrigger, AutomationDraft, AutomationGitWorkflowSource, AutomationId, AutomationReplace,
     AutomationRevision, AutomationStore, AutomationStoreError, AutomationTrigger,
-    AutomationTriggerId, ScheduleTrigger,
+    AutomationTriggerId, PlaneTrigger, ScheduleTrigger,
 };
 use fabro_db::Database;
-use fabro_types::{GitRunTarget, RunTarget};
+use fabro_types::{ExternalAgentHarness, GitRunTarget, RunTarget};
 use sqlx::Row as _;
 use tokio::fs;
 
@@ -57,14 +57,17 @@ fn workflow_source(
 
 fn draft(id: &str, api_enabled: bool) -> AutomationDraft {
     AutomationDraft {
-        id:              AutomationId::new(id).unwrap(),
-        name:            "Nightly".to_string(),
-        description:     Some("Runs every night".to_string()),
-        environment_id:  Some("default".to_string()),
-        target:          target(),
-        workflow:        "release".to_string(),
-        workflow_source: None,
-        triggers:        vec![
+        id:                    AutomationId::new(id).unwrap(),
+        name:                  "Nightly".to_string(),
+        description:           Some("Runs every night".to_string()),
+        environment_id:        Some("default".to_string()),
+        target:                target(),
+        workflow:              "release".to_string(),
+        workflow_source:       None,
+        project_id:            None,
+        available_to_projects: false,
+        source_automation_id:  None,
+        triggers:              vec![
             schedule("z-last", "0 2 * * *", false),
             AutomationTrigger::Api(ApiTrigger {
                 id:      AutomationTriggerId::new("custom-api-id").unwrap(),
@@ -77,13 +80,15 @@ fn draft(id: &str, api_enabled: bool) -> AutomationDraft {
 
 fn replacement(name: &str, expression: &str) -> AutomationReplace {
     AutomationReplace {
-        name:            name.to_string(),
-        description:     None,
-        environment_id:  Some("default".to_string()),
-        target:          target(),
-        workflow:        "release".to_string(),
-        workflow_source: None,
-        triggers:        vec![
+        name:                  name.to_string(),
+        description:           None,
+        environment_id:        Some("default".to_string()),
+        target:                target(),
+        workflow:              "release".to_string(),
+        workflow_source:       None,
+        project_id:            None,
+        available_to_projects: false,
+        triggers:              vec![
             schedule("nightly", expression, true),
             AutomationTrigger::Api(ApiTrigger {
                 id:      AutomationTriggerId::new("api").unwrap(),
@@ -131,6 +136,56 @@ async fn crud_normalizes_api_and_schedule_order() {
         .await
         .unwrap();
     assert!(store.get(&replaced.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn plane_trigger_round_trips_through_sqlite() {
+    let (_dir, database) = test_database().await;
+    let store = AutomationStore::new(database.clone_pool());
+    let created = store
+        .create(AutomationDraft {
+            id:                    AutomationId::new("plane-loop").unwrap(),
+            name:                  "Plane Loop".to_string(),
+            description:           None,
+            environment_id:        Some("default".to_string()),
+            target:                target(),
+            workflow:              "plane-loop".to_string(),
+            workflow_source:       None,
+            project_id:            None,
+            available_to_projects: false,
+            source_automation_id:  None,
+            triggers:              vec![
+                AutomationTrigger::Api(ApiTrigger {
+                    id:      AutomationTriggerId::new("manual").unwrap(),
+                    enabled: true,
+                }),
+                AutomationTrigger::Plane(PlaneTrigger {
+                    id:                    AutomationTriggerId::new("tickets").unwrap(),
+                    enabled:               true,
+                    project_id:            "proj-1".to_string(),
+                    ready_state_id:        "ready".to_string(),
+                    in_progress_state_id:  "progress".to_string(),
+                    done_state_id:         "done".to_string(),
+                    cancelled_state_id:    "cancelled".to_string(),
+                    failure_label_id:      Some("failed".to_string()),
+                    default_harness:       ExternalAgentHarness::Omp,
+                    codex_label_id:        Some("codex".to_string()),
+                    omp_label_id:          Some("omp".to_string()),
+                    poll_interval_seconds: 45,
+                    max_concurrency:       2,
+                    max_retries:           1,
+                }),
+            ],
+        })
+        .await
+        .unwrap();
+
+    let fetched = store.get(&created.id).await.unwrap().unwrap();
+    assert_eq!(fetched, created);
+    let plane = fetched.enabled_plane_triggers().next().unwrap();
+    assert_eq!(plane.project_id, "proj-1");
+    assert_eq!(plane.default_harness, ExternalAgentHarness::Omp);
+    assert_eq!(plane.poll_interval_seconds, 45);
 }
 
 #[tokio::test]
@@ -499,13 +554,15 @@ async fn failed_schedule_insert_rolls_back_parent_replace() {
     .await
     .unwrap();
     let replacement = AutomationReplace {
-        name:            "Should roll back".to_string(),
-        description:     None,
-        environment_id:  Some("default".to_string()),
-        target:          target(),
-        workflow:        "release".to_string(),
-        workflow_source: None,
-        triggers:        vec![schedule("blocked", "0 7 * * *", true)],
+        name:                  "Should roll back".to_string(),
+        description:           None,
+        environment_id:        Some("default".to_string()),
+        target:                target(),
+        workflow:              "release".to_string(),
+        workflow_source:       None,
+        project_id:            None,
+        available_to_projects: false,
+        triggers:              vec![schedule("blocked", "0 7 * * *", true)],
     };
 
     let err = store
@@ -693,4 +750,162 @@ expression = "0 3 * * *"
 "#
     )
     .into_bytes()
+}
+
+async fn insert_project(pool: &fabro_db::DbPool, id: &str, repository: &str) {
+    sqlx::query(
+        "INSERT INTO projects (id, revision, name, github_repository_id, repository, \
+         repository_key, default_branch) VALUES (?, ?, ?, '7', ?, lower(?), 'main')",
+    )
+    .bind(id)
+    .bind("0".repeat(64))
+    .bind(id)
+    .bind(repository)
+    .bind(repository)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_link_reads_the_global_workflow_and_source_on_every_load() {
+    let (_dir, database) = test_database().await;
+    insert_project(database.pool(), "tierrapay", "artesanos-digitales/tierrapay").await;
+    let store = AutomationStore::new(database.clone_pool());
+
+    let mut global = draft("woodpecker-loop", true);
+    global.target = RunTarget::Git(GitRunTarget {
+        repo:   "hendrixmar/fabro-demo".to_string(),
+        branch: "master".to_string(),
+        tag:    None,
+        sha:    Some("a895cf55d318edb1496591ed849a46c295cccf0b".to_string()),
+    });
+    global.workflow = "woodpecker-loop".to_string();
+    global.available_to_projects = true;
+    let global = store.create(global).await.unwrap();
+
+    let mut link = draft("tierrapay-woodpecker-loop", true);
+    link.target = RunTarget::Git(GitRunTarget {
+        repo:   "artesanos-digitales/tierrapay".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    None,
+    });
+    link.workflow = "woodpecker-loop".to_string();
+    link.project_id = Some(fabro_automation::ProjectId::new("tierrapay").unwrap());
+    link.source_automation_id = Some(global.id.clone());
+    store.create(link).await.unwrap();
+
+    // Editing the global reaches the link.
+    let mut edited = replacement("Woodpecker", "0 1 * * *");
+    edited.target = global.target.clone();
+    edited.workflow = "woodpecker-loop-v2".to_string();
+    edited.workflow_source = Some(workflow_source("main", None, Some("1e930e021b91bfebfd0b9362300b39717ffa6d6b")));
+    edited.available_to_projects = true;
+    store.replace(&global.id, &global.revision, edited).await.unwrap();
+
+    let loaded = store
+        .get(&AutomationId::new("tierrapay-woodpecker-loop").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.source_automation_id.as_ref(), Some(&global.id));
+    assert_eq!(loaded.workflow, "woodpecker-loop-v2");
+    assert_eq!(
+        loaded.workflow_source,
+        Some(workflow_source("main", None, Some("1e930e021b91bfebfd0b9362300b39717ffa6d6b")))
+    );
+    let Some(RunTarget::Git(target)) = Some(&loaded.target) else { unreachable!() };
+    assert_eq!(target.repo, "artesanos-digitales/tierrapay", "the link keeps its own target");
+
+    // A linked global cannot be deleted.
+    let current = store.get(&global.id).await.unwrap().unwrap();
+    assert!(store.delete(&global.id, &current.revision).await.is_err());
+}
+
+#[tokio::test]
+async fn a_link_to_a_global_without_workflow_source_loads_from_the_global_target() {
+    let (_dir, database) = test_database().await;
+    insert_project(database.pool(), "tierrapay", "artesanos-digitales/tierrapay").await;
+    let store = AutomationStore::new(database.clone_pool());
+    let global = store.create(draft("scanner", true)).await.unwrap();
+    let mut link = draft("tierrapay-scanner", true);
+    link.project_id = Some(fabro_automation::ProjectId::new("tierrapay").unwrap());
+    link.source_automation_id = Some(global.id.clone());
+    store.create(link).await.unwrap();
+
+    let loaded = store
+        .get(&AutomationId::new("tierrapay-scanner").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(RunTarget::Git(global_target)) = Some(&global.target) else { unreachable!() };
+    assert_eq!(loaded.workflow_source.as_ref(), Some(global_target));
+}
+
+#[tokio::test]
+async fn link_guards_are_typed_and_replace_returns_the_stored_link() {
+    let (_dir, database) = test_database().await;
+    insert_project(
+        database.pool(),
+        "tierrapay",
+        "artesanos-digitales/tierrapay",
+    )
+    .await;
+    let store = AutomationStore::new(database.clone_pool());
+    let tierrapay = fabro_automation::ProjectId::new("tierrapay").unwrap();
+    let mut global = draft("scanner", true);
+    global.workflow = "scanner".to_string();
+    global.available_to_projects = true;
+    let global = store.create(global).await.unwrap();
+    let mut link = draft("tierrapay-scanner", true);
+    link.project_id = Some(tierrapay.clone());
+    link.source_automation_id = Some(global.id.clone());
+    let link = store.create(link).await.unwrap();
+
+    // Replacing a link answers with the stored view: still linked, and the
+    // workflow is the global's, not whatever the caller sent.
+    let mut edit = replacement("Renamed", "0 4 * * *");
+    edit.project_id = Some(tierrapay.clone());
+    edit.workflow = "caller-workflow".to_string();
+    let replaced = store
+        .replace(&link.id, &link.revision, edit.clone())
+        .await
+        .unwrap();
+    assert_eq!(replaced.source_automation_id.as_ref(), Some(&global.id));
+    assert_eq!(replaced.workflow, "scanner");
+    assert_eq!(replaced.name, "Renamed");
+
+    // A link cannot become a global.
+    let mut unscoped = edit;
+    unscoped.project_id = None;
+    let error = store
+        .replace(&link.id, &replaced.revision, unscoped)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AutomationStoreError::LinkRequiresProject { .. }),
+        "{error:?}"
+    );
+
+    // A linked global can neither be deleted nor moved into a project.
+    let error = store
+        .delete(&global.id, &global.revision)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AutomationStoreError::InUse { .. }),
+        "{error:?}"
+    );
+    let mut scoped = replacement("Scanner", "0 1 * * *");
+    scoped.workflow = "scanner".to_string();
+    scoped.project_id = Some(tierrapay);
+    let error = store
+        .replace(&global.id, &global.revision, scoped)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AutomationStoreError::InUse { .. }),
+        "{error:?}"
+    );
 }

@@ -6,15 +6,14 @@ pub mod billing;
 pub mod billing_rollup;
 pub mod blob_hash;
 pub mod blob_ref;
-pub mod catalog_api;
 pub mod checkpoint;
 pub mod command_output;
 pub mod conclusion;
 pub mod dense;
 pub mod diff;
 pub mod event_envelope;
+pub mod external_agent;
 pub mod failure_signature;
-pub mod git_identity;
 pub mod graph;
 mod id;
 mod input_scalar;
@@ -22,12 +21,13 @@ pub mod interview;
 pub mod llm_backend;
 pub mod manifest_path;
 pub mod mcp_store;
-pub mod model_test;
 pub mod outcome;
 pub mod pair;
 pub mod parallel;
+pub mod plane_dispatch;
 pub mod principal;
 pub mod pull_request;
+pub mod reasoning;
 pub mod repository;
 pub mod run;
 pub mod run_event;
@@ -55,6 +55,7 @@ pub mod system_integrations;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod timing;
+pub mod todo;
 pub mod transcript;
 pub mod variable;
 pub mod workflow_path;
@@ -63,18 +64,23 @@ pub mod workflow_version_id;
 
 pub use artifact::ArtifactUpload;
 pub use auth::{IdpIdentity, IdpIdentityError};
-pub use billing::{BilledModelUsage, BilledTokenCounts, ModelRef, UsdMicros};
+pub use billing::{
+    AnthropicBillingFacts, AnthropicModelPricing, BilledModelUsage, BilledTokenCounts,
+    GeminiBillingFacts, GeminiModelPricing, GeminiStoragePricing, GeminiStorageSegment,
+    ModelBillingFacts, ModelBillingInput, ModelPricing, ModelPricingPolicy, ModelRef, ModelUsage,
+    OpenAiBillingFacts, OpenAiModelPricing, PricePerMTok, Speed, TokenCounts, UsdMicros,
+};
 pub use blob_hash::BlobHash;
 pub use blob_ref::{format_blob_ref, parse_blob_ref, parse_managed_blob_file_ref};
-pub use catalog_api::{Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits, Provider};
 pub use checkpoint::Checkpoint;
 pub use command_output::{CommandOutputStream, CommandTermination};
 pub use conclusion::{Conclusion, StageSummary};
 pub use dense::{ServerSettings, UserSettings, WorkflowSettings};
 pub use diff::{DiffStats, DiffSummary, RunDiff};
 pub use event_envelope::EventEnvelope;
+pub use external_agent::{ExternalAgentHarness, ExternalAgentProfile, ExternalAgentsSettings};
+pub use fabro_model::ReasoningEffort;
 pub use failure_signature::FailureSignature;
-pub use git_identity::{GitIdentity, GitIdentitySource};
 pub use graph::{
     AttrValue, AttributeScope, ContextKeyAttr, Edge, Graph, KNOWN_HANDLER_TYPES, Node, OnFailure,
     ResolvedOnFailure, is_known_handler_type, is_llm_handler_type, shape_to_handler_type,
@@ -93,7 +99,6 @@ pub use mcp_store::{
     McpServerRevisionParseError, McpServerValidationError, McpServerView, McpTransportView,
     validate_mcp_server_fields,
 };
-pub use model_test::ModelTestMode;
 pub use outcome::{
     FailureCategory, FailureDetail, NodeResult, Outcome, OutcomeMeta, StageOutcome, StageState,
 };
@@ -107,13 +112,9 @@ pub use pair::{
     RunEventDetailEnvelope, RunEventDetailResponse, RunPairStatusResponse,
 };
 pub use parallel::ParallelBranchResult;
-pub use pebble_coding_agent::events::{
-    AgentProfileKind, CodingAgentEvent, CodingEvent, ContextWindowBreakdownItem,
-    ContextWindowCategory, ContextWindowCountMethod, ContextWindowSnapshot, ContextWindowStaleness,
-    ContextWindowWarning, ExecOutputTail, ExecOutputTailTrace, INITIAL_SUBAGENT_GENERATION,
-    LlmOutputKind, LlmRetryPhase, MemoryFileSummary, PermissionLevel, SkillActivationSource,
-    SkillSummary, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection,
-    TodoProjection, TodoStatus, TodoUpdatedProps, ToolCategory, ToolSource, ToolSummary,
+pub use plane_dispatch::{
+    PlaneDispatch, PlaneDispatchListResponse, PlaneDispatchStatus, PlaneLabelResponse,
+    PlaneProjectMetadataResponse, PlaneProjectResponse, PlaneProjectsResponse, PlaneStateResponse,
 };
 pub use principal::{AuthMethod, Principal, SystemActorKind, UserPrincipal};
 pub use pull_request::{
@@ -122,6 +123,7 @@ pub use pull_request::{
     PullRequestDetailsUnavailableReason, PullRequestGithubDetail, PullRequestLink, PullRequestMeta,
     PullRequestRef, PullRequestResponse, PullRequestTimestamps, PullRequestUser,
 };
+pub use reasoning::ReasoningOutput;
 pub use repository::{
     GitHubRepositorySlug, GitHubRepositorySlugError, RepositoryProvider, RepositoryRef,
     is_valid_git_branch_name, is_valid_git_tag_name, normalize_git_commit_sha,
@@ -131,10 +133,12 @@ pub use run::{
     RunServerProvenance, RunSpec,
 };
 pub use run_event::{
-    AgentEventProps, AgentMcpToolSummary, AgentToolsAvailableProps, CODING_EVENT_NAMES, EventBody,
-    FailoverProps, InterviewOption, MetadataSnapshotFailureKind, MetadataSnapshotPhase, RunEvent,
-    RunNoticeCode, RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunRunnableSource,
-    SessionCapability, coding_event_name, is_coding_event_name, sandbox_driver_event_name,
+    AgentMcpToolSummary, AgentMemoryFileProps, AgentSkillActivationSource, AgentSkillSummary,
+    AgentToolCategory, AgentToolSource, AgentToolSummary, AgentToolsAvailableProps, EventBody,
+    ExecOutputTail, FailoverProps, INITIAL_SUBAGENT_GENERATION, InterviewOption, LlmOutputKind,
+    LlmRetryPhase, MetadataSnapshotFailureKind, MetadataSnapshotPhase, RunEvent, RunNoticeCode,
+    RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunRunnableSource, SessionCapability,
+    TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps, initial_subagent_generation,
 };
 pub use run_failure::RunFailure;
 pub use run_id::{RunId, fixtures};
@@ -145,33 +149,40 @@ pub use run_intent::{
 pub use run_projection::{
     ActivatedSkill, AgentControlState, CheckpointRecord, McpServerProjection, McpServerStatus,
     PendingInterviewRecord, RunProjection, SkillsProjection, StageContextWindow,
-    StageContextWindowUnavailableReason, StageInferenceProjection, StageModelUsage,
-    StageProjection, StageToolBatchProjection, SubAgentProjection, SubAgentStatus, first_event_seq,
+    StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
+    StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
+    StageContextWindowWarning, StageInferenceProjection, StageModelUsage, StageProjection,
+    StageToolBatchProjection, SubAgentProjection, SubAgentStatus, first_event_seq,
 };
 pub use run_sandbox::{
     RunSandbox, RunSandboxFailure, RunSandboxInstance, RunSandboxKind, RunSandboxPlan,
     RunSandboxRuntime,
 };
 pub use run_summary::{
-    AskFabro, AskFabroUnavailableReason, AutomationRef, ResolvedAutomationGitWorkflowSource, Run,
-    RunApproval, RunApprovalState, RunBillingSummary, RunError, RunLifecycle, RunLinks, RunModel,
-    RunOrigin, RunOriginKind, RunSize, RunTimestamps, WorkflowRef,
+    AskFabro, AskFabroUnavailableReason, AutomationRef, PROJECT_LABEL,
+    ResolvedAutomationGitWorkflowSource, Run, RunApproval, RunApprovalState, RunBillingSummary,
+    RunError, RunLifecycle, RunLinks, RunModel, RunOrigin, RunOriginKind, RunProjectRef, RunSize,
+    RunTimestamps, WorkflowRef,
 };
 pub use run_title::{
     MAX_RUN_TITLE_CHARS, RunTitleError, infer_run_title, normalize_explicit_run_title,
 };
-pub use sandbox_details::SandboxDetails;
+pub use sandbox_details::{
+    SandboxDetails, SandboxNetwork, SandboxNetworkPolicy, SandboxNetworkPolicyMode,
+    SandboxResources, SandboxState, SandboxTimestamps,
+};
 pub use sandbox_inventory::{
     SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxProviderLookupError,
 };
-pub use sandbox_provider::{
-    BundledProvider, InvalidSandboxProviderKind, SandboxProviderKind, WorkspacePolicy,
+pub use sandbox_provider::SandboxProviderKind;
+pub use sandbox_services::{
+    SandboxService, SandboxServiceDiscoverySource, SandboxServiceListMeta,
+    SandboxServiceListResponse,
 };
-pub use sandbox_services::{SandboxService, SandboxServiceListResponse};
 pub use secret::{OAuthConfig, OAuthCredential, OAuthTokens, SecretMetadata, SecretType};
 pub use session::{
-    RunSessionMetadata, SessionDetail, SessionId, SessionStatus, SessionSummary, SessionTurn,
-    TurnId,
+    PermissionLevel, SessionDetail, SessionId, SessionMessage, SessionRecord, SessionStatus,
+    SessionSummary, SessionTurn, TurnId,
 };
 pub use stage_completion::StageCompletion;
 pub use stage_handler::StageHandler;
@@ -187,9 +198,10 @@ pub use system_integrations::{
     IntegrationProvider, IntegrationStatus, SystemIntegrationStatus, SystemIntegrationsResponse,
 };
 pub use timing::{RunTiming, StageTiming};
+pub use todo::{TodoListKind, TodoListProjection, TodoPatch, TodoProjection, TodoStatus};
 pub use transcript::{
-    MessageId, MessageKind, MessageSource, PairMessageRef, TranscriptMessage, text_of,
-    tool_call_arguments, tool_result_from_json, tool_result_to_json,
+    AudioData, ContentPart, DocumentData, ImageData, Message, MessageId, MessageKind,
+    MessageSource, PairMessageRef, Role, ThinkingData, ToolCall, ToolResult, TranscriptMessage,
 };
 pub use variable::{
     CreateVariableRequest, UpdateVariableRequest, Variable, VariableListResponse, is_env_style_name,
@@ -200,6 +212,5 @@ pub use workflow_path::{
 pub use workflow_version::{
     MAX_WORKFLOW_VERSION_BYTES, MAX_WORKFLOW_VERSION_DEPENDENCIES, MAX_WORKFLOW_VERSION_FILE_BYTES,
     MAX_WORKFLOW_VERSION_FILES, WorkflowVersion, WorkflowVersionShapeError,
-    validate_workflow_files, validate_workflow_source_paths,
 };
 pub use workflow_version_id::{WorkflowVersionId, WorkflowVersionIdParseError};

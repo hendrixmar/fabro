@@ -2396,6 +2396,7 @@ fn worker_command_forwards_github_app_private_key_from_vault() {
         storage_dir.path(),
         false,
         Some("test-private-key".to_string()),
+        None,
     )
     .unwrap();
     let cmd = LocalWorkerRuntime::command_for_spec(&spec);
@@ -2654,6 +2655,7 @@ fn worker_command(
         mode,
         run_dir,
         agent_fabro_tools_enabled,
+        None,
         None,
     )?;
     Ok(LocalWorkerRuntime::command_for_spec(&spec))
