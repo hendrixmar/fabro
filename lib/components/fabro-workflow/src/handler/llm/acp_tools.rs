@@ -203,6 +203,12 @@ fn canonical_name(harness: Option<&str>, observed: &AcpObservedTool<'_>) -> Stri
             AcpToolKind::Execute => "bash".to_owned(),
             AcpToolKind::Edit | AcpToolKind::Delete | AcpToolKind::Move => "edit".to_owned(),
             AcpToolKind::Fetch => "web_search".to_owned(),
+            AcpToolKind::Think
+                if identifies_todo_or_plan(&lower)
+                    || raw_input_identifies_todo_or_plan(observed.raw_input) =>
+            {
+                "todo".to_owned()
+            }
             _ => normalize_extension_name(&lower),
         };
     }
@@ -214,6 +220,24 @@ fn canonical_name(harness: Option<&str>, observed: &AcpObservedTool<'_>) -> Stri
         "shell".into()
     } else {
         normalize_extension_name(&lower)
+    }
+}
+
+fn identifies_todo_or_plan(text: &str) -> bool {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case("todo") || word.eq_ignore_ascii_case("plan"))
+}
+
+fn raw_input_identifies_todo_or_plan(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => identifies_todo_or_plan(text),
+        serde_json::Value::Array(items) => {
+            items.iter().any(raw_input_identifies_todo_or_plan)
+        }
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            identifies_todo_or_plan(key) || raw_input_identifies_todo_or_plan(value)
+        }),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
     }
 }
 
@@ -444,6 +468,51 @@ mod tests {
         assert!(inventory.observe(observed("my_plugin_action", AcpToolKind::Other)));
         assert!(inventory.snapshot().iter().any(|tool| {
             tool.name == "my_plugin_action" && tool.invoked
+        }));
+    }
+
+    #[test]
+    fn omp_think_title_marks_official_todo_entry() {
+        let mut inventory = AcpToolInventory::for_harness(Some("omp"));
+
+        assert!(inventory.observe(observed("Plan next steps", AcpToolKind::Think)));
+
+        let snapshot = inventory.snapshot();
+        assert!(snapshot.iter().find(|tool| tool.name == "todo").unwrap().invoked);
+        assert!(!snapshot.iter().any(|tool| tool.name == "plan_next_steps"));
+    }
+
+    #[test]
+    fn omp_think_raw_input_marks_official_todo_entry() {
+        let mut inventory = AcpToolInventory::for_harness(Some("omp"));
+        let raw_input = serde_json::json!({"operation": "update_todo", "items": []});
+
+        assert!(inventory.observe(AcpObservedTool {
+            title: "Think",
+            kind: AcpToolKind::Think,
+            raw_input: &raw_input,
+        }));
+
+        let snapshot = inventory.snapshot();
+        assert!(snapshot.iter().find(|tool| tool.name == "todo").unwrap().invoked);
+        assert!(!snapshot.iter().any(|tool| tool.name == "think"));
+    }
+
+    #[test]
+    fn omp_unrelated_think_appends_observed_extension() {
+        let mut inventory = AcpToolInventory::for_harness(Some("omp"));
+        let raw_input = serde_json::json!({"question": "Which approach is safer?"});
+
+        assert!(inventory.observe(AcpObservedTool {
+            title: "Analyze architecture",
+            kind: AcpToolKind::Think,
+            raw_input: &raw_input,
+        }));
+
+        let snapshot = inventory.snapshot();
+        assert!(!snapshot.iter().find(|tool| tool.name == "todo").unwrap().invoked);
+        assert!(snapshot.iter().any(|tool| {
+            tool.name == "analyze_architecture" && tool.invoked
         }));
     }
 
