@@ -18,6 +18,32 @@ import type {
 
 import { StageInsightsSidebar } from "./stage-insights-sidebar";
 
+const OMP_NAMES = [
+  "ast_edit",
+  "ast_grep",
+  "bash",
+  "browser",
+  "debug",
+  "edit",
+  "eval",
+  "find",
+  "generate_image",
+  "github",
+  "inspect_image",
+  "irc",
+  "job",
+  "lsp",
+  "read",
+  "recipe",
+  "report_tool_issue",
+  "resolve",
+  "search",
+  "task",
+  "todo",
+  "web_search",
+  "write",
+] as const;
+
 function makeStage(overrides: Partial<StageProjection> = {}): StageProjection {
   return {
     first_event_seq: 1,
@@ -177,6 +203,25 @@ describe("StageInsightsSidebar", () => {
     expect(dom).toContain("Apply a unified diff patch");
     expect(dom).toContain("Search file contents");
     expect(dom).toContain("Used");
+  });
+
+  test("renders the full OMP catalog while marking only invoked tools as used", () => {
+    const ompTools = OMP_NAMES.map((name, index) => ({
+      name,
+      description: `${name} tool`,
+      source:      { kind: "native" as const },
+      category:    name === "bash" ? AgentToolCategory.SHELL : AgentToolCategory.OTHER,
+      invoked:     index < 4,
+    }));
+
+    const dom = render(makeStage({ agent_tools: ompTools }), null);
+
+    // The uppercase section heading visually reads "TOOLS 4/23".
+    expect(dom).toContain("Tools");
+    expect(dom).toContain("4/23");
+    expect(dom.match(/"aria-label":"Used"/g)).toHaveLength(4);
+    expect(dom).toContain("resolve");
+    expect(dom).toContain("write");
   });
 
   test("renders mcp server used/total count, marks invoked servers as 'used'", () => {
