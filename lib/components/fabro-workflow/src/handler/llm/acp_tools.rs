@@ -121,20 +121,20 @@ const OMP_BUILTINS: &[(&str, &str, AgentToolCategory)] = &[
     ),
 ];
 
-pub struct AcpObservedTool<'a> {
-    pub title:     &'a str,
-    pub kind:      AcpToolKind,
-    pub raw_input: &'a serde_json::Value,
+pub(super) struct AcpObservedTool<'a> {
+    pub(super) title:     &'a str,
+    pub(super) kind:      AcpToolKind,
+    pub(super) raw_input: &'a serde_json::Value,
 }
 
-pub struct AcpToolInventory {
+pub(super) struct AcpToolInventory {
     harness:    Option<String>,
     tools:      Vec<AgentToolSummary>,
     name_index: HashMap<String, usize>,
 }
 
 impl AcpToolInventory {
-    pub fn for_harness(harness: Option<&str>) -> Self {
+    pub(super) fn for_harness(harness: Option<&str>) -> Self {
         let capacity = if harness == Some("omp") {
             OMP_BUILTINS.len()
         } else {
@@ -161,11 +161,11 @@ impl AcpToolInventory {
         inventory
     }
 
-    pub fn snapshot(&self) -> Vec<AgentToolSummary> {
+    pub(super) fn snapshot(&self) -> Vec<AgentToolSummary> {
         self.tools.clone()
     }
 
-    pub fn observe(&mut self, observed: AcpObservedTool<'_>) -> bool {
+    pub(super) fn observe(&mut self, observed: AcpObservedTool<'_>) -> bool {
         let name = canonical_name(self.harness.as_deref(), &observed);
         if let Some(index) = self.name_index.get(&name).copied() {
             let tool = &mut self.tools[index];
