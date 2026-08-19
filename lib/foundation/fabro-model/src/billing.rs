@@ -309,6 +309,7 @@ pub enum ModelBillingFacts {
     OpenAi(OpenAiBillingFacts),
     Anthropic(AnthropicBillingFacts),
     Gemini(GeminiBillingFacts),
+    Reported,
 }
 
 impl ModelBillingFacts {
@@ -1007,6 +1008,40 @@ cache_input_cost_per_mtok = 0.3
             }
             .is_zero()
         );
+    }
+
+    #[test]
+    fn reported_facts_are_never_catalog_priced() {
+        let model = ModelRef {
+            provider: ProviderId::new("omp"),
+            model_id: ModelId::new("model"),
+            speed:    None,
+        };
+        let input = ModelBillingInput {
+            usage: ModelUsage {
+                model:  model.clone(),
+                tokens: TokenCounts {
+                    input_tokens:  100,
+                    output_tokens: 20,
+                    ..TokenCounts::default()
+                },
+            },
+            facts: ModelBillingFacts::Reported,
+        };
+        let pricing = ModelPricing {
+            model,
+            policy: ModelPricingPolicy::OpenAi(OpenAiModelPricing {
+                input:        PricePerMTok {
+                    usd_micros: 1_250_000,
+                },
+                cached_input: None,
+                output:       PricePerMTok {
+                    usd_micros: 10_000_000,
+                },
+            }),
+        };
+
+        assert_eq!(pricing.bill(&input), None);
     }
 
     #[test]

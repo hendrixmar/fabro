@@ -3,7 +3,8 @@ pub use fabro_core::outcome::{
 };
 use fabro_llm::types::TokenCounts as LlmTokenCounts;
 use fabro_model::{
-    BilledTokenCounts, Catalog, ModelBillingInput, ModelRef, ModelUsage, TokenCounts,
+    BilledTokenCounts, Catalog, ModelBillingFacts, ModelBillingInput, ModelRef, ModelUsage,
+    TokenCounts, UsdMicros,
 };
 pub use fabro_types::BilledModelUsage;
 
@@ -37,6 +38,21 @@ pub fn billed_model_usage_from_llm(
         input,
         total_usd_micros,
     })
+}
+
+#[must_use]
+pub fn reported_model_usage(
+    model: ModelRef,
+    tokens: TokenCounts,
+    reported_cost: Option<UsdMicros>,
+) -> BilledModelUsage {
+    BilledModelUsage {
+        input: ModelBillingInput {
+            usage: ModelUsage { model, tokens },
+            facts: ModelBillingFacts::Reported,
+        },
+        total_usd_micros: reported_cost.map(|cost| cost.0),
+    }
 }
 
 #[must_use]
@@ -149,9 +165,9 @@ fn token_counts_from_llm_usage(usage: &LlmTokenCounts) -> TokenCounts {
 mod tests {
     use fabro_llm::types::TokenCounts;
     use fabro_model::catalog::LlmCatalogSettings;
-    use fabro_model::{Catalog, ModelRef, ProviderId, Speed, UsdMicros};
+    use fabro_model::{Catalog, ModelBillingFacts, ModelRef, ProviderId, Speed, UsdMicros};
 
-    use super::{OutcomeExt, billed_model_usage_from_llm};
+    use super::{OutcomeExt, billed_model_usage_from_llm, reported_model_usage};
 
     fn model_ref(provider: ProviderId, model_id: &str, speed: Option<Speed>) -> ModelRef {
         ModelRef {
@@ -159,6 +175,41 @@ mod tests {
             model_id: model_id.into(),
             speed,
         }
+    }
+
+    #[test]
+    fn reported_model_usage_keeps_exact_tokens_and_optional_cost() {
+        let usage = reported_model_usage(
+            model_ref(ProviderId::new("omp"), "deepseek", None),
+            TokenCounts {
+                input_tokens:      10,
+                output_tokens:     3,
+                cache_read_tokens: 5,
+                ..TokenCounts::default()
+            },
+            Some(UsdMicros(42_000)),
+        );
+
+        assert_eq!(usage.tokens().total_tokens(), 18);
+        assert_eq!(usage.tokens(), &TokenCounts {
+            input_tokens:      10,
+            output_tokens:     3,
+            cache_read_tokens: 5,
+            ..TokenCounts::default()
+        });
+        assert_eq!(usage.total_usd_micros, Some(42_000));
+        assert!(matches!(usage.input.facts, ModelBillingFacts::Reported));
+    }
+
+    #[test]
+    fn reported_model_usage_without_cost_keeps_cost_unknown() {
+        let usage = reported_model_usage(
+            model_ref(ProviderId::new("omp"), "deepseek", None),
+            TokenCounts::default(),
+            None,
+        );
+
+        assert_eq!(usage.total_usd_micros, None);
     }
 
     #[test]
