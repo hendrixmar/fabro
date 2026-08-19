@@ -1054,7 +1054,7 @@ mod tests {
     use std::time::Duration;
 
     use fabro_acp::test_support::fake_acp_agent_script;
-    use fabro_acp::{AcpError, AcpProcessExit, AcpSessionActivity};
+    use fabro_acp::{AcpError, AcpProcessExit, AcpSessionActivity, AcpToolKind};
     use fabro_agent::{LocalSandbox, RefreshOutcome, Sandbox, shell_quote};
     use fabro_graphviz::graph::{AttrValue, Node};
     use fabro_sandbox::test_support::MockSandbox;
@@ -1132,6 +1132,7 @@ mod tests {
         );
 
         callback(AcpSessionActivity::ToolStarted {
+            kind:         AcpToolKind::Read,
             tool_call_id: "read-1".to_string(),
             tool_name:    "Read file '/workspace/src/main.rs'".to_string(),
             title:        "Read file '/workspace/src/main.rs'".to_string(),
@@ -1139,12 +1140,14 @@ mod tests {
         });
         // A repeated title is the same observed tool, not a second dropdown item.
         callback(AcpSessionActivity::ToolStarted {
+            kind:         AcpToolKind::Read,
             tool_call_id: "read-2".to_string(),
             tool_name:    "Read file '/workspace/src/main.rs'".to_string(),
             title:        "Read file '/workspace/src/main.rs'".to_string(),
             raw_input:    serde_json::json!({"path": "/workspace/src/main.rs"}),
         });
         callback(AcpSessionActivity::ToolStarted {
+            kind:         AcpToolKind::Execute,
             tool_call_id: "shell-1".to_string(),
             tool_name:    "$ echo ok".to_string(),
             title:        "$ echo ok".to_string(),
