@@ -1702,7 +1702,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{RunProjection, RunProjectionReducer, build_summary};
+    use super::{RunProjection, RunProjectionReducer, build_summary, projected_billing};
     use crate::{Error, EventEnvelope, StageId};
 
     /// Live accumulation of inference and tool time while a stage is in
@@ -5113,6 +5113,29 @@ mod tests {
         .expect("billing fixture should deserialize")
     }
 
+    fn acp_billed_usage() -> BilledModelUsage {
+        serde_json::from_value(json!({
+            "input": {
+                "usage": {
+                    "model": {
+                        "provider": "omp",
+                        "model_id": "deepseek"
+                    },
+                    "tokens": {
+                        "input_tokens": 100,
+                        "output_tokens": 30,
+                        "reasoning_tokens": 10,
+                        "cache_read_tokens": 40,
+                        "cache_write_tokens": 10
+                    }
+                },
+                "facts": { "algorithm": "reported" }
+            },
+            "total_usd_micros": 12_300
+        }))
+        .expect("ACP billing fixture should deserialize")
+    }
+
     fn live_agent_message_props(billing: BilledTokenCounts) -> AgentMessageProps {
         AgentMessageProps {
             text: "assistant text".to_string(),
@@ -5224,6 +5247,50 @@ mod tests {
         let stage = state.stage(&stage_id).unwrap();
         assert_eq!(stage.usage, usage_counts(&usage));
         assert_eq!(stage.model.as_ref(), Some(usage.model()));
+    }
+
+    #[test]
+    fn stage_completed_projects_exact_acp_usage_into_stage_and_run_billing() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+        let usage = acp_billed_usage();
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        let mut props = completed_props(42, StageOutcome::Succeeded);
+        props.billing = Some(usage);
+        state
+            .apply_event(&test_stage_event(
+                2,
+                EventBody::StageCompleted(props),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.usage.input_tokens, 100);
+        assert_eq!(stage.usage.output_tokens, 30);
+        assert_eq!(stage.usage.reasoning_tokens, 10);
+        assert_eq!(stage.usage.cache_read_tokens, 40);
+        assert_eq!(stage.usage.cache_write_tokens, 10);
+        assert_eq!(stage.usage.total_tokens, 190);
+        assert_eq!(stage.usage.total_usd_micros, Some(12_300));
+        assert_eq!(stage.model.as_ref().unwrap().provider.as_str(), "omp");
+        assert_eq!(stage.model.as_ref().unwrap().model_id.as_str(), "deepseek");
+
+        let run = projected_billing(&state);
+        assert_eq!(run.input_tokens, 100);
+        assert_eq!(run.output_tokens, 30);
+        assert_eq!(run.reasoning_tokens, 10);
+        assert_eq!(run.cache_read_tokens, 40);
+        assert_eq!(run.cache_write_tokens, 10);
+        assert_eq!(run.total_tokens, 190);
+        assert_eq!(run.total_usd_micros, Some(12_300));
     }
 
     #[test]

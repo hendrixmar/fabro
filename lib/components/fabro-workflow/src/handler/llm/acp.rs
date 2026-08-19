@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_acp::{
-    AcpCommandError, AcpControlHandle, AcpError, AcpLiveControl, AcpProcessSpec, AcpRunRequest,
-    AcpSessionActivity, render_stop_reason,
+    AcpCommandError, AcpControlHandle, AcpError, AcpLiveControl, AcpProcessSpec, AcpReportedCost,
+    AcpRunRequest, AcpRunUsage, AcpSessionActivity, render_stop_reason,
 };
 use fabro_agent::{
     AgentEvent, RefreshOutcome, Sandbox, StaticEnvProvider, SteeringItem, ToolEnvProvider,
 };
 use fabro_graphviz::graph::Node;
+use fabro_model::{ModelRef, ProviderId, TokenCounts, UsdMicros};
 use fabro_static::EnvVars;
 use fabro_types::{
     AgentBackend, AgentToolSummary, ExternalAgentsSettings, Principal, SessionCapability, StageId,
@@ -32,6 +33,7 @@ use super::skills_injection::{
 };
 use super::changed_files;
 use crate::error::Error;
+use crate::outcome::{BilledModelUsage, reported_model_usage};
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::handler::NodeTimeoutPolicy;
 use crate::steering_hub::{ActiveControlHandle, SteeringHub};
@@ -550,7 +552,9 @@ impl AgentAcpBackend {
 
         Ok(CodergenResult::Text {
             text: result.text,
-            usage: None,
+            usage: result
+                .usage
+                .and_then(|usage| billed_acp_usage(harness.as_deref(), node.model(), usage)),
             files_touched,
             last_file_touched,
             timing: StageTiming::active_only(result.duration_ms, 0),
@@ -675,6 +679,55 @@ impl CodergenBackend for AgentAcpBackend {
     fn node_timeout_policy(&self, _node: &Node) -> NodeTimeoutPolicy {
         NodeTimeoutPolicy::HandlerManaged
     }
+}
+
+fn billed_acp_usage(
+    harness: Option<&str>,
+    model: Option<&str>,
+    usage: AcpRunUsage,
+) -> Option<BilledModelUsage> {
+    let has_reported_usage = usage.input_tokens != 0
+        || usage.output_tokens != 0
+        || usage.reasoning_tokens != 0
+        || usage.cache_read_tokens != 0
+        || usage.cache_write_tokens != 0
+        || usage.reported_cost.is_some();
+    if !has_reported_usage {
+        return None;
+    }
+
+    let tokens = TokenCounts {
+        input_tokens:       saturating_token_count(usage.input_tokens),
+        output_tokens:      saturating_token_count(usage.output_tokens),
+        reasoning_tokens:   saturating_token_count(usage.reasoning_tokens),
+        cache_read_tokens:  saturating_token_count(usage.cache_read_tokens),
+        cache_write_tokens: saturating_token_count(usage.cache_write_tokens),
+    };
+    let reported_cost = usage.reported_cost.and_then(valid_reported_usd_cost);
+    let model = ModelRef {
+        provider: ProviderId::new(harness.unwrap_or("acp")),
+        model_id: model.or(harness).unwrap_or("external").into(),
+        speed: None,
+    };
+
+    Some(reported_model_usage(model, tokens, reported_cost))
+}
+
+fn saturating_token_count(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn valid_reported_usd_cost(cost: AcpReportedCost) -> Option<UsdMicros> {
+    if cost.currency == "USD" && cost.amount.is_finite() && cost.amount >= 0.0 {
+        return Some(UsdMicros::from_usd(cost.amount));
+    }
+
+    tracing::warn!(
+        amount = cost.amount,
+        currency = %cost.currency,
+        "ignoring invalid or unsupported ACP reported cost"
+    );
+    None
 }
 
 fn acp_process_error_to_workflow(error: AcpCommandError) -> Error {
@@ -1057,7 +1110,9 @@ mod tests {
     use std::time::Duration;
 
     use fabro_acp::test_support::fake_acp_agent_script;
-    use fabro_acp::{AcpError, AcpProcessExit, AcpSessionActivity, AcpToolKind};
+    use fabro_acp::{
+        AcpError, AcpProcessExit, AcpReportedCost, AcpRunUsage, AcpSessionActivity, AcpToolKind,
+    };
     use fabro_agent::{LocalSandbox, RefreshOutcome, Sandbox, shell_quote};
     use fabro_graphviz::graph::{AttrValue, Node};
     use fabro_sandbox::test_support::MockSandbox;
@@ -1067,8 +1122,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AgentAcpBackend, acp_error_to_workflow, parse_refresh_enabled, parse_refresh_interval,
-        session_activity_callback,
+        AgentAcpBackend, acp_error_to_workflow, billed_acp_usage, parse_refresh_enabled,
+        parse_refresh_interval, session_activity_callback,
     };
     use crate::context::Context;
     use crate::event::{Emitter, StageScope};
@@ -1118,6 +1173,97 @@ mod tests {
                 "{v} should fall back to default"
             );
         }
+    }
+
+    fn exact_acp_usage(reported_cost: Option<AcpReportedCost>) -> AcpRunUsage {
+        AcpRunUsage {
+            input_tokens: 100,
+            output_tokens: 30,
+            reasoning_tokens: 10,
+            cache_read_tokens: 40,
+            cache_write_tokens: 10,
+            total_tokens: 190,
+            reported_cost,
+        }
+    }
+
+    #[test]
+    fn acp_usage_maps_to_harness_model_and_reported_cost() {
+        let billed = billed_acp_usage(
+            Some("omp"),
+            Some("deepseek"),
+            exact_acp_usage(Some(AcpReportedCost {
+                amount:   0.0123,
+                currency: "USD".to_string(),
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(billed.model().provider.as_str(), "omp");
+        assert_eq!(billed.model_id(), "deepseek");
+        assert_eq!(billed.tokens().total_tokens(), 190);
+        assert_eq!(billed.total_usd_micros, Some(12_300));
+    }
+
+    #[test]
+    fn acp_usage_ignores_invalid_reported_cost() {
+        for cost in [
+            AcpReportedCost {
+                amount:   -1.0,
+                currency: "USD".to_string(),
+            },
+            AcpReportedCost {
+                amount:   f64::NAN,
+                currency: "USD".to_string(),
+            },
+            AcpReportedCost {
+                amount:   f64::INFINITY,
+                currency: "USD".to_string(),
+            },
+            AcpReportedCost {
+                amount:   1.0,
+                currency: "EUR".to_string(),
+            },
+        ] {
+            let billed =
+                billed_acp_usage(Some("omp"), Some("m"), exact_acp_usage(Some(cost))).unwrap();
+            assert_eq!(billed.total_usd_micros, None);
+        }
+    }
+
+    #[test]
+    fn acp_usage_saturates_tokens_and_large_usd_cost() {
+        let billed = billed_acp_usage(
+            None,
+            None,
+            AcpRunUsage {
+                input_tokens: u64::MAX,
+                reported_cost: Some(AcpReportedCost {
+                    amount:   f64::MAX,
+                    currency: "USD".to_string(),
+                }),
+                ..AcpRunUsage::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(billed.model().provider.as_str(), "acp");
+        assert_eq!(billed.model_id(), "external");
+        assert_eq!(billed.tokens().input_tokens, i64::MAX);
+        assert_eq!(billed.total_usd_micros, Some(i64::MAX));
+    }
+
+    #[test]
+    fn acp_usage_preserves_unknown_cost_and_ignores_reported_total() {
+        let mut usage = exact_acp_usage(None);
+        usage.total_tokens = u64::MAX;
+
+        let billed = billed_acp_usage(Some("omp"), None, usage).unwrap();
+
+        assert_eq!(billed.model_id(), "omp");
+        assert_eq!(billed.tokens().total_tokens(), 190);
+        assert_eq!(billed.total_usd_micros, None);
+        assert!(billed_acp_usage(None, None, AcpRunUsage::default()).is_none());
     }
 
     fn callback_harness(
@@ -1234,7 +1380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_backend_run_sends_prompt_and_returns_text() {
+    async fn acp_backend_run_sends_prompt_and_returns_text_and_usage() {
         let tempdir = tempfile::tempdir().unwrap();
         init_git(tempdir.path());
         let script_path = tempdir.path().join("fake_acp_agent.py");
@@ -1252,11 +1398,28 @@ mod tests {
                 shell_quote(&script_path.to_string_lossy())
             )),
         );
+        node.attrs.insert(
+            "harness".to_string(),
+            AttrValue::String("omp".to_string()),
+        );
+        node.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("deepseek".to_string()),
+        );
 
-        let backend = AgentAcpBackend::new().with_env(HashMap::from([(
-            "ACP_MODE".to_string(),
-            "write_file".to_string(),
-        )]));
+        let backend = AgentAcpBackend::new().with_env(HashMap::from([
+            ("ACP_MODE".to_string(), "write_file".to_string()),
+            (
+                "ACP_PROMPT_USAGE".to_string(),
+                r#"{"totalTokens":190,"inputTokens":100,"outputTokens":30,"thoughtTokens":10,"cachedReadTokens":40,"cachedWriteTokens":10}"#
+                    .to_string(),
+            ),
+            (
+                "ACP_USAGE_UPDATE".to_string(),
+                r#"{"used":190,"size":1000,"cost":{"amount":0.0123,"currency":"USD"}}"#
+                    .to_string(),
+            ),
+        ]));
         let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
         let emitter = Arc::new(Emitter::default());
         let context = Context::new();
@@ -1277,6 +1440,7 @@ mod tests {
 
         let CodergenResult::Text {
             text,
+            usage,
             files_touched,
             ..
         } = result
@@ -1285,6 +1449,11 @@ mod tests {
         };
         assert_eq!(text, "hello from acp");
         assert_eq!(files_touched, vec!["hello.txt"]);
+        let usage = usage.expect("ACP result should include exact reported usage");
+        assert_eq!(usage.model().provider.as_str(), "omp");
+        assert_eq!(usage.model_id(), "deepseek");
+        assert_eq!(usage.tokens().total_tokens(), 190);
+        assert_eq!(usage.total_usd_micros, Some(12_300));
     }
 
     #[tokio::test]
