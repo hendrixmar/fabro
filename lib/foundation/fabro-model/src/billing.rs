@@ -169,7 +169,7 @@ pub struct ModelRef {
 /// Token counts for one LLM call.
 ///
 /// All five fields are disjoint: each token is counted in exactly one bucket,
-/// and `total_tokens()` is their sum. Provider mappings normalize their wire
+/// and `total_tokens()` is their saturating sum. Provider mappings normalize their wire
 /// formats into this shape. For example, OpenAI's nested cached tokens are
 /// subtracted out of `input_tokens`, while Anthropic thinking tokens remain in
 /// `output_tokens` because Anthropic does not expose a separate billed count.
@@ -188,15 +188,15 @@ pub struct TokenCounts {
 impl TokenCounts {
     #[must_use]
     pub fn billable_output_tokens(&self) -> i64 {
-        self.output_tokens + self.reasoning_tokens
+        self.output_tokens.saturating_add(self.reasoning_tokens)
     }
 
     #[must_use]
     pub fn total_tokens(&self) -> i64 {
         self.input_tokens
-            + self.billable_output_tokens()
-            + self.cache_read_tokens
-            + self.cache_write_tokens
+            .saturating_add(self.billable_output_tokens())
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
     }
 }
 
@@ -205,22 +205,26 @@ impl std::ops::Add for TokenCounts {
 
     fn add(self, rhs: Self) -> Self::Output {
         Self {
-            input_tokens:       self.input_tokens + rhs.input_tokens,
-            output_tokens:      self.output_tokens + rhs.output_tokens,
-            reasoning_tokens:   self.reasoning_tokens + rhs.reasoning_tokens,
-            cache_read_tokens:  self.cache_read_tokens + rhs.cache_read_tokens,
-            cache_write_tokens: self.cache_write_tokens + rhs.cache_write_tokens,
+            input_tokens:       self.input_tokens.saturating_add(rhs.input_tokens),
+            output_tokens:      self.output_tokens.saturating_add(rhs.output_tokens),
+            reasoning_tokens:   self.reasoning_tokens.saturating_add(rhs.reasoning_tokens),
+            cache_read_tokens:  self.cache_read_tokens.saturating_add(rhs.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_add(rhs.cache_write_tokens),
         }
     }
 }
 
 impl std::ops::AddAssign for TokenCounts {
     fn add_assign(&mut self, rhs: Self) {
-        self.input_tokens += rhs.input_tokens;
-        self.output_tokens += rhs.output_tokens;
-        self.reasoning_tokens += rhs.reasoning_tokens;
-        self.cache_read_tokens += rhs.cache_read_tokens;
-        self.cache_write_tokens += rhs.cache_write_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(rhs.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(rhs.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(rhs.reasoning_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(rhs.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(rhs.cache_write_tokens);
     }
 }
 
@@ -415,23 +419,35 @@ impl BilledTokenCounts {
     }
 
     pub fn add_counts(&mut self, source: &Self) {
-        self.input_tokens += source.input_tokens;
-        self.output_tokens += source.output_tokens;
-        self.total_tokens += source.total_tokens;
-        self.reasoning_tokens += source.reasoning_tokens;
-        self.cache_read_tokens += source.cache_read_tokens;
-        self.cache_write_tokens += source.cache_write_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(source.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(source.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(source.total_tokens);
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(source.reasoning_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(source.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(source.cache_write_tokens);
         accumulate_optional_usd_micros(&mut self.total_usd_micros, source.total_usd_micros);
     }
 
     pub fn add_billed_usage(&mut self, usage: &BilledModelUsage) {
         let tokens = usage.tokens();
-        self.input_tokens += tokens.input_tokens;
-        self.output_tokens += tokens.output_tokens;
-        self.reasoning_tokens += tokens.reasoning_tokens;
-        self.cache_read_tokens += tokens.cache_read_tokens;
-        self.cache_write_tokens += tokens.cache_write_tokens;
-        self.total_tokens += tokens.total_tokens();
+        self.input_tokens = self.input_tokens.saturating_add(tokens.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(tokens.output_tokens);
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(tokens.reasoning_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(tokens.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(tokens.cache_write_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(tokens.total_tokens());
         accumulate_optional_usd_micros(&mut self.total_usd_micros, usage.total_usd_micros);
     }
 
@@ -799,6 +815,66 @@ mod tests {
         let mut minimum = Some(UsdMicros(i64::MIN));
         UsdMicros::accumulate(&mut minimum, Some(UsdMicros(-1)));
         assert_eq!(minimum, Some(UsdMicros(i64::MIN)));
+    }
+
+    #[test]
+    fn token_count_rollups_saturate_at_i64_max() {
+        let maximum = TokenCounts {
+            input_tokens:       i64::MAX,
+            output_tokens:      i64::MAX,
+            reasoning_tokens:   i64::MAX,
+            cache_read_tokens:  i64::MAX,
+            cache_write_tokens: i64::MAX,
+        };
+        let ones = TokenCounts {
+            input_tokens:       1,
+            output_tokens:      1,
+            reasoning_tokens:   1,
+            cache_read_tokens:  1,
+            cache_write_tokens: 1,
+        };
+
+        assert_eq!(maximum.billable_output_tokens(), i64::MAX);
+        assert_eq!(maximum.total_tokens(), i64::MAX);
+        assert_eq!(maximum.clone() + ones.clone(), maximum);
+
+        let mut assigned = maximum.clone();
+        assigned += ones;
+        assert_eq!(assigned, maximum);
+
+        let billed = [
+            billed_usage(i64::MAX, 0, None),
+            billed_usage(1, 0, None),
+        ];
+        let rolled_up = BilledTokenCounts::from_billed_usage(&billed);
+        assert_eq!(rolled_up.input_tokens, i64::MAX);
+        assert_eq!(rolled_up.total_tokens, i64::MAX);
+
+        let mut projected = BilledTokenCounts {
+            input_tokens:       i64::MAX,
+            output_tokens:      i64::MAX,
+            total_tokens:       i64::MAX,
+            reasoning_tokens:   i64::MAX,
+            cache_read_tokens:  i64::MAX,
+            cache_write_tokens: i64::MAX,
+            total_usd_micros:   None,
+        };
+        projected.add_counts(&BilledTokenCounts {
+            input_tokens:       1,
+            output_tokens:      1,
+            total_tokens:       1,
+            reasoning_tokens:   1,
+            cache_read_tokens:  1,
+            cache_write_tokens: 1,
+            total_usd_micros:   None,
+        });
+        projected.add_billed_usage(&billed_usage(1, 1, None));
+        assert_eq!(projected.input_tokens, i64::MAX);
+        assert_eq!(projected.output_tokens, i64::MAX);
+        assert_eq!(projected.total_tokens, i64::MAX);
+        assert_eq!(projected.reasoning_tokens, i64::MAX);
+        assert_eq!(projected.cache_read_tokens, i64::MAX);
+        assert_eq!(projected.cache_write_tokens, i64::MAX);
     }
 
     #[test]

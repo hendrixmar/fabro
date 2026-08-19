@@ -1117,7 +1117,8 @@ mod tests {
     use fabro_graphviz::graph::{AttrValue, Node};
     use fabro_sandbox::test_support::MockSandbox;
     use fabro_types::{
-        AgentToolsAvailableProps, CommandTermination, EventBody, ExecOutputTail, RunEvent,
+        AgentToolsAvailableProps, BilledTokenCounts, CommandTermination, EventBody, ExecOutputTail,
+        RunEvent,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -1238,6 +1239,7 @@ mod tests {
             None,
             AcpRunUsage {
                 input_tokens: u64::MAX,
+                output_tokens: 1,
                 reported_cost: Some(AcpReportedCost {
                     amount:   f64::MAX,
                     currency: "USD".to_string(),
@@ -1250,6 +1252,11 @@ mod tests {
         assert_eq!(billed.model().provider.as_str(), "acp");
         assert_eq!(billed.model_id(), "external");
         assert_eq!(billed.tokens().input_tokens, i64::MAX);
+        assert_eq!(billed.tokens().total_tokens(), i64::MAX);
+        assert_eq!(
+            BilledTokenCounts::from_billed_usage(std::slice::from_ref(&billed)).total_tokens,
+            i64::MAX
+        );
         assert_eq!(billed.total_usd_micros, Some(i64::MAX));
     }
 
