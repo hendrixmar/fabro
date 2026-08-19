@@ -939,6 +939,7 @@ fn session_activity_callback(
                 &stage_scope,
             );
         }
+        AcpSessionActivity::UsageUpdated { .. } => {}
     })
 }
 

@@ -3,17 +3,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{
-    CancelNotification, ContentBlock, ContentChunk, InitializeRequest, PermissionOptionKind,
-    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, ToolCall,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
+    CancelNotification, ContentBlock, ContentChunk, Cost, InitializeRequest, PermissionOptionKind,
+    PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolKind, Usage,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{ActiveSession, Agent, Client, Error as ProtocolError, SessionMessage};
 use fabro_sandbox::Sandbox;
 use fabro_types::{Principal, SteeringMessage};
 use fabro_util::time::elapsed_ms;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio::sync::futures::Notified;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -72,6 +73,101 @@ pub enum AcpSessionActivity {
         output:       serde_json::Value,
         is_error:     bool,
     },
+    UsageUpdated {
+        used: u64,
+        size: u64,
+        cost: Option<AcpReportedCost>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcpReportedCost {
+    pub amount:   f64,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AcpRunUsage {
+    pub input_tokens:       u64,
+    pub output_tokens:      u64,
+    pub reasoning_tokens:   u64,
+    pub cache_read_tokens:  u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens:       u64,
+    pub reported_cost:      Option<AcpReportedCost>,
+}
+
+#[derive(Default)]
+struct AcpUsageAccumulator {
+    usage:            AcpRunUsage,
+    saw_prompt_usage: bool,
+}
+
+impl AcpUsageAccumulator {
+    fn add_prompt_usage(&mut self, usage: &Usage) {
+        let reasoning_tokens = usage.thought_tokens.unwrap_or_default();
+        let cache_read_tokens = usage.cached_read_tokens.unwrap_or_default();
+        let cache_write_tokens = usage.cached_write_tokens.unwrap_or_default();
+        let normalized_total = usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .saturating_add(reasoning_tokens)
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_write_tokens);
+        if normalized_total != usage.total_tokens {
+            tracing::warn!(
+                reported_total_tokens = usage.total_tokens,
+                normalized_total_tokens = normalized_total,
+                "ACP prompt usage total differs from disjoint bucket sum"
+            );
+        }
+
+        self.usage.input_tokens = self
+            .usage
+            .input_tokens
+            .saturating_add(usage.input_tokens);
+        self.usage.output_tokens = self
+            .usage
+            .output_tokens
+            .saturating_add(usage.output_tokens);
+        self.usage.reasoning_tokens = self
+            .usage
+            .reasoning_tokens
+            .saturating_add(reasoning_tokens);
+        self.usage.cache_read_tokens = self
+            .usage
+            .cache_read_tokens
+            .saturating_add(cache_read_tokens);
+        self.usage.cache_write_tokens = self
+            .usage
+            .cache_write_tokens
+            .saturating_add(cache_write_tokens);
+        self.usage.total_tokens = self
+            .usage
+            .input_tokens
+            .saturating_add(self.usage.output_tokens)
+            .saturating_add(self.usage.reasoning_tokens)
+            .saturating_add(self.usage.cache_read_tokens)
+            .saturating_add(self.usage.cache_write_tokens);
+        self.saw_prompt_usage = true;
+    }
+
+    fn record_reported_cost(&mut self, cost: Option<AcpReportedCost>) {
+        if let Some(cost) = cost {
+            self.usage.reported_cost = Some(cost);
+        }
+    }
+
+    fn finish(self) -> Option<AcpRunUsage> {
+        (self.saw_prompt_usage || self.usage.reported_cost.is_some()).then_some(self.usage)
+    }
+}
+
+fn convert_reported_cost(cost: &Cost) -> AcpReportedCost {
+    AcpReportedCost {
+        amount:   cost.amount,
+        currency: cost.currency.clone(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +189,11 @@ fn convert_session_update(
     match update {
         SessionUpdate::ToolCall(call) => convert_tool_call(call, tracked),
         SessionUpdate::ToolCallUpdate(update) => convert_tool_call_update(update, tracked),
+        SessionUpdate::UsageUpdate(update) => vec![AcpSessionActivity::UsageUpdated {
+            used: update.used,
+            size: update.size,
+            cost: update.cost.as_ref().map(convert_reported_cost),
+        }],
         _ => Vec::new(),
     }
 }
@@ -346,6 +447,7 @@ pub struct AcpRunRequest {
 pub struct AcpRunResult {
     pub text:        String,
     pub stop_reason: StopReason,
+    pub usage:       Option<AcpRunUsage>,
     pub stderr:      String,
     pub duration_ms: u64,
 }
@@ -393,9 +495,10 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
             cx.build_session(&cwd)
                 .block_task()
                 .run_until(async |mut session| {
-                    session.send_prompt(prompt)?;
+                    let prompt_response = send_prompt_with_response(&session, prompt)?;
                     read_live_session(
                         &mut session,
+                        prompt_response,
                         &read_cancel_token,
                         &live_control.handle,
                         live_control.on_natural_completion.as_ref(),
@@ -437,7 +540,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
             return Err(AcpError::Cancelled);
         }
     };
-    let (text, stop_reason) = match outcome {
+    let (text, stop_reason, usage) = match outcome {
         Ok(result) => result,
         Err(_) if run_cancel_token.is_cancelled() => {
             state.terminate().await?;
@@ -475,6 +578,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     Ok(AcpRunResult {
         text,
         stop_reason,
+        usage,
         stderr,
         duration_ms: elapsed_ms(start),
     })
@@ -509,27 +613,48 @@ fn select_permission_outcome(request: &RequestPermissionRequest) -> RequestPermi
     })
 }
 
+fn send_prompt_with_response(
+    session: &ActiveSession<'_, Agent>,
+    prompt: String,
+) -> Result<oneshot::Receiver<Result<PromptResponse, ProtocolError>>, ProtocolError> {
+    let (tx, rx) = oneshot::channel();
+    session
+        .connection()
+        .send_request_to(
+            Agent,
+            PromptRequest::new(session.session_id().clone(), vec![prompt.into()]),
+        )
+        .on_receiving_result(async move |result| {
+            let _ = tx.send(result);
+            Ok(())
+        })?;
+    Ok(rx)
+}
+
 async fn read_live_session(
     session: &mut ActiveSession<'_, Agent>,
+    initial_prompt_response: oneshot::Receiver<Result<PromptResponse, ProtocolError>>,
     cancel_token: &CancellationToken,
     control_handle: &AcpControlHandle,
     on_natural_completion: Option<&AcpNaturalCompletionCallback>,
     on_steer_prompt: Option<&AcpSteerPromptCallback>,
     on_activity: Option<&Arc<dyn Fn() + Send + Sync>>,
     on_session_activity: Option<&AcpSessionActivityCallback>,
-) -> Result<(String, StopReason), ProtocolError> {
+) -> Result<(String, StopReason, Option<AcpRunUsage>), ProtocolError> {
     let mut text = String::new();
     let mut prompt_active = true;
+    let mut prompt_response = Some(initial_prompt_response);
     let mut cancel_sent = false;
     let mut last_stop_reason: Option<StopReason> = None;
     let mut tracked_tools = HashMap::new();
+    let mut usage_accumulator = AcpUsageAccumulator::default();
     loop {
         if !prompt_active {
             if let Some(message) = control_handle.pop_steer() {
                 if let Some(on_steer_prompt) = on_steer_prompt {
                     on_steer_prompt(message.text.clone(), message.actor.clone());
                 }
-                session.send_prompt(message.text)?;
+                prompt_response = Some(send_prompt_with_response(session, message.text)?);
                 prompt_active = true;
                 cancel_sent = false;
                 continue;
@@ -543,7 +668,7 @@ async fn read_live_session(
                 let notified = control_handle.notified();
                 tokio::select! {
                     () = cancel_token.cancelled() => {
-                        return Ok((text, StopReason::Cancelled));
+                        return Ok((text, StopReason::Cancelled, usage_accumulator.finish()));
                     }
                     () = notified => {}
                 }
@@ -559,13 +684,13 @@ async fn read_live_session(
                 let notified = control_handle.notified();
                 tokio::select! {
                     () = cancel_token.cancelled() => {
-                        return Ok((text, StopReason::Cancelled));
+                        return Ok((text, StopReason::Cancelled, usage_accumulator.finish()));
                     }
                     () = notified => {}
                 }
                 continue;
             }
-            return Ok((text, stop_reason));
+            return Ok((text, stop_reason, usage_accumulator.finish()));
         }
 
         if control_handle.take_interrupt_requested() && !cancel_sent {
@@ -575,6 +700,7 @@ async fn read_live_session(
 
         let control_notified = control_handle.notified();
         tokio::select! {
+            biased;
             update = session.read_update() => {
                 if let Some(on_activity) = on_activity {
                     on_activity();
@@ -583,6 +709,11 @@ async fn read_live_session(
                     SessionMessage::SessionMessage(dispatch) => {
                         MatchDispatch::new(dispatch)
                             .if_notification(async |notification: SessionNotification| {
+                                if let SessionUpdate::UsageUpdate(update) = &notification.update {
+                                    usage_accumulator.record_reported_cost(
+                                        update.cost.as_ref().map(convert_reported_cost),
+                                    );
+                                }
                                 if let Some(on_session_activity) = on_session_activity {
                                     for activity in convert_session_update(
                                         &notification.update,
@@ -603,13 +734,32 @@ async fn read_live_session(
                             .await
                             .otherwise_ignore()?;
                     }
-                    SessionMessage::StopReason(stop_reason) => {
-                        prompt_active = false;
-                        cancel_sent = false;
-                        last_stop_reason = Some(stop_reason);
-                    }
                     _ => {}
                 }
+            }
+            response = async {
+                prompt_response
+                    .as_mut()
+                    .expect("prompt response receiver is guarded")
+                    .await
+            }, if prompt_response.is_some() => {
+                let Ok(response) = response else {
+                    // The ACP connection owns the protocol error. Keep reading it from
+                    // the session channel rather than replacing it with a channel error.
+                    prompt_response = None;
+                    continue;
+                };
+                let response = response?;
+                if let Some(on_activity) = on_activity {
+                    on_activity();
+                }
+                if let Some(usage) = response.usage.as_ref() {
+                    usage_accumulator.add_prompt_usage(usage);
+                }
+                prompt_response = None;
+                prompt_active = false;
+                cancel_sent = false;
+                last_stop_reason = Some(response.stop_reason);
             }
             () = control_notified => {
                 if control_handle.take_interrupt_requested() && !cancel_sent {
@@ -622,7 +772,7 @@ async fn read_live_session(
                 send_cancel_notification(session)?;
             }
             () = sleep(CANCEL_GRACE_PERIOD), if cancel_sent => {
-                return Ok((text, StopReason::Cancelled));
+                return Ok((text, StopReason::Cancelled, usage_accumulator.finish()));
             }
         }
     }
@@ -648,23 +798,89 @@ mod tests {
 
     use agent_client_protocol::schema::{
         SessionNotification, SessionUpdate, ToolCall, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields, ToolKind,
+        ToolCallUpdateFields, ToolKind, Usage,
     };
 
-    use super::{AcpSessionActivity, AcpToolKind, convert_session_update};
+    use super::{
+        AcpReportedCost, AcpRunUsage, AcpSessionActivity, AcpToolKind, AcpUsageAccumulator,
+        convert_session_update,
+    };
+
     #[test]
-    fn codex_usage_update_session_notification_deserializes() {
+    fn usage_update_preserves_context_telemetry_and_cost() {
         let notification = serde_json::json!({
             "sessionId": "session-1",
             "update": {
                 "sessionUpdate": "usage_update",
                 "used": 26128,
-                "size": 258_400
+                "size": 258_400,
+                "cost": {
+                    "amount": 0.0123,
+                    "currency": "USD"
+                }
             }
         });
+        let notification =
+            serde_json::from_value::<SessionNotification>(notification).expect("valid usage update");
 
-        serde_json::from_value::<SessionNotification>(notification)
-            .expect("Codex ACP usage_update notifications should be ignored, not fatal");
+        assert_eq!(
+            convert_session_update(&notification.update, &mut HashMap::new()),
+            vec![AcpSessionActivity::UsageUpdated {
+                used: 26128,
+                size: 258_400,
+                cost: Some(AcpReportedCost {
+                    amount: 0.0123,
+                    currency: "USD".to_string(),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn usage_accumulator_sums_disjoint_prompt_buckets_once_and_keeps_latest_cost() {
+        let mut accumulator = AcpUsageAccumulator::default();
+        accumulator.add_prompt_usage(
+            &Usage::new(999, 10, 20)
+                .thought_tokens(3)
+                .cached_read_tokens(4)
+                .cached_write_tokens(5),
+        );
+        accumulator.record_reported_cost(Some(AcpReportedCost {
+            amount: 0.01,
+            currency: "USD".to_string(),
+        }));
+        accumulator.add_prompt_usage(
+            &Usage::new(1, 100, 200)
+                .thought_tokens(30)
+                .cached_read_tokens(40)
+                .cached_write_tokens(50),
+        );
+        accumulator.record_reported_cost(Some(AcpReportedCost {
+            amount: 0.02,
+            currency: "USD".to_string(),
+        }));
+        accumulator.record_reported_cost(None);
+
+        assert_eq!(
+            accumulator.finish(),
+            Some(AcpRunUsage {
+                input_tokens: 110,
+                output_tokens: 220,
+                reasoning_tokens: 33,
+                cache_read_tokens: 44,
+                cache_write_tokens: 55,
+                total_tokens: 462,
+                reported_cost: Some(AcpReportedCost {
+                    amount: 0.02,
+                    currency: "USD".to_string(),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn usage_accumulator_without_prompt_usage_or_cost_returns_none() {
+        assert_eq!(AcpUsageAccumulator::default().finish(), None);
     }
 
     #[test]

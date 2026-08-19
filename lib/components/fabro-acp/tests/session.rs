@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::StopReason;
 use fabro_acp::{
-    AcpControlHandle, AcpError, AcpLiveControl, AcpProcessSpec, AcpRunRequest, AcpRunResult,
-    run_acp_turn,
+    AcpControlHandle, AcpError, AcpLiveControl, AcpProcessSpec, AcpReportedCost, AcpRunRequest,
+    AcpRunResult, AcpRunUsage, run_acp_turn,
 };
 use fabro_sandbox::test_support::{MockSandbox, MockStdioProcess};
 use fabro_sandbox::{LocalSandbox, Sandbox, shell_quote};
@@ -96,6 +96,46 @@ async fn clean_stdio_exit_after_final_response_completes_turn() {
 }
 
 #[tokio::test]
+async fn run_acp_turn_preserves_prompt_usage_and_reported_cost() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let result = run_fake_agent(
+        tempdir.path(),
+        HashMap::from([
+            (
+                "ACP_PROMPT_USAGE".to_string(),
+                r#"{"totalTokens":190,"inputTokens":100,"outputTokens":30,"thoughtTokens":10,"cachedReadTokens":40,"cachedWriteTokens":10}"#
+                    .to_string(),
+            ),
+            (
+                "ACP_USAGE_UPDATE".to_string(),
+                r#"{"used":190,"size":1000,"cost":{"amount":0.0123,"currency":"USD"}}"#
+                    .to_string(),
+            ),
+        ]),
+        Some(ACP_TEST_TIMEOUT_MS),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("run ACP turn with usage");
+
+    assert_eq!(
+        result.usage,
+        Some(AcpRunUsage {
+            input_tokens: 100,
+            output_tokens: 30,
+            reasoning_tokens: 10,
+            cache_read_tokens: 40,
+            cache_write_tokens: 10,
+            total_tokens: 190,
+            reported_cost: Some(AcpReportedCost {
+                amount: 0.0123,
+                currency: "USD".to_string(),
+            }),
+        })
+    );
+}
+
+#[tokio::test]
 async fn session_lifecycle_initializes_sends_prompt_and_aggregates_text() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let script_path = tempdir.path().join("fake_acp_agent.py");
@@ -128,6 +168,7 @@ async fn session_lifecycle_initializes_sends_prompt_and_aggregates_text() {
 
     assert_eq!(result.text, "hello from acp");
     assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.usage, None);
     assert_eq!(
         read_to_string(record_path)
             .await
