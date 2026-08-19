@@ -17,5 +17,5 @@ pub use error::{AcpError, AcpProcessExit};
 #[cfg(feature = "runtime")]
 pub use session::{
     AcpControlHandle, AcpLiveControl, AcpRunRequest, AcpRunResult, AcpSessionActivity,
-    AcpSessionActivityCallback, render_stop_reason, run_acp_turn,
+    AcpSessionActivityCallback, AcpToolKind, render_stop_reason, run_acp_turn,
 };

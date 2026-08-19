@@ -6,7 +6,7 @@ use agent_client_protocol::schema::{
     CancelNotification, ContentBlock, ContentChunk, InitializeRequest, PermissionOptionKind,
     ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, ToolCall,
-    ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{ActiveSession, Agent, Client, Error as ProtocolError, SessionMessage};
@@ -26,6 +26,36 @@ pub type AcpNaturalCompletionCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 pub type AcpSteerPromptCallback = Arc<dyn Fn(String, Option<Principal>) + Send + Sync>;
 
 pub type AcpSessionActivityCallback = Arc<dyn Fn(AcpSessionActivity) + Send + Sync>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    Other,
+}
+
+impl From<ToolKind> for AcpToolKind {
+    fn from(value: ToolKind) -> Self {
+        match value {
+            ToolKind::Read => Self::Read,
+            ToolKind::Edit => Self::Edit,
+            ToolKind::Delete => Self::Delete,
+            ToolKind::Move => Self::Move,
+            ToolKind::Search => Self::Search,
+            ToolKind::Execute => Self::Execute,
+            ToolKind::Think => Self::Think,
+            ToolKind::Fetch => Self::Fetch,
+            ToolKind::SwitchMode => Self::SwitchMode,
+            _ => Self::Other,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AcpSessionActivity {
@@ -34,6 +64,7 @@ pub enum AcpSessionActivity {
         tool_name:    String,
         title:        String,
         raw_input:    serde_json::Value,
+        kind:         AcpToolKind,
     },
     ToolCompleted {
         tool_call_id: String,
@@ -46,6 +77,7 @@ pub enum AcpSessionActivity {
 #[derive(Debug, Clone)]
 struct TrackedToolCall {
     tool_name: String,
+    kind:      AcpToolKind,
     started:   bool,
     completed: bool,
 }
@@ -74,6 +106,7 @@ fn convert_tool_call(
     let entry = tracked
         .entry(tool_call_id.clone())
         .or_insert_with(|| TrackedToolCall {
+            kind:      call.kind.into(),
             tool_name: tool_name.clone(),
             started:   false,
             completed: false,
@@ -82,6 +115,7 @@ fn convert_tool_call(
     if !entry.started {
         entry.started = true;
         events.push(AcpSessionActivity::ToolStarted {
+            kind:         entry.kind,
             tool_call_id: tool_call_id.clone(),
             tool_name:    entry.tool_name.clone(),
             title:        call.title.clone(),
@@ -117,16 +151,21 @@ fn convert_tool_call_update(
                 .title
                 .clone()
                 .unwrap_or_else(|| "tool".to_string()),
+            kind:      update.fields.kind.unwrap_or(ToolKind::Other).into(),
             started:   false,
             completed: false,
         });
     if let Some(title) = update.fields.title.clone() {
         entry.tool_name = title;
     }
+    if let Some(kind) = update.fields.kind {
+        entry.kind = kind.into();
+    }
     let mut events = Vec::new();
     if !entry.started {
         entry.started = true;
         events.push(AcpSessionActivity::ToolStarted {
+            kind:         entry.kind,
             tool_call_id: tool_call_id.clone(),
             tool_name:    entry.tool_name.clone(),
             title:        entry.tool_name.clone(),
@@ -609,10 +648,10 @@ mod tests {
 
     use agent_client_protocol::schema::{
         SessionNotification, SessionUpdate, ToolCall, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields,
+        ToolCallUpdateFields, ToolKind,
     };
 
-    use super::{AcpSessionActivity, convert_session_update};
+    use super::{AcpSessionActivity, AcpToolKind, convert_session_update};
     #[test]
     fn codex_usage_update_session_notification_deserializes() {
         let notification = serde_json::json!({
@@ -626,6 +665,25 @@ mod tests {
 
         serde_json::from_value::<SessionNotification>(notification)
             .expect("Codex ACP usage_update notifications should be ignored, not fatal");
+    }
+
+    #[test]
+    fn tool_call_preserves_structured_kind() {
+        let mut tracked = HashMap::new();
+        let started = SessionUpdate::ToolCall(
+            ToolCall::new("call-read", "Read file /tmp/a.rs")
+                .kind(ToolKind::Read)
+                .raw_input(serde_json::json!({"path": "/tmp/a.rs"})),
+        );
+
+        let events = convert_session_update(&started, &mut tracked);
+        assert!(matches!(
+            &events[0],
+            AcpSessionActivity::ToolStarted {
+                kind: AcpToolKind::Read,
+                ..
+            }
+        ));
     }
 
     #[test]
