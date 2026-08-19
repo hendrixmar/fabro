@@ -299,6 +299,8 @@ fn convert_tool_call_update(
 const CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
 // Drain buffered notifications first, but recheck a ready prompt response after a bounded batch.
 const MAX_SESSION_UPDATES_BEFORE_PROMPT_CHECK: usize = 64;
+// Quiescence ends normal drains; this deadline bounds agents that stream after responding.
+const POST_RESPONSE_DRAIN_LIMIT: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct AcpControlState {
@@ -641,6 +643,7 @@ enum LiveSessionEvent {
     ControlNotified,
     CancelRequested,
     CancelGraceElapsed,
+    PostResponseDrainComplete,
 }
 
 async fn read_live_session(
@@ -656,6 +659,8 @@ async fn read_live_session(
     let mut text = String::new();
     let mut prompt_active = true;
     let mut prompt_response = Some(initial_prompt_response);
+    let mut pending_prompt_response: Option<PromptResponse> = None;
+    let mut post_response_drain_deadline: Option<Instant> = None;
     let mut cancel_sent = false;
     let mut cancel_deadline: Option<Instant> = None;
     let mut session_updates_since_prompt_check = 0;
@@ -669,6 +674,8 @@ async fn read_live_session(
                     on_steer_prompt(message.text.clone(), message.actor.clone());
                 }
                 prompt_response = Some(send_prompt_with_response(session, message.text)?);
+                pending_prompt_response = None;
+                post_response_drain_deadline = None;
                 prompt_active = true;
                 cancel_sent = false;
                 cancel_deadline = None;
@@ -718,7 +725,29 @@ async fn read_live_session(
         let control_notified = control_handle.notified();
         let prioritize_session_updates =
             session_updates_since_prompt_check < MAX_SESSION_UPDATES_BEFORE_PROMPT_CHECK;
-        let event = if prioritize_session_updates {
+        let event = if pending_prompt_response.is_some() {
+            tokio::select! {
+                biased;
+                () = async {
+                    sleep_until(cancel_deadline.expect("cancel deadline is guarded")).await;
+                }, if cancel_deadline.is_some() => LiveSessionEvent::CancelGraceElapsed,
+                () = cancel_token.cancelled(), if !cancel_sent => {
+                    LiveSessionEvent::CancelRequested
+                }
+                () = control_notified => LiveSessionEvent::ControlNotified,
+                () = async {
+                    sleep_until(
+                        post_response_drain_deadline
+                            .expect("post-response drain deadline is guarded"),
+                    )
+                    .await;
+                }, if post_response_drain_deadline.is_some() => {
+                    LiveSessionEvent::PostResponseDrainComplete
+                }
+                update = session.read_update() => LiveSessionEvent::SessionMessage(update),
+                () = tokio::task::yield_now() => LiveSessionEvent::PostResponseDrainComplete,
+            }
+        } else if prioritize_session_updates {
             tokio::select! {
                 biased;
                 () = async {
@@ -754,6 +783,14 @@ async fn read_live_session(
                 }, if prompt_response.is_some() => LiveSessionEvent::PromptResponse(response),
                 update = session.read_update() => LiveSessionEvent::SessionMessage(update),
             }
+        };
+        let event = match event {
+            LiveSessionEvent::SessionMessage(Err(_)) if pending_prompt_response.is_some() => {
+                // A completed prompt is authoritative over connection closure while
+                // draining its already-enqueued notifications.
+                LiveSessionEvent::PostResponseDrainComplete
+            }
+            event => event,
         };
 
         match event {
@@ -806,10 +843,20 @@ async fn read_live_session(
                 if let Some(on_activity) = on_activity {
                     on_activity();
                 }
+                prompt_response = None;
+                pending_prompt_response = Some(response);
+                post_response_drain_deadline =
+                    Some(Instant::now() + POST_RESPONSE_DRAIN_LIMIT);
+                session_updates_since_prompt_check = 0;
+            }
+            LiveSessionEvent::PostResponseDrainComplete => {
+                let response = pending_prompt_response
+                    .take()
+                    .expect("completed prompt response is guarded");
+                post_response_drain_deadline = None;
                 if let Some(usage) = response.usage.as_ref() {
                     usage_accumulator.add_prompt_usage(usage);
                 }
-                prompt_response = None;
                 prompt_active = false;
                 cancel_sent = false;
                 cancel_deadline = None;

@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::StopReason;
 use fabro_acp::{
     AcpControlHandle, AcpError, AcpLiveControl, AcpProcessSpec, AcpReportedCost, AcpRunRequest,
-    AcpRunResult, AcpRunUsage, run_acp_turn,
+    AcpRunResult, AcpRunUsage, AcpSessionActivity, run_acp_turn,
 };
 use fabro_sandbox::test_support::{MockSandbox, MockStdioProcess};
 use fabro_sandbox::{LocalSandbox, Sandbox, shell_quote};
@@ -457,6 +457,88 @@ async fn inline_interrupt_reaches_grace_deadline_while_agent_streams_updates() {
             .expect("read cancel record"),
         "session/cancel\n"
     );
+}
+
+#[tokio::test]
+async fn prompt_completion_drains_all_buffered_pre_response_updates() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let script_path = tempdir.path().join("fake_acp_agent.py");
+    write(&script_path, fake_acp_agent_script())
+        .await
+        .expect("write fake ACP agent");
+
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
+    let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+    let activities = Arc::new(Mutex::new(Vec::new()));
+    let activities_for_callback = Arc::clone(&activities);
+    let run = run_acp_turn(AcpRunRequest {
+        command,
+        prompt: "hello".to_string(),
+        cwd: tempdir.path().to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env: HashMap::from([
+            (
+                "ACP_MODE".to_string(),
+                "buffered_updates_before_response".to_string(),
+            ),
+            (
+                "ACP_PROMPT_USAGE".to_string(),
+                r#"{"totalTokens":15,"inputTokens":1,"outputTokens":2,"thoughtTokens":3,"cachedReadTokens":4,"cachedWriteTokens":5}"#
+                    .to_string(),
+            ),
+            (
+                "ACP_USAGE_UPDATE".to_string(),
+                r#"{"used":15,"size":1000,"cost":{"amount":0.02,"currency":"USD"}}"#
+                    .to_string(),
+            ),
+        ]),
+        sandbox,
+        cancel_token: CancellationToken::new(),
+        on_activity: None,
+        on_session_activity: Some(Arc::new(move |activity| {
+            activities_for_callback
+                .lock()
+                .expect("activity lock poisoned")
+                .push(activity);
+        })),
+        live_control: None,
+    });
+    let result = timeout(Duration::from_secs(2), run)
+        .await
+        .expect("buffered response should complete within a bounded interval")
+        .expect("run ACP turn with buffered updates");
+
+    assert_eq!(result.text, format!("{}TAIL", "x".repeat(70)));
+    assert_eq!(
+        result.usage,
+        Some(AcpRunUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            reasoning_tokens: 3,
+            cache_read_tokens: 4,
+            cache_write_tokens: 5,
+            total_tokens: 15,
+            reported_cost: Some(AcpReportedCost {
+                amount: 0.02,
+                currency: "USD".to_string(),
+            }),
+        })
+    );
+    let activities = activities.lock().expect("activity lock poisoned");
+    assert!(activities.iter().any(|activity| matches!(
+        activity,
+        AcpSessionActivity::ToolStarted { tool_call_id, .. } if tool_call_id == "late-tool"
+    )));
+    assert!(activities.iter().any(|activity| matches!(
+        activity,
+        AcpSessionActivity::ToolCompleted {
+            tool_call_id,
+            output,
+            is_error: false,
+            ..
+        } if tool_call_id == "late-tool" && output["ok"] == true
+    )));
 }
 
 #[tokio::test]

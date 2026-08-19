@@ -325,6 +325,84 @@ for line in sys.stdin:
             record_methods()
             respond_to_prompt(message, "end_turn")
             break
+        if mode == "buffered_updates_before_response":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 1,
+                        "size": 1000,
+                        "cost": {"amount": 0.01, "currency": "USD"},
+                    },
+                },
+            })
+            for _ in range(70):
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "x"}
+                        }
+                    }
+                })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "TAIL"}
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "late-tool",
+                        "title": "Late tool",
+                        "kind": "read",
+                        "rawInput": {"path": "late.txt"}
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "late-tool",
+                        "status": "completed",
+                        "rawOutput": {"ok": True}
+                    }
+                }
+            })
+            record_methods()
+            respond_to_prompt(message, "end_turn")
+            while True:
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": ""}
+                        }
+                    }
+                })
         for text in ["hello ", "from acp"]:
             send({
                 "jsonrpc": "2.0",
