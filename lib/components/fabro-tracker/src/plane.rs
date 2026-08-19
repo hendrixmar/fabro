@@ -391,6 +391,11 @@ impl PlaneClient {
             issues.push(normalized);
         }
 
+        // Some Plane-compatible deployments ignore the `?state=` query filter
+        // and return every issue; enforce the requested state client-side so
+        // the dispatcher never sees non-ready issues as candidates.
+        issues.retain(|issue| issue.state == state_id);
+
         Ok(issues)
     }
 

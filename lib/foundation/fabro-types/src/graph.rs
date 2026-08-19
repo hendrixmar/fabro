@@ -362,6 +362,29 @@ impl Node {
     }
 
     #[must_use]
+    pub fn harness_attr(&self) -> Option<&str> {
+        self.str_attr("harness")
+    }
+
+    #[must_use]
+    pub fn reasoning_effort_attr(&self) -> Option<&str> {
+        self.str_attr("reasoning_effort")
+    }
+
+    /// Comma-separated `skills` attribute split into trimmed, non-empty names.
+    #[must_use]
+    pub fn skills_attr(&self) -> Option<Vec<String>> {
+        let raw = self.str_attr("skills")?;
+        let names: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        (!names.is_empty()).then_some(names)
+    }
+
+    #[must_use]
     pub fn selection(&self) -> &str {
         self.str_attr("selection").unwrap_or("deterministic")
     }

@@ -662,7 +662,10 @@ impl Session {
             let skills_str = skills_dir.to_string_lossy().to_string();
             default_skill_dirs(Some(&skills_str), Some(&doc_root))
         };
-        self.skills = discover_skills(self.sandbox.as_ref(), &skill_dirs, &cancel_token).await?;
+        self.skills = crate::skills::filter_skills_by_allowlist(
+            discover_skills(self.sandbox.as_ref(), &skill_dirs, &cancel_token).await?,
+            self.config.skill_allowlist.as_deref(),
+        );
         debug!(skill_count = self.skills.len(), "Skills discovered");
 
         let skill_summaries: Vec<SkillSummary> = self

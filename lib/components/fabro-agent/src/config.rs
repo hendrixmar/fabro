@@ -187,6 +187,9 @@ pub struct SessionOptions {
     /// Skill directories. `None` = use convention defaults, `Some(dirs)` = use
     /// these instead.
     pub skill_dirs: Option<Vec<String>>,
+    /// When set, discovered skills are filtered to these names before session
+    /// assignment; `None` keeps every discovered skill.
+    pub skill_allowlist: Option<Vec<String>>,
     /// MCP server configurations to connect to on session startup.
     pub mcp_servers: Vec<McpServerSettings>,
     /// Wall-clock timeout for the entire `process_input` call.
@@ -222,6 +225,7 @@ impl std::fmt::Debug for SessionOptions {
                 "compaction_threshold_percent",
                 &self.compaction_threshold_percent,
             )
+            .field("skill_allowlist", &self.skill_allowlist)
             .field("compaction_preserve_turns", &self.compaction_preserve_turns)
             .field("skill_dirs", &self.skill_dirs)
             .field("mcp_servers", &self.mcp_servers.len())
@@ -251,6 +255,7 @@ impl Default for SessionOptions {
             compaction_threshold_percent: 80,
             compaction_preserve_turns: 6,
             skill_dirs: None,
+            skill_allowlist: None,
             mcp_servers: Vec::new(),
             wall_clock_timeout: None,
         }

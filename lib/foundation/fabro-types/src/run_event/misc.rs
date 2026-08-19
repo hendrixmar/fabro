@@ -263,6 +263,14 @@ pub struct AgentAcpTimedOutProps {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSkillsMaterializedProps {
+    pub visit:      u32,
+    pub names:      Vec<String>,
+    pub target_dir: String,
+    pub harness:    String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PullRequestCreationRequestedProps {
     pub creation_id: PullRequestCreationId,
     pub model:       String,

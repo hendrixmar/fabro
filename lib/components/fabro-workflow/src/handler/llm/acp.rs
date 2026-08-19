@@ -26,6 +26,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::agent::{CodergenBackend, CodergenResult, CodergenRunRequest, OneShotRequest};
 use super::activation_lease::{ActivationLease, ActivationLeaseOptions};
+use super::skills_injection::{
+    SkillTarget, materialize_skills_at, resolve_sandbox_home, skill_target_base,
+};
 use super::changed_files;
 use crate::error::Error;
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
@@ -173,6 +176,13 @@ pub struct AgentAcpBackend {
     github_token_refresh_managed: bool,
     steering_hub:                 Option<Arc<SteeringHub>>,
     profile_override:             Option<AcpProcessSpec>,
+    /// Full server-injected external-agent profile map, so a node-level
+    /// `harness` attr can resolve its harness even when the run itself has no
+    /// selected harness.
+    external_profiles:            ExternalAgentsSettings,
+    /// Run-level selected harness (`FABRO_EXTERNAL_AGENT_HARNESS`), used as
+    /// the harness hint for env translation when a node sets no `harness` attr.
+    run_harness:                  Option<String>,
 }
 
 impl AgentAcpBackend {
@@ -183,6 +193,8 @@ impl AgentAcpBackend {
             github_token_refresh_managed: false,
             steering_hub:                 None,
             profile_override:             None,
+            external_profiles:            ExternalAgentsSettings::default(),
+            run_harness:                  None,
         }
     }
 
@@ -210,19 +222,23 @@ impl AgentAcpBackend {
     }
 
     /// Construct the backend, applying the server-injected external-agent
-    /// profile when this worker is running a harness-selected run. No-op for
-    /// ordinary runs (env absent, or no matching profile).
+    /// profile when this worker is running a harness-selected run. The full
+    /// profile map is retained either way so node-level `harness` attrs can
+    /// resolve their harness profile. No-op for ordinary runs (env absent, or
+    /// no matching profile).
     #[must_use]
     pub fn from_worker_env() -> Self {
         let mut backend = Self::new();
-        let Some(harness) = external_agent_env(EnvVars::FABRO_EXTERNAL_AGENT_HARNESS) else {
-            return backend;
-        };
         let Ok(profiles) = serde_json::from_str::<ExternalAgentsSettings>(
             external_agent_env(EnvVars::FABRO_EXTERNAL_AGENTS)
                 .as_deref()
                 .unwrap_or("{}"),
         ) else {
+            return backend;
+        };
+        backend.external_profiles = profiles.clone();
+
+        let Some(harness) = external_agent_env(EnvVars::FABRO_EXTERNAL_AGENT_HARNESS) else {
             return backend;
         };
         let profile = match harness.as_str() {
@@ -231,6 +247,7 @@ impl AgentAcpBackend {
             _ => None,
         };
         if let Some(profile) = profile {
+            backend.run_harness = Some(harness.clone());
             backend = backend.with_profile_override(AcpProcessSpec::from_profile(
                 harness.as_str(),
                 profile.command,
@@ -256,7 +273,50 @@ impl AgentAcpBackend {
         sandbox: &Arc<dyn Sandbox>,
         cancel_token: CancellationToken,
     ) -> Result<CodergenResult, Error> {
-        let process_spec = resolve_acp_process_spec(node, self.profile_override.as_ref())?;
+        let process_spec = resolve_acp_process_spec(
+            node,
+            &self.external_profiles,
+            self.profile_override.as_ref(),
+        )?;
+        let harness = node
+            .harness_attr()
+            .map(str::to_string)
+            .or_else(|| self.run_harness.clone());
+        let mut process_spec = apply_harness_env_overrides(&process_spec, node, harness.as_deref());
+
+        // Materialize node-selected skills into the harness-native skill
+        // directory before the process spawns. Non-fatal: names found nowhere
+        // are skipped with a warning (same contract as the push-credential
+        // refresh below).
+        if let Some(names) = node.skills_attr() {
+            let target = harness
+                .as_deref()
+                .map_or(SkillTarget::AcpGeneric, SkillTarget::for_harness);
+            let home = resolve_sandbox_home(sandbox.as_ref()).await;
+            let host_root = fabro_util::Home::from_env().skills_dir();
+            let materialized =
+                materialize_skills_at(sandbox.as_ref(), &names, target, &host_root, &home).await;
+            if !materialized.is_empty() {
+                if matches!(target, SkillTarget::AcpGeneric) {
+                    let mut env = process_spec.env().clone();
+                    env.insert(
+                        "FABRO_ACP_SKILLS".to_string(),
+                        materialized.join(","),
+                    );
+                    process_spec = process_spec.clone().with_env(env);
+                }
+                emitter.emit_scoped(
+                    &Event::AgentSkillsMaterialized {
+                        node_id:    node.id.clone(),
+                        visit:      stage_scope.visit,
+                        names:      materialized,
+                        target_dir: skill_target_base(&home, target),
+                        harness:    target.harness_label().to_string(),
+                    },
+                    stage_scope,
+                );
+            }
+        }
         let config_name = process_spec.name().map(str::to_string);
         let launch_env = self.resolve_launch_env(emitter).await?;
         let on_activity = {
@@ -418,6 +478,13 @@ impl AgentAcpBackend {
                     },
                     stage_scope,
                 );
+                // codex-acp (and peers) exit 0 after in-band protocol errors;
+                // without this guard the run falsely reports success.
+                if let Some(excerpt) = in_band_error_excerpt(&result.text) {
+                    return Err(acp_error_to_workflow(AcpError::InBandError {
+                        excerpt,
+                    }));
+                }
                 result
             }
             Err(AcpError::Cancelled) => {
@@ -634,13 +701,31 @@ fn acp_process_error_to_workflow(error: AcpCommandError) -> Error {
 
 fn resolve_acp_process_spec(
     node: &Node,
-    profile_override: Option<&AcpProcessSpec>,
+    external_profiles: &ExternalAgentsSettings,
+    run_profile_override: Option<&AcpProcessSpec>,
 ) -> Result<AcpProcessSpec, Error> {
-    if node.legacy_acp_command_attr().is_none()
-        && node.acp_command_attr().is_none()
-        && node.acp_config_attr().is_none()
-    {
-        if let Some(spec) = profile_override {
+    let node_command_present = node.legacy_acp_command_attr().is_some()
+        || node.acp_command_attr().is_some()
+        || node.acp_config_attr().is_some();
+
+    // A node-level `harness` attr resolves the base spec from that harness's
+    // server profile. An explicit acp.command/acp.config still wins over the
+    // profile for the command itself (the harness then only drives env
+    // translation).
+    if !node_command_present {
+        if let Some(harness) = node.harness_attr() {
+            return harness_profile_spec(external_profiles, harness).ok_or_else(|| {
+                Error::handler(format!(
+                    "harness=\"{harness}\" has no matching \
+                     [server.external_agents.{harness}] profile; configure it in settings.toml \
+                     or set acp.command on the node"
+                ))
+            });
+        }
+    }
+
+    if !node_command_present {
+        if let Some(spec) = run_profile_override {
             return Ok(spec.clone());
         }
     }
@@ -650,6 +735,98 @@ fn resolve_acp_process_spec(
         node.acp_config_attr(),
     )
     .map_err(acp_process_error_to_workflow)
+}
+
+fn harness_profile_spec(
+    profiles: &ExternalAgentsSettings,
+    harness: &str,
+) -> Option<AcpProcessSpec> {
+    let profile = match harness {
+        "codex" => profiles.codex.as_ref(),
+        "omp" => profiles.omp.as_ref(),
+        _ => None,
+    }?;
+    Some(AcpProcessSpec::from_profile(
+        harness,
+        profile.command.clone(),
+        profile.args.clone(),
+        profile.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+    ))
+}
+
+/// Layer node-level model/effort/harness attrs onto the resolved process
+/// spec's env map, so harness-native config (CODEX_CONFIG, PI_MODEL) reflects
+/// the per-node selection. Single seam covering profile- and node-command-
+/// derived specs.
+fn apply_harness_env_overrides(
+    spec: &AcpProcessSpec,
+    node: &Node,
+    harness: Option<&str>,
+) -> AcpProcessSpec {
+    let model = node.model();
+    let effort = node.reasoning_effort_attr();
+    if model.is_none() && effort.is_none() && harness.is_none() {
+        return spec.clone();
+    }
+
+    let mut env = spec.env().clone();
+    if let Some(model) = model {
+        env.insert("FABRO_ACP_MODEL".to_string(), model.to_string());
+    }
+    if let Some(effort) = effort {
+        env.insert(
+            "FABRO_ACP_REASONING_EFFORT".to_string(),
+            effort.to_string(),
+        );
+    }
+    let Some(harness) = harness else {
+        return spec.clone().with_env(env);
+    };
+
+    env.insert("FABRO_ACP_HARNESS".to_string(), harness.to_string());
+    match harness {
+        "codex" => {
+            if model.is_some() || effort.is_some() {
+                env.insert(
+                    "CODEX_CONFIG".to_string(),
+                    merged_codex_config(spec.env().get("CODEX_CONFIG"), model, effort),
+                );
+            }
+        }
+        "omp" => {
+            if let Some(model) = model {
+                env.insert("PI_MODEL".to_string(), model.to_string());
+            }
+        }
+        _ => {}
+    }
+    spec.clone().with_env(env)
+}
+
+/// Merge node model/effort attrs into an existing CODEX_CONFIG JSON object.
+/// An unparseable or non-object existing value is replaced entirely (node
+/// attrs win); keys are only set for attrs present on the node.
+fn merged_codex_config(
+    existing: Option<&String>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> String {
+    let mut object = existing
+        .and_then(|raw| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw).ok())
+        .unwrap_or_default();
+    if let Some(model) = model {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    if let Some(effort) = effort {
+        object.insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String(effort.to_string()),
+        );
+    }
+    serde_json::Value::Object(object).to_string()
 }
 
 fn session_activity_callback(
@@ -783,6 +960,9 @@ fn acp_error_to_workflow(error: AcpError) -> Error {
             Error::handler(format!("ACP prompt stopped with {stop_reason}: {text}"))
         }
         AcpError::Sandbox(source) => Error::handler_with_source("ACP turn failed", source),
+        AcpError::InBandError { excerpt } => {
+            Error::handler(format!("ACP agent reported an in-band error: {excerpt}"))
+        }
         other => {
             let exec_output_tail = other.exec_output_tail();
             Error::handler_with_source_and_exec_output_tail(
@@ -792,6 +972,31 @@ fn acp_error_to_workflow(error: AcpError) -> Error {
             )
         }
     }
+}
+
+/// Detect an in-band ACP error in the agent's final output and return a short
+/// excerpt for the handler error. Matched on the raw `"type":"error"` marker
+/// (whitespace-tolerant), mirroring the external driver's proven stdout grep.
+fn in_band_error_excerpt(text: &str) -> Option<String> {
+    let marker_start = text.find("\"type\"")?;
+    let candidate = &text[marker_start..];
+    let after_colon = candidate
+        .split_once(':')
+        .map(|(_, rest)| rest.trim_start())
+        .unwrap_or(candidate);
+    if !after_colon.starts_with("\"error\"") {
+        return None;
+    }
+    let start = text
+        .rfind('\n')
+        .filter(|&idx| idx < marker_start)
+        .map_or(0, |idx| idx + 1);
+    let line_end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |offset| start + offset);
+    let line = text[start..line_end].trim();
+    let excerpt: String = line.chars().take(300).collect();
+    Some(excerpt).filter(|excerpt| !excerpt.is_empty())
 }
 
 #[cfg(test)]
@@ -1424,6 +1629,337 @@ mod tests {
         assert_eq!(
             super::skill_name_from_tool("assistant", &serde_json::json!("use skill://nope")),
             None
+        );
+    }
+
+    fn codex_profiles() -> fabro_types::ExternalAgentsSettings {
+        fabro_types::ExternalAgentsSettings {
+            codex: Some(fabro_types::ExternalAgentProfile {
+                command: "codex-acp-wrapper".to_string(),
+                args:    vec![],
+                env:     std::collections::BTreeMap::new(),
+            }),
+            omp: None,
+        }
+    }
+
+    #[test]
+    fn resolve_acp_process_spec_uses_harness_profile_for_harness_attr() {
+        let mut node = Node::new("build");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs
+            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+
+        let spec =
+            super::resolve_acp_process_spec(&node, &codex_profiles(), None).unwrap();
+        assert_eq!(spec.program().to_str(), Some("codex-acp-wrapper"));
+        assert_eq!(spec.name(), Some("codex"));
+    }
+
+    #[test]
+    fn resolve_acp_process_spec_errors_on_missing_harness_profile() {
+        let mut node = Node::new("build");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs
+            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+
+        let error = super::resolve_acp_process_spec(
+            &node,
+            &fabro_types::ExternalAgentsSettings::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("[server.external_agents.codex]"),
+            "error should name the missing profile: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_acp_process_spec_node_command_beats_harness_profile() {
+        let mut node = Node::new("build");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs
+            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "acp.command".to_string(),
+            AttrValue::String("python3 agent.py".to_string()),
+        );
+
+        let spec =
+            super::resolve_acp_process_spec(&node, &codex_profiles(), None).unwrap();
+        assert_eq!(spec.program().to_str(), Some("python3"));
+    }
+
+    #[test]
+    fn merged_codex_config_preserves_other_keys_and_sets_only_present_attrs() {
+        let existing =
+            r#"{"model_providers":{"openai":{"base_url":"x"}},"model":"old"}"#.to_string();
+        let merged = super::merged_codex_config(Some(&existing), None, Some("xhigh"));
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["model"], "old");
+        assert_eq!(value["model_reasoning_effort"], "xhigh");
+        assert!(value["model_providers"]["openai"]["base_url"].is_string());
+
+        let replaced = super::merged_codex_config(Some(&"not json".to_string()), Some("m"), None);
+        let value: serde_json::Value = serde_json::from_str(&replaced).unwrap();
+        assert_eq!(value["model"], "m");
+        assert!(value.get("model_reasoning_effort").is_none());
+    }
+
+    async fn run_env_echo_turn(
+        node: &Node,
+        env_record: &std::path::Path,
+        record_keys: &str,
+    ) {
+        let tempdir = env_record
+            .parent()
+            .unwrap();
+        init_git(tempdir);
+        let script_path = tempdir.join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+
+        let backend = AgentAcpBackend::new().with_env(HashMap::from([
+            ("ACP_ENV_RECORD".to_string(), env_record.to_string_lossy().into_owned()),
+            ("ACP_ENV_RECORD_KEYS".to_string(), record_keys.to_string()),
+        ]));
+        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.to_path_buf()));
+        let emitter = Arc::new(Emitter::default());
+        let context = Context::new();
+        backend
+            .run(CodergenRunRequest {
+                node,
+                prompt: "echo env",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn read_env_record(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn acp_env_translation_sets_codex_model_and_effort() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+
+        let mut node = Node::new("build");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs
+            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "acp.command".to_string(),
+            AttrValue::String(format!(
+                "python3 {}",
+                shell_quote(&script_path.to_string_lossy())
+            )),
+        );
+        node.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("gpt-5.6-luna".to_string()),
+        );
+        node.attrs.insert(
+            "reasoning_effort".to_string(),
+            AttrValue::String("xhigh".to_string()),
+        );
+
+        let env_record = tempdir.path().join("env_codex.json");
+        run_env_echo_turn(
+            &node,
+            &env_record,
+            "FABRO_ACP_MODEL,FABRO_ACP_REASONING_EFFORT,FABRO_ACP_HARNESS,CODEX_CONFIG",
+        )
+        .await;
+
+        let record = read_env_record(&env_record);
+        assert_eq!(record["FABRO_ACP_MODEL"], "gpt-5.6-luna");
+        assert_eq!(record["FABRO_ACP_REASONING_EFFORT"], "xhigh");
+        assert_eq!(record["FABRO_ACP_HARNESS"], "codex");
+        let codex_config: serde_json::Value =
+            serde_json::from_str(record["CODEX_CONFIG"].as_str().unwrap()).unwrap();
+        assert_eq!(codex_config["model"], "gpt-5.6-luna");
+        assert_eq!(codex_config["model_reasoning_effort"], "xhigh");
+    }
+
+    #[tokio::test]
+    async fn acp_env_translation_merges_over_existing_codex_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+
+        let config = serde_json::json!({
+            "type": "stdio",
+            "name": "codex-agent",
+            "command": "python3",
+            "args": [script_path.to_string_lossy()],
+            "env": [
+                {"name": "CODEX_CONFIG", "value": "{\"model\":\"baked-model\",\"model_providers\":{\"p\":{\"base_url\":\"u\"}}}"}
+            ]
+        });
+        let mut node = Node::new("build");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs
+            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "acp.config".to_string(),
+            AttrValue::String(config.to_string()),
+        );
+        node.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("gpt-5.6-luna".to_string()),
+        );
+
+        let env_record = tempdir.path().join("env_merge.json");
+        run_env_echo_turn(&node, &env_record, "CODEX_CONFIG").await;
+
+        let record = read_env_record(&env_record);
+        let codex_config: serde_json::Value =
+            serde_json::from_str(record["CODEX_CONFIG"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            codex_config["model"], "gpt-5.6-luna",
+            "node model attr must beat the baked CODEX_CONFIG model"
+        );
+        assert_eq!(codex_config["model_providers"]["p"]["base_url"], "u");
+    }
+
+    #[tokio::test]
+    async fn acp_env_translation_sets_pi_model_for_omp() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+
+        let mut node = Node::new("build");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs
+            .insert("harness".to_string(), AttrValue::String("omp".to_string()));
+        node.attrs.insert(
+            "acp.command".to_string(),
+            AttrValue::String(format!(
+                "python3 {}",
+                shell_quote(&script_path.to_string_lossy())
+            )),
+        );
+        node.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("glm-4.7".to_string()),
+        );
+
+        let env_record = tempdir.path().join("env_omp.json");
+        run_env_echo_turn(
+            &node,
+            &env_record,
+            "FABRO_ACP_MODEL,PI_MODEL,FABRO_ACP_HARNESS,CODEX_CONFIG",
+        )
+        .await;
+
+        let record = read_env_record(&env_record);
+        assert_eq!(record["PI_MODEL"], "glm-4.7");
+        assert_eq!(record["FABRO_ACP_MODEL"], "glm-4.7");
+        assert_eq!(record["FABRO_ACP_HARNESS"], "omp");
+        assert!(
+            record.get("CODEX_CONFIG").is_none(),
+            "omp harness must not set CODEX_CONFIG"
+        );
+    }
+
+    #[test]
+    fn in_band_error_excerpt_matches_error_type_lines_only() {
+        let error_line =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"denied"}}"#.to_string();
+        // The driver-proven marker: `"type":"error"` in the agent output.
+        let text = format!("working...\n{{\"type\":\"error\",\"message\":\"boom {error_line}\"}}");
+        let excerpt = super::in_band_error_excerpt(&text).unwrap();
+        assert!(excerpt.contains("\"type\":\"error\""));
+        assert!(!excerpt.contains('\n'), "excerpt is a single line");
+
+        // Whitespace-tolerant form.
+        assert!(super::in_band_error_excerpt(r#"{"type":  "error"}"#).is_some());
+
+        // Non-error types and absent marker do not match.
+        assert!(super::in_band_error_excerpt(r#"{"type":"text"}"#).is_none());
+        assert!(super::in_band_error_excerpt("hello from acp").is_none());
+        assert!(super::in_band_error_excerpt("").is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_in_band_error_output_fails_the_turn() {
+        let tempdir = tempfile::tempdir().unwrap();
+        init_git(tempdir.path());
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+
+        let mut node = Node::new("work");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs.insert(
+            "acp.command".to_string(),
+            AttrValue::String(format!(
+                "python3 {}",
+                shell_quote(&script_path.to_string_lossy())
+            )),
+        );
+
+        let backend = AgentAcpBackend::new().with_env(HashMap::from([(
+            "ACP_MODE".to_string(),
+            "in_band_error".to_string(),
+        )]));
+        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+        let emitter = Arc::new(Emitter::default());
+        let context = Context::new();
+        let error = match backend
+            .run(CodergenRunRequest {
+                node:               &node,
+                prompt:             "work",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await
+        {
+            Ok(_result) => panic!("in-band error must fail the turn"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("ACP agent reported an in-band error"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("usage_limit"),
+            "excerpt should carry the in-band payload: {error}"
         );
     }
 

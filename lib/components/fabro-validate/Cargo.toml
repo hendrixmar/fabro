@@ -17,6 +17,7 @@ fabro-acp = { path = "../fabro-acp", default-features = false }
 fabro-graphviz = { path = "../fabro-graphviz" }
 fabro-model = { path = "../../foundation/fabro-model" }
 fabro-types = { path = "../../foundation/fabro-types" }
+fabro-util = { path = "../../foundation/fabro-util" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 

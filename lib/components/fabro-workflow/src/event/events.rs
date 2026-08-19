@@ -721,6 +721,13 @@ pub enum Event {
         stderr:      String,
         duration_ms: u64,
     },
+    AgentSkillsMaterialized {
+        node_id:     String,
+        visit:       u32,
+        names:       Vec<String>,
+        target_dir:  String,
+        harness:     String,
+    },
     PullRequestCreationRequested {
         creation_id: PullRequestCreationId,
         model:       String,
@@ -1534,6 +1541,15 @@ impl Event {
                 ..
             } => {
                 debug!(node_id, duration_ms, "Agent ACP timed out");
+            }
+            Self::AgentSkillsMaterialized {
+                node_id,
+                names,
+                target_dir,
+                harness,
+                ..
+            } => {
+                debug!(node_id, ?names, target_dir, harness, "Skills materialized");
             }
             Self::PullRequestCreationRequested {
                 creation_id,

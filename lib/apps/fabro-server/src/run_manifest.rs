@@ -1066,6 +1066,12 @@ async fn run_llm_check(
         if !is_llm_handler_type(node.handler_type()) {
             continue;
         }
+        // ACP-backed nodes run in an external harness; their `model` attr is
+        // translated to harness env (CODEX_CONFIG/PI_MODEL), never served by
+        // the API client, so probing it against LLM providers is wrong.
+        if node.backend() == Some("acp") {
+            continue;
+        }
         has_llm_nodes = true;
         let node_model = node.model().unwrap_or(model);
         let node_provider = node.provider().unwrap_or(default_provider);

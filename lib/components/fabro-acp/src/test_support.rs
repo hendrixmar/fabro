@@ -106,6 +106,21 @@ for line in sys.stdin:
         if mode == "early_exit":
             print("early boom", file=sys.stderr, flush=True)
             sys.exit(2)
+        if mode == "in_band_error":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "{\"type\":\"error\",\"message\":\"model access denied\",\"code\":\"usage_limit\"}"}
+                    }
+                }
+            })
+            record_methods()
+            respond(message, {"stopReason": "end_turn"})
+            break
         if mode == "write_file":
             path = os.environ.get("ACP_WRITE_PATH", "hello.txt")
             parent = os.path.dirname(path)

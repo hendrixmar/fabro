@@ -299,6 +299,19 @@ pub fn default_skill_dirs(fabro_skills_dir: Option<&str>, git_root: Option<&str>
     dirs
 }
 
+/// Filter discovered skills down to an allowlist of names. `None` keeps every
+/// discovered skill; unknown allowlist entries are simply unmatched.
+#[must_use]
+pub fn filter_skills_by_allowlist(skills: Vec<Skill>, allowlist: Option<&[String]>) -> Vec<Skill> {
+    match allowlist {
+        Some(names) => skills
+            .into_iter()
+            .filter(|skill| names.iter().any(|name| name == &skill.name))
+            .collect(),
+        None => skills,
+    }
+}
+
 pub async fn discover_skills(
     env: &dyn Sandbox,
     dirs: &[String],
@@ -622,6 +635,32 @@ name: trimmed
         .unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "Project commit");
+    }
+
+    #[test]
+    fn filter_skills_by_allowlist_selects_and_passes_through() {
+        let skill = |name: &str| Skill {
+            name:        name.to_string(),
+            description: format!("{name} skill"),
+            template:    format!("# {name}\n"),
+        };
+        let discovered = vec![skill("tdd"), skill("code-review"), skill("diagnosing-bugs")];
+
+        // None keeps everything.
+        let kept = filter_skills_by_allowlist(discovered.clone(), None);
+        assert_eq!(kept.len(), 3);
+
+        let allowlist = vec!["diagnosing-bugs".to_string(), "tdd".to_string()];
+        let kept = filter_skills_by_allowlist(discovered.clone(), Some(&allowlist));
+        assert_eq!(
+            kept.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["tdd", "diagnosing-bugs"]
+        );
+
+        // Unknown allowlist entries match nothing without failing.
+        let allowlist = vec!["no-such-skill".to_string()];
+        let kept = filter_skills_by_allowlist(discovered, Some(&allowlist));
+        assert!(kept.is_empty());
     }
 
     // --- default_skill_dirs tests ---

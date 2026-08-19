@@ -103,6 +103,14 @@ impl AcpProcessSpec {
         Self::from_stdio_parts(Some(name.into()), program.into(), args, env)
     }
 
+    /// Replace the process env map (used by callers that layer harness
+    /// overrides on top of a resolved spec).
+    #[must_use]
+    pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
+        self.env = env;
+        self
+    }
+
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()

@@ -142,6 +142,20 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
                 ..StoredEventFields::default()
             }
         }
+        Event::AgentSkillsMaterialized {
+            node_id,
+            visit,
+            ..
+        } => {
+            let node_id_str = node_id.clone();
+            let node_label = default_node_label(Some(&node_id_str), None);
+            StoredEventFields {
+                node_id: Some(node_id_str.clone()),
+                node_label,
+                stage_id: Some(StageId::new(node_id_str, *visit)),
+                ..StoredEventFields::default()
+            }
+        }
         Event::AgentSessionStarted {
             session_id,
             parent_session_id,

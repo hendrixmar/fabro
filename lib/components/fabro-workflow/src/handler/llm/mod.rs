@@ -5,6 +5,7 @@ pub mod changed_files;
 pub mod preamble;
 pub mod router;
 pub mod routing;
+pub mod skills_injection;
 
 pub use acp::AgentAcpBackend;
 pub use api::AgentApiBackend;

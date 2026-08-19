@@ -1076,6 +1076,35 @@ impl AgentApiBackend {
             profile_builder
         };
         let mut profile = profile_builder.build();
+        use super::skills_injection;
+        // Node-level `skills` selection: materialize the requested skills into
+        // the sandbox-local engine skill directory (host library upload or
+        // repo-local copy), then pin discovery to explicit dirs + the
+        // selection. The default worker-home glob never matched docker
+        // sandboxes; explicit dirs are the working alternative.
+        let mut skill_dirs = None;
+        let mut skill_allowlist = None;
+        if let Some(names) = node.skills_attr() {
+            let home = skills_injection::resolve_sandbox_home(sandbox.as_ref()).await;
+            let host_root = fabro_util::Home::from_env().skills_dir();
+            let materialized = skills_injection::materialize_skills_at(
+                sandbox.as_ref(),
+                &names,
+                skills_injection::SkillTarget::ApiDiscovery,
+                &host_root,
+                &home,
+            )
+            .await;
+            if !materialized.is_empty() {
+                let cwd = sandbox.working_directory().to_string();
+                skill_dirs = Some(vec![
+                    format!("{home}/.fabro/skills"),
+                    format!("{cwd}/.fabro/skills"),
+                    format!("{cwd}/skills"),
+                ]);
+                skill_allowlist = Some(materialized);
+            }
+        }
 
         let config = SessionOptions {
             max_tokens: node.max_tokens(),
@@ -1089,6 +1118,8 @@ impl AgentApiBackend {
             // render "Unknown" for every workflow stage. Override per-stage if
             // a future workflow attribute narrows the scope.
             permission_level: Some(PermissionLevel::Full),
+            skill_dirs,
+            skill_allowlist,
             ..SessionOptions::default()
         };
 

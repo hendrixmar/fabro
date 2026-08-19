@@ -1314,6 +1314,18 @@ fn event_body_from_event(event: &Event) -> EventBody {
             stderr:      stderr.clone(),
             duration_ms: *duration_ms,
         }),
+        Event::AgentSkillsMaterialized {
+            visit,
+            names,
+            target_dir,
+            harness,
+            ..
+        } => EventBody::AgentSkillsMaterialized(fabro_types::AgentSkillsMaterializedProps {
+            visit:      *visit,
+            names:      names.clone(),
+            target_dir: target_dir.clone(),
+            harness:    harness.clone(),
+        }),
         Event::PullRequestCreationRequested {
             creation_id,
             model,

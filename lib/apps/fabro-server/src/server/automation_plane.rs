@@ -116,7 +116,7 @@ where
                     error!(
                         automation_id = %automation.id,
                         trigger_id = %trigger.id,
-                        error = %err,
+                        error = format!("{err:#}"),
                         "Plane dispatcher tick failed",
                     );
                 }

@@ -116,6 +116,12 @@ impl Transform for ModelResolutionTransform {
                 .map(ProviderId::new)
         });
         for node in graph.nodes.values_mut() {
+            // ACP-backed nodes carry `model` as a harness hint (translated to
+            // harness env, e.g. CODEX_CONFIG/PI_MODEL), not an API route —
+            // stamping `provider` here would make the node invalid.
+            if node.backend() == Some("acp") {
+                continue;
+            }
             let model = node
                 .attrs
                 .get("model")
