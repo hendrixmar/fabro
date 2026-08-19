@@ -274,7 +274,22 @@ for line in sys.stdin:
                 }
             })
         record_methods()
-        respond(message, {"stopReason": os.environ.get("ACP_STOP_REASON", "end_turn")})
+        response = {"stopReason": os.environ.get("ACP_STOP_REASON", "end_turn")}
+        if os.environ.get("ACP_PROMPT_USAGE"):
+            response["usage"] = json.loads(os.environ["ACP_PROMPT_USAGE"])
+        if os.environ.get("ACP_USAGE_UPDATE"):
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        **json.loads(os.environ["ACP_USAGE_UPDATE"]),
+                    },
+                },
+            })
+        respond(message, response)
         if mode == "linger_after_response":
             while True:
                 time.sleep(1)
