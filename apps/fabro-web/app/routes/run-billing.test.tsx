@@ -174,6 +174,92 @@ describe("RunBilling", () => {
     expect(text).toContain("Stages will appear as soon as the run starts executing.");
   });
 
+  test("keeps ACP model usage separate and leaves unreported cost unavailable", () => {
+    const codexBilling = makeBilledTokenCounts({
+      input_tokens:      100,
+      output_tokens:     30,
+      cache_read_tokens: 40,
+      reasoning_tokens:  10,
+      total_tokens:      180,
+    });
+    const ompBilling = makeBilledTokenCounts({
+      input_tokens:      200,
+      output_tokens:     50,
+      cache_read_tokens: 80,
+      total_tokens:      330,
+      total_usd_micros:  12_300,
+    });
+
+    const renderer = renderBilling(
+      billing({
+        stages: [
+          {
+            stage:   { id: "codex", name: "codex" },
+            model:   { provider: "codex", model_id: "gpt-5.4" },
+            billing: codexBilling,
+            timing:  stageTiming(),
+            state:   "succeeded",
+          },
+          {
+            stage:   { id: "omp", name: "omp" },
+            model:   { provider: "omp", model_id: "gpt-5.4" },
+            billing: ompBilling,
+            timing:  stageTiming(),
+            state:   "succeeded",
+          },
+        ],
+        totals: {
+          timing: stageTiming(),
+          ...makeBilledTokenCounts({
+            input_tokens:      300,
+            output_tokens:     80,
+            cache_read_tokens: 120,
+            reasoning_tokens:  10,
+            total_tokens:      510,
+            total_usd_micros:  12_300,
+          }),
+        },
+        by_model: [
+          {
+            model:   { provider: "codex", model_id: "gpt-5.4" },
+            stages:  1,
+            billing: codexBilling,
+          },
+          {
+            model:   { provider: "omp", model_id: "gpt-5.4" },
+            stages:  1,
+            billing: ompBilling,
+          },
+        ],
+      }),
+    );
+
+    const tables = renderer.root.findAll((node) => node.type === "table");
+    const byModelBody = tables[1].find((node) => node.type === "tbody");
+    const rowsByModel = new Map(
+      byModelBody.findAll((node) => node.type === "tr").map((row) => {
+        const cells = row
+          .findAll((node) => node.type === "td")
+          .map((cell) => textFromInstance(cell));
+        return [cells[0], cells] as const;
+      }),
+    );
+
+    expect(rowsByModel.get("codex:gpt-5.4")).toEqual([
+      "codex:gpt-5.4",
+      "1",
+      "100 / 40",
+      "—",
+    ]);
+    expect(rowsByModel.get("omp:gpt-5.4")).toEqual([
+      "omp:gpt-5.4",
+      "1",
+      "200 / 50",
+      "$0.01",
+    ]);
+    expect(textFromNode(renderer.toJSON())).not.toContain("$0.00");
+  });
+
   test("renders an in-flight row with live billing and includes its elapsed time in the footer", () => {
     const originalNow = Date.now;
     // Pin "now" to 30s after the in-flight row started.
@@ -238,7 +324,7 @@ describe("RunBilling", () => {
       expect(text).toContain("in-flight");
       expect(text).toContain("anthropic:claude-opus-4-6 · fast");
       expect(text).toContain("1.2k");
-      expect(text).toContain("0.3k");
+      expect(text).toContain("300");
       expect(text).toContain("$0.24");
       expect(text).toContain("By model");
 
