@@ -16,8 +16,8 @@ use fabro_agent::{
 use fabro_graphviz::graph::Node;
 use fabro_static::EnvVars;
 use fabro_types::{
-    AgentBackend, AgentToolCategory, AgentToolSource, AgentToolSummary, ExternalAgentsSettings,
-    Principal, SessionCapability, StageId, StageTiming, SteeringMessage,
+    AgentBackend, AgentToolSummary, ExternalAgentsSettings, Principal, SessionCapability, StageId,
+    StageTiming, SteeringMessage,
 };
 use fabro_util::time::elapsed_ms;
 use tokio::task::JoinHandle;
@@ -25,6 +25,7 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::super::agent::{CodergenBackend, CodergenResult, CodergenRunRequest, OneShotRequest};
+use super::acp_tools::{AcpObservedTool, AcpToolInventory};
 use super::activation_lease::{ActivationLease, ActivationLeaseOptions};
 use super::skills_injection::{
     SkillTarget, materialize_skills_at, resolve_sandbox_home, skill_target_base,
@@ -458,6 +459,7 @@ impl AgentAcpBackend {
                 stage_scope.clone(),
                 node.id.clone(),
                 activation_session_id.clone(),
+                harness.as_deref(),
             )),
             live_control: Some(AcpLiveControl {
                 handle: control_handle.clone(),
@@ -829,56 +831,74 @@ fn merged_codex_config(
     serde_json::Value::Object(object).to_string()
 }
 
+fn emit_tools_snapshot(
+    emitter: &Emitter,
+    stage_scope: &StageScope,
+    node_id: &str,
+    session_id: &str,
+    tools: Vec<AgentToolSummary>,
+) {
+    emitter.emit_scoped(
+        &Event::AgentToolsAvailable {
+            node_id: node_id.to_owned(),
+            visit: stage_scope.visit,
+            session_id: session_id.to_owned(),
+            tools,
+        },
+        stage_scope,
+    );
+}
+
 fn session_activity_callback(
     emitter: Arc<Emitter>,
     stage_scope: StageScope,
     node_id: String,
     session_id: String,
+    harness: Option<&str>,
 ) -> fabro_acp::AcpSessionActivityCallback {
     let activated_skills = Mutex::new(std::collections::HashSet::new());
-    // ACP exposes tool calls, but no inventory/list operation. Publish the
-    // growing set of tools actually observed so the stage tools dropdown can
-    // use the same projection as native Fabro-agent sessions.
-    let observed_tools = Mutex::new(Vec::<AgentToolSummary>::new());
+    let inventory = Mutex::new(AcpToolInventory::for_harness(harness));
+    let initial = match inventory.lock() {
+        Ok(inventory) => inventory.snapshot(),
+        Err(poisoned) => poisoned.into_inner().snapshot(),
+    };
+    if !initial.is_empty() {
+        emit_tools_snapshot(&emitter, &stage_scope, &node_id, &session_id, initial);
+    }
+
     Arc::new(move |activity| match activity {
         AcpSessionActivity::ToolStarted {
             tool_call_id,
             tool_name,
+            kind,
             raw_input,
             ..
         } => {
+            let observed = AcpObservedTool {
+                title: &tool_name,
+                kind,
+                raw_input: &raw_input,
+            };
             maybe_emit_skill_activation(
                 &emitter,
                 &stage_scope,
                 &node_id,
                 &session_id,
                 &activated_skills,
-                &tool_name,
-                &raw_input,
+                observed.title,
+                observed.raw_input,
             );
-            {
-                let mut tools = match observed_tools.lock() {
-                    Ok(tools) => tools,
+            let snapshot = {
+                let mut inventory = match inventory.lock() {
+                    Ok(inventory) => inventory,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                if !tools.iter().any(|tool| tool.name == tool_name) {
-                    tools.push(AgentToolSummary {
-                        name:        tool_name.clone(),
-                        description: String::new(),
-                        source:      AgentToolSource::Native,
-                        category:    acp_tool_category(&tool_name),
-                        invoked:     true,
-                    });
-                    emitter.emit_scoped(
-                        &Event::AgentToolsAvailable {
-                            node_id:    node_id.clone(),
-                            visit:      stage_scope.visit,
-                            session_id: session_id.clone(),
-                            tools:      tools.clone(),
-                        },
-                        &stage_scope,
-                    );
-                }
+                inventory
+                    .observe(observed)
+                    .then(|| inventory.snapshot())
+            };
+            if let Some(tools) = snapshot {
+                emit_tools_snapshot(&emitter, &stage_scope, &node_id, &session_id, tools);
             }
             emitter.emit_scoped(
                 &Event::Agent {
@@ -1002,24 +1022,6 @@ fn acp_error_to_workflow(error: AcpError) -> Error {
     }
 }
 
-/// Infer a display category from an ACP tool title. ACP carries no structured
-/// tool metadata, so this affects presentation only.
-fn acp_tool_category(title: &str) -> AgentToolCategory {
-    let lower = title.to_ascii_lowercase();
-    let contains_any = |terms: &[&str]| terms.iter().any(|term| lower.contains(term));
-    if contains_any(&["read", "view", "cat ", "ls ", "list", "glob", "grep", "find"]) {
-        AgentToolCategory::Read
-    } else if contains_any(&["write", "edit", "create", "touch", "append", "patch"]) {
-        AgentToolCategory::Write
-    } else if contains_any(&[
-        "echo", "bash", "shell", "sh ", "run", "exec", "command", "install", "npm", "uv ",
-        "git ", "pytest", "ruff", "python",
-    ]) {
-        AgentToolCategory::Shell
-    } else {
-        AgentToolCategory::Other
-    }
-}
 
 /// Detect an in-band ACP error in the agent's final output and return a short
 /// excerpt for the handler error. Matched on the raw `"type":"error"` marker
@@ -1058,7 +1060,9 @@ mod tests {
     use fabro_agent::{LocalSandbox, RefreshOutcome, Sandbox, shell_quote};
     use fabro_graphviz::graph::{AttrValue, Node};
     use fabro_sandbox::test_support::MockSandbox;
-    use fabro_types::{AgentToolCategory, CommandTermination, EventBody, ExecOutputTail};
+    use fabro_types::{
+        AgentToolsAvailableProps, CommandTermination, EventBody, ExecOutputTail, RunEvent,
+    };
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -1115,8 +1119,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn acp_observed_tools_populate_tools_available_snapshots() {
+    fn callback_harness(
+        harness: &str,
+    ) -> (
+        Arc<Emitter>,
+        std::sync::mpsc::Receiver<RunEvent>,
+        fabro_acp::AcpSessionActivityCallback,
+    ) {
         let emitter = Arc::new(Emitter::default());
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         emitter.on_event(move |event| {
@@ -1129,49 +1138,86 @@ mod tests {
             stage_scope,
             "work".to_string(),
             "acp-session".to_string(),
+            Some(harness),
+        );
+        (emitter, event_rx, callback)
+    }
+
+    fn next_tools_snapshot(
+        event_rx: &std::sync::mpsc::Receiver<RunEvent>,
+    ) -> AgentToolsAvailableProps {
+        loop {
+            if let Some(props) = to_tools_props(event_rx.recv().unwrap()) {
+                return props;
+            }
+        }
+    }
+
+    fn to_tools_props(event: RunEvent) -> Option<AgentToolsAvailableProps> {
+        match event.body {
+            EventBody::AgentToolsAvailable(props) => Some(props),
+            _ => None,
+        }
+    }
+
+    fn tool_started(id: &str, title: &str, kind: AcpToolKind) -> AcpSessionActivity {
+        AcpSessionActivity::ToolStarted {
+            tool_call_id: id.into(),
+            tool_name:    title.into(),
+            title:        title.into(),
+            kind,
+            raw_input:    serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn omp_acp_tools_emit_catalog_then_invoked_snapshot() {
+        let (_emitter, event_rx, callback) = callback_harness("omp");
+        let initial = next_tools_snapshot(&event_rx);
+        assert_eq!(initial.tools.len(), 23);
+        assert_eq!(
+            initial.tools.iter().filter(|tool| tool.invoked).count(),
+            0
         );
 
         callback(AcpSessionActivity::ToolStarted {
+            tool_call_id: "read-1".into(),
+            tool_name:    "read one file".into(),
+            title:        "read one file".into(),
             kind:         AcpToolKind::Read,
-            tool_call_id: "read-1".to_string(),
-            tool_name:    "Read file '/workspace/src/main.rs'".to_string(),
-            title:        "Read file '/workspace/src/main.rs'".to_string(),
-            raw_input:    serde_json::json!({"path": "/workspace/src/main.rs"}),
+            raw_input:    serde_json::json!({"path": "a.rs"}),
         });
-        // A repeated title is the same observed tool, not a second dropdown item.
-        callback(AcpSessionActivity::ToolStarted {
-            kind:         AcpToolKind::Read,
-            tool_call_id: "read-2".to_string(),
-            tool_name:    "Read file '/workspace/src/main.rs'".to_string(),
-            title:        "Read file '/workspace/src/main.rs'".to_string(),
-            raw_input:    serde_json::json!({"path": "/workspace/src/main.rs"}),
-        });
-        callback(AcpSessionActivity::ToolStarted {
-            kind:         AcpToolKind::Execute,
-            tool_call_id: "shell-1".to_string(),
-            tool_name:    "$ echo ok".to_string(),
-            title:        "$ echo ok".to_string(),
-            raw_input:    serde_json::json!({"command": "echo ok"}),
-        });
+        let updated = next_tools_snapshot(&event_rx);
+        assert_eq!(
+            updated
+                .tools
+                .iter()
+                .filter(|tool| tool.invoked)
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read"]
+        );
+    }
 
-        let events = event_rx.try_iter().collect::<Vec<_>>();
-        let snapshots = events
-            .iter()
-            .filter_map(|event| match &event.body {
-                EventBody::AgentToolsAvailable(props) => Some(props),
-                _ => None,
-            })
+    #[test]
+    fn codex_acp_tools_group_argument_specific_titles() {
+        let (_emitter, event_rx, callback) = callback_harness("codex");
+        callback(tool_started(
+            "r1",
+            "Read file '/a.rs'",
+            AcpToolKind::Read,
+        ));
+        callback(tool_started(
+            "r2",
+            "Read file '/b.rs'",
+            AcpToolKind::Read,
+        ));
+        let snapshots = event_rx
+            .try_iter()
+            .filter_map(to_tools_props)
             .collect::<Vec<_>>();
-        assert_eq!(snapshots.len(), 2, "emit only when a new tool is observed");
-        let latest = snapshots.last().unwrap();
-        assert_eq!(latest.visit, 1);
-        assert_eq!(latest.tools.len(), 2);
-        assert_eq!(latest.tools[0].name, "Read file '/workspace/src/main.rs'");
-        assert_eq!(latest.tools[0].category, AgentToolCategory::Read);
-        assert!(latest.tools[0].invoked);
-        assert_eq!(latest.tools[1].name, "$ echo ok");
-        assert_eq!(latest.tools[1].category, AgentToolCategory::Shell);
-        assert!(latest.tools[1].invoked);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].tools[0].name, "read_file");
     }
 
     #[tokio::test]
