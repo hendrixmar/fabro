@@ -321,6 +321,21 @@ impl AgentAcpBackend {
             }
         }
         let config_name = process_spec.name().map(str::to_string);
+        let billing_model = if harness.is_some() {
+            node.model()
+                .map(str::to_owned)
+                .or_else(|| {
+                    if harness.as_deref() == Some("omp") {
+                        process_spec.env().get("PI_MODEL").cloned()
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| config_name.clone())
+                .or_else(|| harness.clone())
+        } else {
+            node.model().map(str::to_owned)
+        };
         let launch_env = self.resolve_launch_env(emitter).await?;
         let on_activity = {
             let emitter = Arc::clone(emitter);
@@ -554,7 +569,9 @@ impl AgentAcpBackend {
             text: result.text,
             usage: result
                 .usage
-                .and_then(|usage| billed_acp_usage(harness.as_deref(), node.model(), usage)),
+                .and_then(|usage| {
+                    billed_acp_usage(harness.as_deref(), billing_model.as_deref(), usage)
+                }),
             files_touched,
             last_file_touched,
             timing: StageTiming::active_only(result.duration_ms, 0),
@@ -718,7 +735,10 @@ fn saturating_token_count(value: u64) -> i64 {
 }
 
 fn valid_reported_usd_cost(cost: AcpReportedCost) -> Option<UsdMicros> {
-    if cost.currency == "USD" && cost.amount.is_finite() && cost.amount >= 0.0 {
+    if cost.currency.eq_ignore_ascii_case("USD")
+        && cost.amount.is_finite()
+        && cost.amount >= 0.0
+    {
         return Some(UsdMicros::from_usd(cost.amount));
     }
 
@@ -1111,7 +1131,8 @@ mod tests {
 
     use fabro_acp::test_support::fake_acp_agent_script;
     use fabro_acp::{
-        AcpError, AcpProcessExit, AcpReportedCost, AcpRunUsage, AcpSessionActivity, AcpToolKind,
+        AcpError, AcpProcessExit, AcpProcessSpec, AcpReportedCost, AcpRunUsage,
+        AcpSessionActivity, AcpToolKind,
     };
     use fabro_agent::{LocalSandbox, RefreshOutcome, Sandbox, shell_quote};
     use fabro_graphviz::graph::{AttrValue, Node};
@@ -1204,6 +1225,23 @@ mod tests {
         assert_eq!(billed.model_id(), "deepseek");
         assert_eq!(billed.tokens().total_tokens(), 190);
         assert_eq!(billed.total_usd_micros, Some(12_300));
+    }
+
+    #[test]
+    fn acp_usage_accepts_case_insensitive_usd_currency() {
+        for currency in ["usd", "Usd"] {
+            let billed = billed_acp_usage(
+                Some("omp"),
+                Some("deepseek"),
+                exact_acp_usage(Some(AcpReportedCost {
+                    amount: 0.0123,
+                    currency: currency.to_string(),
+                })),
+            )
+            .unwrap();
+
+            assert_eq!(billed.total_usd_micros, Some(12_300), "{currency}");
+        }
     }
 
     #[test]
@@ -1461,6 +1499,64 @@ mod tests {
         assert_eq!(usage.model_id(), "deepseek");
         assert_eq!(usage.tokens().total_tokens(), 190);
         assert_eq!(usage.total_usd_micros, Some(12_300));
+    }
+
+    #[tokio::test]
+    async fn omp_profile_pi_model_is_used_for_billing_without_node_model() {
+        let tempdir = tempfile::tempdir().unwrap();
+        init_git(tempdir.path());
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+
+        let mut node = Node::new("work");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+
+        let profile = AcpProcessSpec::from_profile(
+            "omp",
+            "python3".to_string(),
+            vec![script_path.to_string_lossy().into_owned()],
+            HashMap::from([("PI_MODEL".to_string(), "profile-model".to_string())]),
+        );
+        let mut backend = AgentAcpBackend::new()
+            .with_profile_override(profile)
+            .with_env(HashMap::from([(
+                "ACP_PROMPT_USAGE".to_string(),
+                r#"{"totalTokens":1,"inputTokens":1,"outputTokens":0}"#.to_string(),
+            )]));
+        backend.run_harness = Some("omp".to_string());
+
+        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+        let emitter = Arc::new(Emitter::default());
+        let context = Context::new();
+        let result = backend
+            .run(CodergenRunRequest {
+                node:               &node,
+                prompt:             "report usage",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await
+            .unwrap();
+
+        let CodergenResult::Text {
+            usage: Some(usage),
+            ..
+        } = result
+        else {
+            panic!("expected billed text result");
+        };
+        assert_eq!(
+            format!("{}:{}", usage.model().provider.as_str(), usage.model_id()),
+            "omp:profile-model"
+        );
     }
 
     #[tokio::test]

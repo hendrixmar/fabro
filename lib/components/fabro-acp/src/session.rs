@@ -153,8 +153,20 @@ impl AcpUsageAccumulator {
     }
 
     fn record_reported_cost(&mut self, cost: Option<AcpReportedCost>) {
-        if let Some(cost) = cost {
+        let Some(cost) = cost else {
+            return;
+        };
+        if cost.currency.eq_ignore_ascii_case("USD")
+            && cost.amount.is_finite()
+            && cost.amount >= 0.0
+        {
             self.usage.reported_cost = Some(cost);
+        } else {
+            tracing::warn!(
+                amount = cost.amount,
+                currency = %cost.currency,
+                "ignoring invalid or unsupported ACP reported cost update"
+            );
         }
     }
 
@@ -978,6 +990,41 @@ mod tests {
                     amount: 0.02,
                     currency: "USD".to_string(),
                 }),
+            })
+        );
+    }
+
+    #[test]
+    fn usage_accumulator_retains_latest_valid_cost_after_invalid_updates() {
+        let mut accumulator = AcpUsageAccumulator::default();
+        accumulator.record_reported_cost(Some(AcpReportedCost {
+            amount: 0.02,
+            currency: "Usd".to_string(),
+        }));
+
+        for cost in [
+            AcpReportedCost {
+                amount: -1.0,
+                currency: "USD".to_string(),
+            },
+            AcpReportedCost {
+                amount: f64::NAN,
+                currency: "usd".to_string(),
+            },
+            AcpReportedCost {
+                amount: 1.0,
+                currency: "EUR".to_string(),
+            },
+        ] {
+            accumulator.record_reported_cost(Some(cost));
+        }
+        accumulator.record_reported_cost(None);
+
+        assert_eq!(
+            accumulator.finish().unwrap().reported_cost,
+            Some(AcpReportedCost {
+                amount: 0.02,
+                currency: "Usd".to_string(),
             })
         );
     }
