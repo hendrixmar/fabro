@@ -211,6 +211,16 @@ async fn steering_sends_followup_session_prompt_over_acp() {
                 "ACP_STEER_PROMPT_RECORD".to_string(),
                 steer_prompt_path.to_string_lossy().into_owned(),
             ),
+            (
+                "ACP_PROMPT_USAGE".to_string(),
+                r#"[{"totalTokens":20,"inputTokens":10,"outputTokens":2,"thoughtTokens":1,"cachedReadTokens":3,"cachedWriteTokens":4},{"totalTokens":40,"inputTokens":20,"outputTokens":4,"thoughtTokens":2,"cachedReadTokens":6,"cachedWriteTokens":8}]"#
+                    .to_string(),
+            ),
+            (
+                "ACP_USAGE_UPDATE".to_string(),
+                r#"[{"used":20,"size":1000,"cost":{"amount":0.01,"currency":"USD"}},{"used":40,"size":1000,"cost":{"amount":0.02,"currency":"USD"}}]"#
+                    .to_string(),
+            ),
         ]),
         sandbox,
         cancel_token: CancellationToken::new(),
@@ -226,6 +236,21 @@ async fn steering_sends_followup_session_prompt_over_acp() {
     .expect("run ACP turn with steering");
 
     assert_eq!(result.text, "initial steered:please revise");
+    assert_eq!(
+        result.usage,
+        Some(AcpRunUsage {
+            input_tokens: 30,
+            output_tokens: 6,
+            reasoning_tokens: 3,
+            cache_read_tokens: 9,
+            cache_write_tokens: 12,
+            total_tokens: 60,
+            reported_cost: Some(AcpReportedCost {
+                amount: 0.02,
+                currency: "USD".to_string(),
+            }),
+        })
+    );
     assert_eq!(
         read_to_string(record_path)
             .await
@@ -372,6 +397,60 @@ async fn inline_interrupt_terminates_agent_that_ignores_cancel() {
             .expect("read method record"),
         "initialize\nsession/new\nsession/prompt\nsession/cancel\n"
     );
+    assert_eq!(
+        read_to_string(cancel_path)
+            .await
+            .expect("read cancel record"),
+        "session/cancel\n"
+    );
+}
+
+#[tokio::test]
+async fn inline_interrupt_reaches_grace_deadline_while_agent_streams_updates() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let script_path = tempdir.path().join("fake_acp_agent.py");
+    let cancel_path = tempdir.path().join("cancel.txt");
+    write(&script_path, fake_acp_agent_script())
+        .await
+        .expect("write fake ACP agent");
+
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
+    let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+    let control_handle = AcpControlHandle::new();
+    let handle_for_activity = control_handle.clone();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_for_activity = Arc::clone(&interrupted);
+
+    let run = run_acp_turn(AcpRunRequest {
+        on_session_activity: None,
+        command,
+        prompt: "hello".to_string(),
+        cwd: tempdir.path().to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env: HashMap::from([
+            ("ACP_MODE".to_string(), "stream_after_cancel".to_string()),
+            ("LC_ALL".to_string(), "C".to_string()),
+            (
+                "ACP_CANCEL_RECORD".to_string(),
+                cancel_path.to_string_lossy().into_owned(),
+            ),
+        ]),
+        sandbox,
+        cancel_token: CancellationToken::new(),
+        on_activity: Some(Arc::new(move || {
+            if !interrupted_for_activity.swap(true, Ordering::AcqRel) {
+                handle_for_activity.interrupt(None);
+            }
+        })),
+        live_control: Some(AcpLiveControl::new(control_handle)),
+    });
+    let err = timeout(Duration::from_secs(2), run)
+        .await
+        .expect("inline interrupt should complete within the cancellation grace period")
+        .expect_err("streaming agent should terminate as cancelled");
+
+    assert!(matches!(err, AcpError::Cancelled), "{err:?}");
     assert_eq!(
         read_to_string(cancel_path)
             .await

@@ -77,6 +77,36 @@ def first_prompt_text(message):
         return first
     return first.get("text", "")
 
+def prompt_control(name):
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    value = json.loads(raw)
+    if isinstance(value, list):
+        index = prompt_count - 1
+        return value[index] if index < len(value) else None
+    return value
+
+def respond_to_prompt(message, stop_reason):
+    usage_update = prompt_control("ACP_USAGE_UPDATE")
+    if usage_update is not None:
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    **usage_update,
+                },
+            },
+        })
+    response = {"stopReason": stop_reason}
+    usage = prompt_control("ACP_PROMPT_USAGE")
+    if usage is not None:
+        response["usage"] = usage
+    respond(message, response)
+
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
@@ -119,7 +149,7 @@ for line in sys.stdin:
                 }
             })
             record_methods()
-            respond(message, {"stopReason": "end_turn"})
+            respond_to_prompt(message, "end_turn")
             break
         if mode == "write_file":
             path = os.environ.get("ACP_WRITE_PATH", "hello.txt")
@@ -148,7 +178,7 @@ for line in sys.stdin:
                 if cancel_message.get("method") == "session/cancel":
                     with open(os.environ["ACP_CANCEL_RECORD"], "w", encoding="utf-8") as record:
                         record.write("session/cancel\n")
-                    respond(message, {"stopReason": "cancelled"})
+                    respond_to_prompt(message, "cancelled")
                     sys.exit(0)
         if mode == "ignore_cancel":
             send({
@@ -171,6 +201,40 @@ for line in sys.stdin:
                             record.write("session/cancel\n")
                     record_methods()
                     time.sleep(60)
+        if mode == "stream_after_cancel":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "waiting for streaming cancellation"}
+                    }
+                }
+            })
+            for control_line in sys.stdin:
+                control_message = json.loads(control_line)
+                methods.append(control_message.get("method"))
+                if control_message.get("method") == "session/cancel":
+                    if os.environ.get("ACP_CANCEL_RECORD"):
+                        with open(os.environ["ACP_CANCEL_RECORD"], "w", encoding="utf-8") as record:
+                            record.write("session/cancel\n")
+                    record_methods()
+                    break
+            while True:
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "still streaming"}
+                        }
+                    }
+                })
+                time.sleep(0.001)
         if mode == "permission":
             send({
                 "jsonrpc": "2.0",
@@ -209,7 +273,7 @@ for line in sys.stdin:
                         if os.environ.get("ACP_CANCEL_RECORD"):
                             with open(os.environ["ACP_CANCEL_RECORD"], "w", encoding="utf-8") as record:
                                 record.write("session/cancel\n")
-                        respond(message, {"stopReason": "cancelled"})
+                        respond_to_prompt(message, "cancelled")
                         break
                 continue
             if os.environ.get("ACP_STEER_PROMPT_RECORD"):
@@ -227,7 +291,7 @@ for line in sys.stdin:
                 }
             })
             record_methods()
-            respond(message, {"stopReason": "end_turn"})
+            respond_to_prompt(message, "end_turn")
             break
         if mode == "steer":
             if prompt_count == 1:
@@ -242,7 +306,7 @@ for line in sys.stdin:
                         }
                     }
                 })
-                respond(message, {"stopReason": "end_turn"})
+                respond_to_prompt(message, "end_turn")
                 continue
             if os.environ.get("ACP_STEER_PROMPT_RECORD"):
                 with open(os.environ["ACP_STEER_PROMPT_RECORD"], "w", encoding="utf-8") as record:
@@ -259,7 +323,7 @@ for line in sys.stdin:
                 }
             })
             record_methods()
-            respond(message, {"stopReason": "end_turn"})
+            respond_to_prompt(message, "end_turn")
             break
         for text in ["hello ", "from acp"]:
             send({
@@ -274,22 +338,7 @@ for line in sys.stdin:
                 }
             })
         record_methods()
-        response = {"stopReason": os.environ.get("ACP_STOP_REASON", "end_turn")}
-        if os.environ.get("ACP_PROMPT_USAGE"):
-            response["usage"] = json.loads(os.environ["ACP_PROMPT_USAGE"])
-        if os.environ.get("ACP_USAGE_UPDATE"):
-            send({
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "usage_update",
-                        **json.loads(os.environ["ACP_USAGE_UPDATE"]),
-                    },
-                },
-            })
-        respond(message, response)
+        respond_to_prompt(message, os.environ.get("ACP_STOP_REASON", "end_turn"))
         if mode == "linger_after_response":
             while True:
                 time.sleep(1)

@@ -16,7 +16,7 @@ use fabro_types::{Principal, SteeringMessage};
 use fabro_util::time::elapsed_ms;
 use tokio::sync::{Notify, oneshot};
 use tokio::sync::futures::Notified;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::command::AcpProcessSpec;
@@ -297,6 +297,8 @@ fn convert_tool_call_update(
 }
 
 const CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
+// Drain buffered notifications first, but recheck a ready prompt response after a bounded batch.
+const MAX_SESSION_UPDATES_BEFORE_PROMPT_CHECK: usize = 64;
 
 #[derive(Default)]
 struct AcpControlState {
@@ -631,6 +633,16 @@ fn send_prompt_with_response(
     Ok(rx)
 }
 
+enum LiveSessionEvent {
+    SessionMessage(Result<SessionMessage, ProtocolError>),
+    PromptResponse(
+        Result<Result<PromptResponse, ProtocolError>, oneshot::error::RecvError>,
+    ),
+    ControlNotified,
+    CancelRequested,
+    CancelGraceElapsed,
+}
+
 async fn read_live_session(
     session: &mut ActiveSession<'_, Agent>,
     initial_prompt_response: oneshot::Receiver<Result<PromptResponse, ProtocolError>>,
@@ -645,6 +657,8 @@ async fn read_live_session(
     let mut prompt_active = true;
     let mut prompt_response = Some(initial_prompt_response);
     let mut cancel_sent = false;
+    let mut cancel_deadline: Option<Instant> = None;
+    let mut session_updates_since_prompt_check = 0;
     let mut last_stop_reason: Option<StopReason> = None;
     let mut tracked_tools = HashMap::new();
     let mut usage_accumulator = AcpUsageAccumulator::default();
@@ -657,6 +671,8 @@ async fn read_live_session(
                 prompt_response = Some(send_prompt_with_response(session, message.text)?);
                 prompt_active = true;
                 cancel_sent = false;
+                cancel_deadline = None;
+                session_updates_since_prompt_check = 0;
                 continue;
             }
 
@@ -695,13 +711,55 @@ async fn read_live_session(
 
         if control_handle.take_interrupt_requested() && !cancel_sent {
             cancel_sent = true;
+            cancel_deadline = Some(Instant::now() + CANCEL_GRACE_PERIOD);
             send_cancel_notification(session)?;
         }
 
         let control_notified = control_handle.notified();
-        tokio::select! {
-            biased;
-            update = session.read_update() => {
+        let prioritize_session_updates =
+            session_updates_since_prompt_check < MAX_SESSION_UPDATES_BEFORE_PROMPT_CHECK;
+        let event = if prioritize_session_updates {
+            tokio::select! {
+                biased;
+                () = async {
+                    sleep_until(cancel_deadline.expect("cancel deadline is guarded")).await;
+                }, if cancel_deadline.is_some() => LiveSessionEvent::CancelGraceElapsed,
+                () = cancel_token.cancelled(), if !cancel_sent => {
+                    LiveSessionEvent::CancelRequested
+                }
+                () = control_notified => LiveSessionEvent::ControlNotified,
+                update = session.read_update() => LiveSessionEvent::SessionMessage(update),
+                response = async {
+                    prompt_response
+                        .as_mut()
+                        .expect("prompt response receiver is guarded")
+                        .await
+                }, if prompt_response.is_some() => LiveSessionEvent::PromptResponse(response),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = async {
+                    sleep_until(cancel_deadline.expect("cancel deadline is guarded")).await;
+                }, if cancel_deadline.is_some() => LiveSessionEvent::CancelGraceElapsed,
+                () = cancel_token.cancelled(), if !cancel_sent => {
+                    LiveSessionEvent::CancelRequested
+                }
+                () = control_notified => LiveSessionEvent::ControlNotified,
+                response = async {
+                    prompt_response
+                        .as_mut()
+                        .expect("prompt response receiver is guarded")
+                        .await
+                }, if prompt_response.is_some() => LiveSessionEvent::PromptResponse(response),
+                update = session.read_update() => LiveSessionEvent::SessionMessage(update),
+            }
+        };
+
+        match event {
+            LiveSessionEvent::SessionMessage(update) => {
+                session_updates_since_prompt_check =
+                    session_updates_since_prompt_check.saturating_add(1);
                 if let Some(on_activity) = on_activity {
                     on_activity();
                 }
@@ -737,12 +795,7 @@ async fn read_live_session(
                     _ => {}
                 }
             }
-            response = async {
-                prompt_response
-                    .as_mut()
-                    .expect("prompt response receiver is guarded")
-                    .await
-            }, if prompt_response.is_some() => {
+            LiveSessionEvent::PromptResponse(response) => {
                 let Ok(response) = response else {
                     // The ACP connection owns the protocol error. Keep reading it from
                     // the session channel rather than replacing it with a channel error.
@@ -759,19 +812,23 @@ async fn read_live_session(
                 prompt_response = None;
                 prompt_active = false;
                 cancel_sent = false;
+                cancel_deadline = None;
+                session_updates_since_prompt_check = 0;
                 last_stop_reason = Some(response.stop_reason);
             }
-            () = control_notified => {
+            LiveSessionEvent::ControlNotified => {
                 if control_handle.take_interrupt_requested() && !cancel_sent {
                     cancel_sent = true;
+                    cancel_deadline = Some(Instant::now() + CANCEL_GRACE_PERIOD);
                     send_cancel_notification(session)?;
                 }
             }
-            () = cancel_token.cancelled(), if !cancel_sent => {
+            LiveSessionEvent::CancelRequested => {
                 cancel_sent = true;
+                cancel_deadline = Some(Instant::now() + CANCEL_GRACE_PERIOD);
                 send_cancel_notification(session)?;
             }
-            () = sleep(CANCEL_GRACE_PERIOD), if cancel_sent => {
+            LiveSessionEvent::CancelGraceElapsed => {
                 return Ok((text, StopReason::Cancelled, usage_accumulator.finish()));
             }
         }
