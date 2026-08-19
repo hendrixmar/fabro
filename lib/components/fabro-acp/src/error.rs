@@ -49,6 +49,11 @@ pub enum AcpError {
         stop_reason: String,
         text:        String,
     },
+
+    #[error("ACP agent reported an in-band error: {excerpt}")]
+    InBandError {
+        excerpt: String,
+    },
 }
 
 impl AcpError {

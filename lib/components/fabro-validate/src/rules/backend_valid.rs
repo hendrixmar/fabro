@@ -88,12 +88,21 @@ fn validate_acp_node(rule: &str, node: &Node) -> Vec<Diagnostic> {
         });
     }
 
-    if let Err(error) = AcpProcessSpec::from_attrs(
-        node.legacy_acp_command_attr(),
-        node.acp_command_attr(),
-        node.acp_config_attr(),
-    ) {
-        diagnostics.push(acp_process_diagnostic(rule, node, &error));
+    // A node-level `harness` attr resolves the process spec from the
+    // server-side external-agent profile at runtime, so it satisfies the
+    // process requirement on its own (a missing profile surfaces then as a
+    // handler error naming [server.external_agents.<harness>]).
+    let has_acp_process_attr = node.legacy_acp_command_attr().is_some()
+        || node.acp_command_attr().is_some()
+        || node.acp_config_attr().is_some();
+    if has_acp_process_attr || node.harness_attr().is_none() {
+        if let Err(error) = AcpProcessSpec::from_attrs(
+            node.legacy_acp_command_attr(),
+            node.acp_command_attr(),
+            node.acp_config_attr(),
+        ) {
+            diagnostics.push(acp_process_diagnostic(rule, node, &error));
+        }
     }
 
     let api_only_attrs = api_only_attrs_present(node);
@@ -107,7 +116,11 @@ fn validate_acp_node(rule: &str, node: &Node) -> Vec<Diagnostic> {
             ),
             node_id: Some(node.id.clone()),
             edge: None,
-            fix: Some("Remove API model/provider/control attributes from ACP nodes".to_string()),
+            fix: Some(
+                "Remove provider/max_tokens/speed from ACP nodes; model and \
+                 reasoning_effort are translated to harness environment overrides"
+                    .to_string(),
+            ),
 
             ..Diagnostic::default()
         });
@@ -170,13 +183,7 @@ fn render_acp_process_error(error: &AcpCommandError) -> String {
 }
 
 fn api_only_attrs_present(node: &Node) -> Vec<&'static str> {
-    const API_ONLY_ATTRS: &[&str] = &[
-        "model",
-        "provider",
-        "reasoning_effort",
-        "max_tokens",
-        "speed",
-    ];
+    const API_ONLY_ATTRS: &[&str] = &["provider", "max_tokens", "speed"];
     API_ONLY_ATTRS
         .iter()
         .copied()
@@ -353,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_valid_rejects_acp_on_prompt_nodes_and_api_only_attrs() {
+    fn backend_valid_rejects_acp_on_prompt_nodes_but_accepts_model_and_effort() {
         let mut graph = minimal_graph();
         let mut node = Node::new("prompt");
         node.attrs
@@ -375,17 +382,88 @@ mod tests {
         graph.nodes.insert("prompt".to_string(), node);
 
         let diagnostics = Rule.apply(&graph);
-        assert_eq!(diagnostics.len(), 2);
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
                 .message
                 .contains("backend=\"acp\" is only valid on agent nodes")
-        }));
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic
+        );
+    }
+
+    #[test]
+    fn backend_valid_accepts_model_and_effort_on_acp_agent_nodes() {
+        let mut graph = minimal_graph();
+        let mut node = Node::new("work");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs.insert(
+            "acp.command".to_string(),
+            AttrValue::String("python3 agent.py".to_string()),
+        );
+        node.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("gpt-5.6-luna".to_string()),
+        );
+        node.attrs.insert(
+            "reasoning_effort".to_string(),
+            AttrValue::String("xhigh".to_string()),
+        );
+        graph.nodes.insert("work".to_string(), node);
+
+        assert!(Rule.apply(&graph).is_empty());
+    }
+
+    #[test]
+    fn backend_valid_accepts_harness_attr_without_process_attr() {
+        let mut graph = minimal_graph();
+        let mut node = Node::new("build");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs
+            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        graph.nodes.insert("build".to_string(), node);
+
+        // The harness profile is resolved server-side at runtime; validate
+        // must not demand acp.command/acp.config alongside it.
+        assert!(Rule.apply(&graph).is_empty());
+    }
+
+    #[test]
+    fn backend_valid_still_rejects_api_only_attrs_on_acp_nodes() {
+        let mut graph = minimal_graph();
+        let mut node = Node::new("work");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs.insert(
+            "acp.command".to_string(),
+            AttrValue::String("python3 agent.py".to_string()),
+        );
+        node.attrs.insert(
+            "provider".to_string(),
+            AttrValue::String("openai".to_string()),
+        );
+        node.attrs
+            .insert("max_tokens".to_string(), AttrValue::Integer(4096));
+        node.attrs.insert(
+            "speed".to_string(),
+            AttrValue::String("fast".to_string()),
+        );
+        graph.nodes.insert("work".to_string(), node);
+
+        let diagnostics = Rule.apply(&graph);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
                 .message
                 .contains("backend=\"acp\" does not support API-only attributes")
-        }));
+        );
+        for attr in ["provider", "max_tokens", "speed"] {
+            assert!(
+                diagnostics[0].message.contains(attr),
+                "message should list {attr}: {}",
+                diagnostics[0].message
+            );
+        }
     }
 
     #[test]
