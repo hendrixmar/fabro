@@ -38,7 +38,7 @@ pub(super) struct Intent {
 }
 
 impl Intent {
-    pub fn inputs(&self) -> [(String, String); 5] {
+    pub(super) fn inputs(&self) -> [(String, String); 5] {
         [
             (
                 "incident".into(),

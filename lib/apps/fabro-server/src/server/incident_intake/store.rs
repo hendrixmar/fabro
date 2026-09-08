@@ -84,33 +84,6 @@ impl IncidentStore {
         .await?)
     }
 
-    /// Complete only the captured refresh; later notifications remain pending.
-    /// Workers applying observation fields must do so in this same
-    /// UPDATE/transaction.
-    pub(crate) async fn complete_refresh(
-        &self,
-        incident_key: &str,
-        generation: i64,
-    ) -> anyhow::Result<()> {
-        let changed = sqlx::query(
-            "UPDATE bugsink_incidents SET applied_generation = ?, refresh_generation = NULL,
-             read_attempts = 0, next_read_ms = NULL,
-             alert_reason = CASE WHEN requested_generation > refresh_generation THEN
-                (SELECT reason FROM bugsink_deliveries d WHERE d.origin=bugsink_incidents.origin
-                 AND d.project_id=bugsink_incidents.project_id AND d.issue_id=bugsink_incidents.issue_id
-                 AND d.reason!='TEST' ORDER BY d.rowid DESC LIMIT 1) ELSE alert_reason END
-             WHERE incident_key = ? AND refresh_generation = ?",
-        )
-        .bind(generation)
-        .bind(incident_key)
-        .bind(generation)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        ensure!(changed == 1, "refresh generation is no longer current");
-        Ok(())
-    }
-
     /// Operator data only: no delivery bodies, signing material, or upstream
     /// cursors. The handler adds { data: snapshot, meta: { enabled,
     /// dispatch_enabled } }.
@@ -277,31 +250,6 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    #[tokio::test]
-    async fn notification_during_refresh_remains_pending() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = database(&dir.path().join("intake.sqlite")).await;
-        let store = IncidentStore::new(db.clone_pool());
-        store
-            .accept(ORIGIN, &alert(AlertReason::New, 'a'))
-            .await
-            .unwrap();
-        let key = store.snapshot().await.unwrap()["incidents"][0]["incident_key"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let generation = store.capture_refresh(&key).await.unwrap().unwrap();
-        store
-            .accept(ORIGIN, &alert(AlertReason::Regressed, 'b'))
-            .await
-            .unwrap();
-        store.complete_refresh(&key, generation).await.unwrap();
-        let row = &store.snapshot().await.unwrap()["incidents"][0];
-        assert_eq!(row["applied_generation"], 1);
-        assert_eq!(row["requested_generation"], 2);
-        assert_eq!(store.capture_refresh(&key).await.unwrap(), Some(2));
     }
 
     #[tokio::test]
