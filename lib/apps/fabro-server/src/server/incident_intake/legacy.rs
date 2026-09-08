@@ -97,6 +97,7 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
     let mut records = Vec::new();
     let mut imported = BTreeMap::<String, (String, RunId, RunProjection)>::new();
     let mut abandoned = BTreeMap::<String, String>::new();
+    let mut resolved_unknown = BTreeSet::new();
     let mut inventories = BTreeMap::<String, String>::new();
     for (name, owner) in &config.owners {
         origin(&owner.api_origin)?;
@@ -158,12 +159,19 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
             ensure!(!status.is_empty() && status.len() <= 100, "legacy_record_status_invalid");
             if let Some(run_id) = record.get("run").and_then(Value::as_str) {
                 let run_id = run_id.parse::<RunId>()?;
-                ensure!(runs.get(incident).is_some_and(|found| found.iter().any(|(id,_)| *id == run_id)), "legacy_record_run_unverified");
+                if !runs.get(incident).is_some_and(|found| found.iter().any(|(id,_)| *id == run_id)) {
+                    let projection: RunProjection=serde_json::from_value(get(format!("/runs/{run_id}/state")).await?)?;
+                    ensure!(projection.spec.run_id==run_id && projection.status.is_terminal()
+                        && projection.spec.settings.run.inputs.get("incident").and_then(toml::Value::as_str)==Some(incident.as_str()), "legacy_record_run_unverified");
+                    runs.entry(incident.clone()).or_default().push((run_id,projection));
+                }
+                resolved_unknown.insert(incident.clone());
             } else {
-                if !runs.contains_key(incident) { abandoned.insert(incident.clone(), name.clone()); }
+                // A missing cached summary is not authoritative proof that a lost create never happened.
+                abandoned.insert(incident.clone(), name.clone());
             }
         }
-        // Lost dispatcher acknowledgments are recovered from the owner's actual complete Run inventory.
+        // Every discovered identity is checked through its exact persisted owner projection.
         for (incident, found) in runs {
             for (id,projection) in found {
                 if let Some((old_incident,_,_)) = imported.get(&id.to_string()) { ensure!(old_incident == &incident, "legacy_run_owner_mismatch"); }
@@ -234,12 +242,18 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
         let actual: String=sqlx::query_scalar("SELECT incident_key FROM bugsink_runs WHERE run_id=?").bind(id.to_string()).fetch_one(&mut *tx).await?;
         ensure!(actual==key,"legacy_import_collision");
     }
+    for incident in resolved_unknown.iter().filter(|incident| !abandoned.contains_key(*incident)) {
+        let (project,issue)=canonical_incident(incident)?;
+        sqlx::query("UPDATE bugsink_incidents SET parked_reason=NULL WHERE incident_key=? AND parked_reason='legacy_spawn_uncertain'")
+            .bind(incident_key(bugsink_origin,project,issue)?).execute(&mut *tx).await?;
+    }
     for (incident,owner) in abandoned {
         let (project,issue)=canonical_incident(&incident)?;
         let key=incident_key(bugsink_origin,project,issue)?;
-        sqlx::query("INSERT INTO bugsink_incidents(incident_key,origin,project_id,issue_id,parked_reason) VALUES(?,?,?,?,'legacy_spawn_not_created') ON CONFLICT DO NOTHING")
+        sqlx::query("INSERT INTO bugsink_incidents(incident_key,origin,project_id,issue_id,parked_reason) VALUES(?,?,?,?,'legacy_spawn_uncertain')
+            ON CONFLICT(incident_key) DO UPDATE SET parked_reason='legacy_spawn_uncertain'")
             .bind(&key).bind(bugsink_origin).bind(i64::try_from(project)?).bind(issue.to_string()).execute(&mut *tx).await?;
-        records.push(json!({"owner":owner,"incident_key":key,"run_id":null,"status":"verified_not_created"}));
+        records.push(json!({"owner":owner,"incident_key":key,"run_id":null,"status":"unresolved_spawn"}));
     }
     for (incident,ticket) in &tickets {
         let (project,issue)=canonical_incident(incident)?;
@@ -250,6 +264,11 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
             records.push(json!({"owner":"plane","incident_key":key,"run_id":null,"ticket_id":ticket,"status":"verified_ticket"}));
         }
     }
+    let incomplete: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM bugsink_incidents WHERE origin=? AND parked_reason='legacy_spawn_uncertain')")
+        .bind(bugsink_origin).fetch_one(&mut *tx).await?;
+    if incomplete {
+        for owner in owners.values_mut() { owner["in_flight_reconciled"]=json!(false); }
+    }
     tx.commit().await?;
-    Ok(json!({"schema_version":1,"status":"reconciled","owners":owners,"records":records}))
+    Ok(json!({"schema_version":1,"status":if incomplete {"incomplete"} else {"reconciled"},"owners":owners,"records":records}))
 }

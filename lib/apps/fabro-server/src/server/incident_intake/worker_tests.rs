@@ -317,7 +317,7 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
     let incident=format!("bugsink:25:{issue}");
     let project=uuid::Uuid::new_v4();let ticket=uuid::Uuid::new_v4();
     let source=dir.path().join("legacy.json");
-    std::fs::write(&source,serde_json::to_vec(&json!({(incident.clone()):{"status":"spawn-failed","run":null}})).unwrap()).unwrap();
+    std::fs::write(&source,b"{}").unwrap();
     std::fs::set_permissions(&source,std::fs::Permissions::from_mode(0o600)).unwrap();
     let config=dir.path().join("bugsink-legacy.json");
     let owner=json!({"state_file":source,"api_origin":remote.base_url(),"token_secret":"bugsink-api"});
@@ -332,9 +332,15 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
     let summary=legacy::import(&state).await.unwrap();
     assert_eq!(summary["status"],"reconciled");
     assert!(summary["records"].as_array().unwrap().iter().any(|r|r["ticket_id"]==ticket.to_string() && r["run_id"].is_null()));
+    std::fs::write(&source,serde_json::to_vec(&json!({(incident.clone()):{"status":"spawn-failed","run":null}})).unwrap()).unwrap();
+    let incomplete=legacy::import(&state).await.unwrap();
+    assert_eq!(incomplete["status"],"incomplete");
+    assert_eq!(incomplete["owners"]["laptop"]["in_flight_reconciled"],false);
     let snapshot=state.incident_store().snapshot().await.unwrap();
-    assert_eq!(snapshot["incidents"][0]["parked_reason"],"legacy_spawn_not_created");
+    assert_eq!(snapshot["incidents"][0]["parked_reason"],"legacy_spawn_uncertain");
     assert!(snapshot["runs"].as_array().unwrap().is_empty());
+    std::fs::write(&source,b"{}").unwrap();
+    assert_eq!(legacy::import(&state).await.unwrap()["status"],"incomplete");
     std::fs::remove_file(&source).unwrap();
     assert!(legacy::import(&state).await.is_err());
     assert_eq!(state.incident_store().snapshot().await.unwrap()["incidents"],snapshot["incidents"]);

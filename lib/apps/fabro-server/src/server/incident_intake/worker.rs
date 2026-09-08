@@ -289,6 +289,7 @@ pub(super) async fn scan_once(state: &Arc<AppState>, client: &BugsinkClient, now
                     Some(summary) => serde_json::from_str(&summary)?,
                     None => super::legacy::import(state).await?,
                 });
+                ensure!(progress.legacy_import.as_ref().and_then(|value|value.get("status")).and_then(Value::as_str)==Some("reconciled"), "legacy_import_incomplete");
                 progress.import_complete = true;
             }
             if row.try_get::<Option<i64>,_>("scan_started_ms")?.is_none() {
@@ -315,7 +316,7 @@ pub(super) async fn scan_once(state: &Arc<AppState>, client: &BugsinkClient, now
                 progress.read_attempts=(progress.read_attempts+1).min(5);
                 let due=retry_deadline(progress.read_attempts, now);
                 if due.is_none() { progress.parked_reason=Some(if progress.import_complete { "scan_read_failed" } else { "legacy_import_incomplete" }.into()); }
-                if !progress.import_complete {
+                if !progress.import_complete && progress.legacy_import.is_none() {
                     progress.legacy_import=Some(serde_json::json!({"schema_version":1,"status":"incomplete","owners":{},"records":[]}));
                 }
                 (false,due)

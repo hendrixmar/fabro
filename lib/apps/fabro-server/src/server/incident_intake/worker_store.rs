@@ -215,7 +215,8 @@ impl IncidentStore {
             let mut progress: ScanProgress = serde_json::from_str(&raw).context("corrupt_scan_progress")?;
             // Explicit baseline resumes only scan/import errors; incident and Run budgets are untouched.
             progress.read_attempts=0; progress.parked_reason=None;
-            sqlx::query("UPDATE bugsink_scans SET cursor=?,next_scan_ms=? WHERE origin=? AND project_id=? AND baseline_complete=0")
+            sqlx::query("UPDATE bugsink_scans SET cursor=?,next_scan_ms=? WHERE origin=? AND project_id=?
+                AND (baseline_complete=0 OR json_extract(cursor,'$.parked_reason') IS NOT NULL)")
                 .bind(serde_json::to_string(&progress)?).bind(now).bind(origin).bind(i64::try_from(*project)?).execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -248,6 +249,7 @@ impl IncidentStore {
         ensure!(row.try_get::<bool,_>("baseline_complete")?,"baseline_incomplete");
         let mut progress: ScanProgress=serde_json::from_str(&row.try_get::<String,_>("cursor")?)?;
         // The operator identity is retained in the private durable cursor journal, never in GET.
+        // ponytail: low-volume operator audit shares scan progress; split into an audit table if this becomes high-volume.
         progress.operator_audit.push(json!({"operator":actor,"incident_key":key,"at_ms":now,"allow_additional_run":allow_additional_run}));
         let parked=(used>=2 && !allow_additional_run && !succeeded).then_some("investigation_exhausted");
         sqlx::query("UPDATE bugsink_incidents SET observation_key=?,observed_event=?,is_resolved=?,is_muted=?,episode=?,
