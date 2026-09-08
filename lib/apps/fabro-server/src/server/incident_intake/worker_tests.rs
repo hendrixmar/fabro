@@ -108,6 +108,9 @@ async fn real_materialized_run_contains_only_trusted_five_inputs() {
     let blob=run.read_blob(projection.spec.manifest_blob.as_ref().unwrap()).await.unwrap().unwrap();
     let persisted: fabro_api::types::RunManifest=serde_json::from_slice(&blob).unwrap();
     assert_eq!(persisted.args.unwrap().input.len(),5);
+    for event in [fabro_workflow::event::Event::RunStarting, fabro_workflow::event::Event::RunRunning] {
+        fabro_workflow::event::append_event(&run,&id,&event).await.unwrap();
+    }
     let mut report=json!({"schema_version":1,"run_id":id.to_string(),"incident":intent.inputs()[0].1,
         "event":intent.event.to_string(),"observation":intent.observation,"episode":intent.episode,"status":"completed",
         "publication":{"status":"completed","project_id":uuid::Uuid::new_v4(),"issue_id":uuid::Uuid::new_v4(),"operation_key":"fixture-operation"},
@@ -235,6 +238,7 @@ async fn captured_generation_survives_restart_and_poll_never_resets_parked_budge
 async fn scans_more_than_ten_issues_across_restart_without_backlog_dispatch() {
     let remote=httpmock::MockServer::start();
     let origin=remote.base_url();
+    let boundary=chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().timestamp_millis();
     let first:Vec<_>=(0..11).map(|_|json!({"id":uuid::Uuid::new_v4(),"project":25,"is_resolved":false,"is_muted":false,"first_seen":"2020-01-01T00:00:00Z"})).collect();
     let last_id=uuid::Uuid::new_v4();
     let first_page=remote.mock(|when,then| {
@@ -243,24 +247,24 @@ async fn scans_more_than_ten_issues_across_restart_without_backlog_dispatch() {
     });
     let second_page=remote.mock(|when,then| {
         when.method(httpmock::Method::GET).path(client::ISSUES_PATH).query_param("cursor","page2");
-        then.json_body(json!({"results":[{"id":last_id,"project":25,"is_resolved":false,"is_muted":false,"first_seen":"2030-01-01T00:00:00Z"}],"next":null}));
+        then.json_body(json!({"results":[{"id":last_id,"project":25,"is_resolved":false,"is_muted":false,"first_seen":"2026-01-01T00:00:00.001Z"}],"next":null}));
     });
     let dir=tempfile::tempdir().unwrap();let bundle=test_store_bundle();
     let state=build(dir.path(),&bundle,&origin,false,false);
-    state.incident_store().start_baseline(&origin,&[25],1_000_000).await.unwrap();
+    state.incident_store().start_baseline(&origin,&[25],boundary).await.unwrap();
     let progress=ScanProgress {import_complete:true,..ScanProgress::default()};
     sqlx::query("UPDATE bugsink_scans SET cursor=?").bind(serde_json::to_string(&progress).unwrap()).execute(&state.incident_store().pool).await.unwrap();
-    worker::scan_once(&state,&client::BugsinkClient::new(&state).await.unwrap(),1_000_000).await.unwrap();
+    worker::scan_once(&state,&client::BugsinkClient::new(&state).await.unwrap(),boundary).await.unwrap();
     assert_eq!(first_page.calls(),1);assert_eq!(second_page.calls(),0);
     drop(state);
     let resumed=build(dir.path(),&bundle,&origin,false,false);
-    worker::scan_once(&resumed,&client::BugsinkClient::new(&resumed).await.unwrap(),1_000_001).await.unwrap();
+    worker::scan_once(&resumed,&client::BugsinkClient::new(&resumed).await.unwrap(),boundary+1).await.unwrap();
     let snapshot=resumed.incident_store().snapshot().await.unwrap();
     assert_eq!(snapshot["incidents"].as_array().unwrap().len(),12);
     let pending:Vec<_>=snapshot["incidents"].as_array().unwrap().iter().filter(|i|i["status"]=="pending").collect();
     assert_eq!(pending.len(),1);assert_eq!(pending[0]["issue_id"],last_id.to_string());
     assert_eq!(snapshot["scans"][0]["baseline_complete"],true);
-    worker::scan_once(&resumed,&client::BugsinkClient::new(&resumed).await.unwrap(),1_000_002).await.unwrap();
+    worker::scan_once(&resumed,&client::BugsinkClient::new(&resumed).await.unwrap(),boundary+2).await.unwrap();
     assert_eq!(first_page.calls(),1);assert_eq!(second_page.calls(),1);
 }
 
