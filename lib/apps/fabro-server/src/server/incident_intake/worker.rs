@@ -4,12 +4,14 @@ use anyhow::{Context as _, ensure};
 use axum::http::HeaderMap;
 use fabro_api::types::ManifestArgs;
 use fabro_automation::{Automation, AutomationId};
+use fabro_types::run_event::EventBody;
 use fabro_types::{
     AutomationRef, Principal, RunId, RunProjection, RunStatus, StageOutcome, SystemActorKind,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use tokio::time::sleep;
 
 use super::super::AppState;
 use super::client::{BugsinkClient, Issue, ScanProgress};
@@ -53,12 +55,16 @@ pub(crate) fn spawn_incident_intake(state: Arc<AppState>) {
             }
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+                () = sleep(std::time::Duration::from_secs(1)) => {},
             }
         }
     });
 }
 
+#[expect(
+    clippy::large_futures,
+    reason = "One dedicated intake task awaits one globally owned Run at a time; retaining its bounded state avoids a per-tick Box allocation"
+)]
 pub(crate) async fn reconcile_once(state: &Arc<AppState>, now_ms: i64) -> anyhow::Result<()> {
     let store = state.incident_store();
     for id in store.active_runs().await? {
@@ -80,7 +86,7 @@ pub(crate) async fn reconcile_once(state: &Arc<AppState>, now_ms: i64) -> anyhow
             Ok((issue, event)) => {
                 store
                     .apply_observation(&client.origin, &pending, &issue, event)
-                    .await?
+                    .await?;
             }
             Err(error) => {
                 let reason = match error.to_string().as_str() {
@@ -247,10 +253,7 @@ pub(crate) async fn reconcile_run(state: &Arc<AppState>, run_id: RunId) -> anyho
         .await
         .is_ok_and(|events| {
             events.iter().any(|event| {
-                matches!(
-                    event.event.body,
-                    fabro_types::run_event::EventBody::RunSubmitted(_)
-                )
+                matches!(event.event.body, EventBody::RunSubmitted(_))
             })
         });
     if !submitted {
@@ -258,21 +261,15 @@ pub(crate) async fn reconcile_run(state: &Arc<AppState>, run_id: RunId) -> anyho
             .transition_run(&intent, "uncertain", Some("partial_run_creation"))
             .await;
     }
-    let projection = match run.state().await {
-        Ok(projection) => projection,
-        Err(_) => {
-            return store
-                .transition_run(&intent, "uncertain", Some("partial_run_creation"))
-                .await;
-        }
+    let Ok(projection) = run.state().await else {
+        return store
+            .transition_run(&intent, "uncertain", Some("partial_run_creation"))
+            .await;
     };
-    let automation = match mapped_automation(state, intent.project).await {
-        Ok(automation) => automation,
-        Err(_) => {
-            return store
-                .transition_run(&intent, "uncertain", Some("workflow_mapping_changed"))
-                .await;
-        }
+    let Ok(automation) = mapped_automation(state, intent.project).await else {
+        return store
+            .transition_run(&intent, "uncertain", Some("workflow_mapping_changed"))
+            .await;
     };
     let blob = if let Some(hash) = &projection.spec.manifest_blob {
         run.read_blob(hash).await.ok().flatten()
@@ -342,19 +339,16 @@ async fn materialize_create(state: &Arc<AppState>, intent: &Intent) -> anyhow::R
             temp_root:          state.automation_temp_root(),
         })
         .await;
-    let mut materialized = match materialized {
-        Ok(value) => value,
-        Err(_) => {
-            return store
-                .transition_run(intent, "failed", Some("materialization_failed"))
-                .await;
-        }
+    let Ok(mut materialized) = materialized else {
+        return store
+            .transition_run(intent, "failed", Some("materialization_failed"))
+            .await;
     };
-    if !materialized
+    if materialized
         .manifest
         .git
         .as_ref()
-        .is_some_and(|git| git.sha.as_deref() == Some(intent.revision.as_str()))
+        .is_none_or(|git| git.sha.as_deref() != Some(intent.revision.as_str()))
     {
         return store
             .transition_run(intent, "failed", Some("workflow_source_mismatch"))
@@ -694,44 +688,41 @@ pub(super) async fn scan_once(
             Ok(next.is_null())
         }
         .await;
-        let (finished, due) = match result {
-            Ok(finished) => {
-                progress.read_attempts = 0;
-                (
-                    finished,
-                    Some(if finished {
-                        now.saturating_add(300_000)
+        let (finished, due) = if let Ok(finished) = result {
+            progress.read_attempts = 0;
+            (
+                finished,
+                Some(if finished {
+                    now.saturating_add(300_000)
+                } else {
+                    now
+                }),
+            )
+        } else {
+            // A page is retried from its original cursor; failed reads never consume
+            // coverage.
+            let original: ScanProgress = serde_json::from_str(&raw)?;
+            progress.cursor = original.cursor;
+            progress.seen = original.seen;
+            progress.seen_issues = original.seen_issues;
+            progress.read_attempts = (progress.read_attempts + 1).min(5);
+            let due = retry_deadline(progress.read_attempts, now);
+            if due.is_none() {
+                progress.parked_reason = Some(
+                    if progress.import_complete {
+                        "scan_read_failed"
                     } else {
-                        now
-                    }),
-                )
+                        "legacy_import_incomplete"
+                    }
+                    .into(),
+                );
             }
-            Err(_) => {
-                // A page is retried from its original cursor; failed reads never consume
-                // coverage.
-                let original: ScanProgress = serde_json::from_str(&raw)?;
-                progress.cursor = original.cursor;
-                progress.seen = original.seen;
-                progress.seen_issues = original.seen_issues;
-                progress.read_attempts = (progress.read_attempts + 1).min(5);
-                let due = retry_deadline(progress.read_attempts, now);
-                if due.is_none() {
-                    progress.parked_reason = Some(
-                        if progress.import_complete {
-                            "scan_read_failed"
-                        } else {
-                            "legacy_import_incomplete"
-                        }
-                        .into(),
-                    );
-                }
-                if !progress.import_complete && progress.legacy_import.is_none() {
-                    progress.legacy_import = Some(
-                        serde_json::json!({"schema_version":1,"status":"incomplete","owners":{},"records":[]}),
-                    );
-                }
-                (false, due)
+            if !progress.import_complete && progress.legacy_import.is_none() {
+                progress.legacy_import = Some(
+                    serde_json::json!({"schema_version":1,"status":"incomplete","owners":{},"records":[]}),
+                );
             }
+            (false, due)
         };
         sqlx::query("UPDATE bugsink_scans SET cursor=?,baseline_complete=CASE WHEN ? THEN 1 ELSE baseline_complete END,
             scan_started_ms=?,next_scan_ms=? WHERE origin=? AND project_id=? AND cursor=?")

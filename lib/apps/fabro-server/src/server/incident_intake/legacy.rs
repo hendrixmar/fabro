@@ -5,6 +5,8 @@ use anyhow::{Context as _, ensure};
 use fabro_types::{RunId, RunProjection};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::fs::{self, File};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::super::AppState;
@@ -29,17 +31,17 @@ struct Owner {
 
 pub(super) async fn private_json(path: &Path) -> anyhow::Result<Value> {
     use std::os::unix::fs::PermissionsExt;
-    let metadata = tokio::fs::symlink_metadata(path).await?;
+    // Group and other permissions occupy the six low POSIX mode bits.
+    let metadata = fs::symlink_metadata(path).await?;
     ensure!(
         metadata.is_file()
             && !metadata.file_type().is_symlink()
-            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.permissions().mode().trailing_zeros() >= 6
             && metadata.len() <= 1_048_576,
         "legacy_source_not_private"
     );
-    use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
-    tokio::fs::File::open(path)
+    File::open(path)
         .await?
         .take(1_048_577)
         .read_to_end(&mut bytes)
@@ -99,7 +101,11 @@ pub(super) fn html_incidents(html: &str) -> anyhow::Result<Vec<String>> {
     Ok(result)
 }
 
-fn origin(value: &str) -> anyhow::Result<url::Url> {
+fn origin(value: &str) -> anyhow::Result<()> {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Validates configured origin components without formatting the raw URL in diagnostics"
+    )]
     let url = url::Url::parse(value)?;
     ensure!(
         matches!(url.scheme(), "http" | "https")
@@ -108,7 +114,7 @@ fn origin(value: &str) -> anyhow::Result<url::Url> {
             && url.password().is_none(),
         "legacy_origin_invalid"
     );
-    Ok(url)
+    Ok(())
 }
 
 pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
@@ -337,6 +343,10 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
         .api_base
         .as_deref()
         .context("legacy_plane_not_configured")?;
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Mutates a validated Plane URL solely for bounded HTTP transit; failures are normalized before exposure"
+    )]
     let mut base = url::Url::parse(api_base)?;
     ensure!(
         matches!(base.scheme(), "http" | "https")

@@ -1,4 +1,5 @@
 use anyhow::{Context as _, ensure};
+use fabro_http::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -16,7 +17,7 @@ pub(super) struct BugsinkClient {
 
 pub(super) fn http_client() -> anyhow::Result<fabro_http::HttpClient> {
     Ok(fabro_http::HttpClientBuilder::new()
-        .redirect(fabro_http::redirect::Policy::none())
+        .redirect(Policy::none())
         .proxy_policy(fabro_http::ProxyPolicy::Disabled)
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(15))
@@ -39,7 +40,7 @@ pub(super) async fn bounded_json(mut response: fabro_http::Response) -> anyhow::
         );
         bytes.extend_from_slice(&chunk);
     }
-    Ok(serde_json::from_slice(&bytes).context("upstream_malformed")?)
+    serde_json::from_slice(&bytes).context("upstream_malformed")
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +114,10 @@ impl BugsinkClient {
         })
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Validated URLs are consumed by HTTP transit; callers expose only normalized failures, never URL display"
+    )]
     async fn get(&self, url: url::Url) -> anyhow::Result<Value> {
         let response = self.http.get(url).bearer_auth(&self.token).send().await?;
         ensure!(
@@ -122,6 +127,10 @@ impl BugsinkClient {
         bounded_json(response).await
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Constructs canonical issue/event wire URLs from validated identities; URLs never enter logs or status"
+    )]
     pub(super) async fn issue(&self, project: u64, id: Uuid) -> anyhow::Result<(Issue, Uuid)> {
         let issue = Issue::parse(
             &self
@@ -157,6 +166,10 @@ impl BugsinkClient {
         Ok((issue, event_id))
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Constructs the fixed origin-scoped scan URL for HTTP transit, not logging or error display"
+    )]
     pub(super) async fn page(&self, project: u64, cursor: Option<&str>) -> anyhow::Result<Value> {
         let mut url = url::Url::parse(&format!("{}{ISSUES_PATH}", self.origin))?;
         url.query_pairs_mut()
@@ -197,6 +210,10 @@ impl ScanProgress {
             self.cursor = None;
             return Ok(());
         };
+        #[expect(
+            clippy::disallowed_types,
+            reason = "Parses provider cursors only for strict scope comparisons; malformed URLs are never displayed"
+        )]
         let next = url::Url::parse(next)?;
         ensure!(
             next.origin().ascii_serialization() == origin
