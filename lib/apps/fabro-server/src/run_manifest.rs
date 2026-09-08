@@ -9,7 +9,7 @@ use fabro_api::types;
 use fabro_auth::auth_issue_message;
 use fabro_config::parse::SettingsSource;
 use fabro_config::{
-    CliLayer, CliOutputLayer, EnvironmentLayer, MergeMap, RunLayer, SettingsLayer,
+    CliLayer, CliOutputLayer, EnvironmentLayer, MergeMap, ResolveErrors, RunLayer, SettingsLayer,
     WorkflowSettingsBuilder, parse_input_overrides, parse_labels, project,
 };
 use fabro_graphviz::graph::{Graph, is_llm_handler_type};
@@ -72,11 +72,44 @@ pub(crate) fn manifest_run_defaults(run: Option<&RunLayer>) -> RunLayer {
     run.cloned().unwrap_or_default()
 }
 
+/// Client-side structural validation must preserve unresolved server-owned
+/// catalogs in the manifest, without judging their availability locally.
+pub(crate) fn prepare_manifest_for_client(
+    manifest_run_defaults: &RunLayer,
+    manifest: &types::RunManifest,
+) -> Result<PreparedManifest> {
+    prepare_manifest_with_resolver(
+        manifest_run_defaults,
+        &fabro_environment::seeded_catalog_layer(),
+        &HashMap::new(),
+        manifest,
+        WorkflowSettingsBuilder::build_manifest_metadata,
+    )
+}
+
 pub(crate) fn prepare_manifest_with_environment_defaults(
     manifest_run_defaults: &RunLayer,
     manifest_environment_defaults: &MergeMap<EnvironmentLayer>,
     manifest_mcp_server_catalog: &HashMap<String, McpServerSettings>,
     manifest: &types::RunManifest,
+) -> Result<PreparedManifest> {
+    prepare_manifest_with_resolver(
+        manifest_run_defaults,
+        manifest_environment_defaults,
+        manifest_mcp_server_catalog,
+        manifest,
+        WorkflowSettingsBuilder::build,
+    )
+}
+
+fn prepare_manifest_with_resolver(
+    manifest_run_defaults: &RunLayer,
+    manifest_environment_defaults: &MergeMap<EnvironmentLayer>,
+    manifest_mcp_server_catalog: &HashMap<String, McpServerSettings>,
+    manifest: &types::RunManifest,
+    build_settings: fn(
+        WorkflowSettingsBuilder,
+    ) -> std::result::Result<WorkflowSettings, ResolveErrors>,
 ) -> Result<PreparedManifest> {
     if manifest.version != 1 {
         bail!("unsupported manifest version {}", manifest.version);
@@ -140,9 +173,8 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
             workflow_settings_builder = workflow_settings_builder.user_toml(source)?;
         }
     }
-    let mut settings = workflow_settings_builder
-        .build()
-        .context("failed to resolve manifest settings")?;
+    let mut settings =
+        build_settings(workflow_settings_builder).context("failed to resolve manifest settings")?;
     settings.run.inputs.extend(args_overrides.input_overrides);
     if let Some(goal) = manifest
         .goal

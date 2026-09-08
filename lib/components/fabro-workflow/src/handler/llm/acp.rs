@@ -14,6 +14,8 @@ use fabro_agent::{
     AgentEvent, RefreshOutcome, Sandbox, StaticEnvProvider, SteeringItem, ToolEnvProvider,
 };
 use fabro_graphviz::graph::Node;
+use fabro_mcp::config::McpServerSettings;
+use fabro_mcp::sandbox::ManagedMcpServers;
 use fabro_model::{ModelRef, ProviderId, TokenCounts, UsdMicros};
 use fabro_static::EnvVars;
 use fabro_types::{
@@ -28,14 +30,14 @@ use tokio_util::sync::CancellationToken;
 use super::super::agent::{CodergenBackend, CodergenResult, CodergenRunRequest, OneShotRequest};
 use super::acp_tools::{AcpObservedTool, AcpToolInventory};
 use super::activation_lease::{ActivationLease, ActivationLeaseOptions};
+use super::changed_files;
 use super::skills_injection::{
     SkillTarget, materialize_skills_at, resolve_sandbox_home, skill_target_base,
 };
-use super::changed_files;
 use crate::error::Error;
-use crate::outcome::{BilledModelUsage, reported_model_usage};
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::handler::NodeTimeoutPolicy;
+use crate::outcome::{BilledModelUsage, reported_model_usage};
 use crate::steering_hub::{ActiveControlHandle, SteeringHub};
 
 /// Default refresh-ahead interval — comfortably under the ~60-min GitHub App
@@ -176,6 +178,7 @@ async fn refresh_ahead_loop(
 
 pub struct AgentAcpBackend {
     tool_env:                     Option<Arc<dyn ToolEnvProvider>>,
+    mcp_servers:                  Vec<McpServerSettings>,
     github_token_refresh_managed: bool,
     steering_hub:                 Option<Arc<SteeringHub>>,
     profile_override:             Option<AcpProcessSpec>,
@@ -193,6 +196,7 @@ impl AgentAcpBackend {
     pub fn new() -> Self {
         Self {
             tool_env:                     None,
+            mcp_servers:                  Vec::new(),
             github_token_refresh_managed: false,
             steering_hub:                 None,
             profile_override:             None,
@@ -204,6 +208,12 @@ impl AgentAcpBackend {
     #[must_use]
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
         self.tool_env = Some(Arc::new(StaticEnvProvider(env)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_mcp_servers(mut self, servers: Vec<McpServerSettings>) -> Self {
+        self.mcp_servers = servers;
         self
     }
 
@@ -302,10 +312,7 @@ impl AgentAcpBackend {
             if !materialized.is_empty() {
                 if matches!(target, SkillTarget::AcpGeneric) {
                     let mut env = process_spec.env().clone();
-                    env.insert(
-                        "FABRO_ACP_SKILLS".to_string(),
-                        materialized.join(","),
-                    );
+                    env.insert("FABRO_ACP_SKILLS".to_string(), materialized.join(","));
                     process_spec = process_spec.clone().with_env(env);
                 }
                 emitter.emit_scoped(
@@ -462,12 +469,23 @@ impl AgentAcpBackend {
 
         let files_before = changed_files::detect_changed_files(sandbox).await;
         let launch_start = std::time::Instant::now();
-        let result = match fabro_acp::run_acp_turn(AcpRunRequest {
+        let mut managed_mcp =
+            ManagedMcpServers::start(&self.mcp_servers, Arc::clone(sandbox), &cancel_token, true)
+                .await
+                .map_err(|error| {
+                    if cancel_token.is_cancelled() {
+                        Error::Cancelled
+                    } else {
+                        Error::handler(format!("ACP MCP startup failed: {error}"))
+                    }
+                })?;
+        let outcome = fabro_acp::run_acp_turn(AcpRunRequest {
             command: process_spec,
             prompt,
             cwd: sandbox.working_directory().to_string(),
             timeout_ms: node.timeout().map(crate::millis_u64),
             env: launch_env,
+            mcp_servers: managed_mcp.servers().to_vec(),
             sandbox: Arc::clone(sandbox),
             cancel_token: cancel_token.child_token(),
             on_activity: Some(on_activity),
@@ -484,8 +502,9 @@ impl AgentAcpBackend {
                 on_steer_prompt,
             }),
         })
-        .await
-        {
+        .await;
+        managed_mcp.shutdown().await;
+        let result = match outcome {
             Ok(result) => {
                 emitter.emit_scoped(
                     &Event::AgentAcpCompleted {
@@ -500,9 +519,7 @@ impl AgentAcpBackend {
                 // codex-acp (and peers) exit 0 after in-band protocol errors;
                 // without this guard the run falsely reports success.
                 if let Some(excerpt) = in_band_error_excerpt(&result.text) {
-                    return Err(acp_error_to_workflow(AcpError::InBandError {
-                        excerpt,
-                    }));
+                    return Err(acp_error_to_workflow(AcpError::InBandError { excerpt }));
                 }
                 result
             }
@@ -567,11 +584,9 @@ impl AgentAcpBackend {
 
         Ok(CodergenResult::Text {
             text: result.text,
-            usage: result
-                .usage
-                .and_then(|usage| {
-                    billed_acp_usage(harness.as_deref(), billing_model.as_deref(), usage)
-                }),
+            usage: result.usage.and_then(|usage| {
+                billed_acp_usage(harness.as_deref(), billing_model.as_deref(), usage)
+            }),
             files_touched,
             last_file_touched,
             timing: StageTiming::active_only(result.duration_ms, 0),
@@ -724,7 +739,7 @@ fn billed_acp_usage(
     let model = ModelRef {
         provider: ProviderId::new(harness.unwrap_or("acp")),
         model_id: model.or(harness).unwrap_or("external").into(),
-        speed: None,
+        speed:    None,
     };
 
     Some(reported_model_usage(model, tokens, reported_cost))
@@ -735,10 +750,7 @@ fn saturating_token_count(value: u64) -> i64 {
 }
 
 fn valid_reported_usd_cost(cost: AcpReportedCost) -> Option<UsdMicros> {
-    if cost.currency.eq_ignore_ascii_case("USD")
-        && cost.amount.is_finite()
-        && cost.amount >= 0.0
-    {
+    if cost.currency.eq_ignore_ascii_case("USD") && cost.amount.is_finite() && cost.amount >= 0.0 {
         return Some(UsdMicros::from_usd(cost.amount));
     }
 
@@ -825,7 +837,11 @@ fn harness_profile_spec(
         harness,
         profile.command.clone(),
         profile.args.clone(),
-        profile.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        profile
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     ))
 }
 
@@ -849,10 +865,7 @@ fn apply_harness_env_overrides(
         env.insert("FABRO_ACP_MODEL".to_string(), model.to_string());
     }
     if let Some(effort) = effort {
-        env.insert(
-            "FABRO_ACP_REASONING_EFFORT".to_string(),
-            effort.to_string(),
-        );
+        env.insert("FABRO_ACP_REASONING_EFFORT".to_string(), effort.to_string());
     }
     let Some(harness) = harness else {
         return spec.clone().with_env(env);
@@ -887,7 +900,9 @@ fn merged_codex_config(
     effort: Option<&str>,
 ) -> String {
     let mut object = existing
-        .and_then(|raw| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw).ok())
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw).ok()
+        })
         .unwrap_or_default();
     if let Some(model) = model {
         object.insert(
@@ -966,9 +981,7 @@ fn session_activity_callback(
                     Ok(inventory) => inventory,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                inventory
-                    .observe(observed)
-                    .then(|| inventory.snapshot())
+                inventory.observe(observed).then(|| inventory.snapshot())
             };
             if let Some(tools) = snapshot {
                 emit_tools_snapshot(&emitter, &stage_scope, &node_id, &session_id, tools);
@@ -1096,7 +1109,6 @@ fn acp_error_to_workflow(error: AcpError) -> Error {
     }
 }
 
-
 /// Detect an in-band ACP error in the agent's final output and return a short
 /// excerpt for the handler error. Matched on the raw `"type":"error"` marker
 /// (whitespace-tolerant), mirroring the external driver's proven stdout grep.
@@ -1131,8 +1143,8 @@ mod tests {
 
     use fabro_acp::test_support::fake_acp_agent_script;
     use fabro_acp::{
-        AcpError, AcpProcessExit, AcpProcessSpec, AcpReportedCost, AcpRunUsage,
-        AcpSessionActivity, AcpToolKind,
+        AcpError, AcpProcessExit, AcpProcessSpec, AcpReportedCost, AcpRunUsage, AcpSessionActivity,
+        AcpToolKind,
     };
     use fabro_agent::{LocalSandbox, RefreshOutcome, Sandbox, shell_quote};
     use fabro_graphviz::graph::{AttrValue, Node};
@@ -1234,7 +1246,7 @@ mod tests {
                 Some("omp"),
                 Some("deepseek"),
                 exact_acp_usage(Some(AcpReportedCost {
-                    amount: 0.0123,
+                    amount:   0.0123,
                     currency: currency.to_string(),
                 })),
             )
@@ -1272,19 +1284,15 @@ mod tests {
 
     #[test]
     fn acp_usage_saturates_tokens_and_large_usd_cost() {
-        let billed = billed_acp_usage(
-            None,
-            None,
-            AcpRunUsage {
-                input_tokens: u64::MAX,
-                output_tokens: 1,
-                reported_cost: Some(AcpReportedCost {
-                    amount:   f64::MAX,
-                    currency: "USD".to_string(),
-                }),
-                ..AcpRunUsage::default()
-            },
-        )
+        let billed = billed_acp_usage(None, None, AcpRunUsage {
+            input_tokens: u64::MAX,
+            output_tokens: 1,
+            reported_cost: Some(AcpReportedCost {
+                amount:   f64::MAX,
+                currency: "USD".to_string(),
+            }),
+            ..AcpRunUsage::default()
+        })
         .unwrap();
 
         assert_eq!(billed.model().provider.as_str(), "acp");
@@ -1355,10 +1363,10 @@ mod tests {
     fn tool_started(id: &str, title: &str, kind: AcpToolKind) -> AcpSessionActivity {
         AcpSessionActivity::ToolStarted {
             tool_call_id: id.into(),
-            tool_name:    title.into(),
-            title:        title.into(),
+            tool_name: title.into(),
+            title: title.into(),
             kind,
-            raw_input:    serde_json::json!({}),
+            raw_input: serde_json::json!({}),
         }
     }
 
@@ -1367,10 +1375,7 @@ mod tests {
         let (_emitter, event_rx, callback) = callback_harness("omp");
         let initial = next_tools_snapshot(&event_rx);
         assert_eq!(initial.tools.len(), 23);
-        assert_eq!(
-            initial.tools.iter().filter(|tool| tool.invoked).count(),
-            0
-        );
+        assert_eq!(initial.tools.iter().filter(|tool| tool.invoked).count(), 0);
 
         callback(AcpSessionActivity::ToolStarted {
             tool_call_id: "read-1".into(),
@@ -1394,16 +1399,8 @@ mod tests {
     #[test]
     fn codex_acp_tools_group_argument_specific_titles() {
         let (_emitter, event_rx, callback) = callback_harness("codex");
-        callback(tool_started(
-            "r1",
-            "Read file '/a.rs'",
-            AcpToolKind::Read,
-        ));
-        callback(tool_started(
-            "r2",
-            "Read file '/b.rs'",
-            AcpToolKind::Read,
-        ));
+        callback(tool_started("r1", "Read file '/a.rs'", AcpToolKind::Read));
+        callback(tool_started("r2", "Read file '/b.rs'", AcpToolKind::Read));
         let snapshots = event_rx
             .try_iter()
             .filter_map(to_tools_props)
@@ -1421,6 +1418,121 @@ mod tests {
         assert_eq!(
             sandbox.refresh_push_credentials().await.unwrap(),
             RefreshOutcome::Skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_backend_delivers_and_cleans_up_managed_mcp_servers() {
+        use fabro_mcp::config::{McpHttpProtocol, McpServerSettings, McpTransport};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        init_git(tempdir.path());
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        let session_path = tempdir.path().join("session.json");
+        let mcp_script = tempdir.path().join("mcp_server.py");
+        let mcp_pid = tempdir.path().join("mcp.pid");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        tokio::fs::write(
+            &mcp_script,
+            r#"
+import http.server
+import os
+import sys
+with open(os.environ["MCP_PID_FILE"], "w") as record:
+    record.write(str(os.getpid()))
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+        let backend = AgentAcpBackend::new()
+            .with_profile_override(
+                AcpProcessSpec::from_command_attr(&format!(
+                    "python3 {}",
+                    shell_quote(&script_path.to_string_lossy())
+                ))
+                .unwrap(),
+            )
+            .with_mcp_servers(vec![McpServerSettings {
+                name: "debugger".to_string(),
+                transport: McpTransport::Sandbox {
+                    protocol: McpHttpProtocol::StreamableHttp,
+                    command: vec![
+                        "python3".to_string(),
+                        mcp_script.to_string_lossy().into_owned(),
+                        port.to_string(),
+                    ],
+                    port,
+                    env: HashMap::from([(
+                        "MCP_PID_FILE".to_string(),
+                        mcp_pid.to_string_lossy().into_owned(),
+                    )]),
+                },
+                ..McpServerSettings::default()
+            }])
+            .with_env(HashMap::from([
+                (
+                    "ACP_MCP_CAPABILITIES".to_string(),
+                    r#"{"http":true}"#.to_string(),
+                ),
+                (
+                    "ACP_SESSION_NEW_PARAMS".to_string(),
+                    session_path.to_string_lossy().into_owned(),
+                ),
+            ]));
+        let node = Node::new("work");
+        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+        let emitter = Arc::new(Emitter::default());
+        let context = Context::new();
+        let result = backend
+            .run(CodergenRunRequest {
+                node:               &node,
+                prompt:             "hello",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result, CodergenResult::Text { text, .. } if text == "hello from acp"));
+        let params: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(session_path).await.unwrap()).unwrap();
+        let server = &params["mcpServers"][0];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["name"], "debugger");
+        assert_eq!(server["url"], format!("http://127.0.0.1:{port}/mcp"));
+        assert!(server["headers"].as_array().unwrap().iter().any(|header| {
+            header["name"] == "Authorization"
+                && header["value"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("Bearer "))
+        }));
+        let pid = tokio::fs::read_to_string(mcp_pid).await.unwrap();
+        let status = tokio::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            !status.success(),
+            "managed MCP process must be gone when the ACP turn returns"
         );
     }
 
@@ -1443,10 +1555,8 @@ mod tests {
                 shell_quote(&script_path.to_string_lossy())
             )),
         );
-        node.attrs.insert(
-            "harness".to_string(),
-            AttrValue::String("omp".to_string()),
-        );
+        node.attrs
+            .insert("harness".to_string(), AttrValue::String("omp".to_string()));
         node.attrs.insert(
             "model".to_string(),
             AttrValue::String("deepseek".to_string()),
@@ -1547,8 +1657,7 @@ mod tests {
             .unwrap();
 
         let CodergenResult::Text {
-            usage: Some(usage),
-            ..
+            usage: Some(usage), ..
         } = result
         else {
             panic!("expected billed text result");
@@ -2065,7 +2174,7 @@ mod tests {
                 args:    vec![],
                 env:     std::collections::BTreeMap::new(),
             }),
-            omp: None,
+            omp:   None,
         }
     }
 
@@ -2074,11 +2183,12 @@ mod tests {
         let mut node = Node::new("build");
         node.attrs
             .insert("backend".to_string(), AttrValue::String("acp".to_string()));
-        node.attrs
-            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "harness".to_string(),
+            AttrValue::String("codex".to_string()),
+        );
 
-        let spec =
-            super::resolve_acp_process_spec(&node, &codex_profiles(), None).unwrap();
+        let spec = super::resolve_acp_process_spec(&node, &codex_profiles(), None).unwrap();
         assert_eq!(spec.program().to_str(), Some("codex-acp-wrapper"));
         assert_eq!(spec.name(), Some("codex"));
     }
@@ -2088,8 +2198,10 @@ mod tests {
         let mut node = Node::new("build");
         node.attrs
             .insert("backend".to_string(), AttrValue::String("acp".to_string()));
-        node.attrs
-            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "harness".to_string(),
+            AttrValue::String("codex".to_string()),
+        );
 
         let error = super::resolve_acp_process_spec(
             &node,
@@ -2098,9 +2210,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("[server.external_agents.codex]"),
+            error.to_string().contains("[server.external_agents.codex]"),
             "error should name the missing profile: {error}"
         );
     }
@@ -2110,15 +2220,16 @@ mod tests {
         let mut node = Node::new("build");
         node.attrs
             .insert("backend".to_string(), AttrValue::String("acp".to_string()));
-        node.attrs
-            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "harness".to_string(),
+            AttrValue::String("codex".to_string()),
+        );
         node.attrs.insert(
             "acp.command".to_string(),
             AttrValue::String("python3 agent.py".to_string()),
         );
 
-        let spec =
-            super::resolve_acp_process_spec(&node, &codex_profiles(), None).unwrap();
+        let spec = super::resolve_acp_process_spec(&node, &codex_profiles(), None).unwrap();
         assert_eq!(spec.program().to_str(), Some("python3"));
     }
 
@@ -2138,14 +2249,8 @@ mod tests {
         assert!(value.get("model_reasoning_effort").is_none());
     }
 
-    async fn run_env_echo_turn(
-        node: &Node,
-        env_record: &std::path::Path,
-        record_keys: &str,
-    ) {
-        let tempdir = env_record
-            .parent()
-            .unwrap();
+    async fn run_env_echo_turn(node: &Node, env_record: &std::path::Path, record_keys: &str) {
+        let tempdir = env_record.parent().unwrap();
         init_git(tempdir);
         let script_path = tempdir.join("fake_acp_agent.py");
         tokio::fs::write(&script_path, fake_acp_agent_script())
@@ -2153,7 +2258,10 @@ mod tests {
             .unwrap();
 
         let backend = AgentAcpBackend::new().with_env(HashMap::from([
-            ("ACP_ENV_RECORD".to_string(), env_record.to_string_lossy().into_owned()),
+            (
+                "ACP_ENV_RECORD".to_string(),
+                env_record.to_string_lossy().into_owned(),
+            ),
             ("ACP_ENV_RECORD_KEYS".to_string(), record_keys.to_string()),
         ]));
         let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.to_path_buf()));
@@ -2163,12 +2271,12 @@ mod tests {
             .run(CodergenRunRequest {
                 node,
                 prompt: "echo env",
-                context:            &context,
-                thread_id:          None,
-                emitter:            &emitter,
-                sandbox:            &sandbox,
-                tool_hooks:         None,
-                cancel_token:       CancellationToken::new(),
+                context: &context,
+                thread_id: None,
+                emitter: &emitter,
+                sandbox: &sandbox,
+                tool_hooks: None,
+                cancel_token: CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
             })
             .await
@@ -2190,8 +2298,10 @@ mod tests {
         let mut node = Node::new("build");
         node.attrs
             .insert("backend".to_string(), AttrValue::String("acp".to_string()));
-        node.attrs
-            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "harness".to_string(),
+            AttrValue::String("codex".to_string()),
+        );
         node.attrs.insert(
             "acp.command".to_string(),
             AttrValue::String(format!(
@@ -2246,8 +2356,10 @@ mod tests {
         let mut node = Node::new("build");
         node.attrs
             .insert("backend".to_string(), AttrValue::String("acp".to_string()));
-        node.attrs
-            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "harness".to_string(),
+            AttrValue::String("codex".to_string()),
+        );
         node.attrs.insert(
             "acp.config".to_string(),
             AttrValue::String(config.to_string()),

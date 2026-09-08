@@ -143,6 +143,10 @@ describe("MCP server form helpers", () => {
     expect(isMcpServerFormValid(values({ transport: "http", url: "" }), { isEdit: false }))
       .toBe(false);
     expect(isMcpServerFormValid(values({ transport: "sandbox", port: 0 }), { isEdit: false }))
+      .toBe(true);
+    expect(isMcpServerFormValid(values({ transport: "sandbox", port: -1 }), { isEdit: false }))
+      .toBe(false);
+    expect(isMcpServerFormValid(values({ transport: "sandbox", port: 65536 }), { isEdit: false }))
       .toBe(false);
     expect(isMcpServerFormValid(values({ transport: "sandbox", port: 65535 }), { isEdit: false }))
       .toBe(true);

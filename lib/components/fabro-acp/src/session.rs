@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{
-    CancelNotification, ContentBlock, ContentChunk, Cost, InitializeRequest, PermissionOptionKind,
-    PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
+    CancelNotification, ContentBlock, ContentChunk, Cost, EnvVariable, HttpHeader,
+    InitializeRequest, McpServer, McpServerHttp, McpServerSse, McpServerStdio, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus,
     ToolCallUpdate, ToolKind, Usage,
@@ -12,12 +13,14 @@ use agent_client_protocol::schema::{
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{ActiveSession, Agent, Client, Error as ProtocolError, SessionMessage};
 use fabro_sandbox::Sandbox;
+use fabro_types::settings::run::{McpHttpProtocol, McpServerSettings, McpTransport};
 use fabro_types::{Principal, SteeringMessage};
 use fabro_util::time::elapsed_ms;
-use tokio::sync::{Notify, oneshot};
 use tokio::sync::futures::Notified;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
 
 use crate::command::AcpProcessSpec;
 use crate::error::AcpError;
@@ -122,18 +125,9 @@ impl AcpUsageAccumulator {
             );
         }
 
-        self.usage.input_tokens = self
-            .usage
-            .input_tokens
-            .saturating_add(usage.input_tokens);
-        self.usage.output_tokens = self
-            .usage
-            .output_tokens
-            .saturating_add(usage.output_tokens);
-        self.usage.reasoning_tokens = self
-            .usage
-            .reasoning_tokens
-            .saturating_add(reasoning_tokens);
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
+        self.usage.reasoning_tokens = self.usage.reasoning_tokens.saturating_add(reasoning_tokens);
         self.usage.cache_read_tokens = self
             .usage
             .cache_read_tokens
@@ -309,9 +303,11 @@ fn convert_tool_call_update(
 }
 
 const CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
-// Drain buffered notifications first, but recheck a ready prompt response after a bounded batch.
+// Drain buffered notifications first, but recheck a ready prompt response after
+// a bounded batch.
 const MAX_SESSION_UPDATES_BEFORE_PROMPT_CHECK: usize = 64;
-// Quiescence ends normal drains; this deadline bounds agents that stream after responding.
+// Quiescence ends normal drains; this deadline bounds agents that stream after
+// responding.
 const POST_RESPONSE_DRAIN_LIMIT: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
@@ -452,6 +448,8 @@ pub struct AcpRunRequest {
     pub cwd:                 String,
     pub timeout_ms:          Option<u64>,
     pub env:                 HashMap<String, String>,
+    /// Resolved transports only; sandbox processes are owned by the caller.
+    pub mcp_servers:         Vec<McpServerSettings>,
     pub sandbox:             Arc<dyn Sandbox>,
     pub cancel_token:        CancellationToken,
     pub on_activity:         Option<Arc<dyn Fn() + Send + Sync>>,
@@ -476,11 +474,13 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         timeout_ms,
         env,
         sandbox,
+        mcp_servers,
         cancel_token,
         on_activity,
         on_session_activity,
         live_control,
     } = request;
+    let mcp_servers = acp_mcp_servers(mcp_servers)?;
     let live_control = live_control.unwrap_or_default();
     let start = std::time::Instant::now();
     let state = TransportState::new();
@@ -504,11 +504,25 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+            let initialized = cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
+            let capabilities = initialized.agent_capabilities.mcp_capabilities;
+            for server in &mcp_servers {
+                let unsupported = match server {
+                    McpServer::Http(server) if !capabilities.http => Some((&server.name, "HTTP")),
+                    McpServer::Sse(server) if !capabilities.sse => Some((&server.name, "SSE")),
+                    _ => None,
+                };
+                if let Some((name, transport)) = unsupported {
+                    return Err(ProtocolError::new(
+                        -32602,
+                        format!("ACP agent does not support MCP {transport} transport required by server {name:?}"),
+                    ));
+                }
+            }
 
-            cx.build_session(&cwd)
+            cx.build_session_from(NewSessionRequest::new(&cwd).mcp_servers(mcp_servers))
                 .block_task()
                 .run_until(async |mut session| {
                     let prompt_response = send_prompt_with_response(&session, prompt)?;
@@ -526,6 +540,9 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                 })
                 .await
         });
+    // The ACP library traces raw JSON-RPC payloads, including MCP auth headers.
+    // Keep that transport trace disabled independently of the host log filter.
+    let run = run.with_subscriber(tracing::subscriber::NoSubscriber::default());
 
     let cancel_deadline_token = cancel_token.clone();
     let run_outcome = async {
@@ -600,6 +617,60 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     })
 }
 
+fn acp_mcp_servers(servers: Vec<McpServerSettings>) -> Result<Vec<McpServer>, AcpError> {
+    servers.into_iter().map(|server| {
+        let invalid = |reason: &str| AcpError::Protocol(ProtocolError::new(
+            -32602, format!("MCP server {:?}: {reason}", server.name),
+        ));
+        if server.name.trim().is_empty() {
+            return Err(invalid("empty name"));
+        }
+        match server.transport {
+            McpTransport::Stdio { command, env } => {
+                let Some((executable, args)) = command.split_first() else {
+                    return Err(invalid("empty command"));
+                };
+                if executable.trim().is_empty() || command.iter().any(|part| part.contains('\0')) {
+                    return Err(invalid("empty command or invalid command argument"));
+                }
+                if env.iter().any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0')) {
+                    return Err(invalid("invalid environment variable"));
+                }
+                if server.current_dir.is_some() || server.clear_env {
+                    return Err(invalid("ACP stdio cannot represent current_dir or clear_env; use a sandbox MCP transport"));
+                }
+                Ok(McpServer::Stdio(
+                    McpServerStdio::new(server.name, executable)
+                        .args(args.to_vec())
+                        .env(env.into_iter().map(|(name, value)| EnvVariable::new(name, value)).collect()),
+                ))
+            }
+            McpTransport::Http { protocol, url, headers } => {
+                let parsed = url::Url::parse(&url).map_err(|_| invalid("invalid HTTP URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                    return Err(invalid("HTTP URL must use http or https and include a host"));
+                }
+                if headers.iter().any(|(name, value)| {
+                    http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+                        || http::header::HeaderValue::from_str(value).is_err()
+                }) {
+                    return Err(invalid("invalid HTTP header"));
+                }
+                let headers = headers.into_iter().map(|(name, value)| HttpHeader::new(name, value)).collect();
+                Ok(match protocol {
+                    McpHttpProtocol::StreamableHttp => McpServer::Http(
+                        McpServerHttp::new(server.name, url).headers(headers),
+                    ),
+                    McpHttpProtocol::Sse => McpServer::Sse(
+                        McpServerSse::new(server.name, url).headers(headers),
+                    ),
+                })
+            }
+            McpTransport::Sandbox { .. } => Err(invalid("sandbox transport must be started before the ACP turn")),
+        }
+    }).collect()
+}
+
 fn map_protocol_error(error: ProtocolError) -> AcpError {
     AcpError::Protocol(error)
 }
@@ -649,9 +720,7 @@ fn send_prompt_with_response(
 
 enum LiveSessionEvent {
     SessionMessage(Result<SessionMessage, ProtocolError>),
-    PromptResponse(
-        Result<Result<PromptResponse, ProtocolError>, oneshot::error::RecvError>,
-    ),
+    PromptResponse(Result<Result<PromptResponse, ProtocolError>, oneshot::error::RecvError>),
     ControlNotified,
     CancelRequested,
     CancelGraceElapsed,
@@ -857,8 +926,7 @@ async fn read_live_session(
                 }
                 prompt_response = None;
                 pending_prompt_response = Some(response);
-                post_response_drain_deadline =
-                    Some(Instant::now() + POST_RESPONSE_DRAIN_LIMIT);
+                post_response_drain_deadline = Some(Instant::now() + POST_RESPONSE_DRAIN_LIMIT);
                 session_updates_since_prompt_check = 0;
             }
             LiveSessionEvent::PostResponseDrainComplete => {
@@ -936,8 +1004,8 @@ mod tests {
                 }
             }
         });
-        let notification =
-            serde_json::from_value::<SessionNotification>(notification).expect("valid usage update");
+        let notification = serde_json::from_value::<SessionNotification>(notification)
+            .expect("valid usage update");
 
         assert_eq!(
             convert_session_update(&notification.update, &mut HashMap::new()),
@@ -945,7 +1013,7 @@ mod tests {
                 used: 26128,
                 size: 258_400,
                 cost: Some(AcpReportedCost {
-                    amount: 0.0123,
+                    amount:   0.0123,
                     currency: "USD".to_string(),
                 }),
             }]
@@ -962,7 +1030,7 @@ mod tests {
                 .cached_write_tokens(5),
         );
         accumulator.record_reported_cost(Some(AcpReportedCost {
-            amount: 0.01,
+            amount:   0.01,
             currency: "USD".to_string(),
         }));
         accumulator.add_prompt_usage(
@@ -972,7 +1040,7 @@ mod tests {
                 .cached_write_tokens(50),
         );
         accumulator.record_reported_cost(Some(AcpReportedCost {
-            amount: 0.02,
+            amount:   0.02,
             currency: "USD".to_string(),
         }));
         accumulator.record_reported_cost(None);
@@ -980,14 +1048,14 @@ mod tests {
         assert_eq!(
             accumulator.finish(),
             Some(AcpRunUsage {
-                input_tokens: 110,
-                output_tokens: 220,
-                reasoning_tokens: 33,
-                cache_read_tokens: 44,
+                input_tokens:       110,
+                output_tokens:      220,
+                reasoning_tokens:   33,
+                cache_read_tokens:  44,
                 cache_write_tokens: 55,
-                total_tokens: 462,
-                reported_cost: Some(AcpReportedCost {
-                    amount: 0.02,
+                total_tokens:       462,
+                reported_cost:      Some(AcpReportedCost {
+                    amount:   0.02,
                     currency: "USD".to_string(),
                 }),
             })
@@ -998,21 +1066,21 @@ mod tests {
     fn usage_accumulator_retains_latest_valid_cost_after_invalid_updates() {
         let mut accumulator = AcpUsageAccumulator::default();
         accumulator.record_reported_cost(Some(AcpReportedCost {
-            amount: 0.02,
+            amount:   0.02,
             currency: "Usd".to_string(),
         }));
 
         for cost in [
             AcpReportedCost {
-                amount: -1.0,
+                amount:   -1.0,
                 currency: "USD".to_string(),
             },
             AcpReportedCost {
-                amount: f64::NAN,
+                amount:   f64::NAN,
                 currency: "usd".to_string(),
             },
             AcpReportedCost {
-                amount: 1.0,
+                amount:   1.0,
                 currency: "EUR".to_string(),
             },
         ] {
@@ -1023,7 +1091,7 @@ mod tests {
         assert_eq!(
             accumulator.finish().unwrap().reported_cost,
             Some(AcpReportedCost {
-                amount: 0.02,
+                amount:   0.02,
                 currency: "Usd".to_string(),
             })
         );
@@ -1044,13 +1112,10 @@ mod tests {
         );
 
         let events = convert_session_update(&started, &mut tracked);
-        assert!(matches!(
-            &events[0],
-            AcpSessionActivity::ToolStarted {
-                kind: AcpToolKind::Read,
-                ..
-            }
-        ));
+        assert!(matches!(&events[0], AcpSessionActivity::ToolStarted {
+            kind: AcpToolKind::Read,
+            ..
+        }));
     }
 
     #[test]

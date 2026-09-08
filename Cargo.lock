@@ -2263,6 +2263,7 @@ dependencies = [
  "fabro-types",
  "fabro-util",
  "futures",
+ "http 1.4.0",
  "serde_json",
  "shlex",
  "tempfile",
@@ -2270,6 +2271,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -2838,7 +2841,9 @@ dependencies = [
  "axum",
  "fabro-config",
  "fabro-http",
+ "fabro-sandbox",
  "fabro-types",
+ "fabro-util",
  "futures",
  "rmcp",
  "serde",
@@ -2847,7 +2852,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
