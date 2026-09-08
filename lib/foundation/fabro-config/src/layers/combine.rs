@@ -22,9 +22,8 @@ use super::run::{
     RunPrepareLayer, ScmGitHubLayer, StringOrSplice,
 };
 use super::server::{
-    BugsinkProjectLayer,
-    ObjectStoreLocalLayer, ObjectStoreS3Layer, ServerApiLayer, ServerAuthGithubLayer,
-    ServerListenLayer,
+    BugsinkProjectLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer, ServerApiLayer,
+    ServerAuthGithubLayer, ServerListenLayer,
 };
 
 /// Internal merge trait used by sparse config layers inside `fabro-config`.

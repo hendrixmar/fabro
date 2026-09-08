@@ -45,12 +45,12 @@ pub use run::{
     RunNamespace, RunPrepareSettings, RunScmSettings, ScmGitHubSettings, TlsMode,
 };
 pub use server::{
-    BugsinkIntegrationSettings, BugsinkProjectSettings,
-    GithubIntegrationSettings, IntegrationWebhooksSettings, LogDestination, ObjectStoreSettings,
-    PlaneIntegrationSettings, ServerApiSettings, ServerArtifactsSettings, ServerAuthGithubSettings,
-    ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings, ServerListenSettings,
-    ServerLoggingSettings, ServerNamespace, ServerSchedulerSettings, ServerSlateDbSettings,
-    ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
+    BugsinkIntegrationSettings, BugsinkProjectSettings, GithubIntegrationSettings,
+    IntegrationWebhooksSettings, LogDestination, ObjectStoreSettings, PlaneIntegrationSettings,
+    ServerApiSettings, ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod,
+    ServerAuthSettings, ServerIntegrationsSettings, ServerListenSettings, ServerLoggingSettings,
+    ServerNamespace, ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings,
+    ServerWebSettings, SlackIntegrationSettings,
 };
 pub use size::{ParseSizeError, Size};
 pub use workflow::WorkflowNamespace;

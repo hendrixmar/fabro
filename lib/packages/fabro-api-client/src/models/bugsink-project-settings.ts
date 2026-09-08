@@ -14,13 +14,11 @@
 
 
 
-/**
- * Git reference summary for a pull request.
- */
-export interface PullRequestRef {
-    'ref': string;
+export interface BugsinkProjectSettings {
+    'project_id': number;
+    'automation_id': string;
     /**
-     * Exact Git revision when supplied by the provider; absent revisions are not verified.
+     * Vault entry name for this project\'s webhook signing key, never its value.
      */
-    'sha'?: string;
+    'signing_secret': string;
 }

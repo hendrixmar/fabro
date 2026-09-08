@@ -206,11 +206,11 @@ pub struct ServerLoggingLayer {
 #[serde(deny_unknown_fields)]
 pub struct ServerIntegrationsLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github: Option<GithubIntegrationLayer>,
+    pub github:  Option<GithubIntegrationLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slack:  Option<SlackIntegrationLayer>,
+    pub slack:   Option<SlackIntegrationLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plane:  Option<PlaneIntegrationLayer>,
+    pub plane:   Option<PlaneIntegrationLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bugsink: Option<BugsinkIntegrationLayer>,
 }
@@ -256,29 +256,30 @@ pub struct PlaneIntegrationLayer {
     pub workspace: Option<String>,
 }
 
-/// `[server.integrations.bugsink]` — native, project-authenticated incident intake.
+/// `[server.integrations.bugsink]` — native, project-authenticated incident
+/// intake.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
 #[serde(deny_unknown_fields)]
 pub struct BugsinkIntegrationLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
+    pub enabled:          Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
+    pub origin:           Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projects: Option<Vec<BugsinkProjectLayer>>,
+    pub projects:         Option<Vec<BugsinkProjectLayer>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
 #[serde(deny_unknown_fields)]
 pub struct BugsinkProjectLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<u64>,
+    pub project_id:     Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub automation_id: Option<String>,
+    pub automation_id:  Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_secret: Option<String>,
 }

@@ -15,7 +15,13 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
+import type { BugsinkIntegrationSettings } from './bugsink-integration-settings';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { GithubIntegrationSettings } from './github-integration-settings';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { PlaneIntegrationSettings } from './plane-integration-settings';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { SlackIntegrationSettings } from './slack-integration-settings';
@@ -23,4 +29,6 @@ import type { SlackIntegrationSettings } from './slack-integration-settings';
 export interface ServerIntegrationsSettings {
     'github': GithubIntegrationSettings;
     'slack': SlackIntegrationSettings;
+    'plane': PlaneIntegrationSettings;
+    'bugsink': BugsinkIntegrationSettings;
 }

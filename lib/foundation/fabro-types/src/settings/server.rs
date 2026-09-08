@@ -243,10 +243,10 @@ pub struct ServerLoggingSettings {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerIntegrationsSettings {
-    pub github: GithubIntegrationSettings,
-    pub slack:  SlackIntegrationSettings,
+    pub github:  GithubIntegrationSettings,
+    pub slack:   SlackIntegrationSettings,
     #[serde(default)]
-    pub plane:  PlaneIntegrationSettings,
+    pub plane:   PlaneIntegrationSettings,
     #[serde(default)]
     pub bugsink: BugsinkIntegrationSettings,
 }
@@ -287,20 +287,20 @@ pub struct PlaneIntegrationSettings {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BugsinkIntegrationSettings {
     #[serde(default)]
-    pub enabled: bool,
+    pub enabled:          bool,
     #[serde(default)]
     pub dispatch_enabled: bool,
-    pub origin: Option<String>,
+    pub origin:           Option<String>,
     /// Vault entry name, never the API token itself.
     pub api_token_secret: Option<String>,
     #[serde(default)]
-    pub projects: Vec<BugsinkProjectSettings>,
+    pub projects:         Vec<BugsinkProjectSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BugsinkProjectSettings {
-    pub project_id: u64,
-    pub automation_id: String,
+    pub project_id:     u64,
+    pub automation_id:  String,
     /// Project-specific vault entry name, never signing material.
     pub signing_secret: String,
 }

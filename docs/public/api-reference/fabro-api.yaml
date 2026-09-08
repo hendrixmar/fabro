@@ -12491,6 +12491,9 @@ components:
         ref:
           type: string
           example: fabro/run/demo
+        sha:
+          description: Exact Git revision when supplied by the provider; absent revisions are not verified.
+          type: string
 
     PullRequestDetails:
       description: Live pull request fields retrieved successfully from GitHub.
@@ -14373,12 +14376,59 @@ components:
 
     ServerIntegrationsSettings:
       type: object
-      required: [github, slack]
+      required: [github, slack, plane, bugsink]
       properties:
         github:
           $ref: "#/components/schemas/GithubIntegrationSettings"
         slack:
           $ref: "#/components/schemas/SlackIntegrationSettings"
+        plane:
+          $ref: "#/components/schemas/PlaneIntegrationSettings"
+        bugsink:
+          $ref: "#/components/schemas/BugsinkIntegrationSettings"
+
+    PlaneIntegrationSettings:
+      type: object
+      required: [enabled, api_base, workspace]
+      properties:
+        enabled:
+          type: boolean
+        api_base:
+          type: ["string", "null"]
+        workspace:
+          type: ["string", "null"]
+
+    BugsinkIntegrationSettings:
+      type: object
+      required: [enabled, dispatch_enabled, origin, api_token_secret, projects]
+      properties:
+        enabled:
+          type: boolean
+        dispatch_enabled:
+          type: boolean
+        origin:
+          type: ["string", "null"]
+        api_token_secret:
+          description: Vault entry name for the Bugsink API credential, never its value.
+          type: ["string", "null"]
+        projects:
+          type: array
+          items:
+            $ref: "#/components/schemas/BugsinkProjectSettings"
+
+    BugsinkProjectSettings:
+      type: object
+      required: [project_id, automation_id, signing_secret]
+      properties:
+        project_id:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+        automation_id:
+          type: string
+        signing_secret:
+          description: Vault entry name for this project's webhook signing key, never its value.
+          type: string
 
     GithubIntegrationSettings:
       type: object

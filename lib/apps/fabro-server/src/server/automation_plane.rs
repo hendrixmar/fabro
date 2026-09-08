@@ -29,7 +29,7 @@ pub(crate) struct ObservedRun {
     pub pull_request_url: Option<String>,
     pub pr_pending:       bool,
     pub pr_failed:        bool,
-    pub clarification: Option<String>,
+    pub clarification:    Option<String>,
 }
 
 #[async_trait]
@@ -40,7 +40,11 @@ pub(crate) trait PlanePort: Send + Sync {
         ready_state_id: &str,
     ) -> anyhow::Result<Vec<Issue>>;
 
-    async fn fetch_issue(&self, project_id: &str, issue_id: &str) -> anyhow::Result<(Issue, Option<String>)>;
+    async fn fetch_issue(
+        &self,
+        project_id: &str,
+        issue_id: &str,
+    ) -> anyhow::Result<(Issue, Option<String>)>;
 
     async fn update_state(
         &self,
@@ -84,10 +88,10 @@ pub(crate) trait RunPort: Send + Sync {
 }
 
 pub(crate) struct PlaneTicketDispatcher<P, R> {
-    store:      PlaneDispatchStore,
-    plane:      P,
-    runs:       R,
-    public_url: String,
+    store:               PlaneDispatchStore,
+    plane:               P,
+    runs:                R,
+    public_url:          String,
     next_candidate_poll: HashMap<(String, String), DateTime<Utc>>,
 }
 
@@ -144,9 +148,14 @@ where
             if polls.get(&key).is_some_and(|due| now < *due) {
                 return Ok(());
             }
-            let interval = chrono::Duration::try_seconds(i64::try_from(trigger.poll_interval_seconds)?)
-                .context("Plane poll interval is out of range")?;
-            polls.insert(key, now.checked_add_signed(interval).context("Plane poll deadline is out of range")?);
+            let interval =
+                chrono::Duration::try_seconds(i64::try_from(trigger.poll_interval_seconds)?)
+                    .context("Plane poll interval is out of range")?;
+            polls.insert(
+                key,
+                now.checked_add_signed(interval)
+                    .context("Plane poll deadline is out of range")?,
+            );
         }
         let active = self
             .store
@@ -219,7 +228,10 @@ where
                     .context("plane automation preflight failed")?;
                 preflight_ok = true;
             }
-            let (issue, _) = self.plane.fetch_issue(&trigger.project_id, &issue.id).await?;
+            let (issue, _) = self
+                .plane
+                .fetch_issue(&trigger.project_id, &issue.id)
+                .await?;
             if issue.state != trigger.ready_state_id {
                 continue;
             }
@@ -268,11 +280,15 @@ where
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         if record.dispatch.last_error.as_deref() == Some(PLANE_STATE_CONFLICT) {
-            self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
+            self.plane
+                .fetch_issue(&trigger.project_id, &record.dispatch.issue_id)
+                .await?;
             if let Some(id) = record.dispatch.current_run_id.as_deref() {
                 self.runs.cancel_run(&id.parse()?).await?;
             }
-            return self.mark_cancelled(trigger, &mut record, now, "ticket moved externally").await;
+            return self
+                .mark_cancelled(trigger, &mut record, now, "ticket moved externally")
+                .await;
         }
         match record.dispatch.status {
             PlaneDispatchStatus::Pending | PlaneDispatchStatus::Claimed => {
@@ -346,7 +362,10 @@ where
         record: &mut PlaneDispatchRecord,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        let (issue, etag) = self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
+        let (issue, etag) = self
+            .plane
+            .fetch_issue(&trigger.project_id, &record.dispatch.issue_id)
+            .await?;
         let expected = if record.effects.claimed_state_applied {
             &trigger.in_progress_state_id
         } else {
@@ -356,13 +375,22 @@ where
             if let Some(id) = record.dispatch.current_run_id.as_deref() {
                 self.runs.cancel_run(&id.parse()?).await?;
             }
-            return self.mark_cancelled(trigger, record, now, "ticket moved externally").await;
+            return self
+                .mark_cancelled(trigger, record, now, "ticket moved externally")
+                .await;
         }
         if !record.effects.claimed_state_applied {
             if issue.state != trigger.in_progress_state_id {
-                if !self.plane
-                    .update_state(&trigger.project_id, &record.dispatch.issue_id, &trigger.in_progress_state_id, etag.as_deref())
-                    .await.context("moving Plane issue to configured in-progress state")?
+                if !self
+                    .plane
+                    .update_state(
+                        &trigger.project_id,
+                        &record.dispatch.issue_id,
+                        &trigger.in_progress_state_id,
+                        etag.as_deref(),
+                    )
+                    .await
+                    .context("moving Plane issue to configured in-progress state")?
                 {
                     return self.record_state_conflict(record, now).await;
                 }
@@ -384,7 +412,6 @@ where
         record: &mut PlaneDispatchRecord,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-
         let (issue, etag) = self
             .plane
             .fetch_issue(&trigger.project_id, &record.dispatch.issue_id)
@@ -394,7 +421,9 @@ where
             if let Some(id) = record.dispatch.current_run_id.as_deref() {
                 self.runs.cancel_run(&id.parse()?).await?;
             }
-            return self.mark_cancelled(trigger, record, now, "ticket moved externally").await;
+            return self
+                .mark_cancelled(trigger, record, now, "ticket moved externally")
+                .await;
         }
         fabro_tracker::plane::strong_etag(etag.as_deref())?;
         let run_id = match record.dispatch.current_run_id.as_deref() {
@@ -410,7 +439,8 @@ where
         };
         self.runs
             .start_run(run_id, automation, trigger, &issue, record.dispatch.harness)
-            .await.context("starting Plane automation run")?;
+            .await
+            .context("starting Plane automation run")?;
         record.dispatch.status = PlaneDispatchStatus::Running;
         record.dispatch.updated_at = now;
         record.dispatch.last_error = None;
@@ -456,7 +486,8 @@ where
             .fetch_issue(&trigger.project_id, &record.dispatch.issue_id)
             .await
             .context("fetching Plane issue during running reconcile")?;
-        let completing = record.effects.success_state_applied && issue.state == trigger.done_state_id;
+        let completing =
+            record.effects.success_state_applied && issue.state == trigger.done_state_id;
         if issue.state != trigger.in_progress_state_id && !completing {
             self.runs.cancel_run(&run_id).await?;
             return self
@@ -465,14 +496,21 @@ where
         }
         let observed = self.runs.observe_run(&run_id).await?;
         if !record.effects.claim_comment_posted {
-            let comment = format!("<p>Fabro run started: {}/runs/{run_id}</p>", self.public_url.trim_end_matches('/'));
-            self.plane.create_comment(&trigger.project_id, &record.dispatch.issue_id, &comment).await?;
+            let comment = format!(
+                "<p>Fabro run started: {}/runs/{run_id}</p>",
+                self.public_url.trim_end_matches('/')
+            );
+            self.plane
+                .create_comment(&trigger.project_id, &record.dispatch.issue_id, &comment)
+                .await?;
             record.effects.claim_comment_posted = true;
             self.store.save(record).await?;
         }
         if matches!(observed.status, RunStatus::Blocked { .. }) {
             if let Some(comment) = observed.clarification.as_deref() {
-                self.plane.create_comment(&trigger.project_id, &record.dispatch.issue_id, comment).await?;
+                self.plane
+                    .create_comment(&trigger.project_id, &record.dispatch.issue_id, comment)
+                    .await?;
             }
         }
         match observed.status {
@@ -526,12 +564,15 @@ where
         );
         let comment = format!("<p>Fabro run failed ({reason}): {run_url}</p>");
         if !record.effects.failure_comment_posted {
-            self.plane.create_comment(&trigger.project_id, &record.dispatch.issue_id, &comment).await?;
+            self.plane
+                .create_comment(&trigger.project_id, &record.dispatch.issue_id, &comment)
+                .await?;
             record.effects.failure_comment_posted = true;
             self.store.save(record).await?;
         }
 
-        if record.dispatch.attempt < 2 && (record.dispatch.attempt as usize) <= trigger.max_retries {
+        if record.dispatch.attempt < 2 && (record.dispatch.attempt as usize) <= trigger.max_retries
+        {
             record.dispatch.attempt += 1;
             record.dispatch.status = PlaneDispatchStatus::RetryPending;
             record.dispatch.current_run_id = None;
@@ -571,14 +612,27 @@ where
         pr_url: &str,
     ) -> anyhow::Result<()> {
         record.dispatch.pull_request_url = Some(pr_url.to_string());
-        let (issue, etag) = self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
+        let (issue, etag) = self
+            .plane
+            .fetch_issue(&trigger.project_id, &record.dispatch.issue_id)
+            .await?;
         if issue.state != trigger.in_progress_state_id && issue.state != trigger.done_state_id {
-            return self.mark_cancelled(trigger, record, now, "ticket moved externally").await;
+            return self
+                .mark_cancelled(trigger, record, now, "ticket moved externally")
+                .await;
         }
         if !record.effects.success_state_applied {
             if issue.state != trigger.done_state_id {
-                if !self.plane.update_state(&trigger.project_id, &record.dispatch.issue_id, &trigger.done_state_id, etag.as_deref())
-                    .await.context("moving Plane issue to configured completion state")?
+                if !self
+                    .plane
+                    .update_state(
+                        &trigger.project_id,
+                        &record.dispatch.issue_id,
+                        &trigger.done_state_id,
+                        etag.as_deref(),
+                    )
+                    .await
+                    .context("moving Plane issue to configured completion state")?
                 {
                     return self.record_state_conflict(record, now).await;
                 }
@@ -606,7 +660,11 @@ where
         Ok(())
     }
 
-    async fn record_state_conflict(&self, record: &mut PlaneDispatchRecord, now: DateTime<Utc>) -> anyhow::Result<()> {
+    async fn record_state_conflict(
+        &self,
+        record: &mut PlaneDispatchRecord,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
         // Persist before any fallible reconciliation: a restart must never refresh
         // the tag and blindly re-authorize the rejected transition.
         record.dispatch.last_error = Some(PLANE_STATE_CONFLICT.into());
@@ -624,16 +682,22 @@ where
     ) -> anyhow::Result<()> {
         let mut reason = reason;
         if reason != "ticket moved externally" && !record.effects.cancelled_state_applied {
-            let (issue, etag) = self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
+            let (issue, etag) = self
+                .plane
+                .fetch_issue(&trigger.project_id, &record.dispatch.issue_id)
+                .await?;
             if issue.state != trigger.in_progress_state_id {
                 reason = "ticket moved externally";
-            } else if !self.plane.update_state(
+            } else if !self
+                .plane
+                .update_state(
                     &trigger.project_id,
                     &record.dispatch.issue_id,
                     &trigger.cancelled_state_id,
                     etag.as_deref(),
                 )
-                .await? {
+                .await?
+            {
                 return self.record_state_conflict(record, now).await;
             } else {
                 record.effects.cancelled_state_applied = true;
@@ -747,12 +811,18 @@ async fn tick_all(
     {
         return Ok(());
     }
-    let dispatcher = dispatcher.get_or_insert_with(|| PlaneTicketDispatcher::new(
-        state.plane_dispatch_store().clone(),
-        LivePlanePort { client: client.clone() },
-        LiveRunPort { state: Arc::clone(&state) },
-        state.effective_web_url(),
-    ));
+    let dispatcher = dispatcher.get_or_insert_with(|| {
+        PlaneTicketDispatcher::new(
+            state.plane_dispatch_store().clone(),
+            LivePlanePort {
+                client: client.clone(),
+            },
+            LiveRunPort {
+                state: Arc::clone(&state),
+            },
+            state.effective_web_url(),
+        )
+    });
     dispatcher.plane.client = client;
     dispatcher.tick(&automations, Utc::now()).await
 }
@@ -795,7 +865,11 @@ impl PlanePort for LivePlanePort {
             .await
     }
 
-    async fn fetch_issue(&self, project_id: &str, issue_id: &str) -> anyhow::Result<(Issue, Option<String>)> {
+    async fn fetch_issue(
+        &self,
+        project_id: &str,
+        issue_id: &str,
+    ) -> anyhow::Result<(Issue, Option<String>)> {
         let mut raw = self.client.fetch_issue_raw(project_id, issue_id).await?;
         let etag = raw.etag.take();
         Ok((self.client.normalize_issue(raw, project_id)?, etag))
@@ -808,7 +882,11 @@ impl PlanePort for LivePlanePort {
         state_id: &str,
         etag: Option<&str>,
     ) -> anyhow::Result<bool> {
-        match self.client.update_state(project_id, issue_id, state_id, etag).await {
+        match self
+            .client
+            .update_state(project_id, issue_id, state_id, etag)
+            .await
+        {
             Ok(()) => Ok(true),
             Err(err) if err.is::<fabro_tracker::plane::PlaneStateConflict>() => Ok(false),
             Err(err) => Err(err),
@@ -822,10 +900,15 @@ impl PlanePort for LivePlanePort {
         comment_html: &str,
     ) -> anyhow::Result<()> {
         // Reconcile an acknowledged-or-ambiguous POST before repeating it.
-        let comments = self.client.paged_request(
-            &format!("projects/{project_id}/issues/{issue_id}/comments/")
-        ).await?;
-        if comments.iter().any(|comment| comment.get("comment_html").and_then(|v| v.as_str()) == Some(comment_html)) {
+        let comments = self
+            .client
+            .paged_request(&format!(
+                "projects/{project_id}/issues/{issue_id}/comments/"
+            ))
+            .await?;
+        if comments.iter().any(|comment| {
+            comment.get("comment_html").and_then(|v| v.as_str()) == Some(comment_html)
+        }) {
             return Ok(());
         }
         self.client
@@ -873,19 +956,35 @@ impl RunPort for LiveRunPort {
         issue: &Issue,
         harness: ExternalAgentHarness,
     ) -> anyhow::Result<RunId> {
-        let existing = self.state.stores.runs.get_cached_projection(&run_id).await?;
+        let existing = self
+            .state
+            .stores
+            .runs
+            .get_cached_projection(&run_id)
+            .await?;
         if let Some(existing) = existing {
             anyhow::ensure!(
-                existing.spec.automation.as_ref().is_some_and(|reference|
-                    reference.id == automation.id.to_string() && reference.trigger_id.as_deref() == Some(trigger.id.as_str())),
+                existing
+                    .spec
+                    .automation
+                    .as_ref()
+                    .is_some_and(|reference| reference.id == automation.id.to_string()
+                        && reference.trigger_id.as_deref() == Some(trigger.id.as_str())),
                 "reserved run identity belongs to another automation"
             );
             if existing.status != RunStatus::Submitted {
                 return Ok(run_id);
             }
-            super::handler::lifecycle::queue_run_start(self.state.as_ref(), run_id, false, Principal::System {
-                system_kind: SystemActorKind::Engine,
-            }).await.map_err(|err| anyhow::anyhow!("{}", err.detail()))?;
+            super::handler::lifecycle::queue_run_start(
+                self.state.as_ref(),
+                run_id,
+                false,
+                Principal::System {
+                    system_kind: SystemActorKind::Engine,
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{}", err.detail()))?;
             return Ok(run_id);
         }
         let mut materialized = self
@@ -936,15 +1035,28 @@ impl RunPort for LiveRunPort {
     }
 
     async fn observe_run(&self, run_id: &RunId) -> anyhow::Result<ObservedRun> {
-        let projection = self.state.stores.runs.get_cached_projection(run_id).await?
+        let projection = self
+            .state
+            .stores
+            .runs
+            .get_cached_projection(run_id)
+            .await?
             .context("run projection not found")?;
         let creation = projection.pull_request_creation.as_ref();
         let pr_pending = creation.is_some_and(fabro_types::PullRequestCreation::is_pending);
-        let pr_failed = creation.is_some_and(|creation| creation.status == fabro_types::PullRequestCreationStatus::Failed);
-        let pull_request_url = if matches!(projection.status, RunStatus::Succeeded { .. }) && !pr_pending && !pr_failed {
-            super::handler::pull_requests::verified_draft_for_run(&self.state, run_id).await
+        let pr_failed = creation.is_some_and(|creation| {
+            creation.status == fabro_types::PullRequestCreationStatus::Failed
+        });
+        let pull_request_url = if matches!(projection.status, RunStatus::Succeeded { .. })
+            && !pr_pending
+            && !pr_failed
+        {
+            super::handler::pull_requests::verified_draft_for_run(&self.state, run_id)
+                .await
                 .map_err(|err| anyhow::anyhow!("{}", err.detail()))?
-        } else { None };
+        } else {
+            None
+        };
         Ok(ObservedRun {
             status: projection.status.clone(),
             pull_request_url,
@@ -958,10 +1070,22 @@ impl RunPort for LiveRunPort {
         let Some(projection) = self.state.stores.runs.get_cached_projection(run_id).await? else {
             return Ok(()); // Reservation exists, but creation never committed.
         };
-        if projection.status.is_terminal() { return Ok(()); }
-        super::append_control_request(self.state.as_ref(), *run_id, fabro_types::RunControlAction::Cancel,
-            Some(Principal::System { system_kind: SystemActorKind::Engine })).await?;
-        if matches!(projection.status, RunStatus::Submitted | RunStatus::Pending { .. } | RunStatus::Runnable) {
+        if projection.status.is_terminal() {
+            return Ok(());
+        }
+        super::append_control_request(
+            self.state.as_ref(),
+            *run_id,
+            fabro_types::RunControlAction::Cancel,
+            Some(Principal::System {
+                system_kind: SystemActorKind::Engine,
+            }),
+        )
+        .await?;
+        if matches!(
+            projection.status,
+            RunStatus::Submitted | RunStatus::Pending { .. } | RunStatus::Runnable
+        ) {
             return super::persist_cancelled_run_status(self.state.as_ref(), *run_id).await;
         }
         self.state
@@ -976,36 +1100,63 @@ impl RunPort for LiveRunPort {
     }
 }
 
-
-/// Read the validated artifact mirrored into the durable checkpoint by parse_clarity.
-/// The sandbox path is not a server-local path and is never read as one.
-fn clarification_comment(run_id: &RunId, projection: &fabro_types::RunProjection) -> anyhow::Result<Option<String>> {
+/// Read the validated artifact mirrored into the durable checkpoint by
+/// parse_clarity. The sandbox path is not a server-local path and is never read
+/// as one.
+fn clarification_comment(
+    run_id: &RunId,
+    projection: &fabro_types::RunProjection,
+) -> anyhow::Result<Option<String>> {
     if !matches!(projection.status, RunStatus::Blocked { .. }) {
         return Ok(None);
     }
-    let Some(checkpoint) = projection.current_checkpoint() else { return Ok(None) };
+    let Some(checkpoint) = projection.current_checkpoint() else {
+        return Ok(None);
+    };
     if checkpoint.next_node_id.as_deref() != Some("clarification")
-        || !checkpoint.node_outcomes.get("parse_clarity")
+        || !checkpoint
+            .node_outcomes
+            .get("parse_clarity")
             .is_some_and(|outcome| outcome.status == fabro_types::StageOutcome::Succeeded)
     {
         return Ok(None);
     }
-    let Some(value) = checkpoint.context_values.get("ticket_clarity") else { return Ok(None) };
-    let object = value.as_object().context("clarification artifact is not an object")?;
-    anyhow::ensure!(object.len() == 3 && object.get("schema_version").and_then(|v| v.as_u64()) == Some(1),
-        "invalid clarification artifact schema");
-    let status = object.get("status").and_then(|v| v.as_str()).context("missing clarification status")?;
-    let questions = object.get("questions").and_then(|v| v.as_array()).context("missing clarification questions")?;
-    if status == "ready" && questions.is_empty() { return Ok(None); }
-    anyhow::ensure!(status == "needs_clarification" && (1..=5).contains(&questions.len()),
-        "invalid clarification questions");
+    let Some(value) = checkpoint.context_values.get("ticket_clarity") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .context("clarification artifact is not an object")?;
+    anyhow::ensure!(
+        object.len() == 3 && object.get("schema_version").and_then(|v| v.as_u64()) == Some(1),
+        "invalid clarification artifact schema"
+    );
+    let status = object
+        .get("status")
+        .and_then(|v| v.as_str())
+        .context("missing clarification status")?;
+    let questions = object
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .context("missing clarification questions")?;
+    if status == "ready" && questions.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        status == "needs_clarification" && (1..=5).contains(&questions.len()),
+        "invalid clarification questions"
+    );
     let mut seen = HashSet::new();
     let mut comment = format!("<p>Fabro run {run_id} is blocked and needs clarification:</p><ol>");
     for value in questions {
-        let question = value.as_str().context("clarification question is not text")?;
+        let question = value
+            .as_str()
+            .context("clarification question is not text")?;
         anyhow::ensure!(
-            (10..=500).contains(&question.chars().count()) && question == question.trim()
-                && question.ends_with('?') && !question.chars().any(|c| c < ' ')
+            (10..=500).contains(&question.chars().count())
+                && question == question.trim()
+                && question.ends_with('?')
+                && !question.chars().any(|c| c < ' ')
                 && seen.insert(question),
             "invalid clarification question"
         );
@@ -1041,14 +1192,14 @@ mod tests {
 
     #[derive(Default)]
     struct FakePlane {
-        issues:     Mutex<Vec<Issue>>,
-        states:     Mutex<BTreeMap<String, String>>,
-        comments:   Mutex<Vec<(String, String)>>,
-        labels:     Mutex<Vec<(String, String)>>,
+        issues:            Mutex<Vec<Issue>>,
+        states:            Mutex<BTreeMap<String, String>>,
+        comments:          Mutex<Vec<(String, String)>>,
+        labels:            Mutex<Vec<(String, String)>>,
         candidate_fetches: Mutex<usize>,
-        fail_fetch: Mutex<bool>,
-        fail_label_once: Mutex<bool>,
-        conflict_state: Mutex<Option<String>>,
+        fail_fetch:        Mutex<bool>,
+        fail_label_once:   Mutex<bool>,
+        conflict_state:    Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -1072,14 +1223,21 @@ mod tests {
                 .collect())
         }
 
-        async fn fetch_issue(&self, _project_id: &str, issue_id: &str) -> anyhow::Result<(Issue, Option<String>)> {
+        async fn fetch_issue(
+            &self,
+            _project_id: &str,
+            issue_id: &str,
+        ) -> anyhow::Result<(Issue, Option<String>)> {
             self.issues
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|issue| issue.id == issue_id)
                 .cloned()
-                .map(|issue| { let etag = Some(format!("\"{}\"", issue.state)); (issue, etag) })
+                .map(|issue| {
+                    let etag = Some(format!("\"{}\"", issue.state));
+                    (issue, etag)
+                })
                 .context("missing issue")
         }
 
@@ -1092,11 +1250,18 @@ mod tests {
         ) -> anyhow::Result<bool> {
             let mut issues = self.issues.lock().unwrap();
             if let Some(state) = self.conflict_state.lock().unwrap().take() {
-                issues.iter_mut().find(|issue| issue.id == issue_id).unwrap().state = state;
+                issues
+                    .iter_mut()
+                    .find(|issue| issue.id == issue_id)
+                    .unwrap()
+                    .state = state;
                 return Ok(false);
             }
             if let Some(issue) = issues.iter_mut().find(|issue| issue.id == issue_id) {
-                anyhow::ensure!(etag == Some(format!("\"{}\"", issue.state).as_str()), "wrong observed version");
+                anyhow::ensure!(
+                    etag == Some(format!("\"{}\"", issue.state).as_str()),
+                    "wrong observed version"
+                );
                 issue.state = state_id.to_string();
             }
             self.states
@@ -1138,12 +1303,12 @@ mod tests {
 
     #[derive(Default)]
     struct FakeRuns {
-        preflight_ok: Mutex<bool>,
-        started:      Mutex<Vec<(String, ExternalAgentHarness)>>,
-        observed:     Mutex<BTreeMap<String, ObservedRun>>,
-        observations: Mutex<usize>,
+        preflight_ok:    Mutex<bool>,
+        started:         Mutex<Vec<(String, ExternalAgentHarness)>>,
+        observed:        Mutex<BTreeMap<String, ObservedRun>>,
+        observations:    Mutex<usize>,
         fail_start_once: Mutex<bool>,
-        cancelled:    Mutex<Vec<String>>,
+        cancelled:       Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1164,7 +1329,12 @@ mod tests {
             issue: &Issue,
             harness: ExternalAgentHarness,
         ) -> anyhow::Result<RunId> {
-            if self.observed.lock().unwrap().contains_key(&run_id.to_string()) {
+            if self
+                .observed
+                .lock()
+                .unwrap()
+                .contains_key(&run_id.to_string())
+            {
                 return Ok(run_id);
             }
             self.started
@@ -1179,7 +1349,7 @@ mod tests {
                     pull_request_url: None,
                     pr_pending:       false,
                     pr_failed:        false,
-                    clarification: None,
+                    clarification:    None,
                 });
             if std::mem::take(&mut *self.fail_start_once.lock().unwrap()) {
                 anyhow::bail!("start committed but acknowledgment lost");
@@ -1282,7 +1452,8 @@ mod tests {
             preflight_ok: Mutex::new(true),
             ..FakeRuns::default()
         };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
             .await
@@ -1344,7 +1515,8 @@ mod tests {
             preflight_ok: Mutex::new(true),
             ..FakeRuns::default()
         };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
             .await
@@ -1363,7 +1535,7 @@ mod tests {
             pull_request_url: None,
             pr_pending:       false,
             pr_failed:        false,
-            clarification: None,
+            clarification:    None,
         });
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
@@ -1382,7 +1554,7 @@ mod tests {
             pull_request_url: None,
             pr_pending:       false,
             pr_failed:        false,
-            clarification: None,
+            clarification:    None,
         });
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
@@ -1411,7 +1583,8 @@ mod tests {
             preflight_ok: Mutex::new(true),
             ..FakeRuns::default()
         };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
             .await
@@ -1431,7 +1604,7 @@ mod tests {
                 pull_request_url: None,
                 pr_pending:       true,
                 pr_failed:        false,
-                clarification: None,
+                clarification:    None,
             });
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
@@ -1450,7 +1623,7 @@ mod tests {
             pull_request_url: Some("https://github.com/o/r/pull/1".into()),
             pr_pending:       false,
             pr_failed:        false,
-            clarification: None,
+            clarification:    None,
         });
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
@@ -1462,7 +1635,10 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(record.dispatch.status, PlaneDispatchStatus::Succeeded);
-        assert_eq!(plane.states.lock().unwrap().get("iss").unwrap(), "in-review-uuid");
+        assert_eq!(
+            plane.states.lock().unwrap().get("iss").unwrap(),
+            "in-review-uuid"
+        );
     }
 
     #[tokio::test]
@@ -1474,7 +1650,8 @@ mod tests {
             preflight_ok: Mutex::new(true),
             ..FakeRuns::default()
         };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
             .await
@@ -1504,7 +1681,8 @@ mod tests {
             preflight_ok: Mutex::new(true),
             ..FakeRuns::default()
         };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
         dispatcher
             .tick_trigger(&automation, trigger(&automation), Utc::now())
             .await
@@ -1512,7 +1690,11 @@ mod tests {
         assert!(runs.started.lock().unwrap().is_empty());
         *plane.fail_fetch.lock().unwrap() = false;
         dispatcher
-            .tick_trigger(&automation, trigger(&automation), Utc::now() + chrono::Duration::seconds(60))
+            .tick_trigger(
+                &automation,
+                trigger(&automation),
+                Utc::now() + chrono::Duration::seconds(60),
+            )
             .await
             .unwrap();
         assert_eq!(runs.started.lock().unwrap().len(), 1);
@@ -1538,11 +1720,21 @@ mod tests {
         let (_dir, automation, store) = setup().await;
         let plane = FakePlane::default();
         *plane.issues.lock().unwrap() = vec![issue("iss", "T-1", Some(1), &[])];
-        let runs = FakeRuns { preflight_ok: Mutex::new(true), ..FakeRuns::default() };
+        let runs = FakeRuns {
+            preflight_ok: Mutex::new(true),
+            ..FakeRuns::default()
+        };
         let mut dispatcher = PlaneTicketDispatcher::new(store, &plane, &runs, "http://fabro");
         let now = Utc::now();
         for seconds in [0, 15, 59, 60] {
-            dispatcher.tick_trigger(&automation, trigger(&automation), now + chrono::Duration::seconds(seconds)).await.unwrap();
+            dispatcher
+                .tick_trigger(
+                    &automation,
+                    trigger(&automation),
+                    now + chrono::Duration::seconds(seconds),
+                )
+                .await
+                .unwrap();
         }
         assert_eq!(*plane.candidate_fetches.lock().unwrap(), 2);
         assert_eq!(*runs.observations.lock().unwrap(), 3);
@@ -1555,17 +1747,43 @@ mod tests {
         let plane = FakePlane::default();
         *plane.issues.lock().unwrap() = vec![issue("iss", "T-1", Some(1), &[])];
         let runs = FakeRuns {
-            preflight_ok: Mutex::new(true), fail_start_once: Mutex::new(true), ..FakeRuns::default()
+            preflight_ok: Mutex::new(true),
+            fail_start_once: Mutex::new(true),
+            ..FakeRuns::default()
         };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
-        assert!(dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.is_err());
-        let reserved = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        assert!(
+            dispatcher
+                .tick_trigger(&automation, trigger(&automation), Utc::now())
+                .await
+                .is_err()
+        );
+        let reserved = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(reserved.dispatch.run_ids.len(), 1);
-        assert_eq!(reserved.dispatch.current_run_id.as_ref(), reserved.dispatch.run_ids.first());
-        let mut restarted = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
-        restarted.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
-        let recovered = store.list_for_automation(&automation.id).await.unwrap().remove(0);
-        assert_eq!(recovered.dispatch.current_run_id, reserved.dispatch.current_run_id);
+        assert_eq!(
+            reserved.dispatch.current_run_id.as_ref(),
+            reserved.dispatch.run_ids.first()
+        );
+        let mut restarted =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        restarted
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
+        let recovered = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            recovered.dispatch.current_run_id,
+            reserved.dispatch.current_run_id
+        );
         assert_eq!(recovered.dispatch.status, PlaneDispatchStatus::Running);
         assert_eq!(runs.started.lock().unwrap().len(), 1);
     }
@@ -1576,13 +1794,28 @@ mod tests {
         let plane = FakePlane::default();
         *plane.issues.lock().unwrap() = vec![issue("iss", "T-1", Some(1), &[])];
         let runs = FakeRuns {
-            preflight_ok: Mutex::new(true), fail_start_once: Mutex::new(true), ..FakeRuns::default()
+            preflight_ok: Mutex::new(true),
+            fail_start_once: Mutex::new(true),
+            ..FakeRuns::default()
         };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
-        assert!(dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.is_err());
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        assert!(
+            dispatcher
+                .tick_trigger(&automation, trigger(&automation), Utc::now())
+                .await
+                .is_err()
+        );
         plane.issues.lock().unwrap()[0].state = "backlog".into();
-        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
-        let record = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        dispatcher
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
+        let record = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(record.dispatch.status, PlaneDispatchStatus::Cancelled);
         assert_eq!(plane.issues.lock().unwrap()[0].state, "backlog");
         assert_eq!(runs.started.lock().unwrap().len(), 1);
@@ -1594,38 +1827,64 @@ mod tests {
         use fabro_workflow::event::Event;
         let mut graph = Graph::new("ticket");
         let mut node = Node::new("verify");
-        node.attrs.insert("goal_gate".into(), AttrValue::Boolean(true));
+        node.attrs
+            .insert("goal_gate".into(), AttrValue::Boolean(true));
         graph.nodes.insert("verify".into(), node);
         super::super::tests::create_durable_run_with_events(state, run_id, &[
             Event::RunCreated {
-                run_id, title: None,
+                run_id,
+                title: None,
                 settings: serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
-                graph: serde_json::to_value(graph).unwrap(), workflow_source: None,
-                labels: BTreeMap::new(), source_directory: None, workflow_slug: None,
-                automation: None, provenance: fabro_types::test_support::test_run_provenance(),
-                manifest_blob: None, fork_source_ref: None, retried_from: None, parent_id: None, web_url: None,
+                graph: serde_json::to_value(graph).unwrap(),
+                workflow_source: None,
+                labels: BTreeMap::new(),
+                source_directory: None,
+                workflow_slug: None,
+                automation: None,
+                provenance: fabro_types::test_support::test_run_provenance(),
+                manifest_blob: None,
+                fork_source_ref: None,
+                retried_from: None,
+                parent_id: None,
+                web_url: None,
                 git: Some(fabro_types::GitContext {
-                    origin_url: "https://github.com/acme/widgets".into(), branch: "main".into(),
-                    sha: None, dirty: fabro_types::DirtyStatus::Clean,
+                    origin_url: "https://github.com/acme/widgets".into(),
+                    branch:     "main".into(),
+                    sha:        None,
+                    dirty:      fabro_types::DirtyStatus::Clean,
                 }),
             },
             Event::CheckpointCompleted {
-                node_id: "verify".into(), current_node: "verify".into(), status: "succeeded".into(),
-                completed_nodes: vec!["verify".into()], node_retries: BTreeMap::new(),
+                node_id: "verify".into(),
+                current_node: "verify".into(),
+                status: "succeeded".into(),
+                completed_nodes: vec!["verify".into()],
+                node_retries: BTreeMap::new(),
                 context_values: BTreeMap::new(),
                 node_outcomes: BTreeMap::from([("verify".into(), Outcome::success())]),
-                next_node_id: Some("exit".into()), git_commit_sha: Some("final-sha".into()),
-                loop_failure_signatures: BTreeMap::new(), restart_failure_signatures: BTreeMap::new(),
-                node_visits: BTreeMap::new(), diff: None, diff_summary: None,
-                graph_visit: Some(1), resumed_from_stage_id: None,
+                next_node_id: Some("exit".into()),
+                git_commit_sha: Some("final-sha".into()),
+                loop_failure_signatures: BTreeMap::new(),
+                restart_failure_signatures: BTreeMap::new(),
+                node_visits: BTreeMap::new(),
+                diff: None,
+                diff_summary: None,
+                graph_visit: Some(1),
+                resumed_from_stage_id: None,
             },
             Event::WorkflowRunCompleted {
-                timing: fabro_types::RunTiming::wall_only(1), artifact_count: 0,
-                status: "succeeded".into(), reason: SuccessReason::Completed,
-                total_usd_micros: None, final_git_commit_sha: Some("final-sha".into()),
-                final_patch: Some("diff".into()), diff_summary: None, billing: None,
+                timing:               fabro_types::RunTiming::wall_only(1),
+                artifact_count:       0,
+                status:               "succeeded".into(),
+                reason:               SuccessReason::Completed,
+                total_usd_micros:     None,
+                final_git_commit_sha: Some("final-sha".into()),
+                final_patch:          Some("diff".into()),
+                diff_summary:         None,
+                billing:              None,
             },
-        ]).await;
+        ])
+        .await;
     }
 
     #[tokio::test]
@@ -1633,33 +1892,66 @@ mod tests {
         use fabro_workflow::event::{Event, append_event};
         use serde_json::json;
         let github = httpmock::MockServer::start_async().await;
-        let state = super::super::tests::create_github_token_app_state(Some("ghu_test"), Some(github.base_url()));
+        let state = super::super::tests::create_github_token_app_state(
+            Some("ghu_test"),
+            Some(github.base_url()),
+        );
         let run_id = RunId::new();
         completed_gated_run(&state, run_id).await;
-        let runs = LiveRunPort { state: Arc::clone(&state) };
-        assert!(runs.observe_run(&run_id).await.unwrap().pull_request_url.is_none());
+        let runs = LiveRunPort {
+            state: Arc::clone(&state),
+        };
+        assert!(
+            runs.observe_run(&run_id)
+                .await
+                .unwrap()
+                .pull_request_url
+                .is_none()
+        );
         let store = state.stores.runs.open_run(&run_id).await.unwrap();
         let creation_id = fabro_types::PullRequestCreationId::new();
         append_event(&store, &run_id, &Event::PullRequestCreationRequested {
-            creation_id, model: "test".into(), force: false,
-        }).await.unwrap();
+            creation_id,
+            model: "test".into(),
+            force: false,
+        })
+        .await
+        .unwrap();
         assert!(runs.observe_run(&run_id).await.unwrap().pr_pending);
         append_event(&store, &run_id, &Event::PullRequestFailed {
-            creation_id: Some(creation_id), error: "provider failed".into(),
-        }).await.unwrap();
+            creation_id: Some(creation_id),
+            error:       "provider failed".into(),
+        })
+        .await
+        .unwrap();
         assert!(runs.observe_run(&run_id).await.unwrap().pr_failed);
         append_event(&store, &run_id, &Event::PullRequestCreationRequested {
-            creation_id: fabro_types::PullRequestCreationId::new(), model: "test".into(), force: false,
-        }).await.unwrap();
+            creation_id: fabro_types::PullRequestCreationId::new(),
+            model:       "test".into(),
+            force:       false,
+        })
+        .await
+        .unwrap();
         append_event(&store, &run_id, &Event::PullRequestCreated {
-            pr_url: "https://github.com/acme/widgets/pull/42".into(), pr_number: 42,
-            owner: "acme".into(), repo: "widgets".into(), base_branch: "main".into(),
-            head_branch: "feature".into(), head_sha: Some("final-sha".into()), title: "Fix".into(), draft: true,
-        }).await.unwrap();
+            pr_url:      "https://github.com/acme/widgets/pull/42".into(),
+            pr_number:   42,
+            owner:       "acme".into(),
+            repo:        "widgets".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            head_sha:    Some("final-sha".into()),
+            title:       "Fix".into(),
+            draft:       true,
+        })
+        .await
+        .unwrap();
 
-        for (draft, sha, verified) in [(false, Some("final-sha"), false), (true, Some("stale"), false),
-            (true, None, false), (true, Some("final-sha"), true)]
-        {
+        for (draft, sha, verified) in [
+            (false, Some("final-sha"), false),
+            (true, Some("stale"), false),
+            (true, None, false),
+            (true, Some("final-sha"), true),
+        ] {
             let mut mock = github.mock(|when, then| {
                 when.method("GET").path("/repos/acme/widgets/pulls/42");
                 then.status(200).json_body(json!({
@@ -1684,16 +1976,33 @@ mod tests {
         let state = crate::test_support::test_app_state();
         let run_id = RunId::new();
         completed_gated_run(&state, run_id).await;
-        let mut projection = (*state.stores.runs.get_cached_projection(&run_id).await.unwrap().unwrap()).clone();
+        let mut projection = (*state
+            .stores
+            .runs
+            .get_cached_projection(&run_id)
+            .await
+            .unwrap()
+            .unwrap())
+        .clone();
         let checkpoint = &mut projection.checkpoints.last_mut().unwrap().checkpoint;
         checkpoint.next_node_id = Some("clarification".into());
-        checkpoint.node_outcomes.insert("parse_clarity".into(), fabro_types::Outcome::success());
+        checkpoint
+            .node_outcomes
+            .insert("parse_clarity".into(), fabro_types::Outcome::success());
         checkpoint.context_values.insert("ticket_clarity".into(), serde_json::json!({
             "schema_version":1,"status":"needs_clarification","questions":["Should <admin> users be included?"]
         }));
-        assert!(clarification_comment(&run_id, &projection).unwrap().is_none());
-        projection.status = RunStatus::Blocked { blocked_reason: fabro_types::BlockedReason::HumanInputRequired };
-        let comment = clarification_comment(&run_id, &projection).unwrap().unwrap();
+        assert!(
+            clarification_comment(&run_id, &projection)
+                .unwrap()
+                .is_none()
+        );
+        projection.status = RunStatus::Blocked {
+            blocked_reason: fabro_types::BlockedReason::HumanInputRequired,
+        };
+        let comment = clarification_comment(&run_id, &projection)
+            .unwrap()
+            .unwrap();
         assert!(comment.contains("Should &lt;admin&gt; users be included?"));
         projection.checkpoints.last_mut().unwrap().checkpoint.context_values.insert(
             "ticket_clarity".into(), serde_json::json!({"schema_version":1,"status":"needs_clarification","questions":[]})
@@ -1706,10 +2015,21 @@ mod tests {
         let (_dir, automation, store) = setup().await;
         let plane = FakePlane::default();
         *plane.issues.lock().unwrap() = vec![issue("iss", "T-1", Some(1), &[])];
-        let runs = FakeRuns { preflight_ok: Mutex::new(true), ..FakeRuns::default() };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
-        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
-        let mut record = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        let runs = FakeRuns {
+            preflight_ok: Mutex::new(true),
+            ..FakeRuns::default()
+        };
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        dispatcher
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
+        let mut record = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
         record.dispatch.attempt = 2;
         store.save(&record).await.unwrap();
         let id = record.dispatch.current_run_id.clone().unwrap();
@@ -1717,12 +2037,26 @@ mod tests {
             reason: FailureReason::WorkflowError,
         };
         *plane.fail_label_once.lock().unwrap() = true;
-        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
-        let pending = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        dispatcher
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
+        let pending = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(pending.dispatch.status, PlaneDispatchStatus::Running);
         assert!(!pending.effects.failure_label_applied);
-        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
-        let done = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        dispatcher
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
+        let done = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(done.dispatch.status, PlaneDispatchStatus::Failed);
         assert!(done.effects.failure_label_applied);
         assert_eq!(runs.started.lock().unwrap().len(), 1);
@@ -1736,14 +2070,31 @@ mod tests {
         // A concurrent metadata edit may leave the state unchanged. A new tag
         // must still not silently authorize the rejected write.
         *plane.conflict_state.lock().unwrap() = Some("ready".into());
-        let runs = FakeRuns { preflight_ok: Mutex::new(true), ..FakeRuns::default() };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
-        assert!(dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.is_err());
-        let mut restarted = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
-        restarted.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
+        let runs = FakeRuns {
+            preflight_ok: Mutex::new(true),
+            ..FakeRuns::default()
+        };
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        assert!(
+            dispatcher
+                .tick_trigger(&automation, trigger(&automation), Utc::now())
+                .await
+                .is_err()
+        );
+        let mut restarted =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        restarted
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
         assert!(runs.started.lock().unwrap().is_empty());
         assert!(plane.states.lock().unwrap().is_empty());
-        let record = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        let record = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(record.dispatch.status, PlaneDispatchStatus::Cancelled);
         assert_eq!(plane.issues.lock().unwrap()[0].state, "ready");
     }
@@ -1753,20 +2104,43 @@ mod tests {
         let (_dir, automation, store) = setup().await;
         let plane = FakePlane::default();
         *plane.issues.lock().unwrap() = vec![issue("iss", "T-1", Some(1), &[])];
-        let runs = FakeRuns { preflight_ok: Mutex::new(true), ..FakeRuns::default() };
-        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
-        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
-        let record = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        let runs = FakeRuns {
+            preflight_ok: Mutex::new(true),
+            ..FakeRuns::default()
+        };
+        let mut dispatcher =
+            PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        dispatcher
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
+        let record = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
         let id = record.dispatch.current_run_id.unwrap();
         let mut observed = runs.observed.lock().unwrap();
         let run = observed.get_mut(&id).unwrap();
-        run.status = RunStatus::Succeeded { reason: SuccessReason::Completed };
+        run.status = RunStatus::Succeeded {
+            reason: SuccessReason::Completed,
+        };
         run.pull_request_url = Some("https://github.com/acme/widgets/pull/42".into());
         drop(observed);
         *plane.conflict_state.lock().unwrap() = Some("backlog".into());
-        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
-        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
-        let record = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        dispatcher
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
+        dispatcher
+            .tick_trigger(&automation, trigger(&automation), Utc::now())
+            .await
+            .unwrap();
+        let record = store
+            .list_for_automation(&automation.id)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(record.dispatch.status, PlaneDispatchStatus::Cancelled);
         assert!(!record.effects.success_state_applied);
         assert_eq!(plane.issues.lock().unwrap()[0].state, "backlog");

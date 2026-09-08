@@ -180,8 +180,9 @@ async fn load_pull_request_github_context(
         creds,
     })
 }
-/// Completion requires authoritative successful gates and a live draft at the final commit.
-/// A stored URL alone (including one linked manually) is never proof of completion.
+/// Completion requires authoritative successful gates and a live draft at the
+/// final commit. A stored URL alone (including one linked manually) is never
+/// proof of completion.
 pub(in crate::server) async fn verified_draft_for_run(
     state: &Arc<AppState>,
     id: &RunId,
@@ -191,16 +192,27 @@ pub(in crate::server) async fn verified_draft_for_run(
     if !matches!(projection.status, fabro_types::RunStatus::Succeeded { .. }) {
         return Ok(None);
     }
-    if projection.pull_request_creation.as_ref().is_some_and(|creation|
-        creation.status != fabro_types::PullRequestCreationStatus::Succeeded)
+    if projection
+        .pull_request_creation
+        .as_ref()
+        .is_some_and(|creation| {
+            creation.status != fabro_types::PullRequestCreationStatus::Succeeded
+        })
     {
         return Ok(None);
     }
-    let Some(conclusion) = projection.conclusion.as_ref()
-        .filter(|conclusion| conclusion.status == fabro_types::StageOutcome::Succeeded) else {
+    let Some(conclusion) = projection
+        .conclusion
+        .as_ref()
+        .filter(|conclusion| conclusion.status == fabro_types::StageOutcome::Succeeded)
+    else {
         return Ok(None);
     };
-    let Some(final_git_sha) = conclusion.final_git_commit_sha.as_deref().filter(|sha| !sha.trim().is_empty()) else {
+    let Some(final_git_sha) = conclusion
+        .final_git_commit_sha
+        .as_deref()
+        .filter(|sha| !sha.trim().is_empty())
+    else {
         return Ok(None);
     };
     let Some(checkpoint) = projection.current_checkpoint() else {
@@ -210,8 +222,10 @@ pub(in crate::server) async fn verified_draft_for_run(
     for node in projection.spec.graph.nodes.values() {
         if node.goal_gate() {
             has_gate = true;
-            if !checkpoint.node_outcomes.get(&node.id).is_some_and(|outcome|
-                outcome.status == fabro_types::StageOutcome::Succeeded)
+            if !checkpoint
+                .node_outcomes
+                .get(&node.id)
+                .is_some_and(|outcome| outcome.status == fabro_types::StageOutcome::Succeeded)
             {
                 return Ok(None);
             }
@@ -233,16 +247,19 @@ pub(in crate::server) async fn verified_draft_for_run(
     }
     let creds = load_server_github_credentials(state.as_ref()).await?;
     let github = server_github_context(state.as_ref(), &creds)?;
-    let detail = fabro_github::get_pull_request(&github, &record.owner, &record.repo, record.number)
-        .await.map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "PR verification unavailable"))?;
-    if detail.draft && detail.state == "open" && !detail.merged
+    let detail =
+        fabro_github::get_pull_request(&github, &record.owner, &record.repo, record.number)
+            .await
+            .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "PR verification unavailable"))?;
+    if detail.draft
+        && detail.state == "open"
+        && !detail.merged
         && detail.head.sha.as_deref() == Some(final_git_sha)
     {
         return Ok(Some(record.html_url()));
     }
     Ok(None)
 }
-
 
 pub(in crate::server) struct RunPrInputs<'a> {
     pub(in crate::server) goal:              &'a str,

@@ -2546,6 +2546,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "fabro-automation",
  "fabro-macros",
  "fabro-model",
  "fabro-options-metadata",
@@ -2566,6 +2567,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "url",
 ]
 
 [[package]]

@@ -83,6 +83,8 @@ models/billing-speed.ts
 models/billing-stage-ref.ts
 models/blocked-reason.ts
 models/board-column.ts
+models/bugsink-integration-settings.ts
+models/bugsink-project-settings.ts
 models/check-run-status.ts
 models/check-run.ts
 models/checkpoint-record.ts
@@ -278,6 +280,7 @@ models/permission-level.ts
 models/plane-dispatch-list-response.ts
 models/plane-dispatch-status.ts
 models/plane-dispatch.ts
+models/plane-integration-settings.ts
 models/plane-label.ts
 models/plane-project-metadata-response.ts
 models/plane-project.ts

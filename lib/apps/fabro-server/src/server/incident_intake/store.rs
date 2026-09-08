@@ -20,8 +20,12 @@ impl IncidentStore {
         origin: &str,
         alert: &AcceptedAlert,
     ) -> anyhow::Result<AcceptResult> {
-        ensure!(!origin.is_empty() && origin.trim() == origin, "invalid configured origin");
-        let project_id = i64::try_from(alert.project_id).context("project ID exceeds SQLite bounds")?;
+        ensure!(
+            !origin.is_empty() && origin.trim() == origin,
+            "invalid configured origin"
+        );
+        let project_id =
+            i64::try_from(alert.project_id).context("project ID exceeds SQLite bounds")?;
         let issue_id = alert.issue_id.to_string();
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
@@ -66,7 +70,8 @@ impl IncidentStore {
         Ok(result)
     }
 
-    /// Persist the generation before doing authoritative HTTP work outside a transaction.
+    /// Persist the generation before doing authoritative HTTP work outside a
+    /// transaction.
     pub(crate) async fn capture_refresh(&self, incident_key: &str) -> anyhow::Result<Option<i64>> {
         Ok(sqlx::query_scalar(
             "UPDATE bugsink_incidents SET refresh_generation = requested_generation
@@ -80,8 +85,13 @@ impl IncidentStore {
     }
 
     /// Complete only the captured refresh; later notifications remain pending.
-    /// Workers applying observation fields must do so in this same UPDATE/transaction.
-    pub(crate) async fn complete_refresh(&self, incident_key: &str, generation: i64) -> anyhow::Result<()> {
+    /// Workers applying observation fields must do so in this same
+    /// UPDATE/transaction.
+    pub(crate) async fn complete_refresh(
+        &self,
+        incident_key: &str,
+        generation: i64,
+    ) -> anyhow::Result<()> {
         let changed = sqlx::query(
             "UPDATE bugsink_incidents SET applied_generation = ?, refresh_generation = NULL,
              read_attempts = 0, next_read_ms = NULL,
@@ -101,8 +111,9 @@ impl IncidentStore {
         Ok(())
     }
 
-    /// Operator data only: no delivery bodies, signing material, or upstream cursors.
-    /// The handler adds { data: snapshot, meta: { enabled, dispatch_enabled } }.
+    /// Operator data only: no delivery bodies, signing material, or upstream
+    /// cursors. The handler adds { data: snapshot, meta: { enabled,
+    /// dispatch_enabled } }.
     pub(crate) async fn snapshot(&self) -> anyhow::Result<Value> {
         let mut tx = self.pool.begin().await?;
         let incidents: Vec<String> = sqlx::query_scalar(
@@ -125,7 +136,9 @@ impl IncidentStore {
                 'observation_key', observation_key, 'episode', episode, 'attempt', attempt,
                 'state', state, 'failure_class', failure_class)
              FROM bugsink_runs ORDER BY incident_key, observation_key, attempt",
-        ).fetch_all(&mut *tx).await?;
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         let scans: Vec<String> = sqlx::query_scalar(
             "SELECT json_object('origin', origin, 'project_id', project_id,
                 'baseline_started_ms', baseline_started_ms,
@@ -139,14 +152,23 @@ impl IncidentStore {
              FROM bugsink_scans ORDER BY origin, project_id",
         ).fetch_all(&mut *tx).await?;
         let delivery_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bugsink_deliveries")
-            .fetch_one(&mut *tx).await?;
+            .fetch_one(&mut *tx)
+            .await?;
         let import_rows: Vec<Option<String>> = sqlx::query_scalar(
             "SELECT CASE WHEN json_valid(cursor) THEN json_extract(cursor,'$.legacy_import') END
              FROM bugsink_scans ORDER BY origin,project_id",
-        ).fetch_all(&mut *tx).await?;
-        let legacy_import = import_rows.into_iter().flatten().next()
-            .map(|value| serde_json::from_str::<Value>(&value)).transpose()?
-            .unwrap_or_else(|| json!({"schema_version":1,"status":"pending","owners":{},"records":[]}));
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let legacy_import = import_rows
+            .into_iter()
+            .flatten()
+            .next()
+            .map(|value| serde_json::from_str::<Value>(&value))
+            .transpose()?
+            .unwrap_or_else(
+                || json!({"schema_version":1,"status":"pending","owners":{},"records":[]}),
+            );
         tx.commit().await?;
         let parse_rows = |rows: Vec<String>| -> serde_json::Result<Vec<Value>> {
             rows.iter().map(|row| serde_json::from_str(row)).collect()
@@ -193,13 +215,18 @@ mod tests {
         let second = IncidentStore::new(other_db.clone_pool());
         let alert = alert(AlertReason::New, 'a');
         let (one, two) = tokio::join!(first.accept(ORIGIN, &alert), second.accept(ORIGIN, &alert));
-        assert!(matches!((one.unwrap(), two.unwrap()),
-            (AcceptResult::Queued, AcceptResult::Duplicate) |
-            (AcceptResult::Duplicate, AcceptResult::Queued)));
+        assert!(matches!(
+            (one.unwrap(), two.unwrap()),
+            (AcceptResult::Queued, AcceptResult::Duplicate)
+                | (AcceptResult::Duplicate, AcceptResult::Queued)
+        ));
         db.pool().close().await;
         other_db.pool().close().await;
         let reopened = database(&path).await;
-        let snapshot = IncidentStore::new(reopened.clone_pool()).snapshot().await.unwrap();
+        let snapshot = IncidentStore::new(reopened.clone_pool())
+            .snapshot()
+            .await
+            .unwrap();
         assert_eq!(snapshot["delivery_count"], 1);
         assert_eq!(snapshot["incidents"].as_array().unwrap().len(), 1);
         assert_eq!(snapshot["incidents"][0]["requested_generation"], 1);
@@ -210,21 +237,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = database(&dir.path().join("intake.sqlite")).await;
         let store = IncidentStore::new(db.clone_pool());
-        assert_eq!(store.accept(ORIGIN, &alert(AlertReason::Test, 'a')).await.unwrap(), AcceptResult::Test);
-        assert_eq!(store.snapshot().await.unwrap()["incidents"], serde_json::json!([]));
-        store.accept(ORIGIN, &alert(AlertReason::New, 'b')).await.unwrap();
+        assert_eq!(
+            store
+                .accept(ORIGIN, &alert(AlertReason::Test, 'a'))
+                .await
+                .unwrap(),
+            AcceptResult::Test
+        );
+        assert_eq!(
+            store.snapshot().await.unwrap()["incidents"],
+            serde_json::json!([])
+        );
+        store
+            .accept(ORIGIN, &alert(AlertReason::New, 'b'))
+            .await
+            .unwrap();
         let before = store.snapshot().await.unwrap();
-        store.accept(ORIGIN, &alert(AlertReason::Test, 'c')).await.unwrap();
+        store
+            .accept(ORIGIN, &alert(AlertReason::Test, 'c'))
+            .await
+            .unwrap();
         let after = store.snapshot().await.unwrap();
         assert_eq!(before["incidents"], after["incidents"]);
         assert_eq!(after["delivery_count"], 3);
         // Failure after the delivery insert must roll the entire acceptance back.
         sqlx::query("CREATE TRIGGER reject_incident BEFORE UPDATE ON bugsink_incidents BEGIN SELECT RAISE(ABORT, 'storage failure'); END")
             .execute(db.pool()).await.unwrap();
-        assert!(store.accept(ORIGIN, &alert(AlertReason::Unmuted, 'd')).await.is_err());
+        assert!(
+            store
+                .accept(ORIGIN, &alert(AlertReason::Unmuted, 'd'))
+                .await
+                .is_err()
+        );
         assert_eq!(store.snapshot().await.unwrap(), after);
         db.pool().close().await;
-        assert!(store.accept(ORIGIN, &alert(AlertReason::Regressed, 'e')).await.is_err());
+        assert!(
+            store
+                .accept(ORIGIN, &alert(AlertReason::Regressed, 'e'))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -232,10 +284,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = database(&dir.path().join("intake.sqlite")).await;
         let store = IncidentStore::new(db.clone_pool());
-        store.accept(ORIGIN, &alert(AlertReason::New, 'a')).await.unwrap();
-        let key = store.snapshot().await.unwrap()["incidents"][0]["incident_key"].as_str().unwrap().to_owned();
+        store
+            .accept(ORIGIN, &alert(AlertReason::New, 'a'))
+            .await
+            .unwrap();
+        let key = store.snapshot().await.unwrap()["incidents"][0]["incident_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let generation = store.capture_refresh(&key).await.unwrap().unwrap();
-        store.accept(ORIGIN, &alert(AlertReason::Regressed, 'b')).await.unwrap();
+        store
+            .accept(ORIGIN, &alert(AlertReason::Regressed, 'b'))
+            .await
+            .unwrap();
         store.complete_refresh(&key, generation).await.unwrap();
         let row = &store.snapshot().await.unwrap()["incidents"][0];
         assert_eq!(row["applied_generation"], 1);
@@ -248,13 +309,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = database(&dir.path().join("intake.sqlite")).await;
         let store = IncidentStore::new(db.clone_pool());
-        store.accept(ORIGIN, &alert(AlertReason::New, 'a')).await.unwrap();
-        let key = store.snapshot().await.unwrap()["incidents"][0]["incident_key"].as_str().unwrap().to_owned();
+        store
+            .accept(ORIGIN, &alert(AlertReason::New, 'a'))
+            .await
+            .unwrap();
+        let key = store.snapshot().await.unwrap()["incidents"][0]["incident_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let insert = "INSERT INTO bugsink_runs (run_id, incident_key, observation_key, episode, attempt, state, source_revision) VALUES (?, ?, ?, 1, ?, ?, 'revision')";
-        sqlx::query(insert).bind("first").bind(&key).bind("observation").bind(1).bind("uncertain").execute(db.pool()).await.unwrap();
-        assert!(sqlx::query(insert).bind("second").bind(&key).bind("different").bind(1).bind("reserved").execute(db.pool()).await.is_err());
-        sqlx::query("UPDATE bugsink_runs SET state = 'failed' WHERE run_id = 'first'").execute(db.pool()).await.unwrap();
-        assert!(sqlx::query(insert).bind("third").bind(&key).bind("observation").bind(3).bind("reserved").execute(db.pool()).await.is_err());
-        sqlx::query(insert).bind("second").bind(&key).bind("observation").bind(2).bind("reserved").execute(db.pool()).await.unwrap();
+        sqlx::query(insert)
+            .bind("first")
+            .bind(&key)
+            .bind("observation")
+            .bind(1)
+            .bind("uncertain")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query(insert)
+                .bind("second")
+                .bind(&key)
+                .bind("different")
+                .bind(1)
+                .bind("reserved")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE bugsink_runs SET state = 'failed' WHERE run_id = 'first'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query(insert)
+                .bind("third")
+                .bind(&key)
+                .bind("observation")
+                .bind(3)
+                .bind("reserved")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        sqlx::query(insert)
+            .bind("second")
+            .bind(&key)
+            .bind("observation")
+            .bind(2)
+            .bind("reserved")
+            .execute(db.pool())
+            .await
+            .unwrap();
     }
 }

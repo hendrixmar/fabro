@@ -2592,7 +2592,12 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         github_webhook_secret: vault.get(WEBHOOK_SECRET_ENV).map(str::to_string),
     });
     if state.server_settings().server.integrations.bugsink.enabled
-        || state.server_settings().server.integrations.bugsink.dispatch_enabled
+        || state
+            .server_settings()
+            .server
+            .integrations
+            .bugsink
+            .dispatch_enabled
     {
         let validation_state = Arc::clone(&state);
         load_store_blocking("Bugsink integration validation", move || async move {
