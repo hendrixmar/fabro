@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use fabro_types::settings::server::{
+    BugsinkIntegrationSettings, BugsinkProjectSettings,
     GithubIntegrationSettings, GithubIntegrationStrategy, IntegrationWebhooksSettings,
     ObjectStoreProvider, ObjectStoreSettings, PlaneIntegrationSettings, ServerApiSettings,
     ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings,
@@ -18,6 +19,7 @@ use super::{
 };
 use crate::user::default_storage_dir;
 use crate::{
+    BugsinkIntegrationLayer,
     ExternalAgentProfileLayer, ExternalAgentsLayer, IntegrationWebhooksLayer,
     ObjectStoreLocalLayer, ObjectStoreS3Layer, PlaneIntegrationLayer, ServerApiLayer,
     ServerArtifactsLayer, ServerAuthLayer, ServerIntegrationsLayer, ServerLayer, ServerListenLayer,
@@ -30,7 +32,7 @@ pub fn resolve_server(layer: &ServerLayer, errors: &mut Vec<ResolveError>) -> Se
     let listen = resolve_listen(layer.listen.as_ref(), errors);
     let web = resolve_web(layer.web.as_ref());
     let auth = resolve_auth(layer.auth.as_ref(), errors);
-    let integrations = resolve_integrations(layer.integrations.as_ref());
+    let integrations = resolve_integrations(layer.integrations.as_ref(), errors);
     validate_github_webhook_strategy(&integrations, layer.api.as_ref(), errors);
 
     let api_url = layer.api.as_ref().and_then(|api| api.url.clone());
@@ -336,7 +338,10 @@ fn object_store_default_root(storage_root: &str, domain: &str) -> String {
         .into_owned()
 }
 
-fn resolve_integrations(layer: Option<&ServerIntegrationsLayer>) -> ServerIntegrationsSettings {
+fn resolve_integrations(
+    layer: Option<&ServerIntegrationsLayer>,
+    errors: &mut Vec<ResolveError>,
+) -> ServerIntegrationsSettings {
     ServerIntegrationsSettings {
         github: layer
             .and_then(|integrations| integrations.github.as_ref())
@@ -382,6 +387,10 @@ fn resolve_integrations(layer: Option<&ServerIntegrationsLayer>) -> ServerIntegr
             .and_then(|integrations| integrations.plane.as_ref())
             .map(resolve_plane)
             .unwrap_or_default(),
+        bugsink: layer
+            .and_then(|integrations| integrations.bugsink.as_ref())
+            .map(|bugsink| resolve_bugsink(bugsink, errors))
+            .unwrap_or_default(),
     }
 }
 
@@ -398,6 +407,150 @@ fn resolve_plane(layer: &PlaneIntegrationLayer) -> PlaneIntegrationSettings {
         enabled:   layer.enabled.unwrap_or(false),
         api_base:  layer.api_base.clone(),
         workspace: layer.workspace.clone(),
+    }
+}
+
+fn resolve_bugsink(layer: &BugsinkIntegrationLayer, errors: &mut Vec<ResolveError>) -> BugsinkIntegrationSettings {
+    let enabled = layer.enabled.unwrap_or(false);
+    let dispatch_enabled = layer.dispatch_enabled.unwrap_or(false);
+    let path = "server.integrations.bugsink";
+    let mut invalid = |field: &str, reason: &str| {
+        errors.push(ResolveError::Invalid {
+            path: format!("{path}.{field}"),
+            reason: reason.to_owned(),
+        });
+    };
+    if dispatch_enabled && !enabled {
+        invalid("dispatch_enabled", "requires enabled intake");
+    }
+    if enabled || layer.origin.is_some() {
+        let valid_origin = layer.origin.as_deref().and_then(|origin| {
+            let url = url::Url::parse(origin).ok()?;
+            Some(matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && origin == url.origin().ascii_serialization())
+        }).unwrap_or(false);
+        if !valid_origin {
+            invalid("origin", "requires an exact HTTP(S) origin without credentials, path, query or fragment");
+        }
+    }
+    let valid_name = |name: &str| !name.is_empty() && name.trim() == name && !name.chars().any(char::is_control);
+    if (enabled || layer.api_token_secret.is_some())
+        && !layer.api_token_secret.as_deref().is_some_and(valid_name)
+    {
+        invalid("api_token_secret", "requires a nonempty vault secret name");
+    }
+    if enabled && layer.projects.as_ref().is_none_or(Vec::is_empty) {
+        invalid("projects", "enabled intake requires at least one project mapping");
+    }
+    let mut project_ids = std::collections::HashSet::new();
+    let mut secret_names = std::collections::HashSet::new();
+    if let Some(name) = &layer.api_token_secret {
+        secret_names.insert(name.as_str());
+    }
+    let projects = layer.projects.iter().flatten().enumerate().map(|(index, project)| {
+        let prefix = format!("{path}.projects[{index}]");
+        let project_id = project.project_id.unwrap_or_else(|| {
+            errors.push(ResolveError::Missing { path: format!("{prefix}.project_id") });
+            0
+        });
+        let automation_id = require_string(project.automation_id.as_ref(), &format!("{prefix}.automation_id"), errors);
+        let signing_secret = require_string(project.signing_secret.as_ref(), &format!("{prefix}.signing_secret"), errors);
+        let mut invalid = |field: &str, reason: &str| {
+            errors.push(ResolveError::Invalid { path: format!("{prefix}.{field}"), reason: reason.to_owned() });
+        };
+        if i64::try_from(project_id).is_err() || !project_ids.insert(project_id) {
+            invalid("project_id", "must be a unique nonnegative SQLite integer");
+        }
+        if fabro_automation::AutomationId::new(automation_id.clone()).is_err() {
+            invalid("automation_id", "must be a valid automation ID");
+        }
+        if !valid_name(&signing_secret) {
+            invalid("signing_secret", "requires a nonempty vault secret name");
+        }
+        if enabled && !secret_names.insert(project.signing_secret.as_deref().unwrap_or("")) {
+            invalid("signing_secret", "enabled mappings must use distinct signing and API secret names");
+        }
+        BugsinkProjectSettings { project_id, automation_id, signing_secret }
+    }).collect();
+    BugsinkIntegrationSettings {
+        enabled,
+        dispatch_enabled,
+        origin: layer.origin.clone(),
+        api_token_secret: layer.api_token_secret.clone(),
+        projects,
+    }
+}
+
+#[cfg(test)]
+mod bugsink_tests {
+    use super::*;
+
+    fn valid_layer() -> BugsinkIntegrationLayer {
+        toml::from_str(r#"
+enabled = true
+origin = "https://bugsink.example"
+api_token_secret = "bugsink-api"
+[[projects]]
+project_id = 7
+automation_id = "incident-loop"
+signing_secret = "bugsink-project-7"
+"#).unwrap()
+    }
+
+    #[test]
+    fn bugsink_rejects_unknown_fields_and_missing_enabled_mapping_fields() {
+        assert!(toml::from_str::<BugsinkIntegrationLayer>("enable = true").is_err());
+        let mut errors = Vec::new();
+        let settings = resolve_bugsink(&valid_layer(), &mut errors);
+        assert!(errors.is_empty());
+        assert!(settings.enabled);
+        assert!(!settings.dispatch_enabled);
+        let mut layer = valid_layer();
+        layer.projects.as_mut().unwrap()[0].project_id = None;
+        resolve_bugsink(&layer, &mut errors);
+        assert!(errors.iter().any(|error| matches!(error, ResolveError::Missing { .. })));
+    }
+
+    #[test]
+    fn bugsink_rejects_ambiguous_identity_credentials_and_dispatch_without_intake() {
+        for edit in 0..7 {
+            let mut layer = valid_layer();
+            match edit {
+                0 => {
+                    let duplicate = layer.projects.as_ref().unwrap()[0].clone();
+                    layer.projects.as_mut().unwrap().push(duplicate);
+                }
+                1 => layer.api_token_secret = Some("bugsink-project-7".into()),
+                2 => layer.projects.as_mut().unwrap()[0].project_id = Some(u64::MAX),
+                3 => layer.projects.as_mut().unwrap()[0].automation_id = Some("../other".into()),
+                4 => layer.origin = Some("https://user:password@bugsink.example/path?token=x".into()),
+                5 => layer.api_token_secret = Some(" ".into()),
+                _ => { layer.enabled = Some(false); layer.dispatch_enabled = Some(true); }
+            }
+            let mut errors = Vec::new();
+            resolve_bugsink(&layer, &mut errors);
+            assert!(!errors.is_empty(), "invalid mapping {edit} was accepted");
+        }
+    }
+
+    #[test]
+    fn project_mapping_override_replaces_instead_of_merging_credentials() {
+        use crate::Combine as _;
+        let fallback = valid_layer();
+        let override_layer = BugsinkIntegrationLayer {
+            projects: Some(Vec::new()),
+            ..Default::default()
+        };
+        let combined = override_layer.combine(fallback);
+        let mut errors = Vec::new();
+        resolve_bugsink(&combined, &mut errors);
+        assert!(errors.iter().any(|error| matches!(error,
+            ResolveError::Invalid { path, .. } if path.ends_with(".projects"))));
     }
 }
 

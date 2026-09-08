@@ -41,6 +41,7 @@ pub use home::Home;
 pub use input_overrides::{InputOverrideParseError, parse_input_overrides, parse_labels};
 pub(crate) use layers::Combine;
 pub use layers::{
+    BugsinkIntegrationLayer, BugsinkProjectLayer,
     CliAuthLayer, CliExecAgentLayer, CliExecLayer, CliExecModelLayer, CliLayer, CliLoggingLayer,
     CliOutputLayer, CliTargetLayer, CliUpdatesLayer, CostRates, CredentialRef,
     CredentialRefParseError, EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer,

@@ -22,6 +22,7 @@ use super::run::{
     RunPrepareLayer, ScmGitHubLayer, StringOrSplice,
 };
 use super::server::{
+    BugsinkProjectLayer,
     ObjectStoreLocalLayer, ObjectStoreS3Layer, ServerApiLayer, ServerAuthGithubLayer,
     ServerListenLayer,
 };
@@ -105,6 +106,12 @@ impl Combine for Option<Vec<CredentialRef>> {
 }
 
 impl Combine for Option<Vec<ServerAuthMethod>> {
+    fn combine(self, other: Self) -> Self {
+        self.or(other)
+    }
+}
+
+impl Combine for Option<Vec<BugsinkProjectLayer>> {
     fn combine(self, other: Self) -> Self {
         self.or(other)
     }

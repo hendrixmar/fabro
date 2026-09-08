@@ -174,6 +174,7 @@ use crate::{
 mod automation_plane;
 mod automation_scheduler;
 mod handler;
+mod incident_intake;
 mod pull_request_supervisor;
 mod resource_sampler;
 mod session_runtime;
@@ -1157,6 +1158,7 @@ pub(crate) struct AppStores {
     pub(crate) run_summaries:    Arc<RunSummaryStore>,
     pub(crate) automations:      Arc<AutomationStore>,
     pub(crate) plane_dispatches: Arc<PlaneDispatchStore>,
+    pub(crate) incidents:        Arc<incident_intake::IncidentStore>,
     pub(crate) environments:     Arc<EnvironmentStore>,
     pub(crate) mcp_servers:      Arc<McpServerStore>,
     pub(crate) vault:            Arc<SecretStore>,
@@ -1170,6 +1172,10 @@ impl AppState {
 
     pub(crate) fn plane_dispatch_store(&self) -> &PlaneDispatchStore {
         &self.stores.plane_dispatches
+    }
+
+    pub(crate) fn incident_store(&self) -> &incident_intake::IncidentStore {
+        &self.stores.incidents
     }
 
     pub(crate) fn environment_store(&self) -> &EnvironmentStore {
@@ -1628,6 +1634,11 @@ impl AppState {
             manifest_run_defaults,
             llm_catalog_settings,
         } = resolved_settings;
+        anyhow::ensure!(
+            server_settings.server.integrations.bugsink
+                == self.server_settings().server.integrations.bugsink,
+            "Bugsink integration changes require a server restart and enablement validation"
+        );
         let server_settings = Arc::new(server_settings);
         let manifest_run_defaults = Arc::new(manifest_run_defaults);
         let effective_web_url =
@@ -2405,6 +2416,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
 
     let automation_store = Arc::new(AutomationStore::new(db_pool.clone()));
     let plane_dispatch_store = Arc::new(PlaneDispatchStore::new(db_pool.clone()));
+    let incident_store = Arc::new(incident_intake::IncidentStore::new(db_pool.clone()));
     let local_provider_enabled = resolved_settings
         .server_settings
         .server
@@ -2523,7 +2535,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
             Arc::new(LocalWorkerRuntime::new())
         }
     };
-    Ok(Arc::new(AppState {
+    let state = Arc::new(AppState {
         runs: Mutex::new(HashMap::new()),
         aggregate_billing: Mutex::new(BillingAccumulator::default()),
         stores: AppStores {
@@ -2531,6 +2543,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
             run_summaries,
             automations: automation_store,
             plane_dispatches: plane_dispatch_store,
+            incidents: incident_store,
             environments: environment_store,
             mcp_servers: mcp_server_store,
             vault: secret_store,
@@ -2574,7 +2587,16 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         // Startup snapshot for the sync router build; rotating the webhook
         // secret requires a server restart.
         github_webhook_secret: vault.get(WEBHOOK_SECRET_ENV).map(str::to_string),
-    }))
+    });
+    if state.server_settings().server.integrations.bugsink.enabled
+        || state.server_settings().server.integrations.bugsink.dispatch_enabled
+    {
+        let validation_state = Arc::clone(&state);
+        load_store_blocking("Bugsink integration validation", move || async move {
+            incident_intake::validate_enablement(&validation_state).await
+        })?;
+    }
+    Ok(state)
 }
 
 const MAX_PAGE_OFFSET: u32 = 1_000_000;

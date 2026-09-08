@@ -20,6 +20,7 @@ workspace = true
 anyhow.workspace = true
 clap = { workspace = true, optional = true }
 chrono.workspace = true
+fabro-automation = { path = "../../components/fabro-automation" }
 fabro-macros = { path = "../fabro-macros" }
 fabro-model = { path = "../fabro-model" }
 fabro-options-metadata.workspace = true
@@ -40,6 +41,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 ulid.workspace = true
+url = "2"
 
 [dev-dependencies]
 toml.workspace = true
