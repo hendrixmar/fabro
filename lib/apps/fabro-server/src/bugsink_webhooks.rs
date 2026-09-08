@@ -242,7 +242,7 @@ mod tests {
             description: None,
             target: AutomationTarget {
                 repository: "test/incident-workflows".into(),
-                ref_selector: "main".into(),
+                ref_selector: "a".repeat(40),
                 workflow: "incident-loop".into(),
             },
             triggers: vec![],
