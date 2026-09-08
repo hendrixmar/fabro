@@ -17,6 +17,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/incidents/bugsink/{project}/{issue}/retry", post(retry))
 }
 
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "Serde must accept exactly an empty JSON object; a unit struct would change the request contract to null"
+)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BaselineRequest {}

@@ -69,6 +69,10 @@ pub(super) async fn validate_enablement(state: &super::AppState) -> anyhow::Resu
         .origin
         .as_deref()
         .context("Bugsink requires an origin")?;
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Validates configured origin components and rejects credentials; diagnostics never format the raw URL"
+    )]
     let url = url::Url::parse(origin).context("Bugsink origin is invalid")?;
     ensure!(
         matches!(url.scheme(), "http" | "https")

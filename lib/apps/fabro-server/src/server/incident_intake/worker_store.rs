@@ -103,7 +103,7 @@ impl IncidentStore {
                 (SELECT reason FROM bugsink_deliveries d WHERE d.origin=bugsink_incidents.origin AND d.project_id=bugsink_incidents.project_id
                  AND d.issue_id=bugsink_incidents.issue_id AND d.reason!='TEST' ORDER BY d.rowid DESC LIMIT 1) ELSE alert_reason END
             WHERE incident_key=? AND refresh_generation=?")
-            .bind(attempts).bind(retry_deadline(attempts as u8, now))
+            .bind(attempts).bind(retry_deadline(u8::try_from(attempts)?, now))
             .bind((attempts == 5).then_some(reason))
             .bind(&pending.key).bind(pending.generation).execute(&mut *tx).await?;
         tx.commit().await?;
