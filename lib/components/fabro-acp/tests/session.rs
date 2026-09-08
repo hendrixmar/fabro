@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::StopReason;
@@ -10,10 +10,10 @@ use fabro_acp::{
     AcpRunResult, AcpRunUsage, AcpSessionActivity, run_acp_turn,
 };
 use fabro_sandbox::test_support::{MockSandbox, MockStdioProcess};
-use fabro_sandbox::{RunSandbox, local_sandbox};
+use fabro_sandbox::{LocalSandbox, Sandbox, shell_quote};
+use fabro_types::SteeringMessage;
+use fabro_types::settings::run::{McpHttpProtocol, McpServerSettings, McpTransport};
 use fabro_util::error::collect_chain;
-use fabro_util::shell;
-use pebble_coding_agent::SteeringMessage;
 use tokio::fs::{read_to_string, write};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::process::Command;
@@ -40,9 +40,10 @@ async fn stdio_spawn_failure_returns_sandbox_error() {
     let command = AcpProcessSpec::from_command_attr("fake-acp-agent").expect("parse ACP command");
     let mut sandbox = MockSandbox::linux();
     sandbox.stdio_process_error = Some(SANDBOX_FAILURE.to_string());
-    let sandbox = sandbox.sandbox();
+    let sandbox: Arc<dyn Sandbox> = Arc::new(sandbox);
 
     let result = run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         command,
         prompt: "hello".to_string(),
         cwd: "/workspace".to_string(),
@@ -72,14 +73,13 @@ async fn stdio_spawn_failure_returns_sandbox_error() {
 
 #[tokio::test]
 async fn clean_stdio_exit_after_final_response_completes_turn() {
-    let sandbox = MockSandbox {
-        stdio_process: Some(mock_acp_stdio_process("end_turn")),
-        ..MockSandbox::linux()
-    }
-    .sandbox();
+    let sandbox = MockSandbox::linux();
+    sandbox.set_stdio_process(mock_acp_stdio_process("end_turn"));
+    let sandbox: Arc<dyn Sandbox> = Arc::new(sandbox);
     let command = AcpProcessSpec::from_command_attr("mock-acp-agent").expect("parse ACP command");
 
     let result = run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         command,
         prompt: "hello".to_string(),
         cwd: "/workspace".to_string(),
@@ -124,14 +124,14 @@ async fn run_acp_turn_preserves_prompt_usage_and_reported_cost() {
     assert_eq!(
         result.usage,
         Some(AcpRunUsage {
-            input_tokens: 100,
-            output_tokens: 30,
-            reasoning_tokens: 10,
-            cache_read_tokens: 40,
+            input_tokens:       100,
+            output_tokens:      30,
+            reasoning_tokens:   10,
+            cache_read_tokens:  40,
             cache_write_tokens: 10,
-            total_tokens: 190,
-            reported_cost: Some(AcpReportedCost {
-                amount: 0.0123,
+            total_tokens:       190,
+            reported_cost:      Some(AcpReportedCost {
+                amount:   0.0123,
                 currency: "USD".to_string(),
             }),
         })
@@ -147,18 +147,12 @@ async fn session_lifecycle_initializes_sends_prompt_and_aggregates_text() {
         .await
         .expect("write fake ACP agent");
 
-    let raw_command = format!(
-        "python3 {}",
-        shell::shell_quote(&script_path.to_string_lossy())
-    );
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
     let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
-    let sandbox: Arc<RunSandbox> = Arc::new(
-        local_sandbox(tempdir.path().to_path_buf())
-            .await
-            .expect("local sandbox should be created"),
-    );
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
 
     let result = run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -197,22 +191,16 @@ async fn steering_sends_followup_session_prompt_over_acp() {
         .await
         .expect("write fake ACP agent");
 
-    let raw_command = format!(
-        "python3 {}",
-        shell::shell_quote(&script_path.to_string_lossy())
-    );
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
     let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
-    let sandbox: Arc<RunSandbox> = Arc::new(
-        local_sandbox(tempdir.path().to_path_buf())
-            .await
-            .expect("local sandbox should be created"),
-    );
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
     let control_handle = AcpControlHandle::new();
     let handle_for_activity = control_handle.clone();
     let queued = Arc::new(AtomicBool::new(false));
     let queued_for_activity = Arc::clone(&queued);
 
     let result = run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         on_session_activity: None,
         command,
         prompt: "hello".to_string(),
@@ -243,7 +231,8 @@ async fn steering_sends_followup_session_prompt_over_acp() {
         cancel_token: CancellationToken::new(),
         on_activity: Some(Arc::new(move || {
             if !queued_for_activity.swap(true, Ordering::AcqRel) {
-                handle_for_activity.enqueue_bounded(SteeringMessage::new("please revise"), 32);
+                handle_for_activity
+                    .enqueue_bounded(SteeringMessage::new("please revise", None), 32);
             }
         })),
         live_control: Some(AcpLiveControl::new(control_handle)),
@@ -255,14 +244,14 @@ async fn steering_sends_followup_session_prompt_over_acp() {
     assert_eq!(
         result.usage,
         Some(AcpRunUsage {
-            input_tokens: 30,
-            output_tokens: 6,
-            reasoning_tokens: 3,
-            cache_read_tokens: 9,
+            input_tokens:       30,
+            output_tokens:      6,
+            reasoning_tokens:   3,
+            cache_read_tokens:  9,
             cache_write_tokens: 12,
-            total_tokens: 60,
-            reported_cost: Some(AcpReportedCost {
-                amount: 0.02,
+            total_tokens:       60,
+            reported_cost:      Some(AcpReportedCost {
+                amount:   0.02,
                 currency: "USD".to_string(),
             }),
         })
@@ -292,22 +281,16 @@ async fn interrupt_then_steer_sends_cancel_then_followup_session_prompt_over_acp
         .await
         .expect("write fake ACP agent");
 
-    let raw_command = format!(
-        "python3 {}",
-        shell::shell_quote(&script_path.to_string_lossy())
-    );
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
     let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
-    let sandbox: Arc<RunSandbox> = Arc::new(
-        local_sandbox(tempdir.path().to_path_buf())
-            .await
-            .expect("local sandbox should be created"),
-    );
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
     let control_handle = AcpControlHandle::new();
     let handle_for_activity = control_handle.clone();
     let queued = Arc::new(AtomicBool::new(false));
     let queued_for_activity = Arc::clone(&queued);
 
     let result = run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         on_session_activity: None,
         command,
         prompt: "hello".to_string(),
@@ -333,8 +316,10 @@ async fn interrupt_then_steer_sends_cancel_then_followup_session_prompt_over_acp
         cancel_token: CancellationToken::new(),
         on_activity: Some(Arc::new(move || {
             if !queued_for_activity.swap(true, Ordering::AcqRel) {
-                handle_for_activity
-                    .interrupt_then_enqueue_bounded(SteeringMessage::new("please revise"), 32);
+                handle_for_activity.interrupt_then_enqueue_bounded(
+                    SteeringMessage::new("please revise", None),
+                    32,
+                );
             }
         })),
         live_control: Some(AcpLiveControl::new(control_handle)),
@@ -373,22 +358,16 @@ async fn inline_interrupt_terminates_agent_that_ignores_cancel() {
         .await
         .expect("write fake ACP agent");
 
-    let raw_command = format!(
-        "python3 {}",
-        shell::shell_quote(&script_path.to_string_lossy())
-    );
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
     let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
-    let sandbox: Arc<RunSandbox> = Arc::new(
-        local_sandbox(tempdir.path().to_path_buf())
-            .await
-            .expect("local sandbox should be created"),
-    );
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
     let control_handle = AcpControlHandle::new();
     let handle_for_activity = control_handle.clone();
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_for_activity = Arc::clone(&interrupted);
 
     let err = run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         on_session_activity: None,
         command,
         prompt: "hello".to_string(),
@@ -410,7 +389,7 @@ async fn inline_interrupt_terminates_agent_that_ignores_cancel() {
         cancel_token: CancellationToken::new(),
         on_activity: Some(Arc::new(move || {
             if !interrupted_for_activity.swap(true, Ordering::AcqRel) {
-                handle_for_activity.interrupt();
+                handle_for_activity.interrupt(None);
             }
         })),
         live_control: Some(AcpLiveControl::new(control_handle)),
@@ -451,6 +430,7 @@ async fn inline_interrupt_reaches_grace_deadline_while_agent_streams_updates() {
     let interrupted_for_activity = Arc::clone(&interrupted);
 
     let run = run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         on_session_activity: None,
         command,
         prompt: "hello".to_string(),
@@ -501,6 +481,7 @@ async fn prompt_completion_drains_all_buffered_pre_response_updates() {
     let activities = Arc::new(Mutex::new(Vec::new()));
     let activities_for_callback = Arc::clone(&activities);
     let run = run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -541,14 +522,14 @@ async fn prompt_completion_drains_all_buffered_pre_response_updates() {
     assert_eq!(
         result.usage,
         Some(AcpRunUsage {
-            input_tokens: 1,
-            output_tokens: 2,
-            reasoning_tokens: 3,
-            cache_read_tokens: 4,
+            input_tokens:       1,
+            output_tokens:      2,
+            reasoning_tokens:   3,
+            cache_read_tokens:  4,
             cache_write_tokens: 5,
-            total_tokens: 15,
-            reported_cost: Some(AcpReportedCost {
-                amount: 0.02,
+            total_tokens:       15,
+            reported_cost:      Some(AcpReportedCost {
+                amount:   0.02,
                 currency: "USD".to_string(),
             }),
         })
@@ -884,6 +865,206 @@ async fn early_exit_returns_process_exit_with_redacted_stderr_tail() {
     );
 }
 
+#[tokio::test]
+async fn session_new_delivers_configured_mcp_transports() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let servers = vec![
+        McpServerSettings {
+            name: "stdio-tools".to_string(),
+            transport: McpTransport::Stdio {
+                command: vec!["tool-server".to_string(), "--stdio".to_string()],
+                env:     HashMap::from([("TOOL_SCOPE".to_string(), "sandbox".to_string())]),
+            },
+            ..McpServerSettings::default()
+        },
+        http_mcp_server(McpHttpProtocol::StreamableHttp),
+        http_mcp_server(McpHttpProtocol::Sse),
+    ];
+    let result = run_fake_agent_with_mcp(tempdir.path(), servers, r#"{"http":true,"sse":true}"#)
+        .await
+        .expect("compatible agent accepts configured MCP servers");
+    let params: serde_json::Value = serde_json::from_str(
+        &read_to_string(tempdir.path().join("session.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        params["mcpServers"],
+        serde_json::json!([
+            {"name":"stdio-tools","command":"tool-server","args":["--stdio"],
+             "env":[{"name":"TOOL_SCOPE","value":"sandbox"}]},
+            {"type":"http","name":"streamable_http","url":"http://127.0.0.1:4321/mcp",
+             "headers":[{"name":"Authorization","value":"Bearer test-mcp-secret"}]},
+            {"type":"sse","name":"sse","url":"http://127.0.0.1:4321/sse",
+             "headers":[{"name":"Authorization","value":"Bearer test-mcp-secret"}]}
+        ])
+    );
+    assert_eq!(result.text, "hello from acp");
+    assert!(!result.stderr.contains("test-mcp-secret"));
+}
+
+#[tokio::test]
+async fn unsupported_mcp_transports_fail_before_session_or_prompt() {
+    for (protocol, capabilities) in [
+        (McpHttpProtocol::StreamableHttp, r#"{"sse":true}"#),
+        (McpHttpProtocol::Sse, r#"{"http":true}"#),
+    ] {
+        let tempdir = tempfile::tempdir().unwrap();
+        let error = run_fake_agent_with_mcp(
+            tempdir.path(),
+            vec![http_mcp_server(protocol)],
+            capabilities,
+        )
+        .await
+        .expect_err("missing transport capability must fail");
+        let diagnostic = collect_chain(&error).join(": ");
+        assert!(diagnostic.contains("does not support MCP"), "{diagnostic}");
+        assert!(!diagnostic.contains("test-mcp-secret"));
+        assert!(!tempdir.path().join("session.json").exists());
+        assert!(!tempdir.path().join("prompt.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn mcp_auth_headers_are_not_emitted_by_protocol_tracing() {
+    use tracing::instrument::WithSubscriber;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let trace_path = tempdir.path().join("trace.log");
+    let trace_file = std::fs::File::create(&trace_path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || trace_file.try_clone().unwrap())
+        .finish();
+    async {
+        tracing::info!("trace capture active");
+        run_fake_agent_with_mcp(
+            tempdir.path(),
+            vec![http_mcp_server(McpHttpProtocol::StreamableHttp)],
+            r#"{"http":true}"#,
+        )
+        .await
+        .unwrap();
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let trace = read_to_string(trace_path).await.unwrap();
+    assert!(trace.contains("trace capture active"));
+    assert!(!trace.contains("test-mcp-secret"));
+}
+
+#[tokio::test]
+async fn malformed_mcp_http_configuration_fails_before_agent_launch() {
+    for transport in [
+        McpTransport::Http {
+            protocol: McpHttpProtocol::StreamableHttp,
+            url:      "file:///tmp/not-an-mcp-server".to_string(),
+            headers:  HashMap::new(),
+        },
+        McpTransport::Http {
+            protocol: McpHttpProtocol::StreamableHttp,
+            url:      "http://127.0.0.1:4321/mcp".to_string(),
+            headers:  HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer test-mcp-secret\ninjected".to_string(),
+            )]),
+        },
+    ] {
+        let tempdir = tempfile::tempdir().unwrap();
+        let error = run_fake_agent_with_mcp(
+            tempdir.path(),
+            vec![McpServerSettings {
+                name: "broken".to_string(),
+                transport,
+                ..McpServerSettings::default()
+            }],
+            r#"{"http":true}"#,
+        )
+        .await
+        .expect_err("malformed MCP config must fail");
+        assert!(!collect_chain(&error).join(": ").contains("test-mcp-secret"));
+        assert!(!tempdir.path().join("agent.pid").exists());
+    }
+}
+
+#[tokio::test]
+async fn malformed_mcp_command_fails_before_agent_launch() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let error = run_fake_agent_with_mcp(
+        tempdir.path(),
+        vec![McpServerSettings {
+            name: "broken".to_string(),
+            ..McpServerSettings::default()
+        }],
+        "{}",
+    )
+    .await
+    .expect_err("empty MCP command must fail");
+    assert!(collect_chain(&error).join(": ").contains("empty command"));
+    assert!(!tempdir.path().join("agent.pid").exists());
+}
+
+fn http_mcp_server(protocol: McpHttpProtocol) -> McpServerSettings {
+    McpServerSettings {
+        name: protocol.to_string(),
+        transport: McpTransport::Http {
+            protocol,
+            url: format!("http://127.0.0.1:4321/{}", match protocol {
+                McpHttpProtocol::StreamableHttp => "mcp",
+                McpHttpProtocol::Sse => "sse",
+            }),
+            headers: HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer test-mcp-secret".to_string(),
+            )]),
+        },
+        ..McpServerSettings::default()
+    }
+}
+
+async fn run_fake_agent_with_mcp(
+    tempdir: &Path,
+    mcp_servers: Vec<McpServerSettings>,
+    capabilities: &str,
+) -> Result<AcpRunResult, AcpError> {
+    let script_path = tempdir.join("fake_acp_agent.py");
+    write(&script_path, fake_acp_agent_script()).await.unwrap();
+    run_acp_turn(AcpRunRequest {
+        command: AcpProcessSpec::from_command_attr(&format!(
+            "python3 {}",
+            shell_quote(&script_path.to_string_lossy())
+        ))
+        .unwrap(),
+        prompt: "hello".to_string(),
+        cwd: tempdir.to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env: HashMap::from([
+            ("ACP_MCP_CAPABILITIES".to_string(), capabilities.to_string()),
+            (
+                "ACP_SESSION_NEW_PARAMS".to_string(),
+                tempdir.join("session.json").to_string_lossy().into_owned(),
+            ),
+            (
+                "ACP_PROMPT_RECORD".to_string(),
+                tempdir.join("prompt.json").to_string_lossy().into_owned(),
+            ),
+            (
+                "ACP_PID_RECORD".to_string(),
+                tempdir.join("agent.pid").to_string_lossy().into_owned(),
+            ),
+        ]),
+        mcp_servers,
+        sandbox: Arc::new(LocalSandbox::new(tempdir.to_path_buf())),
+        cancel_token: CancellationToken::new(),
+        on_activity: None,
+        on_session_activity: None,
+        live_control: None,
+    })
+    .await
+}
+
 async fn run_fake_agent(
     tempdir: &Path,
     env: HashMap<String, String>,
@@ -904,20 +1085,14 @@ async fn run_fake_agent_with_activity(
     write(&script_path, fake_acp_agent_script())
         .await
         .expect("write fake ACP agent");
-    let raw_command = format!(
-        "python3 {}",
-        shell::shell_quote(&script_path.to_string_lossy())
-    );
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
     let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
-    let sandbox: Arc<RunSandbox> = Arc::new(
-        local_sandbox(tempdir.to_path_buf())
-            .await
-            .expect("local sandbox should be created"),
-    );
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.to_path_buf()));
     env.entry("LC_ALL".to_string())
         .or_insert_with(|| "C".to_string());
 
     run_acp_turn(AcpRunRequest {
+        mcp_servers: Vec::new(),
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.to_string_lossy().into_owned(),

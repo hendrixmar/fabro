@@ -115,7 +115,12 @@ for line in sys.stdin:
     if method == "initialize":
         if os.environ.get("ACP_MODE") == "slow_initialize":
             time.sleep(60)
-        respond(message, {"protocolVersion": 1, "agentCapabilities": {}})
+        respond(message, {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "mcpCapabilities": json.loads(os.environ.get("ACP_MCP_CAPABILITIES", "{}"))
+            },
+        })
     elif method == "session/new":
         if os.environ.get("ACP_SESSION_NEW_PARAMS"):
             with open(os.environ["ACP_SESSION_NEW_PARAMS"], "w", encoding="utf-8") as record:
