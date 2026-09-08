@@ -483,9 +483,10 @@ impl PlaneClient {
                 }
             }
         }
-        if !label_ids.iter().any(|id| id == label_id) {
-            label_ids.push(label_id.to_string());
+        if label_ids.iter().any(|id| id == label_id) {
+            return Ok(());
         }
+        label_ids.push(label_id.to_string());
         let body = serde_json::json!({ "labels": label_ids });
         self.request(
             Method::PATCH,
@@ -525,27 +526,18 @@ impl PlaneClient {
 
         let priority = issue.priority.as_deref().and_then(map_priority);
 
-        let state_name = if let Some(detail) = &issue.state_detail {
-            detail.name.clone()
-        } else if let Some(state_val) = &issue.state {
-            if let Some(name) = state_val.get("name").and_then(|n| n.as_str()) {
-                name.to_string()
-            } else if let Some(s) = state_val.as_str() {
-                s.to_string()
-            } else {
-                state_val.to_string()
-            }
-        } else {
-            "unknown".to_string()
-        };
+        // The expanded name remains available in PlaneIssue::state_detail;
+        // authorization always compares the provider identity, never its display name.
+        let state_id = issue.state.as_ref()
+            .and_then(|state| state.as_str().or_else(|| state.get("id").and_then(|id| id.as_str())))
+            .or_else(|| issue.state_detail.as_ref().map(|detail| detail.id.as_str()))
+            .context("Plane issue has no state identity")?
+            .to_string();
 
         let mut labels = Vec::new();
         if let Some(raw_labels) = issue.labels {
             for l in raw_labels {
                 match l {
-                    PlaneLabelOrId::Object {
-                        name: Some(name), ..
-                    } => labels.push(name),
                     PlaneLabelOrId::Object { id: Some(id), .. } | PlaneLabelOrId::Id(id) => {
                         labels.push(id);
                     }
@@ -563,7 +555,7 @@ impl PlaneClient {
             title: issue.name,
             description,
             priority,
-            state: state_name,
+            state: state_id,
             branch_name: None,
             url,
             assignee_id,
@@ -721,6 +713,27 @@ mod tests {
         PlaneClient::with_client(fabro_http::test_http_client().unwrap(), options)
     }
 
+    #[tokio::test]
+    async fn expanded_state_preserves_authorization_uuid() {
+        let server = MockServer::start_async().await;
+        let client = test_client(&server.url(""));
+        let ready = "00000000-0000-0000-0000-000000000001";
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/test-workspace/projects/p/issues/");
+            then.status(200).json_body(json!({
+                "results": [
+                    {"id":"authorized","name":"Fix","state":ready,
+                     "state_detail":{"id":ready,"name":"Ready for agent"}},
+                    {"id":"todo","name":"Not authorized","state":"todo",
+                     "state_detail":{"id":"todo","name":"Todo"}}
+                ], "next_page_results":false
+            }));
+        });
+        let issues = client.fetch_candidate_issues("p", ready).await.unwrap();
+        assert_eq!(issues.iter().map(|issue| issue.id.as_str()).collect::<Vec<_>>(), vec!["authorized"]);
+        assert_eq!(issues[0].state, ready);
+    }
+
     #[test]
     fn url_normalization() {
         let opt1 = PlaneOptions::new("https://plane.example.com", "ws", "key");
@@ -801,13 +814,13 @@ mod tests {
             Some("The button is not clickable on mobile")
         );
         assert_eq!(issue.priority, Some(1));
-        assert_eq!(issue.state, "Ready");
+        assert_eq!(issue.state, "state-1");
         assert_eq!(
             issue.url,
             "https://plane.example.com/workspace-1/projects/proj-1/issues/issue-uuid-1"
         );
         assert_eq!(issue.assignee_id.as_deref(), Some("user-uuid-1"));
-        assert_eq!(issue.labels, vec!["bug", "label-uuid-2"]);
+        assert_eq!(issue.labels, vec!["label-1", "label-uuid-2"]);
     }
 
     #[test]
@@ -844,7 +857,7 @@ mod tests {
             Some("Title Body paragraph with bold text.")
         );
         assert_eq!(issue.priority, Some(2));
-        assert_eq!(issue.state, "In Progress");
+        assert_eq!(issue.state, "s2");
     }
 
     #[tokio::test]

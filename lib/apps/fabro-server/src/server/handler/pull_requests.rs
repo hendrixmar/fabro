@@ -180,6 +180,62 @@ async fn load_pull_request_github_context(
         creds,
     })
 }
+/// Completion requires authoritative successful gates and a live draft at the final commit.
+/// A stored URL alone (including one linked manually) is never proof of completion.
+pub(in crate::server) async fn verified_draft_for_run(
+    state: &Arc<AppState>,
+    id: &RunId,
+) -> Result<Option<String>, ApiError> {
+    let cached = state.cached_run(id).await?;
+    let projection = &cached.projection;
+    if !matches!(projection.status, fabro_types::RunStatus::Succeeded { .. }) {
+        return Ok(None);
+    }
+    if projection.pull_request_creation.as_ref().is_some_and(|creation|
+        creation.status != fabro_types::PullRequestCreationStatus::Succeeded)
+    {
+        return Ok(None);
+    }
+    let Some(conclusion) = projection.conclusion.as_ref()
+        .filter(|conclusion| conclusion.status == fabro_types::StageOutcome::Succeeded) else {
+        return Ok(None);
+    };
+    let Some(final_git_sha) = conclusion.final_git_commit_sha.as_deref().filter(|sha| !sha.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(checkpoint) = projection.current_checkpoint() else {
+        return Ok(None);
+    };
+    let mut gates = projection.spec.graph.nodes.values().filter(|node| node.goal_gate()).peekable();
+    if gates.peek().is_none() || !gates.all(|node|
+        checkpoint.node_outcomes.get(&node.id).is_some_and(|outcome|
+            outcome.status == fabro_types::StageOutcome::Succeeded))
+    {
+        return Ok(None);
+    }
+    let Some(record) = projection.pull_request.as_ref() else {
+        return Ok(None);
+    };
+    let Some(origin) = projection.spec.repo_origin_url() else {
+        return Ok(None);
+    };
+    let normalized = fabro_github::normalize_repo_origin_url(origin);
+    let (owner, repo) = parse_github_owner_repo_from_url(&normalized, "run repository")?;
+    if !record.owner.eq_ignore_ascii_case(&owner) || !record.repo.eq_ignore_ascii_case(&repo) {
+        return Ok(None);
+    }
+    let creds = load_server_github_credentials(state.as_ref()).await?;
+    let github = server_github_context(state.as_ref(), &creds)?;
+    let detail = fabro_github::get_pull_request(&github, &record.owner, &record.repo, record.number)
+        .await.map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "PR verification unavailable"))?;
+    if detail.draft && detail.state == "open" && !detail.merged
+        && detail.head.sha.as_deref() == Some(final_git_sha)
+    {
+        return Ok(Some(record.html_url()));
+    }
+    Ok(None)
+}
+
 
 pub(in crate::server) struct RunPrInputs<'a> {
     pub(in crate::server) goal:              &'a str,

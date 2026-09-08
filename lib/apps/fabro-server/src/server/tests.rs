@@ -4438,7 +4438,7 @@ async fn create_and_start_run(app: &Router, dot_source: &str) -> String {
     run_id
 }
 
-async fn create_durable_run_with_events(
+pub(super) async fn create_durable_run_with_events(
     state: &Arc<AppState>,
     run_id: RunId,
     events: &[workflow_event::Event],
@@ -6842,7 +6842,7 @@ strategy = "token"
     .expect("github token settings fixture should resolve")
 }
 
-fn create_github_token_app_state(
+pub(super) fn create_github_token_app_state(
     token: Option<&str>,
     github_api_base_url: Option<String>,
 ) -> Arc<AppState> {

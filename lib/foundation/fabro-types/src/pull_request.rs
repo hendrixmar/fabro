@@ -225,6 +225,8 @@ pub struct PullRequestUser {
 pub struct PullRequestRef {
     #[serde(rename = "ref")]
     pub ref_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
 }
 
 /// Fields mirrored directly from GitHub's pull request REST payload.
