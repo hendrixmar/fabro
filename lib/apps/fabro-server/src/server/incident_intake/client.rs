@@ -52,7 +52,7 @@ pub(super) struct Issue {
 }
 
 impl Issue {
-    pub fn parse(value: &Value, project: u64, expected: Option<Uuid>) -> anyhow::Result<Self> {
+    pub(super) fn parse(value: &Value, project: u64, expected: Option<Uuid>) -> anyhow::Result<Self> {
         let id = value
             .get("id")
             .and_then(Value::as_str)
@@ -89,7 +89,7 @@ impl Issue {
 }
 
 impl BugsinkClient {
-    pub async fn new(state: &AppState) -> anyhow::Result<Self> {
+    pub(super) async fn new(state: &AppState) -> anyhow::Result<Self> {
         let settings = state.server_settings();
         let config = &settings.server.integrations.bugsink;
         let origin = config.origin.clone().context("bugsink_not_configured")?;
@@ -122,7 +122,7 @@ impl BugsinkClient {
         bounded_json(response).await
     }
 
-    pub async fn issue(&self, project: u64, id: Uuid) -> anyhow::Result<(Issue, Uuid)> {
+    pub(super) async fn issue(&self, project: u64, id: Uuid) -> anyhow::Result<(Issue, Uuid)> {
         let issue = Issue::parse(
             &self
                 .get(url::Url::parse(&format!(
@@ -157,7 +157,7 @@ impl BugsinkClient {
         Ok((issue, event_id))
     }
 
-    pub async fn page(&self, project: u64, cursor: Option<&str>) -> anyhow::Result<Value> {
+    pub(super) async fn page(&self, project: u64, cursor: Option<&str>) -> anyhow::Result<Value> {
         let mut url = url::Url::parse(&format!("{}{ISSUES_PATH}", self.origin))?;
         url.query_pairs_mut()
             .append_pair("project", &project.to_string())
@@ -187,7 +187,7 @@ pub(super) struct ScanProgress {
 }
 
 impl ScanProgress {
-    pub fn advance(
+    pub(super) fn advance(
         &mut self,
         origin: &str,
         project: u64,

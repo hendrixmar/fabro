@@ -4,7 +4,6 @@ mod store;
 mod worker;
 mod worker_store;
 
-use client::ScanProgress;
 use worker::retry_deadline;
 pub(crate) use worker::{
     begin_baseline, discovery_eligible, operator_retry, reconcile_once, reconcile_run,

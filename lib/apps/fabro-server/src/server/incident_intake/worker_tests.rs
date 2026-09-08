@@ -1,4 +1,5 @@
 use super::*;
+use super::client::ScanProgress;
 
 #[test]
 fn repeated_events_are_not_new_work() {
