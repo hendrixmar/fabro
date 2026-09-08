@@ -232,7 +232,7 @@ mod tests {
         database.migrate().await.unwrap();
         let pool = database.clone_pool();
         let vault = SecretStore::new(pool.clone());
-        for (name, value) in [("bugsink-api", "isolated-api-material"), ("bugsink-signing", KEY), ("bugsink-other", "other-project-key")] {
+        for (name, value) in [("BUGSINK_API_TOKEN", "isolated-api-material"), ("BUGSINK_SIGNING_25", KEY), ("BUGSINK_SIGNING_26", "other-project-key")] {
             vault.set(name, value, SecretType::Token, None).await.unwrap();
         }
         AutomationStore::new(pool.clone()).create(AutomationDraft {
@@ -251,10 +251,10 @@ mod tests {
             enabled,
             dispatch_enabled: false,
             origin: Some("https://bugsink.example".into()),
-            api_token_secret: Some("bugsink-api".into()),
+            api_token_secret: Some("BUGSINK_API_TOKEN".into()),
             projects: vec![
-                BugsinkProjectSettings { project_id: 25, automation_id: "incident-loop".into(), signing_secret: "bugsink-signing".into() },
-                BugsinkProjectSettings { project_id: 26, automation_id: "incident-loop".into(), signing_secret: "bugsink-other".into() },
+                BugsinkProjectSettings { project_id: 25, automation_id: "incident-loop".into(), signing_secret: "BUGSINK_SIGNING_25".into() },
+                BugsinkProjectSettings { project_id: 26, automation_id: "incident-loop".into(), signing_secret: "BUGSINK_SIGNING_26".into() },
             ],
         };
         let (store, artifact_store) = test_store_bundle();
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(disabled.app.oneshot(request(NEW_BODY)).await.unwrap().status(), StatusCode::NOT_FOUND);
         assert_no_work(&disabled.state, 0).await;
         let f = fixture(true).await;
-        f.state.stores.vault.remove("bugsink-other").await.unwrap();
+        f.state.stores.vault.remove("BUGSINK_SIGNING_26").await.unwrap();
         assert_eq!(f.app.clone().oneshot(request(TEST_BODY)).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_no_work(&f.state, 0).await;
         f.pool.close().await;
