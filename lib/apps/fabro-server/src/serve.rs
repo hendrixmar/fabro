@@ -828,6 +828,7 @@ where
     spawn_scheduler(Arc::clone(&state));
     spawn_automation_scheduler(Arc::clone(&state));
     spawn_plane_dispatcher(Arc::clone(&state));
+    server::incident_intake::spawn_incident_intake(Arc::clone(&state));
     let pull_request_creation_supervisor =
         spawn_pull_request_creation_supervisor(Arc::clone(&state));
     let router = build_router_with_options(Arc::clone(&state), &auth_mode, RouterOptions {
