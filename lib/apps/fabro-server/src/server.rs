@@ -174,7 +174,7 @@ use crate::{
 mod automation_plane;
 mod automation_scheduler;
 mod handler;
-mod incident_intake;
+pub(crate) mod incident_intake;
 mod pull_request_supervisor;
 mod resource_sampler;
 mod session_runtime;
@@ -1809,6 +1809,8 @@ pub fn build_router_with_options(
     let github_endpoints =
         github_endpoints.unwrap_or_else(|| Arc::new(GithubEndpoints::production_defaults()));
     let webhook_secret = state.github_webhook_secret.clone();
+    let bugsink_webhooks =
+        crate::bugsink_webhooks::routes(Arc::clone(&state)).with_state(Arc::clone(&state));
     let principal_layer = middleware::from_fn_with_state(Arc::clone(&state), principal_middleware);
     let api_common = if web_enabled {
         Router::new()
@@ -1901,6 +1903,7 @@ pub fn build_router_with_options(
         let secret: Arc<[u8]> = Arc::from(secret.into_bytes().into_boxed_slice());
         router = github_webhook_routes(secret).merge(router);
     }
+    router = bugsink_webhooks.merge(router);
 
     router
         // Innermost of the outer layers so every response body — static SPA

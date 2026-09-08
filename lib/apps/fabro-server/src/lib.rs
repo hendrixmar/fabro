@@ -14,6 +14,7 @@ pub mod auth;
     reason = "Automation materializer test hooks and helpers are only referenced by selected targets."
 )]
 mod automation_materializer;
+mod bugsink_webhooks;
 mod canonical_host;
 mod canonical_origin;
 pub mod csp;
