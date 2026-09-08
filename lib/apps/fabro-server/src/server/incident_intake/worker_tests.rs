@@ -251,7 +251,7 @@ async fn scans_more_than_ten_issues_across_restart_without_backlog_dispatch() {
     let progress=ScanProgress {import_complete:true,..ScanProgress::default()};
     sqlx::query("UPDATE bugsink_scans SET cursor=?").bind(serde_json::to_string(&progress).unwrap()).execute(&state.incident_store().pool).await.unwrap();
     worker::scan_once(&state,&client::BugsinkClient::new(&state).await.unwrap(),1_000_000).await.unwrap();
-    assert_eq!(first_page.hits(),1);assert_eq!(second_page.hits(),0);
+    assert_eq!(first_page.calls(),1);assert_eq!(second_page.calls(),0);
     drop(state);
     let resumed=build(dir.path(),&bundle,&origin,false,false);
     worker::scan_once(&resumed,&client::BugsinkClient::new(&resumed).await.unwrap(),1_000_001).await.unwrap();
@@ -261,7 +261,7 @@ async fn scans_more_than_ten_issues_across_restart_without_backlog_dispatch() {
     assert_eq!(pending.len(),1);assert_eq!(pending[0]["issue_id"],last_id.to_string());
     assert_eq!(snapshot["scans"][0]["baseline_complete"],true);
     worker::scan_once(&resumed,&client::BugsinkClient::new(&resumed).await.unwrap(),1_000_002).await.unwrap();
-    assert_eq!(first_page.hits(),1);assert_eq!(second_page.hits(),1);
+    assert_eq!(first_page.calls(),1);assert_eq!(second_page.calls(),1);
 }
 
 #[test]

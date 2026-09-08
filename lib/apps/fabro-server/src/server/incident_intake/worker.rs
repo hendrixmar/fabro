@@ -32,7 +32,7 @@ pub(crate) fn spawn_incident_intake(state: Arc<AppState>) {
             if state.is_shutting_down() { break; }
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                result = reconcile_once(&state, chrono::Utc::now().timestamp_millis()) => {
+                result = super::reconcile_once(&state, chrono::Utc::now().timestamp_millis()) => {
                     if result.is_err() { tracing::warn!("Bugsink intake reconciliation incomplete"); }
                 }
             }
@@ -47,7 +47,7 @@ pub(crate) fn spawn_incident_intake(state: Arc<AppState>) {
 pub(crate) async fn reconcile_once(state: &Arc<AppState>, now_ms: i64) -> anyhow::Result<()> {
     let store = state.incident_store();
     for id in store.active_runs().await? {
-        reconcile_run(state, id).await?;
+        super::reconcile_run(state, id).await?;
     }
     let config = state.server_settings().server.integrations.bugsink.clone();
     if !config.enabled { return Ok(()); }
@@ -73,7 +73,7 @@ pub(crate) async fn reconcile_once(state: &Arc<AppState>, now_ms: i64) -> anyhow
     for mapping in config.projects {
         let automation = mapped_automation(state, mapping.project_id).await?;
         if let Some(run_id) = store.reserve(&client.origin, mapping.project_id, &automation.target.ref_selector).await? {
-            reconcile_run(state, run_id).await?;
+            super::reconcile_run(state, run_id).await?;
             break;
         }
     }
