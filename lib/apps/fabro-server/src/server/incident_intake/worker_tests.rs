@@ -54,15 +54,15 @@ fn build(dir: &std::path::Path, bundle: &(Arc<fabro_store::Database>,fabro_store
     settings.server.integrations.plane.api_base=Some(format!("{origin}/api/v1"));
     settings.server.integrations.plane.workspace=Some("workspace".into());
     settings.server.integrations.bugsink=fabro_types::settings::server::BugsinkIntegrationSettings {
-        enabled,dispatch_enabled:dispatch,origin:Some(origin.into()),api_token_secret:Some("bugsink-api".into()),
+        enabled,dispatch_enabled:dispatch,origin:Some(origin.into()),api_token_secret:Some("BUGSINK_API_TOKEN".into()),
         projects:vec![
-            fabro_types::settings::server::BugsinkProjectSettings {project_id:25,automation_id:"incident-loop".into(),signing_secret:"sign-25".into()},
-            fabro_types::settings::server::BugsinkProjectSettings {project_id:26,automation_id:"incident-loop".into(),signing_secret:"sign-26".into()},
+            fabro_types::settings::server::BugsinkProjectSettings {project_id:25,automation_id:"incident-loop".into(),signing_secret:"BUGSINK_SIGNING_25".into()},
+            fabro_types::settings::server::BugsinkProjectSettings {project_id:26,automation_id:"incident-loop".into(),signing_secret:"BUGSINK_SIGNING_26".into()},
         ],
     };
     TestAppStateBuilder::new().runtime_settings(settings, fabro_config::RunLayer::default())
         .vault_path(dir.join("secrets.json")).active_config_path(dir.join("settings.toml"))
-        .vault_entries([("bugsink-api","fixture"),("sign-25","fixture-25"),("sign-26","fixture-26"),(fabro_static::EnvVars::OPENAI_API_KEY,"fixture-openai"),(fabro_static::EnvVars::PLANE_API_KEY,"fixture-plane")])
+        .vault_entries([("BUGSINK_API_TOKEN","fixture"),("BUGSINK_SIGNING_25","fixture-25"),("BUGSINK_SIGNING_26","fixture-26"),(fabro_static::EnvVars::OPENAI_API_KEY,"fixture-openai"),(fabro_static::EnvVars::PLANE_API_KEY,"fixture-plane")])
         .store_bundle(Arc::clone(&bundle.0),bundle.1.clone())
         .automation_materializer(TestAutomationRunMaterializer::succeed(manifest(),b"stale submitted bytes".to_vec()))
         .build()
@@ -320,7 +320,7 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
     std::fs::write(&source,b"{}").unwrap();
     std::fs::set_permissions(&source,std::fs::Permissions::from_mode(0o600)).unwrap();
     let config=dir.path().join("bugsink-legacy.json");
-    let owner=json!({"state_file":source,"api_origin":remote.base_url(),"token_secret":"bugsink-api"});
+    let owner=json!({"state_file":source,"api_origin":remote.base_url(),"token_secret":"BUGSINK_API_TOKEN"});
     std::fs::write(&config,serde_json::to_vec(&json!({"schema_version":1,"owners":{"laptop":owner,"el-telar":owner},"plane_project_id":project})).unwrap()).unwrap();
     std::fs::set_permissions(&config,std::fs::Permissions::from_mode(0o600)).unwrap();
     remote.mock(|when,then| {when.method(httpmock::Method::GET).path("/api/v1/automations");then.json_body(json!({"data":[]}));});
