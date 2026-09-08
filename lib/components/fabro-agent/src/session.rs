@@ -12,20 +12,18 @@ use fabro_llm::types::{
     TokenCounts, ToolChoice,
 };
 use fabro_llm::{Error as LlmError, retry};
-use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_mcp::connection_manager::McpConnectionManager;
-use fabro_mcp::http_transport;
+use fabro_mcp::sandbox::ManagedMcpServers;
 use fabro_model::{AgentProfileKind, Catalog, ModelId, ModelRef, Speed, UsdMicros};
 use fabro_types::{
     AgentToolSummary, LlmOutputKind, LlmRetryPhase, PermissionLevel, Principal, SessionMessage,
     SessionRecord, StageContextWindowProjection, SteeringMessage,
 };
-use fabro_util::shell;
 use futures::StreamExt;
 use tokio::sync::{Notify, broadcast};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use crate::agent_profile::AgentProfile;
 use crate::compaction::{check_context_usage, compact_context};
@@ -395,6 +393,7 @@ pub struct Session {
     llm_client: Client,
     provider_profile: Arc<dyn AgentProfile>,
     sandbox: Arc<dyn Sandbox>,
+    mcp_servers: Option<ManagedMcpServers>,
     control_state: Arc<Mutex<ControlState>>,
     control_notify: Arc<Notify>,
     followup_queue: Arc<Mutex<VecDeque<String>>>,
@@ -436,6 +435,7 @@ impl Session {
             llm_client,
             provider_profile,
             sandbox,
+            mcp_servers: None,
             control_state: Arc::new(Mutex::new(ControlState::default())),
             control_notify: Arc::new(Notify::new()),
             followup_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -694,14 +694,32 @@ impl Session {
             }
         }
 
+        let mut managed_mcp = None;
         // Start MCP servers and register their tools
         if !self.config.mcp_servers.is_empty() {
-            // Resolve Sandbox transports: start the server inside the sandbox,
-            // then rewrite the config to Http using the sandbox's preview URL.
-            let mcp_servers = self.resolve_sandbox_mcp_servers(&cancel_token).await?;
+            let mut managed = ManagedMcpServers::start(
+                &self.config.mcp_servers,
+                Arc::clone(&self.sandbox),
+                &cancel_token,
+                false,
+            )
+            .await
+            .map_err(|error| {
+                if cancel_token.is_cancelled() {
+                    Error::Interrupted(InterruptReason::Cancelled)
+                } else {
+                    Error::InvalidState(error.to_string())
+                }
+            })?;
 
             let mut manager = McpConnectionManager::new();
-            let results = manager.start_servers(&mcp_servers).await;
+            let results = tokio::select! {
+                () = cancel_token.cancelled() => {
+                    managed.shutdown().await;
+                    return Err(Error::Interrupted(InterruptReason::Cancelled));
+                }
+                results = manager.start_servers(managed.servers()) => results,
+            };
 
             for (server_name, result) in &results {
                 match result {
@@ -721,14 +739,22 @@ impl Session {
                                 tools,
                             });
                     }
-                    Err(e) => {
+                    Err(_) => {
                         self.event_emitter
                             .emit(self.id.clone(), AgentEvent::McpServerFailed {
                                 server_name: server_name.clone(),
-                                error:       e.to_string(),
+                                error:       format!(
+                                    "MCP server '{server_name}' connection failed"
+                                ),
                             });
                     }
                 }
+            }
+            if results.iter().any(|(_, result)| result.is_err()) {
+                managed.shutdown().await;
+                return Err(Error::InvalidState(
+                    "Configured MCP server connection failed".into(),
+                ));
             }
 
             let manager = Arc::new(manager);
@@ -738,6 +764,7 @@ impl Session {
                     profile.tool_registry_mut().register(tool);
                 }
             }
+            managed_mcp = Some(managed);
         }
 
         // Populate environment context
@@ -761,192 +788,8 @@ impl Session {
             &self.skills,
         );
 
+        self.mcp_servers = managed_mcp;
         Ok(())
-    }
-
-    /// Resolve `McpTransport::Sandbox` configs by starting the MCP server
-    /// inside the sandbox and rewriting the transport to `Http` with the
-    /// sandbox's preview URL.
-    async fn resolve_sandbox_mcp_servers(
-        &self,
-        cancel_token: &CancellationToken,
-    ) -> Result<Vec<McpServerSettings>, Error> {
-        let mut resolved = Vec::with_capacity(self.config.mcp_servers.len());
-
-        for config in &self.config.mcp_servers {
-            if cancel_token.is_cancelled() {
-                return Err(Error::Interrupted(InterruptReason::Cancelled));
-            }
-            match &config.transport {
-                McpTransport::Sandbox {
-                    protocol,
-                    command,
-                    port,
-                    env,
-                } => {
-                    let port = *port;
-                    match self
-                        .start_sandbox_mcp_server(command, port, env, cancel_token)
-                        .await?
-                    {
-                        Ok((url, headers)) => {
-                            let url = http_transport::sandbox_mcp_http_url(*protocol, &url)
-                                .map_err(|err| Error::InvalidState(err.to_string()))?;
-                            info!(
-                                server = %config.name,
-                                url = %url,
-                                "Sandbox MCP server started, connecting via HTTP"
-                            );
-                            resolved.push(McpServerSettings {
-                                name:                 config.name.clone(),
-                                transport:            McpTransport::Http {
-                                    protocol: *protocol,
-                                    url,
-                                    headers,
-                                },
-                                current_dir:          config.current_dir.clone(),
-                                clear_env:            config.clear_env,
-                                startup_timeout_secs: config.startup_timeout_secs,
-                                tool_timeout_secs:    config.tool_timeout_secs,
-                            });
-                        }
-                        Err(e) => {
-                            warn!(
-                                server = %config.name,
-                                error = %e,
-                                "Failed to start sandbox MCP server"
-                            );
-                            self.event_emitter
-                                .emit(self.id.clone(), AgentEvent::McpServerFailed {
-                                    server_name: config.name.clone(),
-                                    error:       e,
-                                });
-                        }
-                    }
-                }
-                _ => resolved.push(config.clone()),
-            }
-        }
-
-        Ok(resolved)
-    }
-
-    /// Start an MCP server inside the sandbox and return (url, headers) for
-    /// HTTP connection.
-    ///
-    /// The outer `Result` surfaces fatal cancellation as
-    /// `Error::Interrupted(InterruptReason::Cancelled)` (the running MCP
-    /// process group is terminated before returning). The inner `Result`
-    /// captures non-fatal startup failures that the caller logs and turns
-    /// into an `McpServerFailed` event.
-    async fn start_sandbox_mcp_server(
-        &self,
-        command: &[String],
-        port: u16,
-        env: &std::collections::HashMap<String, String>,
-        cancel_token: &CancellationToken,
-    ) -> Result<Result<(String, std::collections::HashMap<String, String>), String>, Error> {
-        let sandbox = self.sandbox.as_ref();
-
-        let launch_script = sandbox_mcp_launch_script(command);
-        let env_ref = if env.is_empty() { None } else { Some(env) };
-
-        if cancel_token.is_cancelled() {
-            return Err(Error::Interrupted(InterruptReason::Cancelled));
-        }
-        let launch_result = match sandbox
-            .exec_command(
-                &launch_script,
-                30_000,
-                None,
-                env_ref,
-                Some(cancel_token.child_token()),
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                if cancel_token.is_cancelled() {
-                    return Err(Error::Interrupted(InterruptReason::Cancelled));
-                }
-                return Ok(Err(format!(
-                    "Failed to launch MCP server: {}",
-                    e.display_with_causes()
-                )));
-            }
-        };
-
-        let pid = launch_result.stdout.trim().to_string();
-        info!(pid = %pid, port, "MCP server process launched in sandbox");
-
-        // Wait for the server to start listening on the port
-        let poll_cmd = format!(
-            "for i in $(seq 1 30); do ss -tln | grep -q ':{port} ' && echo ready && exit 0; sleep 1; done; echo timeout"
-        );
-        let poll_result = sandbox
-            .exec_command(
-                &poll_cmd,
-                60_000,
-                None,
-                None,
-                Some(cancel_token.child_token()),
-            )
-            .await;
-
-        if cancel_token.is_cancelled() {
-            kill_mcp_pid(sandbox, &pid).await;
-            return Err(Error::Interrupted(InterruptReason::Cancelled));
-        }
-
-        let poll_result = match poll_result {
-            Ok(result) => result,
-            Err(e) => {
-                return Ok(Err(format!(
-                    "Failed to poll MCP server readiness: {}",
-                    e.display_with_causes()
-                )));
-            }
-        };
-
-        if poll_result.stdout.trim() != "ready" {
-            // Grab stderr for debugging
-            let stderr = sandbox
-                .exec_command(
-                    "cat /tmp/mcp_server_stderr.log 2>/dev/null | tail -20",
-                    10_000,
-                    None,
-                    None,
-                    Some(cancel_token.child_token()),
-                )
-                .await
-                .map(|r| r.stdout)
-                .unwrap_or_default();
-            return Ok(Err(format!(
-                "MCP server did not start listening on port {port} within 30s. stderr:\n{stderr}"
-            )));
-        }
-
-        // Get the preview URL for the port, or fall back to localhost for local
-        // sandboxes
-        let preview = match sandbox.get_preview_url(port).await {
-            Ok(p) => p,
-            Err(e) => return Ok(Err(e.display_with_causes())),
-        };
-
-        if cancel_token.is_cancelled() {
-            kill_mcp_pid(sandbox, &pid).await;
-            return Err(Error::Interrupted(InterruptReason::Cancelled));
-        }
-
-        if let Some(url_and_headers) = preview {
-            Ok(Ok(url_and_headers))
-        } else {
-            info!(port, "No preview URL available, using localhost");
-            Ok(Ok((
-                format!("http://localhost:{port}"),
-                std::collections::HashMap::new(),
-            )))
-        }
     }
 
     async fn build_env_context(
@@ -1235,6 +1078,9 @@ impl Session {
         self.transition(SessionState::Closed);
         if let Some(supervisor) = &self.subagent_supervisor {
             supervisor.shutdown_all().await;
+        }
+        if let Some(mut managed) = self.mcp_servers.take() {
+            managed.shutdown().await;
         }
         self.ended = true;
         self.event_emitter
@@ -2212,52 +2058,6 @@ const fn is_auth_error(err: &LlmError) -> bool {
     )
 }
 
-/// Build the script that launches a sandbox MCP server detached and echoes its
-/// PID.
-///
-/// `setsid` fully detaches the server so Daytona's exec doesn't block on it.
-/// The inner command is shell-quoted for the wrapper so a single quote or
-/// metacharacter in any argv element can't break out, and the wrapper itself is
-/// the current `$BASH` because the sandbox evaluates this string as non-login
-/// Bash and may resolve that executable outside `/bin` (for example on NixOS).
-fn sandbox_mcp_launch_script(command: &[String]) -> String {
-    let command_source = match command {
-        // Sandbox MCP `script` entries resolve to this exact argv shape. The
-        // surrounding launcher is already the provider-selected Bash, so
-        // evaluate the source in that process instead of PATH-resolving a
-        // second interpreter. Grouping keeps the log redirections scoped to
-        // the whole script, including multi-command and trailing-comment
-        // forms.
-        [interpreter, flag, source] if interpreter == "bash" && flag == "-c" => {
-            format!("{{\n{source}\n}}")
-        }
-        _ => shell::shell_join(command),
-    };
-    let inner =
-        format!("{command_source} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log");
-    format!(
-        "setsid \"$BASH\" -c {quoted} </dev/null >/dev/null 2>&1 &\necho $!",
-        quoted = shell::shell_quote(&inner)
-    )
-}
-
-/// Best-effort kill of a sandbox MCP server process group. Used when
-/// `start_sandbox_mcp_server` is cancelled after spawning a detached
-/// `setsid` child but before reporting readiness. Errors from the sandbox
-/// are logged and swallowed; the caller is already returning a Cancelled
-/// error.
-async fn kill_mcp_pid(sandbox: &dyn Sandbox, pid: &str) {
-    let pid = pid.trim();
-    if pid.is_empty() {
-        return;
-    }
-    let script =
-        format!("kill -TERM -{pid} 2>/dev/null; sleep 1; kill -KILL -{pid} 2>/dev/null; true");
-    if let Err(err) = sandbox.exec_command(&script, 5_000, None, None, None).await {
-        warn!(pid, error = %err.display_with_causes(), "Failed to kill MCP server process group during cancellation");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2282,86 +2082,6 @@ mod tests {
     use crate::subagent::{SubAgentStatus, make_wait_tool};
     use crate::test_support::*;
     use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
-
-    #[test]
-    fn sandbox_mcp_launch_wrapper_uses_bash() {
-        // The sandbox evaluates this string as non-login Bash, so the detached
-        // wrapper reuses the executable selected by the provider.
-        let script = sandbox_mcp_launch_script(&[
-            "npx".to_string(),
-            "@playwright/mcp@latest".to_string(),
-            "--port".to_string(),
-            "3100".to_string(),
-        ]);
-
-        assert!(
-            script.starts_with("setsid \"$BASH\" -c "),
-            "launch wrapper should detach through the provider-selected Bash: {script}"
-        );
-        assert!(
-            script.ends_with(" </dev/null >/dev/null 2>&1 &\necho $!"),
-            "launch wrapper should stay detached and report its PID: {script}"
-        );
-        assert!(
-            script.contains("/tmp/mcp_server_stdout.log")
-                && script.contains("2>/tmp/mcp_server_stderr.log"),
-            "launch wrapper should keep its log redirection: {script}"
-        );
-    }
-
-    #[test]
-    fn sandbox_mcp_launch_wrapper_evaluates_scripts_in_the_selected_bash() {
-        let source =
-            "PATH=/mcp-only\nprintf 'starting server\\n'\nexec my-server --port 3100 # ready";
-        let script =
-            sandbox_mcp_launch_script(&["bash".to_string(), "-c".to_string(), source.to_string()]);
-
-        let wrapper_argument = script
-            .strip_prefix("setsid \"$BASH\" -c ")
-            .and_then(|rest| rest.strip_suffix(" </dev/null >/dev/null 2>&1 &\necho $!"))
-            .expect("launch wrapper should have the canonical shape");
-        let unwrapped = shlex::split(wrapper_argument).expect("wrapper argument should parse");
-
-        assert_eq!(unwrapped, vec![format!(
-            "{{\n{source}\n}} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log"
-        )]);
-        assert!(
-            !unwrapped[0].contains("bash -c"),
-            "script entries must not PATH-resolve a nested Bash: {}",
-            unwrapped[0]
-        );
-    }
-
-    #[test]
-    fn sandbox_mcp_launch_wrapper_quotes_arbitrary_argv() {
-        // A quote or metacharacter in any argv element must not break out of
-        // the wrapper; it has to arrive as one argument.
-        let script = sandbox_mcp_launch_script(&[
-            "my-server".to_string(),
-            "--flag=it's a value".to_string(),
-            "$(touch /tmp/pwned)".to_string(),
-        ]);
-
-        let wrapper_argument = script
-            .strip_prefix("setsid \"$BASH\" -c ")
-            .and_then(|rest| rest.strip_suffix(" </dev/null >/dev/null 2>&1 &\necho $!"))
-            .expect("launch wrapper should have the canonical shape");
-
-        // Unwrap the wrapper's own quoting: the whole inner script must arrive
-        // as one argument to `bash -c`, with each argv element still quoted so
-        // the substitution stays inert.
-        let unwrapped = shlex::split(wrapper_argument).expect("wrapper argument should parse");
-        assert_eq!(
-            unwrapped.len(),
-            1,
-            "the command must stay a single argument"
-        );
-        assert_eq!(
-            unwrapped[0],
-            "my-server \"--flag=it's a value\" '$(touch /tmp/pwned)' > \
-             /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log"
-        );
-    }
 
     struct NamedToolAccessPolicy {
         decisions: Vec<(&'static str, ToolAccess)>,

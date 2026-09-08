@@ -2130,6 +2130,31 @@ impl Sandbox for DockerSandbox {
         )))
     }
 
+    async fn get_preview_url(
+        &self,
+        port: u16,
+    ) -> crate::Result<Option<(String, HashMap<String, String>)>> {
+        let inspect = self.inspect_container(self.container_id()?).await?;
+        let networks = inspect
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .unwrap_or_default();
+        let address = networks
+            .values()
+            .filter_map(|network| network.ip_address.as_deref())
+            .filter_map(|address| address.parse::<std::net::Ipv4Addr>().ok())
+            .filter(std::net::Ipv4Addr::is_private)
+            .min()
+            .ok_or_else(|| {
+                crate::Error::message(
+                    "Docker sandbox has no private IPv4 preview address; use a host-local bridge network",
+                )
+            })?;
+        // Reach the container directly from its Docker host; never publish a
+        // debugger port on the host's public interfaces.
+        Ok(Some((format!("http://{address}:{port}"), HashMap::new())))
+    }
+
     fn platform(&self) -> &str {
         self.cached_platform.get().map_or("linux", String::as_str)
     }

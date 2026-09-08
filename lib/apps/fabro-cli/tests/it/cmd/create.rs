@@ -136,6 +136,54 @@ fn create_defers_provider_validation_to_the_server() {
 }
 
 #[test]
+fn create_defers_environment_and_mcp_catalogs_to_the_server() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let run_id = unique_run_id();
+    let create_mock = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/v1/runs")
+            .body_includes("server-environment")
+            .body_includes("server-debugger");
+        then.status(201)
+            .header("Content-Type", "application/json")
+            .body(run_status_response(run_id.as_str(), "submitted").to_string());
+    });
+    context.write_temp(
+        "managed.fabro",
+        "digraph Managed { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }",
+    );
+    context.write_temp(
+        "managed.toml",
+        r#"_version = 1
+[workflow]
+graph = "managed.fabro"
+[run.environment]
+id = "server-environment"
+[run.agent.mcps.debugger]
+id = "server-debugger"
+"#,
+    );
+    let output = context
+        .create_cmd()
+        .args([
+            "--server",
+            &format!("{}/api/v1", server.base_url()),
+            "--dry-run",
+        ])
+        .arg(context.temp_dir.join("managed.toml"))
+        .output()
+        .expect("command should execute");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    create_mock.assert();
+    assert_eq!(output_stdout(&output).trim(), run_id.as_str());
+}
+
+#[test]
 fn create_uses_configured_server_target_without_server_flag() {
     let context = test_context!();
     let server = MockServer::start();

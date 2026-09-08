@@ -177,7 +177,7 @@ export function isMcpServerFormValid(
       break;
     case "sandbox":
       if (values.command.trim() === "") return false;
-      if (!Number.isInteger(values.port) || values.port < 1 || values.port > 65_535) {
+      if (!Number.isInteger(values.port) || values.port < 0 || values.port > 65_535) {
         return false;
       }
       break;
@@ -394,12 +394,12 @@ function SandboxTransportFields({ values, patch, isEdit }: TransportFieldsProps)
         help="Command and arguments used to launch the MCP server inside the run sandbox."
         placeholder="python server.py"
       />
-      <Row title={<Label required>Port</Label>} help="Port where the in-sandbox MCP server listens.">
+      <Row title={<Label required>Port</Label>} help="Use 0 for an automatically assigned port. The command must listen on FABRO_MCP_PORT.">
         <input
           type="number"
           name="port"
           aria-label="Port"
-          min={1}
+          min={0}
           max={65_535}
           value={values.port}
           onChange={(e) => patch({ port: Number(e.target.value) })}

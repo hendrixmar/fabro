@@ -166,7 +166,7 @@ pub fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManifest> {
         workflow_settings_builder = workflow_settings_builder.user_file(path)?;
     }
     let mut workflow_settings = workflow_settings_builder
-        .build()
+        .build_manifest_metadata()
         .context("failed to resolve manifest settings")?;
     workflow_settings.run.inputs.extend(input.input_overrides);
     let target_path = root_location.graph.clone();
@@ -459,6 +459,46 @@ mod tests {
                 ..EnvironmentLayer::default()
             },
         )]))
+    }
+
+    #[test]
+    fn manifest_preserves_server_owned_catalog_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = r#"_version = 1
+[workflow]
+graph = "workflow.fabro"
+[run.environment]
+id = "server-owned-environment"
+[run.agent.mcps.debugger]
+id = "server-owned-debugger"
+"#;
+        std::fs::write(temp.path().join("workflow.toml"), source).unwrap();
+        std::fs::write(
+            temp.path().join("workflow.fabro"),
+            "digraph Proof { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }",
+        )
+        .unwrap();
+        let built = build_run_manifest(ManifestBuildInput {
+            workflow: temp.path().join("workflow.toml"),
+            cwd: temp.path().to_path_buf(),
+            environment_defaults: test_environment_defaults(),
+            ..Default::default()
+        })
+        .unwrap();
+        let bundled = built.manifest.workflows["workflow.fabro"]
+            .config
+            .as_ref()
+            .unwrap();
+        assert_eq!(bundled.source, source);
+        // The server still must reject these references without its catalog;
+        // metadata extraction must not erase them or invent local substitutes.
+        assert!(
+            WorkflowSettingsBuilder::new()
+                .workflow_toml(&bundled.source)
+                .unwrap()
+                .build()
+                .is_err()
+        );
     }
 
     fn assert_manifest_bundles_output_schema_file(node_attributes: &str) {

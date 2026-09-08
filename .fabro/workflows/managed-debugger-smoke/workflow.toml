@@ -1,0 +1,15 @@
+_version = 1
+[workflow]
+graph = "workflow.fabro"
+[run.environment]
+id = "debugger-agents"
+[run.environment.env]
+MINIMAX_API_KEY = "{{ secrets.MINIMAX_API_KEY }}"
+[run.clone]
+enabled = false
+[run.run_branch]
+enabled = false
+[run.meta_branch]
+enabled = false
+[run.pull_request]
+enabled = false
