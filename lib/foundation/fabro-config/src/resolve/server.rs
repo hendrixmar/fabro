@@ -438,11 +438,10 @@ fn resolve_bugsink(layer: &BugsinkIntegrationLayer, errors: &mut Vec<ResolveErro
             invalid("origin", "requires an exact HTTP(S) origin without credentials, path, query or fragment");
         }
     }
-    let valid_name = |name: &str| !name.is_empty() && name.trim() == name && !name.chars().any(char::is_control);
     if (enabled || layer.api_token_secret.is_some())
-        && !layer.api_token_secret.as_deref().is_some_and(valid_name)
+        && !layer.api_token_secret.as_deref().is_some_and(fabro_types::is_env_style_name)
     {
-        invalid("api_token_secret", "requires a nonempty vault secret name");
+        invalid("api_token_secret", "requires an environment-style vault secret name");
     }
     if enabled && layer.projects.as_ref().is_none_or(Vec::is_empty) {
         invalid("projects", "enabled intake requires at least one project mapping");
@@ -469,8 +468,8 @@ fn resolve_bugsink(layer: &BugsinkIntegrationLayer, errors: &mut Vec<ResolveErro
         if fabro_automation::AutomationId::new(automation_id.clone()).is_err() {
             invalid("automation_id", "must be a valid automation ID");
         }
-        if !valid_name(&signing_secret) {
-            invalid("signing_secret", "requires a nonempty vault secret name");
+        if !fabro_types::is_env_style_name(&signing_secret) {
+            invalid("signing_secret", "requires an environment-style vault secret name");
         }
         if enabled && !secret_names.insert(project.signing_secret.as_deref().unwrap_or("")) {
             invalid("signing_secret", "enabled mappings must use distinct signing and API secret names");
@@ -494,11 +493,11 @@ mod bugsink_tests {
         toml::from_str(r#"
 enabled = true
 origin = "https://bugsink.example"
-api_token_secret = "bugsink-api"
+api_token_secret = "BUGSINK_API_TOKEN"
 [[projects]]
 project_id = 7
 automation_id = "incident-loop"
-signing_secret = "bugsink-project-7"
+signing_secret = "BUGSINK_SIGNING_7"
 "#).unwrap()
     }
 
@@ -518,18 +517,20 @@ signing_secret = "bugsink-project-7"
 
     #[test]
     fn bugsink_rejects_ambiguous_identity_credentials_and_dispatch_without_intake() {
-        for edit in 0..7 {
+        for edit in 0..9 {
             let mut layer = valid_layer();
             match edit {
                 0 => {
                     let duplicate = layer.projects.as_ref().unwrap()[0].clone();
                     layer.projects.as_mut().unwrap().push(duplicate);
                 }
-                1 => layer.api_token_secret = Some("bugsink-project-7".into()),
+                1 => layer.api_token_secret = Some("BUGSINK_SIGNING_7".into()),
                 2 => layer.projects.as_mut().unwrap()[0].project_id = Some(u64::MAX),
                 3 => layer.projects.as_mut().unwrap()[0].automation_id = Some("../other".into()),
                 4 => layer.origin = Some("https://user:password@bugsink.example/path?token=x".into()),
                 5 => layer.api_token_secret = Some(" ".into()),
+                6 => layer.api_token_secret = Some("bugsink-api".into()),
+                7 => layer.projects.as_mut().unwrap()[0].signing_secret = Some("bugsink-signing".into()),
                 _ => { layer.enabled = Some(false); layer.dispatch_enabled = Some(true); }
             }
             let mut errors = Vec::new();
