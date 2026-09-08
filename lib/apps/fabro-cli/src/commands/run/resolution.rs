@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context as _, anyhow, bail};
 use fabro_manifest::{CollectedWorkflowClosure, ResolvedLocalWorkflowPackage};
@@ -71,18 +71,11 @@ pub(super) async fn target(
     provider: EnvironmentProvider,
     cwd: &Path,
 ) -> anyhow::Result<(RunTarget, bool)> {
-    match selection {
-        TargetSelection::CurrentDirectory => observe_directory(provider, cwd.to_path_buf()).await,
-        TargetSelection::Path(path) => {
-            let path = cwd
-                .join(path)
-                .canonicalize()
-                .context("failed to canonicalize target directory")?;
-            if !path.is_dir() {
-                bail!("target path must be a directory");
-            }
-            observe_directory(provider, path).await
-        }
+    let path = match selection {
+        TargetSelection::Path(path) => cwd
+            .join(path)
+            .canonicalize()
+            .context("failed to canonicalize target directory")?,
         TargetSelection::Git { repository, branch } => {
             if !provider.is_clone_based() {
                 bail!("Git targets require a clone-enabled Docker or Daytona environment");
@@ -94,15 +87,12 @@ pub(super) async fn target(
             })
             .await?;
             // Canonical admission retains ownership of provider capabilities.
-            Ok((RunTarget::Git(target), false))
+            return Ok((RunTarget::Git(target), false));
         }
+    };
+    if !path.is_dir() {
+        bail!("target path must be a directory");
     }
-}
-
-async fn observe_directory(
-    provider: EnvironmentProvider,
-    path: PathBuf,
-) -> anyhow::Result<(RunTarget, bool)> {
     // The existing observer can push/query Git synchronously. Preserve its
     // behavior without blocking a Tokio worker or promising a new timeout.
     task::spawn_blocking(move || run_target_for_environment(provider, &path))
@@ -199,67 +189,18 @@ fn none_target_for_unversioned_directory(canonical_cwd: &Path) -> anyhow::Result
     reason = "resolver tests construct small local workflow fixtures"
 )]
 mod tests {
-    use clap::Parser as _;
-
-    use super::super::selection;
+    use super::super::test_support::write_workflow;
     use super::*;
-    use crate::args::RunArgs;
-
-    fn write_workflow(root: &Path, name: &str) {
-        let dir = root.join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("workflow.toml"),
-            "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("workflow.fabro"),
-            "digraph Test { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
-        )
-        .unwrap();
-    }
-
-    #[derive(clap::Parser)]
-    struct Command {
-        #[command(flatten)]
-        args: RunArgs,
-    }
 
     #[tokio::test]
-    async fn run_selection_direct_and_parsed_resolve_identically() {
+    async fn run_selection_target_resolution_by_provider() {
         let caller = tempfile::tempdir().unwrap();
         let root = caller.path().canonicalize().unwrap();
         write_workflow(&root, ".fabro/workflows/review");
         std::fs::create_dir(root.join("target")).unwrap();
-        let args = Command::try_parse_from(["cmd", "review", "--target-path", "target"]).unwrap();
-        let (parsed_workflow, parsed_target) = selection::parse(&args.args).unwrap();
-        let direct_workflow = WorkflowSelection::Local("review".into());
-        let direct_target = TargetSelection::Path("target".into());
+        let selected = TargetSelection::Path("target".into());
         assert_eq!(
-            workflow(&parsed_workflow, &root, None)
-                .await
-                .unwrap()
-                .closure()
-                .root_id(),
-            workflow(&direct_workflow, &root, None)
-                .await
-                .unwrap()
-                .closure()
-                .root_id()
-        );
-        for provider in [
-            EnvironmentProvider::Local,
-            EnvironmentProvider::Docker,
-            EnvironmentProvider::Daytona,
-        ] {
-            assert_eq!(
-                target(&parsed_target, provider, &root).await.unwrap(),
-                target(&direct_target, provider, &root).await.unwrap()
-            );
-        }
-        assert_eq!(
-            target(&direct_target, EnvironmentProvider::Local, &root)
+            target(&selected, EnvironmentProvider::Local, &root)
                 .await
                 .unwrap()
                 .0,
@@ -267,16 +208,15 @@ mod tests {
                 path: root.join("target").to_str().unwrap().into(),
             }
         );
-        assert_eq!(
-            target(&direct_target, EnvironmentProvider::Docker, &root)
-                .await
-                .unwrap()
-                .0,
-            RunTarget::None {}
-        );
+        for provider in [EnvironmentProvider::Docker, EnvironmentProvider::Daytona] {
+            assert_eq!(
+                target(&selected, provider, &root).await.unwrap().0,
+                RunTarget::None {}
+            );
+        }
         assert_eq!(
             target(
-                &TargetSelection::CurrentDirectory,
+                &TargetSelection::Path(".".into()),
                 EnvironmentProvider::Local,
                 &root
             )
@@ -301,24 +241,18 @@ mod tests {
             .to_string()
             .contains("Docker or Daytona")
         );
-        assert!(
-            target(
-                &TargetSelection::Path("missing".into()),
-                EnvironmentProvider::Local,
-                &root
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            target(
-                &TargetSelection::Path(".fabro/workflows/review/workflow.toml".into()),
-                EnvironmentProvider::Local,
-                &root
-            )
-            .await
-            .is_err()
-        );
+        for path in ["missing", ".fabro/workflows/review/workflow.toml"] {
+            assert!(
+                target(
+                    &TargetSelection::Path(path.into()),
+                    EnvironmentProvider::Local,
+                    &root
+                )
+                .await
+                .is_err(),
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -36,19 +36,18 @@ pub(crate) async fn create_run(
         )
     })?;
     let user_workflows_root = fabro_util::Home::from_env().workflows_dir();
+    let resolve_workflow = || {
+        resolution::workflow(
+            &workflow_selection,
+            &canonical_cwd,
+            Some(&user_workflows_root),
+        )
+    };
     // Preserve local lookup diagnostics before contacting the server. Remote
     // acquisition waits until parent, environment, and target are validated.
-    let local_package = if matches!(workflow_selection, WorkflowSelection::Local(_)) {
-        Some(
-            resolution::workflow(
-                &workflow_selection,
-                &canonical_cwd,
-                Some(&user_workflows_root),
-            )
-            .await?,
-        )
-    } else {
-        None
+    let local_package = match &workflow_selection {
+        WorkflowSelection::Local(_) => Some(resolve_workflow().await?),
+        WorkflowSelection::Git { .. } => None,
     };
     let prepared = prepare_intent_overrides(args, &canonical_cwd).await?;
 
@@ -100,14 +99,7 @@ pub(crate) async fn create_run(
     }
     let package = match local_package {
         Some(package) => package,
-        None => {
-            resolution::workflow(
-                &workflow_selection,
-                &canonical_cwd,
-                Some(&user_workflows_root),
-            )
-            .await?
-        }
+        None => resolve_workflow().await?,
     };
     let workflow_version_id = package.closure().root_id();
     client

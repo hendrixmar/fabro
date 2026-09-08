@@ -7,15 +7,12 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use fabro_manifest::CollectedWorkflowClosure;
 use fabro_types::{GitHubRepositorySlug, GitRunTarget, repository};
-use nix::errno::Errno;
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
 use tokio::{fs, signal as tokio_signal, task, time};
 use tokio_util::sync::CancellationToken;
 
-use super::selection::{self, RemoteWorkflowRevision};
+use super::selection::RemoteWorkflowRevision;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -55,8 +52,10 @@ impl NativeGit {
         }
     }
 
+    /// Run one Git command; `operation` labels it in failure diagnostics.
     async fn command(
         &self,
+        operation: &'static str,
         cwd: &Path,
         args: &[&str],
         cancel: &CancellationToken,
@@ -118,7 +117,7 @@ impl NativeGit {
                 if !status.success() {
                     // Output may contain arbitrary helper/config secrets, even after pattern
                     // redaction. Never retain it in an error/cause chain or tracing event.
-                    return Err(RemoteWorkflowError::Process { operation: operation(args), status });
+                    return Err(RemoteWorkflowError::Process { operation, status });
                 }
                 if overflow { return Err(RemoteWorkflowError::OutputLimit); }
                 Ok(stdout)
@@ -126,24 +125,14 @@ impl NativeGit {
         };
         // Helpers may inherit pipes or survive their Git parent. Terminate the
         // owned process group on both completion and interruption, then reap Git.
-        let mut cleanup_error = None;
         #[cfg(unix)]
         if let Some(id) = process_id {
-            let pid = Pid::from_raw(id.cast_signed());
-            match signal::killpg(pid, Signal::SIGKILL) {
-                Ok(()) | Err(Errno::ESRCH) => {}
-                Err(source) => cleanup_error = Some(std::io::Error::from(source)),
-            }
+            fabro_proc::sigkill_process_group(id);
         }
         if result.is_err() {
-            if let Err(source) = child.kill().await {
-                cleanup_error = Some(source);
-            }
+            child.kill().await?;
         }
         child.wait().await?;
-        if let Some(source) = cleanup_error {
-            return Err(source.into());
-        }
         result
     }
 
@@ -156,7 +145,9 @@ impl NativeGit {
         let url = repository.https_url();
         let mut args = vec!["ls-remote", "--symref", &url];
         args.extend(patterns.iter().map(String::as_str));
-        let bytes = self.command(&self.cwd, &args, cancel).await?;
+        let bytes = self
+            .command("metadata lookup", &self.cwd, &args, cancel)
+            .await?;
         Ok(std::str::from_utf8(&bytes)
             .context("local Git returned invalid metadata encoding")?
             .to_owned())
@@ -169,9 +160,6 @@ impl NativeGit {
         cancel: &CancellationToken,
     ) -> anyhow::Result<GitRunTarget> {
         let (branch, sha) = if let Some(branch) = branch {
-            if !repository::is_valid_git_branch_name(&branch) {
-                bail!("invalid target working branch");
-            }
             let reference = format!("refs/heads/{branch}");
             let records = self
                 .records(&repository, std::slice::from_ref(&reference), cancel)
@@ -198,26 +186,17 @@ impl NativeGit {
         cancel: &CancellationToken,
     ) -> anyhow::Result<String> {
         match revision {
-            RemoteWorkflowRevision::Commit(sha) => {
-                repository::normalize_git_commit_sha(sha).context("invalid full source commit SHA")
-            }
+            RemoteWorkflowRevision::Commit(sha) => Ok(sha.clone()),
             RemoteWorkflowRevision::DefaultBranch => {
                 let records = self.records(repository, &["HEAD".into()], cancel).await?;
                 Ok(default_head(&records)?.1)
             }
             RemoteWorkflowRevision::Ref(reference) => {
-                RemoteWorkflowRevision::parse(Some(reference))?;
-                let patterns = if reference.starts_with("refs/") {
-                    vec![reference.clone(), format!("{reference}^{{}}")]
-                } else {
-                    vec![
-                        format!("refs/heads/{reference}"),
-                        format!("refs/tags/{reference}"),
-                        format!("refs/tags/{reference}^{{}}"),
-                    ]
-                };
-                let records = self.records(repository, &patterns, cancel).await?;
-                resolve_named_ref(&records, reference)
+                let candidates = RefCandidates::new(reference);
+                let records = self
+                    .records(repository, &candidates.patterns(), cancel)
+                    .await?;
+                candidates.resolve(&records)
             }
         }
     }
@@ -229,7 +208,6 @@ impl NativeGit {
         revision: RemoteWorkflowRevision,
         cancel: CancellationToken,
     ) -> anyhow::Result<CollectedWorkflowClosure> {
-        selection::validate_remote_selector(&selector)?;
         let sha = self
             .resolve_revision(&repository, &revision, &cancel)
             .await?;
@@ -277,9 +255,15 @@ impl NativeGit {
         root: &Path,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
-        self.command(root, &["init", "--quiet", "--template="], cancel)
-            .await?;
         self.command(
+            "repository initialization",
+            root,
+            &["init", "--quiet", "--template="],
+            cancel,
+        )
+        .await?;
+        self.command(
+            "fetch",
             root,
             &[
                 "fetch",
@@ -293,7 +277,9 @@ impl NativeGit {
             cancel,
         )
         .await?;
-        let kind = self.command(root, &["cat-file", "-t", sha], cancel).await?;
+        let kind = self
+            .command("object inspection", root, &["cat-file", "-t", sha], cancel)
+            .await?;
         if kind != b"commit\n" {
             bail!("the selected source SHA is not a commit");
         }
@@ -306,6 +292,7 @@ impl NativeGit {
         )
         .await?;
         self.command(
+            "checkout",
             root,
             &[
                 "-c",
@@ -320,21 +307,17 @@ impl NativeGit {
         )
         .await?;
         let head = self
-            .command(root, &["rev-parse", "--verify", "HEAD"], cancel)
+            .command(
+                "checkout verification",
+                root,
+                &["rev-parse", "--verify", "HEAD"],
+                cancel,
+            )
             .await?;
         if head != format!("{sha}\n").as_bytes() {
             bail!("workflow checkout did not match the selected commit");
         }
         Ok(())
-    }
-}
-
-fn operation(args: &[&str]) -> &'static str {
-    match args.first().copied() {
-        Some("ls-remote") => "metadata lookup",
-        Some("fetch") => "fetch",
-        Some("checkout") => "checkout",
-        _ => "repository operation",
     }
 }
 
@@ -394,48 +377,83 @@ fn default_head(records: &str) -> anyhow::Result<(String, String)> {
     ))
 }
 
-fn resolve_named_ref(records: &str, reference: &str) -> anyhow::Result<String> {
-    let heads = if reference.starts_with("refs/") {
-        reference.to_owned()
-    } else {
-        format!("refs/heads/{reference}")
-    };
-    let tags = if reference.starts_with("refs/") {
-        reference.to_owned()
-    } else {
-        format!("refs/tags/{reference}")
-    };
-    let branch = if heads.starts_with("refs/heads/") {
-        exact_record(records, &heads)?
-    } else {
-        None
-    };
-    let tag = if tags.starts_with("refs/tags/") {
-        exact_record(records, &tags)?
-    } else {
-        None
-    };
-    if branch.is_some() && tag.is_some() {
-        bail!(
-            "workflow ref is ambiguous between a branch and tag; use refs/heads/... or refs/tags/..."
-        );
+/// The fully qualified refs a validated `--workflow-ref` may name. A bare name
+/// may be a branch or a tag; a `refs/heads/` or `refs/tags/` name is exactly
+/// one.
+struct RefCandidates {
+    branch: Option<String>,
+    tag:    Option<String>,
+}
+
+impl RefCandidates {
+    fn new(reference: &str) -> Self {
+        if reference.starts_with("refs/") {
+            let qualified = Some(reference.to_owned());
+            if reference.starts_with("refs/heads/") {
+                Self {
+                    branch: qualified,
+                    tag:    None,
+                }
+            } else {
+                Self {
+                    branch: None,
+                    tag:    qualified,
+                }
+            }
+        } else {
+            Self {
+                branch: Some(format!("refs/heads/{reference}")),
+                tag:    Some(format!("refs/tags/{reference}")),
+            }
+        }
     }
-    if let Some(sha) = branch {
-        return Ok(sha);
+
+    /// `ls-remote` patterns, including the peeled form of any tag candidate.
+    fn patterns(&self) -> Vec<String> {
+        self.branch
+            .iter()
+            .cloned()
+            .chain(
+                self.tag
+                    .iter()
+                    .flat_map(|tag| [tag.clone(), format!("{tag}^{{}}")]),
+            )
+            .collect()
     }
-    if let Some(sha) = tag {
-        return Ok(exact_record(records, &format!("{tags}^{{}}"))?.unwrap_or(sha));
+
+    fn resolve(&self, records: &str) -> anyhow::Result<String> {
+        let branch = match &self.branch {
+            Some(name) => exact_record(records, name)?,
+            None => None,
+        };
+        let tag = match &self.tag {
+            Some(name) => exact_record(records, name)?.map(|sha| (name, sha)),
+            None => None,
+        };
+        match (branch, tag) {
+            (Some(_), Some(_)) => bail!(
+                "workflow ref is ambiguous between a branch and tag; use refs/heads/... or refs/tags/..."
+            ),
+            (Some(sha), None) => Ok(sha),
+            // Prefer the peeled commit of an annotated tag over the tag object.
+            (None, Some((name, sha))) => {
+                Ok(exact_record(records, &format!("{name}^{{}}"))?.unwrap_or(sha))
+            }
+            (None, None) => {
+                bail!("workflow ref was not found; no alternative revision was selected")
+            }
+        }
     }
-    bail!("workflow ref was not found; no alternative revision was selected")
 }
 
 fn check_source_symlinks(root: &Path) -> anyhow::Result<()> {
     let root = root.canonicalize()?;
+    let git_dir = root.join(".git");
     // Validate links before the collector's initial TOML lookup can read them.
     for entry in walkdir::WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| entry.path() != root.join(".git"))
+        .filter_entry(|entry| entry.path() != git_dir)
     {
         let entry = entry?;
         if entry.file_type().is_symlink() && !entry.path().canonicalize()?.starts_with(&root) {
@@ -479,6 +497,7 @@ mod tests {
     use nix::sys::stat::Mode;
     use nix::unistd;
 
+    use super::super::test_support::{commit_all, write_workflow};
     use super::*;
 
     struct Fixture {
@@ -497,30 +516,8 @@ mod tests {
                 git2::RepositoryInitOptions::new().initial_head("trunk"),
             )
             .unwrap();
-            let workflow = repo_dir.join(".fabro/workflows/review");
-            std::fs::create_dir_all(&workflow).unwrap();
-            std::fs::write(
-                workflow.join("workflow.toml"),
-                "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n",
-            )
-            .unwrap();
-            std::fs::write(
-                workflow.join("workflow.fabro"),
-                "digraph Review { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
-            )
-            .unwrap();
-            let mut index = repo.index().unwrap();
-            index
-                .add_all(["."], git2::IndexAddOption::DEFAULT, None)
-                .unwrap();
-            let tree_id = index.write_tree().unwrap();
-            let sha = {
-                let tree = repo.find_tree(tree_id).unwrap();
-                let signature = git2::Signature::now("Fixture", "fixture@example.test").unwrap();
-                repo.commit(Some("HEAD"), &signature, &signature, "workflow", &tree, &[])
-                    .unwrap()
-                    .to_string()
-            };
+            write_workflow(&repo_dir, ".fabro/workflows/review");
+            let sha = commit_all(&repo, "workflow");
             let config = root.path().join("gitconfig");
             std::fs::write(
                 &config,
@@ -546,30 +543,6 @@ mod tests {
 
         fn repository() -> GitHubRepositorySlug {
             "acme/workflows".parse().unwrap()
-        }
-    }
-
-    impl Fixture {
-        fn commit_changes(&self) -> String {
-            let mut index = self.repo.index().unwrap();
-            index
-                .add_all(["."], git2::IndexAddOption::DEFAULT, None)
-                .unwrap();
-            let tree_id = index.write_tree().unwrap();
-            let tree = self.repo.find_tree(tree_id).unwrap();
-            let parent = self.repo.head().unwrap().peel_to_commit().unwrap();
-            let signature = git2::Signature::now("Fixture", "fixture@example.test").unwrap();
-            self.repo
-                .commit(
-                    Some("HEAD"),
-                    &signature,
-                    &signature,
-                    "update workflow",
-                    &tree,
-                    &[&parent],
-                )
-                .unwrap()
-                .to_string()
         }
     }
 
@@ -610,7 +583,7 @@ mod tests {
                 &format!("touch '{}'; cat", sentinel.display()),
             )
             .unwrap();
-        let sha = fixture.commit_changes();
+        let sha = commit_all(&fixture.repo, "update workflow");
         let local = fabro_manifest::collect_workflow_versions(Path::new("review"), source).unwrap();
         assert_eq!(local.versions().count(), 2);
         for selector in [
@@ -676,7 +649,7 @@ mod tests {
             .join(".fabro/workflows/review/workflow.toml");
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&fifo, path).unwrap();
-        let sha = fixture.commit_changes();
+        let sha = commit_all(&fixture.repo, "update workflow");
         let error = fixture
             .git
             .collect(
@@ -712,7 +685,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let pid: i32 = std::fs::read_to_string(path.join("pid"))
+        let pid: u32 = std::fs::read_to_string(path.join("pid"))
             .unwrap()
             .parse()
             .unwrap();
@@ -725,7 +698,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(signal::kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+        assert!(!fabro_proc::process_exists(pid));
         drop(fake);
     }
 
@@ -936,7 +909,11 @@ mod tests {
     #[test]
     fn remote_workflow_matches_records_exactly_and_rejects_host_symlinks() {
         let sha = "1234567890123456789012345678901234567890";
-        assert!(resolve_named_ref(&format!("{sha}\trefs/heads/nested/main\n"), "main").is_err());
+        assert!(
+            RefCandidates::new("main")
+                .resolve(&format!("{sha}\trefs/heads/nested/main\n"))
+                .is_err()
+        );
         let root = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(host.path(), root.path().join("outside")).unwrap();
@@ -960,7 +937,7 @@ mod tests {
             "i=0; while [ $i -lt 9000 ]; do printf 'sentinel-secret-plain-text\\n'; printf 'sentinel-secret-plain-text\\n' >&2; i=$((i+1)); done; exit 42",
         );
         let error = git
-            .command(root.path(), &["fetch"], &CancellationToken::new())
+            .command("fetch", root.path(), &["fetch"], &CancellationToken::new())
             .await
             .unwrap_err();
         assert!(
@@ -971,9 +948,14 @@ mod tests {
             "i=0; while [ $i -lt 9000 ]; do printf 'metadata-output\\n'; i=$((i+1)); done",
         );
         assert!(matches!(
-            git.command(root.path(), &["ls-remote"], &CancellationToken::new())
-                .await
-                .unwrap_err(),
+            git.command(
+                "metadata lookup",
+                root.path(),
+                &["ls-remote"],
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
             RemoteWorkflowError::OutputLimit
         ));
     }
@@ -996,17 +978,20 @@ mod tests {
                     cancel.cancel();
                 }
             };
-            let (result, ()) = tokio::join!(git.command(root.path(), &["fetch"], &cancel), trigger);
+            let (result, ()) = tokio::join!(
+                git.command("fetch", root.path(), &["fetch"], &cancel),
+                trigger
+            );
             let error = result.unwrap_err();
             assert!(matches!(
                 error,
                 RemoteWorkflowError::Timeout | RemoteWorkflowError::Cancelled
             ));
-            let pid: i32 = std::fs::read_to_string(root.path().join("pid"))
+            let pid: u32 = std::fs::read_to_string(root.path().join("pid"))
                 .unwrap()
                 .parse()
                 .unwrap();
-            assert_eq!(signal::kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+            assert!(!fabro_proc::process_exists(pid));
         }
     }
 }

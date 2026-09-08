@@ -31,6 +31,8 @@ mod selection;
 pub(crate) mod ssh;
 pub(crate) mod start;
 pub(crate) mod steer;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod wait;
 
 pub(crate) async fn dispatch(

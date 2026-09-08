@@ -1268,6 +1268,8 @@ pub(crate) struct UpgradeArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RunCommands {
+    // Boxed so `RunArgs` does not dominate the size of the flattened
+    // `Commands` enum (clippy `large_enum_variant`).
     /// Register a workflow version, create a run, and start it
     Run(Box<RunArgs>),
     /// Register a workflow version and create a submitted run
@@ -2002,21 +2004,12 @@ fn parse_reasoning_effort_arg(value: &str) -> Result<ReasoningEffort, String> {
 
 #[cfg(test)]
 mod run_selection_grammar_tests {
-    use clap::Parser as _;
-
-    use super::RunArgs;
-
-    #[derive(clap::Parser)]
-    struct Command {
-        #[command(flatten)]
-        run: RunArgs,
-    }
+    use crate::commands::run::test_support::parse_run_args;
 
     #[test]
     fn run_selection_accepts_independent_resource_flags() {
         for flags in [
             vec![
-                "fabro",
                 "review",
                 "--workflow-git",
                 "acme/workflows",
@@ -2027,28 +2020,21 @@ mod run_selection_grammar_tests {
                 "--target-branch",
                 "release/topic",
             ],
-            vec!["fabro", "./review.toml", "--target-path", "../app"],
+            vec!["./review.toml", "--target-path", "../app"],
         ] {
-            assert!(Command::try_parse_from(flags).is_ok());
+            assert!(parse_run_args(flags).is_ok());
         }
     }
 
     #[test]
     fn run_selection_requires_modifier_owners_and_exclusive_targets() {
         for flags in [
-            vec!["fabro", "review", "--workflow-ref", "v1"],
-            vec!["fabro", "review", "--target-branch", "release"],
-            vec![
-                "fabro",
-                "review",
-                "--target-path",
-                ".",
-                "--target-git",
-                "acme/app",
-            ],
-            vec!["fabro", "--workflow-git", "acme/workflows"],
+            vec!["review", "--workflow-ref", "v1"],
+            vec!["review", "--target-branch", "release"],
+            vec!["review", "--target-path", ".", "--target-git", "acme/app"],
+            vec!["--workflow-git", "acme/workflows"],
         ] {
-            assert!(Command::try_parse_from(flags).is_err());
+            assert!(parse_run_args(flags).is_err());
         }
     }
 }

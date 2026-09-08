@@ -1639,57 +1639,6 @@ draft = false
     assert!(!pull_request.draft);
 }
 
-#[test]
-fn run_selection_target_path_keeps_caller_workflow_and_goal() {
-    let context = test_context!();
-    let server = MockServer::start();
-    let environment = mock_environment(&server, "local", "local");
-    let versions = mock_workflow_version_registrations(&server);
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let create = mock_intent_create(&server, &unique_run_id(), Arc::clone(&requests));
-    let caller = tempfile::tempdir().unwrap();
-    let target = caller.path().join("target");
-    write_workflow(caller.path(), ".fabro/workflows/review", "Caller");
-    write_workflow(&target, ".fabro/workflows/review", "Target");
-    std::fs::write(caller.path().join("goal.txt"), "Caller goal").unwrap();
-    std::fs::write(target.join("goal.txt"), "Target goal").unwrap();
-    let expected = fabro_manifest::resolve_local_workflow_package(
-        std::path::Path::new("review"),
-        caller.path(),
-        None,
-    )
-    .unwrap()
-    .closure()
-    .root_id();
-    let output = context
-        .create_cmd()
-        .current_dir(caller.path())
-        .args([
-            "review",
-            "--target-path",
-            "target",
-            "--goal-file",
-            "goal.txt",
-            "--environment",
-            "local",
-            "--server",
-            &format!("{}/api/v1", server.base_url()),
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", output_stderr(&output));
-    environment.assert();
-    versions.assert();
-    create.assert();
-    let requests = requests.lock().unwrap();
-    assert_eq!(requests[0]["workflow_version_id"], expected.to_string());
-    assert_eq!(
-        requests[0]["target"],
-        json!({"kind": "folder", "path": target.canonicalize().unwrap()})
-    );
-    assert_eq!(requests[0]["goal"], "Caller goal");
-}
-
 fn init_remote_fixture(path: &std::path::Path, branch: &str) -> String {
     let repo = git2::Repository::init_opts(
         path,

@@ -1,9 +1,9 @@
 //! CLI syntax ends here. Resolvers receive selections and explicit caller
 //! context.
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-use fabro_types::{GitHubRepositorySlug, repository};
+use fabro_types::{GitHubRepositorySlug, WorkflowPath, repository};
 
 use crate::args::RunArgs;
 
@@ -19,7 +19,8 @@ pub(super) enum WorkflowSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TargetSelection {
-    CurrentDirectory,
+    /// Directory relative to the caller; the default is the caller directory
+    /// itself.
     Path(PathBuf),
     Git {
         repository: GitHubRepositorySlug,
@@ -59,43 +60,25 @@ pub(super) fn validate_remote_selector(path: &Path) -> anyhow::Result<()> {
     let value = path
         .to_str()
         .context("remote workflow selector must be valid UTF-8")?;
-    if value.is_empty()
-        || value.contains('\\')
-        || value.chars().any(char::is_control)
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-        || value.split('/').any(|part| part == "..")
-    {
+    let value = value.strip_prefix("./").unwrap_or(value);
+    if WorkflowPath::new(value).is_err() {
         bail!(
             "remote workflow must be a name or repository-relative .fabro/.toml file without traversal"
         );
     }
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("toml" | "fabro") => {}
-        None if path
-            .file_name()
-            .is_some_and(|name| path.as_os_str() == name)
-            && value != "."
-            && !value.starts_with('-') => {}
+    let is_bare_name = !value.contains('/') && !value.starts_with('-');
+    match Path::new(value).extension().and_then(|ext| ext.to_str()) {
+        Some("toml" | "fabro") => Ok(()),
+        None if is_bare_name => Ok(()),
         _ => bail!(
             "remote workflow must be a name or explicit .fabro/.toml file; directories are ambiguous"
         ),
     }
-    Ok(())
 }
 
 pub(super) fn parse(args: &RunArgs) -> anyhow::Result<(WorkflowSelection, TargetSelection)> {
+    // Flag co-occurrence rules (`requires`/`conflicts_with`) are enforced by clap.
     let workflow = args.workflow.as_ref().context("workflow is required")?;
-    if args.workflow_ref.is_some() && args.workflow_git.is_none() {
-        bail!("--workflow-ref requires --workflow-git");
-    }
-    if args.target_branch.is_some() && args.target_git.is_none() {
-        bail!("--target-branch requires --target-git");
-    }
-    if args.target_path.is_some() && args.target_git.is_some() {
-        bail!("--target-path conflicts with --target-git");
-    }
     let workflow = match &args.workflow_git {
         None => WorkflowSelection::Local(workflow.clone()),
         Some(repository) => {
@@ -124,7 +107,7 @@ pub(super) fn parse(args: &RunArgs) -> anyhow::Result<(WorkflowSelection, Target
                 branch:     args.target_branch.clone(),
             }
         }
-        _ => TargetSelection::CurrentDirectory,
+        _ => TargetSelection::Path(PathBuf::from(".")),
     };
     Ok((workflow, target))
 }
@@ -184,16 +167,9 @@ mod tests {
 
 #[cfg(test)]
 mod adapter_tests {
-    use clap::Parser as _;
-
+    use super::super::test_support::parse_run_args;
     use super::*;
     use crate::args::{Cli, Commands, RunCommands};
-
-    #[derive(clap::Parser)]
-    struct Command {
-        #[command(flatten)]
-        args: RunArgs,
-    }
 
     #[test]
     fn run_selection_both_commands_share_the_adapter() {
@@ -240,23 +216,21 @@ mod adapter_tests {
 
     #[test]
     fn run_selection_adapter_rejects_invalid_inputs_without_acquisition() {
+        // Malformed repository slugs never reach the adapter.
         for flags in [
-            vec![
-                "cmd",
+            [
                 "review",
                 "--workflow-git",
                 "https://github.com/acme/workflows",
             ],
-            vec!["cmd", "review", "--target-git", "acme/app/extra"],
-            vec!["cmd", "../review.toml", "--workflow-git", "acme/workflows"],
+            ["review", "--target-git", "acme/app/extra"],
+        ] {
+            assert!(parse_run_args(flags).is_err());
+        }
+        for flags in [
+            vec!["../review.toml", "--workflow-git", "acme/workflows"],
+            vec!["/tmp/review.toml", "--workflow-git", "acme/workflows"],
             vec![
-                "cmd",
-                "/tmp/review.toml",
-                "--workflow-git",
-                "acme/workflows",
-            ],
-            vec![
-                "cmd",
                 "review",
                 "--workflow-git",
                 "acme/workflows",
@@ -264,7 +238,6 @@ mod adapter_tests {
                 "HEAD~1",
             ],
             vec![
-                "cmd",
                 "review",
                 "--target-git",
                 "acme/app",
@@ -272,7 +245,6 @@ mod adapter_tests {
                 "refs/tags/v1",
             ],
             vec![
-                "cmd",
                 "review",
                 "--target-git",
                 "acme/app",
@@ -280,9 +252,8 @@ mod adapter_tests {
                 "1234567890123456789012345678901234567890",
             ],
         ] {
-            if let Ok(command) = Command::try_parse_from(flags) {
-                assert!(parse(&command.args).is_err());
-            }
+            let args = parse_run_args(flags.iter().copied()).unwrap();
+            assert!(parse(&args).is_err(), "{flags:?}");
         }
     }
 }
