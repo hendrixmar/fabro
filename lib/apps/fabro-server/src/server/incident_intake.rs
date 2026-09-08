@@ -1,4 +1,15 @@
 mod store;
+mod client;
+mod legacy;
+mod worker;
+mod worker_store;
+
+pub(crate) use worker::{begin_baseline, discovery_eligible, operator_retry, reconcile_once, reconcile_run, spawn_incident_intake};
+use client::ScanProgress;
+use worker::retry_deadline;
+
+#[cfg(test)]
+mod worker_tests;
 
 pub(crate) use store::IncidentStore;
 
@@ -74,7 +85,10 @@ pub(super) async fn validate_enablement(state: &super::AppState) -> anyhow::Resu
             .map_err(|_| anyhow::anyhow!("Bugsink automation lookup failed"))?
             .context("Bugsink configured automation does not exist")?;
         ensure!(automation.target.workflow == "incident-loop", "Bugsink automation must target incident-loop");
+        ensure!([25,26].contains(&project.project_id), "Bugsink incident workflow supports projects 25 and 26 only");
+        ensure!(worker::pinned_revision(&automation.target.ref_selector), "Bugsink workflow requires an immutable source revision");
     }
+    ensure!(projects == std::collections::HashSet::from([25,26]), "Bugsink requires both project mappings 25 and 26");
     Ok(())
 }
 

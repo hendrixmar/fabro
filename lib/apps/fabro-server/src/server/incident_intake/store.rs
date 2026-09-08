@@ -50,7 +50,8 @@ impl IncidentStore {
                  (incident_key, origin, project_id, issue_id, requested_generation, alert_reason)
                  VALUES (?, ?, ?, ?, 1, ?)
                  ON CONFLICT(origin, project_id, issue_id) DO UPDATE SET
-                 requested_generation = requested_generation + 1, alert_reason = excluded.alert_reason",
+                 requested_generation = requested_generation + 1,
+                 alert_reason = CASE WHEN refresh_generation IS NULL THEN excluded.alert_reason ELSE alert_reason END",
             )
             .bind(incident_key)
             .bind(origin)
@@ -83,7 +84,11 @@ impl IncidentStore {
     pub(crate) async fn complete_refresh(&self, incident_key: &str, generation: i64) -> anyhow::Result<()> {
         let changed = sqlx::query(
             "UPDATE bugsink_incidents SET applied_generation = ?, refresh_generation = NULL,
-             read_attempts = 0, next_read_ms = NULL
+             read_attempts = 0, next_read_ms = NULL,
+             alert_reason = CASE WHEN requested_generation > refresh_generation THEN
+                (SELECT reason FROM bugsink_deliveries d WHERE d.origin=bugsink_incidents.origin
+                 AND d.project_id=bugsink_incidents.project_id AND d.issue_id=bugsink_incidents.issue_id
+                 AND d.reason!='TEST' ORDER BY d.rowid DESC LIMIT 1) ELSE alert_reason END
              WHERE incident_key = ? AND refresh_generation = ?",
         )
         .bind(generation)
@@ -125,11 +130,23 @@ impl IncidentStore {
             "SELECT json_object('origin', origin, 'project_id', project_id,
                 'baseline_started_ms', baseline_started_ms,
                 'baseline_complete', json(CASE baseline_complete WHEN 1 THEN 'true' ELSE 'false' END),
-                'scan_started_ms', scan_started_ms, 'next_scan_ms', next_scan_ms)
+                'scan_started_ms', scan_started_ms, 'next_scan_ms', next_scan_ms,
+                'import_status', CASE WHEN json_valid(cursor) THEN
+                    CASE WHEN json_extract(cursor,'$.import_complete')=1 THEN 'complete'
+                        WHEN json_extract(cursor,'$.parked_reason') IS NOT NULL THEN 'incomplete' ELSE 'pending' END
+                    ELSE 'incomplete' END,
+                'parked_reason', CASE WHEN json_valid(cursor) THEN json_extract(cursor,'$.parked_reason') ELSE 'corrupt_scan_progress' END)
              FROM bugsink_scans ORDER BY origin, project_id",
         ).fetch_all(&mut *tx).await?;
         let delivery_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bugsink_deliveries")
             .fetch_one(&mut *tx).await?;
+        let import_rows: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT CASE WHEN json_valid(cursor) THEN json_extract(cursor,'$.legacy_import') END
+             FROM bugsink_scans ORDER BY origin,project_id",
+        ).fetch_all(&mut *tx).await?;
+        let legacy_import = import_rows.into_iter().flatten().next()
+            .map(|value| serde_json::from_str::<Value>(&value)).transpose()?
+            .unwrap_or_else(|| json!({"schema_version":1,"status":"pending","owners":{},"records":[]}));
         tx.commit().await?;
         let parse_rows = |rows: Vec<String>| -> serde_json::Result<Vec<Value>> {
             rows.iter().map(|row| serde_json::from_str(row)).collect()
@@ -139,6 +156,7 @@ impl IncidentStore {
             "runs": parse_rows(runs)?,
             "scans": parse_rows(scans)?,
             "delivery_count": delivery_count,
+            "legacy_import": legacy_import,
         }))
     }
 }
