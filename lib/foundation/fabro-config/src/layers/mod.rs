@@ -34,6 +34,7 @@ pub use run::{
     StringOrSplice,
 };
 pub use server::{
+    BugsinkIntegrationLayer, BugsinkProjectLayer,
     ExternalAgentProfileLayer, ExternalAgentsLayer, GithubIntegrationLayer,
     IntegrationWebhooksLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer, PlaneIntegrationLayer,
     ServerApiLayer, ServerArtifactsLayer, ServerAuthGithubLayer, ServerAuthLayer,

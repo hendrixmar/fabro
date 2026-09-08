@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 
+use fabro_model::{AgentProfileKind, BillingPolicy, CodecKind, ProviderAuthConfig};
 use fabro_types::PermissionLevel;
 use fabro_types::settings::cli::{CliAuthStrategy, OutputFormat, OutputVerbosity};
-use fabro_types::settings::run::{ApprovalMode, EnvironmentNetworkMode, MergeStrategy, RunMode};
+use fabro_types::settings::run::{
+    ApprovalMode, EnvironmentNetworkMode, EnvironmentProvider, MergeStrategy, RunMode,
+};
 use fabro_types::settings::server::{
     GithubIntegrationStrategy, LogDestination, ObjectStoreProvider, ServerAuthMethod,
     WebhookStrategy,
@@ -12,14 +15,15 @@ use fabro_types::settings::{Duration, InterpString, Size};
 use super::LogFilter;
 use super::cli::{CliAuthLayer, CliLoggingLayer, CliTargetLayer};
 use super::environment::EnvironmentDockerfileLayer;
+use super::llm::{CostRates, CredentialRef, ReasoningEffortFeature};
 use super::run::{
     HookAgentMarker, HookEntry, HookTlsMode, InterviewProviderLayer, ModelRefOrSplice,
     NotificationProviderLayer, RunArtifactsLayer, RunCheckpointLayer, RunGoalLayer,
     RunPrepareLayer, ScmGitHubLayer, StringOrSplice,
 };
 use super::server::{
-    ObjectStoreLocalLayer, ObjectStoreS3Layer, ServerApiLayer, ServerAuthGithubLayer,
-    ServerListenLayer,
+    BugsinkProjectLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer, ServerApiLayer,
+    ServerAuthGithubLayer, ServerListenLayer,
 };
 
 /// Internal merge trait used by sparse config layers inside `fabro-config`.
@@ -81,9 +85,20 @@ impl_combine_or_option!(
     ServerAuthMethod,
     WebhookStrategy,
     LogFilter,
+    AgentProfileKind,
+    BillingPolicy,
+    CodecKind,
+    ProviderAuthConfig,
+    ReasoningEffortFeature,
 );
 
 impl Combine for Option<Vec<String>> {
+    fn combine(self, other: Self) -> Self {
+        self.or(other)
+    }
+}
+
+impl Combine for Option<Vec<CredentialRef>> {
     fn combine(self, other: Self) -> Self {
         self.or(other)
     }
@@ -95,7 +110,13 @@ impl Combine for Option<Vec<ServerAuthMethod>> {
     }
 }
 
-impl Combine for Option<BTreeMap<String, String>> {
+impl Combine for Option<Vec<BugsinkProjectLayer>> {
+    fn combine(self, other: Self) -> Self {
+        self.or(other)
+    }
+}
+
+impl Combine for Option<BTreeMap<String, CostRates>> {
     fn combine(self, other: Self) -> Self {
         self.or(other)
     }
@@ -130,6 +151,7 @@ impl_combine_self!(
     CliLoggingLayer,
     CliTargetLayer,
     EnvironmentNetworkMode,
+    EnvironmentProvider,
     EnvironmentDockerfileLayer,
     InterviewProviderLayer,
     NotificationProviderLayer,
