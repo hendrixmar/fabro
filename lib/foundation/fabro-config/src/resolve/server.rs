@@ -430,6 +430,10 @@ fn resolve_bugsink(
             .origin
             .as_deref()
             .and_then(|origin| {
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = "parse trusted config only to reject credentials and non-origin components; neither the raw URL nor parse error is logged"
+                )]
                 let url = url::Url::parse(origin).ok()?;
                 Some(
                     matches!(url.scheme(), "http" | "https")
