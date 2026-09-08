@@ -190,7 +190,6 @@ mod tests {
     use fabro_automation::{AutomationDraft, AutomationId, AutomationStore, AutomationTarget};
     use fabro_types::settings::server::{BugsinkIntegrationSettings, BugsinkProjectSettings};
     use fabro_vault::{SecretStore, SecretType};
-    use hmac::Mac as _;
     use tower::ServiceExt as _;
 
     use crate::principal_middleware::AuthContextSlot;
