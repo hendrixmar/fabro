@@ -142,6 +142,56 @@ id = "sentry"
 enabled = false
 ```
 
+### ACP agents share the same configuration
+
+Configured MCP servers are also delivered to compatible external agents through
+ACP `session/new`, including OMP and Codex. No agent-specific configuration file
+is written. HTTP and SSE transports require the agent to advertise that
+capability; an unsupported transport fails before the prompt rather than
+silently removing tools. ACP stdio servers execute in the agent's sandbox.
+Host-only `current_dir` and `clear_env` restrictions cannot be represented by
+ACP stdio and are rejected rather than discarded.
+
+### Centrally managed debugger
+
+The repository includes an authenticated adapter for
+[`@debugmcp/mcp-debugger`](https://github.com/debugmcp/mcp-debugger) in
+`.fabro/mcp-debugger/`. Build its clean Python/JavaScript agent image and run
+`setup.py --image <built-image-tag-or-id>` on the Fabro server. Use `--url`,
+`--settings`, and `--token-file` for non-default installations. Setup registers
+the `mcp-debugger` catalog entry and `debugger-agents` environment, and adds one
+default reference to the server's `settings.toml`. Restart Fabro to load the
+default. Existing catalog records are reused unless `--replace` is supplied.
+
+Select the `debugger-agents` environment for the preinstalled runtime. Other
+supported Linux Docker images bootstrap the pinned runtime automatically;
+they need Bash, coreutils, `setsid`, curl and tar, plus access to the package
+registries. No personal OMP/Codex configuration or credentials are baked into
+the image. Agents receive provider credentials through normal run environment
+secret references.
+
+Each agent session gets a separate authenticated gateway, an OS-assigned
+listener port, and isolated debugger sessions inside its run's container.
+Docker listeners use the private container address, without publishing host
+ports. The gateway rejects browser requests, missing credentials and direct
+non-loopback attach targets. This is reproduction debugging, not authorization
+to attach to production. Language runtimes and target dependencies still need
+to exist in the sandbox; the bundled image covers Python and JavaScript.
+
+The runnable `managed-debugger-smoke` workflow demonstrates a native Python
+debugger stage followed by an OMP JavaScript debugger stage, without inline MCP
+definitions. `.fabro/mcp-debugger/smoke.mjs` additionally checks authentication,
+cross-client isolation and explicit session cleanup.
+
+For workflows that must not start this debugger, including local host-only
+investigations, override the shared reference:
+
+```toml
+[run.agent.mcps.managed-debugger]
+id = "mcp-debugger"
+enabled = false
+```
+
 ## Runtime interpolation
 
 Inline transport fields can interpolate values at the run boundary:
@@ -207,7 +257,7 @@ Authorization = "Bearer sk-xxx"
 
 ### Sandbox
 
-Runs the MCP server inside the workflow's sandbox (e.g., a [Daytona](/integrations/daytona) cloud VM). Fabro starts the server as a background process, waits for it to listen on the specified port, obtains an authenticated preview URL, and connects via HTTP. This is the right transport for MCP servers that need access to the sandbox environment — for example, [Playwright](https://github.com/microsoft/playwright-mcp) for browser automation.
+Runs the MCP server inside the workflow's Linux sandbox. Managed process startup requires the provider's bidirectional stdio support (currently local and Docker), Linux procfs, Bash, `setsid`, and coreutils. Fabro verifies that the listening socket belongs to the process it launched, obtains a preview URL, and connects via HTTP. Configured startup failures are explicit errors. The owning session stops its processes on shutdown, cancellation, or drop. Unsupported providers fail rather than running the server on the host.
 
 ```toml
 [run.agent.mcps.playwright]
@@ -218,6 +268,14 @@ port = 3100
 startup_timeout = "60s"
 tool_timeout = "2m"
 ```
+
+Use `port = 0` for concurrent agents sharing one sandbox. The launch command must
+read `FABRO_MCP_PORT` and bind port zero so the OS assigns a free port; Fabro
+discovers the actual owned listener. A fixed nonzero port retains fixed-port
+behavior and cannot be reused concurrently. Fabro also supplies an ephemeral
+`FABRO_MCP_BEARER_TOKEN` and sends it as the HTTP Authorization bearer. A server
+exposed beyond loopback must enforce that credential, as the bundled debugger
+gateway does. Neither reserved variable can be overridden by catalog env values.
 
 | Field | Description | Default |
 |---|---|---|

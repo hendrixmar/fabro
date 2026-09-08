@@ -632,6 +632,19 @@ impl WorkflowSettingsBuilder {
         Self::from_layer_with_mcp_server_catalog(&layer, &mcp_server_catalog)
     }
 
+    /// Resolve only the client-side metadata needed to bundle a manifest.
+    /// Environment and agent catalogs belong to the receiving server; their
+    /// original layers travel in the manifest and are validated there. This
+    /// result must not be used to execute a workflow.
+    pub fn build_manifest_metadata(self) -> std::result::Result<WorkflowSettings, ResolveErrors> {
+        let mut layer = self.build_layer();
+        if let Some(run) = layer.run.as_mut() {
+            run.environment = None;
+            run.agent = None;
+        }
+        Self::from_layer(&layer)
+    }
+
     pub(crate) fn from_layer(
         layer: &SettingsLayer,
     ) -> std::result::Result<WorkflowSettings, ResolveErrors> {

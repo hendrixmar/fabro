@@ -196,6 +196,7 @@ async fn build_registry(
                 api = api.with_fabro_run_tools(services);
             }
             let acp = AgentAcpBackend::from_worker_env()
+                .with_mcp_servers(mcp_servers.clone())
                 .with_tool_env_provider(tool_env_provider.clone(), github_token_refresh_managed)
                 .with_steering_hub(Arc::clone(&steering_hub));
             Some(Box::new(BackendRouter::new(Box::new(api), acp)))

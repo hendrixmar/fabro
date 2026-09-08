@@ -502,6 +502,17 @@ fn sandbox_mcp_http_url_builds_sse_endpoint_under_preview_path() {
 }
 
 #[test]
+fn sandbox_mcp_http_url_builds_streamable_endpoint_under_preview_path() {
+    let url = sandbox_mcp_http_url(
+        McpHttpProtocol::StreamableHttp,
+        "https://preview.example.com/proxy/3100/?token=abc",
+    )
+    .unwrap();
+
+    assert_eq!(url, "https://preview.example.com/proxy/3100/mcp?token=abc");
+}
+
+#[test]
 fn sandbox_mcp_http_url_leaves_streamable_http_preview_url_unchanged() {
     let url = sandbox_mcp_http_url(
         McpHttpProtocol::StreamableHttp,

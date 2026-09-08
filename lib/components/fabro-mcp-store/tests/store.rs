@@ -109,6 +109,25 @@ async fn create_get_list_replace_delete_and_reload_round_trip() {
 }
 
 #[tokio::test]
+async fn sandbox_ephemeral_port_survives_catalog_reload() {
+    let (_dir, database) = test_database().await;
+    let store = McpServerStore::load(database.clone_pool()).await.unwrap();
+    let mut definition = draft("debugger", "Debugger");
+    definition.transport = McpTransport::Sandbox {
+        protocol: McpHttpProtocol::StreamableHttp,
+        command:  vec!["debugger".to_string()],
+        port:     0,
+        env:      HashMap::new(),
+    };
+    let created = store.create(definition).await.unwrap();
+    let reloaded = McpServerStore::load(database.clone_pool()).await.unwrap();
+    assert!(matches!(
+        reloaded.get(&created.id).unwrap().transport,
+        McpTransport::Sandbox { port: 0, .. }
+    ));
+}
+
+#[tokio::test]
 async fn all_transport_variants_round_trip_with_sorted_map_json() {
     let (_dir, database) = test_database().await;
     let store = McpServerStore::load(database.clone_pool()).await.unwrap();
