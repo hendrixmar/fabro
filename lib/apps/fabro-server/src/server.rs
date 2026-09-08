@@ -146,6 +146,7 @@ use crate::automation_materializer::{
     AutomationRunMaterializeInput, AutomationRunMaterialized, AutomationRunMaterializer,
     ProductionAutomationRunMaterializer, RunMaterializeError,
 };
+use crate::bugsink_webhooks;
 use crate::canonical_origin::{canonical_origin_from_effective_web_url, effective_web_url};
 use crate::error::ApiError;
 use crate::git_checkout::GitRepoCache;
@@ -1810,7 +1811,7 @@ pub fn build_router_with_options(
         github_endpoints.unwrap_or_else(|| Arc::new(GithubEndpoints::production_defaults()));
     let webhook_secret = state.github_webhook_secret.clone();
     let bugsink_webhooks =
-        crate::bugsink_webhooks::routes(Arc::clone(&state)).with_state(Arc::clone(&state));
+        bugsink_webhooks::routes(Arc::clone(&state)).with_state(Arc::clone(&state));
     let principal_layer = middleware::from_fn_with_state(Arc::clone(&state), principal_middleware);
     let api_common = if web_enabled {
         Router::new()
