@@ -9,11 +9,13 @@ use fabro_api::types::{ManifestGoal, ManifestGoalType};
 use fabro_automation::{
     Automation, PlaneDispatchEffects, PlaneDispatchRecord, PlaneDispatchStore, PlaneTrigger,
 };
+use fabro_tracker::plane::{PlaneStateConflict, strong_etag};
 use fabro_tracker::{Issue, PlaneClient, PlaneOptions};
 use fabro_types::{
     AutomationRef, ExternalAgentHarness, FailureReason, PlaneDispatch, PlaneDispatchStatus,
     Principal, RunId, RunStatus, SystemActorKind,
 };
+use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -380,8 +382,8 @@ where
                 .await;
         }
         if !record.effects.claimed_state_applied {
-            if issue.state != trigger.in_progress_state_id {
-                if !self
+            if issue.state != trigger.in_progress_state_id
+                && !self
                     .plane
                     .update_state(
                         &trigger.project_id,
@@ -391,9 +393,8 @@ where
                     )
                     .await
                     .context("moving Plane issue to configured in-progress state")?
-                {
-                    return self.record_state_conflict(record, now).await;
-                }
+            {
+                return self.record_state_conflict(record, now).await;
             }
             record.effects.claimed_state_applied = true;
             record.dispatch.status = PlaneDispatchStatus::Claimed;
@@ -425,17 +426,16 @@ where
                 .mark_cancelled(trigger, record, now, "ticket moved externally")
                 .await;
         }
-        fabro_tracker::plane::strong_etag(etag.as_deref())?;
-        let run_id = match record.dispatch.current_run_id.as_deref() {
-            Some(id) => id.parse::<RunId>()?,
-            None => {
-                let id = RunId::new();
-                record.dispatch.run_ids.push(id.to_string());
-                record.dispatch.current_run_id = Some(id.to_string());
-                record.dispatch.updated_at = now;
-                self.store.save(record).await?;
-                id
-            }
+        strong_etag(etag.as_deref())?;
+        let run_id = if let Some(id) = record.dispatch.current_run_id.as_deref() {
+            id.parse::<RunId>()?
+        } else {
+            let id = RunId::new();
+            record.dispatch.run_ids.push(id.to_string());
+            record.dispatch.current_run_id = Some(id.to_string());
+            record.dispatch.updated_at = now;
+            self.store.save(record).await?;
+            id
         };
         self.runs
             .start_run(run_id, automation, trigger, &issue, record.dispatch.harness)
@@ -622,8 +622,8 @@ where
                 .await;
         }
         if !record.effects.success_state_applied {
-            if issue.state != trigger.done_state_id {
-                if !self
+            if issue.state != trigger.done_state_id
+                && !self
                     .plane
                     .update_state(
                         &trigger.project_id,
@@ -633,9 +633,8 @@ where
                     )
                     .await
                     .context("moving Plane issue to configured completion state")?
-                {
-                    return self.record_state_conflict(record, now).await;
-                }
+            {
+                return self.record_state_conflict(record, now).await;
             }
             record.effects.success_state_applied = true;
             record.dispatch.updated_at = now;
@@ -670,7 +669,7 @@ where
         record.dispatch.last_error = Some(PLANE_STATE_CONFLICT.into());
         record.dispatch.updated_at = now;
         self.store.save(record).await?;
-        Err(fabro_tracker::plane::PlaneStateConflict.into())
+        Err(PlaneStateConflict.into())
     }
 
     async fn mark_cancelled(
@@ -888,7 +887,7 @@ impl PlanePort for LivePlanePort {
             .await
         {
             Ok(()) => Ok(true),
-            Err(err) if err.is::<fabro_tracker::plane::PlaneStateConflict>() => Ok(false),
+            Err(err) if err.is::<PlaneStateConflict>() => Ok(false),
             Err(err) => Err(err),
         }
     }
@@ -1058,7 +1057,7 @@ impl RunPort for LiveRunPort {
             None
         };
         Ok(ObservedRun {
-            status: projection.status.clone(),
+            status: projection.status,
             pull_request_url,
             pr_pending,
             pr_failed,
@@ -1128,7 +1127,7 @@ fn clarification_comment(
         .as_object()
         .context("clarification artifact is not an object")?;
     anyhow::ensure!(
-        object.len() == 3 && object.get("schema_version").and_then(|v| v.as_u64()) == Some(1),
+        object.len() == 3 && object.get("schema_version").and_then(Value::as_u64) == Some(1),
         "invalid clarification artifact schema"
     );
     let status = object
