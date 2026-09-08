@@ -1,0 +1,358 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context as _, anyhow, bail};
+use fabro_manifest::{CollectedWorkflowClosure, ResolvedLocalWorkflowPackage};
+use fabro_types::settings::run::EnvironmentProvider;
+use fabro_types::{DirtyStatus, RunTarget};
+use tokio::task;
+
+use super::remote_workflow::{self, NativeGit};
+use super::selection::{TargetSelection, WorkflowSelection};
+
+/// Owns the canonical collector result without copying its contents. Local
+/// location metadata remains available solely for existing settings warnings.
+pub(super) enum ResolvedWorkflow {
+    Local(ResolvedLocalWorkflowPackage),
+    Git(CollectedWorkflowClosure),
+}
+
+impl ResolvedWorkflow {
+    pub(super) fn closure(&self) -> &CollectedWorkflowClosure {
+        match self {
+            Self::Local(package) => package.closure(),
+            Self::Git(closure) => closure,
+        }
+    }
+}
+
+pub(super) async fn workflow(
+    selection: &WorkflowSelection,
+    cwd: &Path,
+    user_workflows: Option<&Path>,
+) -> anyhow::Result<ResolvedWorkflow> {
+    match selection {
+        WorkflowSelection::Local(path) => {
+            let (path, cwd, user_workflows) = (
+                path.clone(),
+                cwd.to_path_buf(),
+                user_workflows.map(Path::to_path_buf),
+            );
+            let package = task::spawn_blocking(move || {
+                fabro_manifest::resolve_local_workflow_package(
+                    &path,
+                    &cwd,
+                    user_workflows.as_deref(),
+                )
+                .map_err(anyhow::Error::new)
+            })
+            .await
+            .context("local workflow collection task failed")??;
+            Ok(ResolvedWorkflow::Local(package))
+        }
+        WorkflowSelection::Git {
+            repository,
+            selector,
+            revision,
+        } => {
+            let git = NativeGit::new(cwd.to_path_buf());
+            let (repository, selector, revision) =
+                (repository.clone(), selector.clone(), revision.clone());
+            let closure = remote_workflow::owned(move |cancel| async move {
+                git.collect(repository, selector, revision, cancel).await
+            })
+            .await?;
+            Ok(ResolvedWorkflow::Git(closure))
+        }
+    }
+}
+
+pub(super) async fn target(
+    selection: &TargetSelection,
+    provider: EnvironmentProvider,
+    cwd: &Path,
+) -> anyhow::Result<(RunTarget, bool)> {
+    match selection {
+        TargetSelection::CurrentDirectory => observe_directory(provider, cwd.to_path_buf()).await,
+        TargetSelection::Path(path) => {
+            let path = cwd
+                .join(path)
+                .canonicalize()
+                .context("failed to canonicalize target directory")?;
+            if !path.is_dir() {
+                bail!("target path must be a directory");
+            }
+            observe_directory(provider, path).await
+        }
+        TargetSelection::Git { repository, branch } => {
+            if !provider.is_clone_based() {
+                bail!("Git targets require a clone-enabled Docker or Daytona environment");
+            }
+            let git = NativeGit::new(cwd.to_path_buf());
+            let (repository, branch) = (repository.clone(), branch.clone());
+            let target = remote_workflow::owned(move |cancel| async move {
+                git.resolve_target(repository, branch, &cancel).await
+            })
+            .await?;
+            // Canonical admission retains ownership of provider capabilities.
+            Ok((RunTarget::Git(target), false))
+        }
+    }
+}
+
+async fn observe_directory(
+    provider: EnvironmentProvider,
+    path: PathBuf,
+) -> anyhow::Result<(RunTarget, bool)> {
+    // The existing observer can push/query Git synchronously. Preserve its
+    // behavior without blocking a Tokio worker or promising a new timeout.
+    task::spawn_blocking(move || run_target_for_environment(provider, &path))
+        .await
+        .context("target observation task failed")?
+}
+
+/// Derives the run target from the selected directory for the environment's
+/// provider. Returns the target plus whether a clone-based observation found a
+/// dirty Git worktree, so the caller can warn about it.
+fn run_target_for_environment(
+    provider: EnvironmentProvider,
+    canonical_cwd: &Path,
+) -> anyhow::Result<(RunTarget, bool)> {
+    if !provider.is_clone_based() {
+        let path = canonical_cwd.to_str().ok_or_else(|| {
+            anyhow!(
+                "target directory is not valid UTF-8: {}",
+                canonical_cwd.display()
+            )
+        })?;
+        return Ok((
+            RunTarget::Folder {
+                path: path.to_string(),
+            },
+            false,
+        ));
+    }
+    let Some(observation) = fabro_manifest::observe_git_run_target(canonical_cwd, None) else {
+        return Ok((none_target_for_unversioned_directory(canonical_cwd)?, false));
+    };
+    let dirty = observation.legacy_git_context.dirty == DirtyStatus::Dirty;
+    let target = observation.run_target.ok_or_else(|| {
+        anyhow!("the target Git checkout cannot be represented as a canonical GitHub run target")
+    })?;
+    if target.sha.is_none() {
+        bail!(
+            "the exact local Git commit could not be made available from the canonical GitHub origin; push the commit and try again"
+        );
+    }
+    Ok((RunTarget::Git(target), dirty))
+}
+
+fn none_target_for_unversioned_directory(canonical_cwd: &Path) -> anyhow::Result<RunTarget> {
+    let repository = match git2::Repository::discover(canonical_cwd) {
+        Ok(repository) => repository,
+        Err(source) if source.code() == git2::ErrorCode::NotFound => return Ok(RunTarget::None {}),
+        Err(source) => {
+            return Err(anyhow::Error::new(source)).with_context(|| {
+                format!(
+                    "failed to inspect target directory {} for Git metadata",
+                    canonical_cwd.display()
+                )
+            });
+        }
+    };
+
+    if repository.is_bare() {
+        bail!(
+            "the target directory resolves to a bare Git repository; clone-based runs require a non-bare checkout with an attached branch"
+        );
+    }
+    match repository.head() {
+        Err(source)
+            if matches!(
+                source.code(),
+                git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+            ) =>
+        {
+            bail!(
+                "the target Git checkout has no commits; create a commit before using a clone-based environment"
+            );
+        }
+        Err(source) => {
+            return Err(anyhow::Error::new(source))
+                .context("failed to inspect the target Git checkout HEAD");
+        }
+        Ok(head) if !head.is_branch() => {
+            bail!(
+                "the target Git checkout has a detached HEAD; check out a branch before using a clone-based environment"
+            );
+        }
+        Ok(_) => {}
+    }
+
+    bail!(
+        "the target Git checkout does not have a usable attached branch for a clone-based run target"
+    )
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "resolver tests construct small local workflow fixtures"
+)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::super::selection;
+    use super::*;
+    use crate::args::RunArgs;
+
+    fn write_workflow(root: &Path, name: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("workflow.toml"),
+            "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.fabro"),
+            "digraph Test { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+        )
+        .unwrap();
+    }
+
+    #[derive(clap::Parser)]
+    struct Command {
+        #[command(flatten)]
+        args: RunArgs,
+    }
+
+    #[tokio::test]
+    async fn run_selection_direct_and_parsed_resolve_identically() {
+        let caller = tempfile::tempdir().unwrap();
+        let root = caller.path().canonicalize().unwrap();
+        write_workflow(&root, ".fabro/workflows/review");
+        std::fs::create_dir(root.join("target")).unwrap();
+        let args = Command::try_parse_from(["cmd", "review", "--target-path", "target"]).unwrap();
+        let (parsed_workflow, parsed_target) = selection::parse(&args.args).unwrap();
+        let direct_workflow = WorkflowSelection::Local("review".into());
+        let direct_target = TargetSelection::Path("target".into());
+        assert_eq!(
+            workflow(&parsed_workflow, &root, None)
+                .await
+                .unwrap()
+                .closure()
+                .root_id(),
+            workflow(&direct_workflow, &root, None)
+                .await
+                .unwrap()
+                .closure()
+                .root_id()
+        );
+        for provider in [
+            EnvironmentProvider::Local,
+            EnvironmentProvider::Docker,
+            EnvironmentProvider::Daytona,
+        ] {
+            assert_eq!(
+                target(&parsed_target, provider, &root).await.unwrap(),
+                target(&direct_target, provider, &root).await.unwrap()
+            );
+        }
+        assert_eq!(
+            target(&direct_target, EnvironmentProvider::Local, &root)
+                .await
+                .unwrap()
+                .0,
+            RunTarget::Folder {
+                path: root.join("target").to_str().unwrap().into(),
+            }
+        );
+        assert_eq!(
+            target(&direct_target, EnvironmentProvider::Docker, &root)
+                .await
+                .unwrap()
+                .0,
+            RunTarget::None {}
+        );
+        assert_eq!(
+            target(
+                &TargetSelection::CurrentDirectory,
+                EnvironmentProvider::Local,
+                &root
+            )
+            .await
+            .unwrap()
+            .0,
+            RunTarget::Folder {
+                path: root.to_str().unwrap().into(),
+            }
+        );
+        assert!(
+            target(
+                &TargetSelection::Git {
+                    repository: "acme/app".parse().unwrap(),
+                    branch:     None,
+                },
+                EnvironmentProvider::Local,
+                &root
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Docker or Daytona")
+        );
+        assert!(
+            target(
+                &TargetSelection::Path("missing".into()),
+                EnvironmentProvider::Local,
+                &root
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            target(
+                &TargetSelection::Path(".fabro/workflows/review/workflow.toml".into()),
+                EnvironmentProvider::Local,
+                &root
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_selection_local_lookup_preserves_precedence_and_explicit_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("user");
+        let project = root.path().join("project");
+        let checkout = root.path().join("project/checkout");
+        write_workflow(&user, "review");
+        write_workflow(&project, ".fabro/workflows/review");
+        write_workflow(&checkout, ".fabro/workflows/review");
+        std::fs::write(project.join(".fabro/project.toml"), "_version = 1\n").unwrap();
+        git2::Repository::init(&checkout).unwrap();
+        let selected = WorkflowSelection::Local("review".into());
+        for (cwd, expected_root) in [
+            (checkout.as_path(), checkout.as_path()),
+            (project.as_path(), project.as_path()),
+            (root.path(), user.as_path()),
+        ] {
+            let ResolvedWorkflow::Local(package) =
+                workflow(&selected, cwd, Some(&user)).await.unwrap()
+            else {
+                panic!("local package");
+            };
+            assert_eq!(package.source_root(), expected_root.canonicalize().unwrap());
+        }
+        assert!(
+            workflow(
+                &WorkflowSelection::Local("missing.toml".into()),
+                &checkout,
+                Some(&user)
+            )
+            .await
+            .is_err()
+        );
+    }
+}

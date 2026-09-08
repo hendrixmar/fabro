@@ -119,22 +119,27 @@ fn help() {
     success: true
     exit_code: 0
     ----- stdout -----
-    Register a local workflow version, create a run, and start it
+    Register a workflow version, create a run, and start it
 
     Usage: fabro run [OPTIONS] <WORKFLOW>
 
     Arguments:
-      <WORKFLOW>  Local workflow name, checkout path, .fabro file, or workflow TOML
+      <WORKFLOW>  Workflow name or path (repository-relative with --workflow-git)
 
     Options:
           --json                       Output as JSON [env: FABRO_JSON=]
           --server <SERVER>            Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
           --debug                      Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
       -I, --input <KEY=VALUE>          Override a workflow input value (repeatable, format: KEY=VALUE)
-          --dry-run                    Execute with simulated LLM backend
           --no-upgrade-check           Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
-          --auto-approve               Auto-approve all human gates
+          --workflow-git <OWNER/REPO>  Acquire workflow source locally from a GitHub OWNER/REPO using native Git credentials
           --quiet                      Suppress non-essential output [env: FABRO_QUIET=]
+          --workflow-ref <REF>         Workflow branch, tag, HEAD (default), or full commit SHA; qualify ambiguous names
+          --target-path <PATH>         Observe this target directory instead of cwd; Folder targets require server filesystem access
+          --target-git <OWNER/REPO>    Target GitHub OWNER/REPO; the execution sandbox still needs its own clone credentials
+          --target-branch <BRANCH>     Target working branch (default: remote default branch), pinned to its observed commit
+          --dry-run                    Simulate execution; workflow source may still be fetched and uploaded
+          --auto-approve               Auto-approve all human gates
           --goal <GOAL>                Override the workflow goal (available as {{ goal }} in prompts)
           --goal-file <GOAL_FILE>      Read a per-run goal value from a local file
           --model <MODEL>              Override default LLM model

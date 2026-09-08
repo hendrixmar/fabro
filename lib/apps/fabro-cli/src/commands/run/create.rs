@@ -7,6 +7,9 @@ use fabro_types::{RunId, RunIntent};
 use fabro_util::terminal::Styles;
 
 use super::overrides::prepare_intent_overrides;
+use super::resolution::ResolvedWorkflow;
+use super::selection::WorkflowSelection;
+use super::{resolution, selection};
 use crate::args::RunArgs;
 use crate::command_context::CommandContext;
 use crate::commands::resolve_run_id;
@@ -16,7 +19,7 @@ pub(crate) struct CreatedRun {
     pub(crate) run_id: RunId,
 }
 
-/// Register the local workflow version closure with the server and create a
+/// Register the workflow version closure with the server and create a
 /// run from an immutable workflow intent, leaving it in the submitted state.
 ///
 /// This does NOT start the workflow — starting is a separate request.
@@ -25,10 +28,7 @@ pub(crate) async fn create_run(
     args: &RunArgs,
     styles: &Styles,
 ) -> anyhow::Result<CreatedRun> {
-    let workflow_path = args
-        .workflow
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--workflow is required"))?;
+    let (workflow_selection, target_selection) = selection::parse(args)?;
     let canonical_cwd = ctx.cwd().canonicalize().with_context(|| {
         format!(
             "failed to canonicalize caller working directory {}",
@@ -36,11 +36,20 @@ pub(crate) async fn create_run(
         )
     })?;
     let user_workflows_root = fabro_util::Home::from_env().workflows_dir();
-    let package = fabro_manifest::resolve_local_workflow_package(
-        workflow_path,
-        &canonical_cwd,
-        Some(&user_workflows_root),
-    )?;
+    // Preserve local lookup diagnostics before contacting the server. Remote
+    // acquisition waits until parent, environment, and target are validated.
+    let local_package = if matches!(workflow_selection, WorkflowSelection::Local(_)) {
+        Some(
+            resolution::workflow(
+                &workflow_selection,
+                &canonical_cwd,
+                Some(&user_workflows_root),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let prepared = prepare_intent_overrides(args, &canonical_cwd).await?;
 
     warn_untransmitted_settings(
@@ -49,7 +58,12 @@ pub(crate) async fn create_run(
         ctx.base_config_path(),
         *ctx.run_settings_key_presence(),
     );
-    let project_config = project::discover_project_config(&package.workflow_location().dir)?;
+    let project_config = match &local_package {
+        Some(ResolvedWorkflow::Local(package)) => {
+            project::discover_project_config(&package.workflow_location().dir)?
+        }
+        _ => project::discover_project_config(&canonical_cwd)?,
+    };
     if let Some(path) = project_config.as_deref() {
         warn_untransmitted_settings(
             ctx,
@@ -71,23 +85,30 @@ pub(crate) async fn create_run(
         },
         resolve_run_environment(client.as_ref(), args.environment.as_deref()),
     )?;
-    let configured_repo_origin_url =
-        fabro_manifest::configured_repo_origin_url_for_location(package.workflow_location())?;
-    let fabro_manifest::DerivedRunTarget {
-        target,
-        dirty_worktree,
-    } = fabro_manifest::derive_run_target_for_provider(
-        &environment.settings.provider,
+    let (target, dirty_worktree) = resolution::target(
+        &target_selection,
+        environment.settings.provider,
         &canonical_cwd,
-        configured_repo_origin_url.as_deref(),
-    )?;
+    )
+    .await?;
     if dirty_worktree {
         fabro_util::printerr!(
             ctx.printer(),
-            "{} the caller Git working tree is dirty; uncommitted changes are not included in the run target.",
+            "{} the selected target Git working tree is dirty; uncommitted changes are not included in the run target.",
             styles.yellow.apply_to("Warning:"),
         );
     }
+    let package = match local_package {
+        Some(package) => package,
+        None => {
+            resolution::workflow(
+                &workflow_selection,
+                &canonical_cwd,
+                Some(&user_workflows_root),
+            )
+            .await?
+        }
+    };
     let workflow_version_id = package.closure().root_id();
     client
         .register_workflow_versions(

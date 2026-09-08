@@ -1,0 +1,1012 @@
+//! Native Git acquisition owned by the CLI, with no server credential lookup.
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
+
+use anyhow::{Context as _, bail};
+use fabro_manifest::CollectedWorkflowClosure;
+use fabro_types::{GitHubRepositorySlug, GitRunTarget, repository};
+use nix::errno::Errno;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
+use tokio::io::{AsyncRead, AsyncReadExt as _};
+use tokio::process::Command;
+use tokio::{fs, signal as tokio_signal, task, time};
+use tokio_util::sync::CancellationToken;
+
+use super::selection::{self, RemoteWorkflowRevision};
+
+const OUTPUT_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RemoteWorkflowError {
+    #[error(
+        "local Git {operation} failed ({status}); verify native Git access to the repository using your local credential helper or SSH configuration; Fabro server login does not grant Git access"
+    )]
+    Process {
+        operation: &'static str,
+        status:    ExitStatus,
+    },
+    #[error("local Git command timed out")]
+    Timeout,
+    #[error("local Git acquisition cancelled")]
+    Cancelled,
+    #[error("local Git metadata exceeds the 64 KiB capture limit")]
+    OutputLimit,
+    #[error("local Git I/O failed")]
+    Io(#[from] std::io::Error),
+}
+
+pub(super) struct NativeGit {
+    cwd:                    PathBuf,
+    timeout:                Duration,
+    #[cfg(test)]
+    pub(super) environment: Vec<(String, String)>,
+}
+
+impl NativeGit {
+    pub(super) fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            timeout: Duration::from_mins(2),
+            #[cfg(test)]
+            environment: Vec::new(),
+        }
+    }
+
+    async fn command(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, RemoteWorkflowError> {
+        if cancel.is_cancelled() {
+            return Err(RemoteWorkflowError::Cancelled);
+        }
+        let mut command = Command::new("git");
+        command
+            .current_dir(cwd)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "filter.lfs.smudge=",
+                "-c",
+                "filter.lfs.process=",
+                "-c",
+                "filter.lfs.required=false",
+                "-c",
+                "submodule.recurse=false",
+                "-c",
+                "protocol.ext.allow=never",
+                "-c",
+                "maintenance.auto=0",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "core.autocrlf=false",
+            ])
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(test)]
+        command.envs(self.environment.iter().cloned());
+        let mut child = command.spawn()?;
+        let process_id = child.id();
+        let mut stdout = child.stdout.take().expect("piped Git stdout exists");
+        let mut stderr = child.stderr.take().expect("piped Git stderr exists");
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(RemoteWorkflowError::Cancelled),
+            () = time::sleep(self.timeout) => Err(RemoteWorkflowError::Timeout),
+            result = async {
+                let (status, (stdout, overflow), _) = tokio::try_join!(
+                    child.wait(), capture(&mut stdout), capture(&mut stderr)
+                )?;
+                if !status.success() {
+                    // Output may contain arbitrary helper/config secrets, even after pattern
+                    // redaction. Never retain it in an error/cause chain or tracing event.
+                    return Err(RemoteWorkflowError::Process { operation: operation(args), status });
+                }
+                if overflow { return Err(RemoteWorkflowError::OutputLimit); }
+                Ok(stdout)
+            } => result,
+        };
+        // Helpers may inherit pipes or survive their Git parent. Terminate the
+        // owned process group on both completion and interruption, then reap Git.
+        let mut cleanup_error = None;
+        #[cfg(unix)]
+        if let Some(id) = process_id {
+            let pid = Pid::from_raw(id.cast_signed());
+            match signal::killpg(pid, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(source) => cleanup_error = Some(std::io::Error::from(source)),
+            }
+        }
+        if result.is_err() {
+            if let Err(source) = child.kill().await {
+                cleanup_error = Some(source);
+            }
+        }
+        child.wait().await?;
+        if let Some(source) = cleanup_error {
+            return Err(source.into());
+        }
+        result
+    }
+
+    async fn records(
+        &self,
+        repository: &GitHubRepositorySlug,
+        patterns: &[String],
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<String> {
+        let url = repository.https_url();
+        let mut args = vec!["ls-remote", "--symref", &url];
+        args.extend(patterns.iter().map(String::as_str));
+        let bytes = self.command(&self.cwd, &args, cancel).await?;
+        Ok(std::str::from_utf8(&bytes)
+            .context("local Git returned invalid metadata encoding")?
+            .to_owned())
+    }
+
+    pub(super) async fn resolve_target(
+        &self,
+        repository: GitHubRepositorySlug,
+        branch: Option<String>,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<GitRunTarget> {
+        let (branch, sha) = if let Some(branch) = branch {
+            if !repository::is_valid_git_branch_name(&branch) {
+                bail!("invalid target working branch");
+            }
+            let reference = format!("refs/heads/{branch}");
+            let records = self
+                .records(&repository, std::slice::from_ref(&reference), cancel)
+                .await?;
+            let sha = exact_record(&records, &reference)?.context("target branch was not found")?;
+            (branch, sha)
+        } else {
+            let records = self.records(&repository, &["HEAD".into()], cancel).await?;
+            default_head(&records)?
+        };
+        let target = GitRunTarget {
+            repo: repository.to_string(),
+            branch,
+            tag: None,
+            sha: Some(sha),
+        };
+        Ok(target.validate()?.into_target())
+    }
+
+    pub(super) async fn resolve_revision(
+        &self,
+        repository: &GitHubRepositorySlug,
+        revision: &RemoteWorkflowRevision,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<String> {
+        match revision {
+            RemoteWorkflowRevision::Commit(sha) => {
+                repository::normalize_git_commit_sha(sha).context("invalid full source commit SHA")
+            }
+            RemoteWorkflowRevision::DefaultBranch => {
+                let records = self.records(repository, &["HEAD".into()], cancel).await?;
+                Ok(default_head(&records)?.1)
+            }
+            RemoteWorkflowRevision::Ref(reference) => {
+                RemoteWorkflowRevision::parse(Some(reference))?;
+                let patterns = if reference.starts_with("refs/") {
+                    vec![reference.clone(), format!("{reference}^{{}}")]
+                } else {
+                    vec![
+                        format!("refs/heads/{reference}"),
+                        format!("refs/tags/{reference}"),
+                        format!("refs/tags/{reference}^{{}}"),
+                    ]
+                };
+                let records = self.records(repository, &patterns, cancel).await?;
+                resolve_named_ref(&records, reference)
+            }
+        }
+    }
+
+    pub(super) async fn collect(
+        &self,
+        repository: GitHubRepositorySlug,
+        selector: PathBuf,
+        revision: RemoteWorkflowRevision,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<CollectedWorkflowClosure> {
+        selection::validate_remote_selector(&selector)?;
+        let sha = self
+            .resolve_revision(&repository, &revision, &cancel)
+            .await?;
+        let checkout = tempfile::Builder::new()
+            .prefix("fabro-workflow-")
+            .tempdir()?;
+        self.collect_checkout(repository, selector, sha, checkout, cancel)
+            .await
+    }
+
+    async fn collect_checkout(
+        &self,
+        repository: GitHubRepositorySlug,
+        selector: PathBuf,
+        sha: String,
+        checkout: tempfile::TempDir,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<CollectedWorkflowClosure> {
+        self.checkout(&repository, &sha, checkout.path(), &cancel)
+            .await?;
+        // Moving the directory into the blocking task keeps it alive even if
+        // the outer future is dropped. Collection is not interruptible; finish
+        // it and clean up before reporting cancellation.
+        let collection_cancel = cancel.clone();
+        let closure = task::spawn_blocking(move || {
+            check_source_symlinks(checkout.path())?;
+            if collection_cancel.is_cancelled() {
+                return Err(RemoteWorkflowError::Cancelled.into());
+            }
+            fabro_manifest::collect_workflow_versions(&selector, checkout.path())
+                .map_err(anyhow::Error::new)
+        })
+        .await
+        .context("workflow collection task failed")??;
+        if cancel.is_cancelled() {
+            return Err(RemoteWorkflowError::Cancelled.into());
+        }
+        Ok(closure)
+    }
+
+    async fn checkout(
+        &self,
+        repository: &GitHubRepositorySlug,
+        sha: &str,
+        root: &Path,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        self.command(root, &["init", "--quiet", "--template="], cancel)
+            .await?;
+        self.command(
+            root,
+            &[
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "--no-tags",
+                "--no-recurse-submodules",
+                &repository.https_url(),
+                sha,
+            ],
+            cancel,
+        )
+        .await?;
+        let kind = self.command(root, &["cat-file", "-t", sha], cancel).await?;
+        if kind != b"commit\n" {
+            bail!("the selected source SHA is not a commit");
+        }
+        // The highest-precedence attributes file prevents repository attributes
+        // from invoking configured filters or rewriting the committed source bytes.
+        fs::create_dir_all(root.join(".git/info")).await?;
+        fs::write(
+            root.join(".git/info/attributes"),
+            "* -filter -text -ident -working-tree-encoding\n",
+        )
+        .await?;
+        self.command(
+            root,
+            &[
+                "-c",
+                &format!("core.worktree={}", root.display()),
+                "checkout",
+                "--quiet",
+                "--detach",
+                sha,
+                "--",
+            ],
+            cancel,
+        )
+        .await?;
+        let head = self
+            .command(root, &["rev-parse", "--verify", "HEAD"], cancel)
+            .await?;
+        if head != format!("{sha}\n").as_bytes() {
+            bail!("workflow checkout did not match the selected commit");
+        }
+        Ok(())
+    }
+}
+
+fn operation(args: &[&str]) -> &'static str {
+    match args.first().copied() {
+        Some("ls-remote") => "metadata lookup",
+        Some("fetch") => "fetch",
+        Some("checkout") => "checkout",
+        _ => "repository operation",
+    }
+}
+
+async fn capture(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut captured = Vec::new();
+    let mut overflow = false;
+    let mut buffer = vec![0; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok((captured, overflow));
+        }
+        let keep = count.min(OUTPUT_LIMIT - captured.len());
+        captured.extend_from_slice(&buffer[..keep]);
+        overflow |= keep != count;
+    }
+}
+
+fn exact_record(records: &str, reference: &str) -> anyhow::Result<Option<String>> {
+    let mut found = None;
+    for line in records.lines() {
+        let Some((value, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if name != reference || value.starts_with("ref: ") {
+            continue;
+        }
+        let sha = repository::normalize_git_commit_sha(value)
+            .context("invalid Git metadata commit SHA")?;
+        if found.as_ref().is_some_and(|previous| previous != &sha) {
+            bail!("conflicting Git metadata records");
+        }
+        found = Some(sha);
+    }
+    Ok(found)
+}
+
+fn default_head(records: &str) -> anyhow::Result<(String, String)> {
+    let mut branch = None;
+    for line in records.lines() {
+        if let Some(value) = line
+            .strip_prefix("ref: refs/heads/")
+            .and_then(|line| line.strip_suffix("\tHEAD"))
+        {
+            if !repository::is_valid_github_ref_selector(value) {
+                bail!("remote default HEAD does not name a valid branch");
+            }
+            if branch.is_some() {
+                bail!("ambiguous remote default HEAD");
+            }
+            branch = Some(value.to_owned());
+        }
+    }
+    Ok((
+        branch.context("remote default HEAD must name a branch")?,
+        exact_record(records, "HEAD")?.context("remote default HEAD has no commit")?,
+    ))
+}
+
+fn resolve_named_ref(records: &str, reference: &str) -> anyhow::Result<String> {
+    let heads = if reference.starts_with("refs/") {
+        reference.to_owned()
+    } else {
+        format!("refs/heads/{reference}")
+    };
+    let tags = if reference.starts_with("refs/") {
+        reference.to_owned()
+    } else {
+        format!("refs/tags/{reference}")
+    };
+    let branch = if heads.starts_with("refs/heads/") {
+        exact_record(records, &heads)?
+    } else {
+        None
+    };
+    let tag = if tags.starts_with("refs/tags/") {
+        exact_record(records, &tags)?
+    } else {
+        None
+    };
+    if branch.is_some() && tag.is_some() {
+        bail!(
+            "workflow ref is ambiguous between a branch and tag; use refs/heads/... or refs/tags/..."
+        );
+    }
+    if let Some(sha) = branch {
+        return Ok(sha);
+    }
+    if let Some(sha) = tag {
+        return Ok(exact_record(records, &format!("{tags}^{{}}"))?.unwrap_or(sha));
+    }
+    bail!("workflow ref was not found; no alternative revision was selected")
+}
+
+fn check_source_symlinks(root: &Path) -> anyhow::Result<()> {
+    let root = root.canonicalize()?;
+    // Validate links before the collector's initial TOML lookup can read them.
+    for entry in walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.path() != root.join(".git"))
+    {
+        let entry = entry?;
+        if entry.file_type().is_symlink() && !entry.path().canonicalize()?.starts_with(&root) {
+            bail!("remote workflow checkout contains a symlink outside its source root");
+        }
+    }
+    Ok(())
+}
+
+/// The task owns its child processes and temporary checkout. Dropping the
+/// waiter requests cooperative cleanup, not task abortion. Ctrl-C waits for
+/// cleanup; an in-progress blocking collection must finish first.
+pub(super) async fn owned<T: Send + 'static, TFuture>(
+    work: impl FnOnce(CancellationToken) -> TFuture + Send + 'static,
+) -> anyhow::Result<T>
+where
+    TFuture: Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let mut task = tokio::spawn(work(cancel.clone()));
+    tokio::select! {
+        result = &mut task => result.context("local Git task failed")?,
+        signal = tokio_signal::ctrl_c() => {
+            cancel.cancel();
+            let _result = task.await.context("local Git cleanup task failed")?;
+            signal.context("failed to listen for interruption")?;
+            Err(RemoteWorkflowError::Cancelled.into())
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "hermetic Git fixtures and fake executables use synchronous file setup"
+)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use nix::sys::stat::Mode;
+    use nix::unistd;
+
+    use super::*;
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        repo: git2::Repository,
+        git:  NativeGit,
+        sha:  String,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let repo_dir = root.path().join("source");
+            let repo = git2::Repository::init_opts(
+                &repo_dir,
+                git2::RepositoryInitOptions::new().initial_head("trunk"),
+            )
+            .unwrap();
+            let workflow = repo_dir.join(".fabro/workflows/review");
+            std::fs::create_dir_all(&workflow).unwrap();
+            std::fs::write(
+                workflow.join("workflow.toml"),
+                "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                workflow.join("workflow.fabro"),
+                "digraph Review { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index
+                .add_all(["."], git2::IndexAddOption::DEFAULT, None)
+                .unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let sha = {
+                let tree = repo.find_tree(tree_id).unwrap();
+                let signature = git2::Signature::now("Fixture", "fixture@example.test").unwrap();
+                repo.commit(Some("HEAD"), &signature, &signature, "workflow", &tree, &[])
+                    .unwrap()
+                    .to_string()
+            };
+            let config = root.path().join("gitconfig");
+            std::fs::write(
+                &config,
+                format!(
+                    "[url \"file://{}\"]\n    insteadOf = https://github.com/acme/workflows\n",
+                    repo_dir.display()
+                ),
+            )
+            .unwrap();
+            let mut git = NativeGit::new(root.path().to_path_buf());
+            git.environment = vec![
+                ("GIT_CONFIG_GLOBAL".into(), config.to_str().unwrap().into()),
+                ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+                ("GIT_CONFIG_COUNT".into(), "0".into()),
+            ];
+            Self {
+                root,
+                repo,
+                git,
+                sha,
+            }
+        }
+
+        fn repository() -> GitHubRepositorySlug {
+            "acme/workflows".parse().unwrap()
+        }
+    }
+
+    impl Fixture {
+        fn commit_changes(&self) -> String {
+            let mut index = self.repo.index().unwrap();
+            index
+                .add_all(["."], git2::IndexAddOption::DEFAULT, None)
+                .unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = self.repo.find_tree(tree_id).unwrap();
+            let parent = self.repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = git2::Signature::now("Fixture", "fixture@example.test").unwrap();
+            self.repo
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "update workflow",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap()
+                .to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_cleanup_preserves_sibling_identity_and_disables_filters_hooks() {
+        let fixture = Fixture::new();
+        let source = fixture.repo.workdir().unwrap();
+        let child = source.join(".fabro/workflows/child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(
+            child.join("workflow.fabro"),
+            "digraph Child { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+        )
+        .unwrap();
+        std::fs::write(source.join(".fabro/workflows/review/workflow.fabro"), "digraph Root { start [shape=Mdiamond] exit [shape=Msquare] child [shape=house, stack.child_workflow=\"../child/workflow.fabro\"] start -> child -> exit }").unwrap();
+        std::fs::write(source.join(".gitattributes"), "*.fabro filter=fixture\n").unwrap();
+        let config_path = fixture.root.path().join("gitconfig");
+        let mut config = git2::Config::open(&config_path).unwrap();
+        let sentinel = fixture.root.path().join("executed");
+        let hooks = fixture.root.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        std::fs::write(
+            hooks.join("post-checkout"),
+            format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            hooks.join("post-checkout"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        config
+            .set_str("core.hooksPath", hooks.to_str().unwrap())
+            .unwrap();
+        config
+            .set_str(
+                "filter.fixture.smudge",
+                &format!("touch '{}'; cat", sentinel.display()),
+            )
+            .unwrap();
+        let sha = fixture.commit_changes();
+        let local = fabro_manifest::collect_workflow_versions(Path::new("review"), source).unwrap();
+        assert_eq!(local.versions().count(), 2);
+        for selector in [
+            "review",
+            ".fabro/workflows/review/workflow.fabro",
+            "missing",
+        ] {
+            let checkout = tempfile::tempdir().unwrap();
+            let checkout_path = checkout.path().to_path_buf();
+            let result = fixture
+                .git
+                .collect_checkout(
+                    Fixture::repository(),
+                    selector.into(),
+                    sha.clone(),
+                    checkout,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(!checkout_path.exists());
+            if selector == "missing" {
+                assert!(result.is_err());
+            } else {
+                let remote = result.unwrap();
+                assert_eq!(local.root_id(), remote.root_id());
+                assert_eq!(
+                    local.versions().map(|(id, _)| id).collect::<Vec<_>>(),
+                    remote.versions().map(|(id, _)| id).collect::<Vec<_>>()
+                );
+            }
+            assert!(!sentinel.exists());
+        }
+        let checkout = tempfile::tempdir().unwrap();
+        let path = checkout.path().to_path_buf();
+        assert!(
+            fixture
+                .git
+                .collect_checkout(
+                    Fixture::repository(),
+                    "review".into(),
+                    "1111111111111111111111111111111111111111".into(),
+                    checkout,
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_rejects_toml_symlink_before_reading_host_content() {
+        let fixture = Fixture::new();
+        let host = tempfile::tempdir().unwrap();
+        let fifo = host.path().join("host.toml");
+        // Any accidental read blocks: there is deliberately no writer. The
+        // successful containment error proves rejection before TOML loading.
+        unistd::mkfifo(&fifo, Mode::S_IRUSR).unwrap();
+        let path = fixture
+            .repo
+            .workdir()
+            .unwrap()
+            .join(".fabro/workflows/review/workflow.toml");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&fifo, path).unwrap();
+        let sha = fixture.commit_changes();
+        let error = fixture
+            .git
+            .collect(
+                Fixture::repository(),
+                "review".into(),
+                RemoteWorkflowRevision::Commit(sha),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outside its source root"));
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_dropped_waiter_cancels_child_before_checkout_cleanup() {
+        let (fake, git) = fake_git("printf '%s' $$ > pid; exec /bin/sleep 60");
+        let checkout = tempfile::tempdir().unwrap();
+        let path = checkout.path().to_path_buf();
+        let worker = tokio::spawn(owned(move |cancel| async move {
+            git.collect_checkout(
+                "acme/workflows".parse().unwrap(),
+                "review".into(),
+                "1111111111111111111111111111111111111111".into(),
+                checkout,
+                cancel,
+            )
+            .await
+        }));
+        time::timeout(Duration::from_secs(5), async {
+            while !path.join("pid").exists() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pid: i32 = std::fs::read_to_string(path.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        time::timeout(Duration::from_secs(5), async {
+            while path.exists() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(signal::kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+        drop(fake);
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_resolves_exact_default_branches_tags_and_commits() {
+        let fixture = Fixture::new();
+        let object = fixture.repo.revparse_single("HEAD").unwrap();
+        fixture
+            .repo
+            .branch("topic/slash", object.as_commit().unwrap(), false)
+            .unwrap();
+        fixture
+            .repo
+            .tag_lightweight("light", &object, false)
+            .unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.test").unwrap();
+        fixture
+            .repo
+            .tag("annotated", &object, &signature, "release", false)
+            .unwrap();
+        let cancel = CancellationToken::new();
+        for reference in [
+            None,
+            Some("HEAD"),
+            Some("trunk"),
+            Some("topic/slash"),
+            Some("light"),
+            Some("annotated"),
+            Some("refs/heads/trunk"),
+            Some("refs/tags/annotated"),
+            Some(fixture.sha.as_str()),
+        ] {
+            let revision = RemoteWorkflowRevision::parse(reference).unwrap();
+            assert_eq!(
+                fixture
+                    .git
+                    .resolve_revision(&Fixture::repository(), &revision, &cancel)
+                    .await
+                    .unwrap(),
+                fixture.sha
+            );
+        }
+        fixture
+            .repo
+            .tag_lightweight("trunk", &object, false)
+            .unwrap();
+        assert!(
+            fixture
+                .git
+                .resolve_revision(
+                    &Fixture::repository(),
+                    &RemoteWorkflowRevision::Ref("trunk".into()),
+                    &cancel
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        for reference in ["missing", "refs/tags/missing"] {
+            assert!(
+                fixture
+                    .git
+                    .resolve_revision(
+                        &Fixture::repository(),
+                        &RemoteWorkflowRevision::Ref(reference.into()),
+                        &cancel
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let target = fixture
+            .git
+            .resolve_target(Fixture::repository(), None, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(target.branch, "trunk");
+        assert_eq!(target.sha.as_deref(), Some(fixture.sha.as_str()));
+        assert_eq!(
+            fixture
+                .git
+                .resolve_target(Fixture::repository(), Some("topic/slash".into()), &cancel)
+                .await
+                .unwrap()
+                .branch,
+            "topic/slash"
+        );
+        for branch in [
+            "missing",
+            "annotated",
+            "HEAD",
+            fixture.sha.as_str(),
+            "refs/heads/trunk",
+        ] {
+            assert!(
+                fixture
+                    .git
+                    .resolve_target(Fixture::repository(), Some(branch.into()), &cancel)
+                    .await
+                    .is_err()
+            );
+        }
+        // Metadata-only target resolution never creates a checkout directory.
+        assert_eq!(std::fs::read_dir(fixture.root.path()).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_same_bytes_have_same_ids_and_no_lookup_fallback() {
+        let fixture = Fixture::new();
+        let local = fabro_manifest::collect_workflow_versions(
+            Path::new("review"),
+            fixture.repo.workdir().unwrap(),
+        )
+        .unwrap();
+        let remote = fixture
+            .git
+            .collect(
+                Fixture::repository(),
+                "review".into(),
+                RemoteWorkflowRevision::DefaultBranch,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local.root_id(), remote.root_id());
+        let before: Vec<_> = local.versions().map(|(id, _)| id).collect();
+        assert_eq!(
+            before,
+            remote.versions().map(|(id, _)| id).collect::<Vec<_>>()
+        );
+        assert!(
+            fixture
+                .git
+                .collect(
+                    Fixture::repository(),
+                    "missing".into(),
+                    RemoteWorkflowRevision::DefaultBranch,
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_fetches_observed_commit_after_branch_moves() {
+        let fixture = Fixture::new();
+        let cancel = CancellationToken::new();
+        let captured = fixture
+            .git
+            .resolve_revision(
+                &Fixture::repository(),
+                &RemoteWorkflowRevision::DefaultBranch,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let parent = fixture
+            .repo
+            .revparse_single("HEAD")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.test").unwrap();
+        let next = fixture
+            .repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "move branch",
+                &parent.tree().unwrap(),
+                &[&parent],
+            )
+            .unwrap();
+        assert_ne!(next.to_string(), captured);
+        let checkout = tempfile::tempdir().unwrap();
+        fixture
+            .git
+            .checkout(&Fixture::repository(), &captured, checkout.path(), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            git2::Repository::open(checkout.path())
+                .unwrap()
+                .head()
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string(),
+            captured
+        );
+        assert!(
+            fixture
+                .git
+                .checkout(
+                    &Fixture::repository(),
+                    "1111111111111111111111111111111111111111",
+                    checkout.path(),
+                    &cancel
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_workflow_matches_records_exactly_and_rejects_host_symlinks() {
+        let sha = "1234567890123456789012345678901234567890";
+        assert!(resolve_named_ref(&format!("{sha}\trefs/heads/nested/main\n"), "main").is_err());
+        let root = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(host.path(), root.path().join("outside")).unwrap();
+        assert!(check_source_symlinks(root.path()).is_err());
+    }
+
+    fn fake_git(script: &str) -> (tempfile::TempDir, NativeGit) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("git");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut git = NativeGit::new(root.path().to_path_buf());
+        git.environment
+            .push(("PATH".into(), root.path().to_str().unwrap().into()));
+        (root, git)
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_caps_drains_diagnostics_and_preserves_safe_status() {
+        let (root, git) = fake_git(
+            "i=0; while [ $i -lt 9000 ]; do printf 'sentinel-secret-plain-text\\n'; printf 'sentinel-secret-plain-text\\n' >&2; i=$((i+1)); done; exit 42",
+        );
+        let error = git
+            .command(root.path(), &["fetch"], &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RemoteWorkflowError::Process { status, .. } if status.code() == Some(42))
+        );
+        assert!(!format!("{error:?} {error}").contains("sentinel-secret"));
+        let (root, git) = fake_git(
+            "i=0; while [ $i -lt 9000 ]; do printf 'metadata-output\\n'; i=$((i+1)); done",
+        );
+        assert!(matches!(
+            git.command(root.path(), &["ls-remote"], &CancellationToken::new())
+                .await
+                .unwrap_err(),
+            RemoteWorkflowError::OutputLimit
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_timeout_and_cancel_reap_owned_children() {
+        for timeout in [true, false] {
+            let (root, mut git) = fake_git("printf '%s' $$ > pid; exec /bin/sleep 60");
+            git.timeout = Duration::from_secs(2);
+            let cancel = CancellationToken::new();
+            let trigger = async {
+                if !timeout {
+                    time::timeout(Duration::from_secs(5), async {
+                        while !root.path().join("pid").exists() {
+                            time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    cancel.cancel();
+                }
+            };
+            let (result, ()) = tokio::join!(git.command(root.path(), &["fetch"], &cancel), trigger);
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error,
+                RemoteWorkflowError::Timeout | RemoteWorkflowError::Cancelled
+            ));
+            let pid: i32 = std::fs::read_to_string(root.path().join("pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(signal::kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+        }
+    }
+}
