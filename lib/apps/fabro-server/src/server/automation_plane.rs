@@ -21,6 +21,7 @@ use super::AppState;
 use crate::automation_materializer::AutomationRunMaterializeInput;
 
 const PLANE_DISPATCHER_IDLE: std::time::Duration = std::time::Duration::from_secs(15);
+const PLANE_STATE_CONFLICT: &str = "Plane conditional state write rejected; authorization revoked";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObservedRun {
@@ -39,14 +40,15 @@ pub(crate) trait PlanePort: Send + Sync {
         ready_state_id: &str,
     ) -> anyhow::Result<Vec<Issue>>;
 
-    async fn fetch_issue(&self, project_id: &str, issue_id: &str) -> anyhow::Result<Issue>;
+    async fn fetch_issue(&self, project_id: &str, issue_id: &str) -> anyhow::Result<(Issue, Option<String>)>;
 
     async fn update_state(
         &self,
         project_id: &str,
         issue_id: &str,
         state_id: &str,
-    ) -> anyhow::Result<()>;
+        etag: Option<&str>,
+    ) -> anyhow::Result<bool>;
 
     async fn create_comment(
         &self,
@@ -217,7 +219,7 @@ where
                     .context("plane automation preflight failed")?;
                 preflight_ok = true;
             }
-            let issue = self.plane.fetch_issue(&trigger.project_id, &issue.id).await?;
+            let (issue, _) = self.plane.fetch_issue(&trigger.project_id, &issue.id).await?;
             if issue.state != trigger.ready_state_id {
                 continue;
             }
@@ -265,6 +267,13 @@ where
         mut record: PlaneDispatchRecord,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
+        if record.dispatch.last_error.as_deref() == Some(PLANE_STATE_CONFLICT) {
+            self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
+            if let Some(id) = record.dispatch.current_run_id.as_deref() {
+                self.runs.cancel_run(&id.parse()?).await?;
+            }
+            return self.mark_cancelled(trigger, &mut record, now, "ticket moved externally").await;
+        }
         match record.dispatch.status {
             PlaneDispatchStatus::Pending | PlaneDispatchStatus::Claimed => {
                 self.advance_claim(automation, trigger, &mut record, now)
@@ -337,7 +346,7 @@ where
         record: &mut PlaneDispatchRecord,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        let issue = self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
+        let (issue, etag) = self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
         let expected = if record.effects.claimed_state_applied {
             &trigger.in_progress_state_id
         } else {
@@ -351,9 +360,12 @@ where
         }
         if !record.effects.claimed_state_applied {
             if issue.state != trigger.in_progress_state_id {
-                self.plane
-                    .update_state(&trigger.project_id, &record.dispatch.issue_id, &trigger.in_progress_state_id)
-                    .await.context("moving Plane issue to configured in-progress state")?;
+                if !self.plane
+                    .update_state(&trigger.project_id, &record.dispatch.issue_id, &trigger.in_progress_state_id, etag.as_deref())
+                    .await.context("moving Plane issue to configured in-progress state")?
+                {
+                    return self.record_state_conflict(record, now).await;
+                }
             }
             record.effects.claimed_state_applied = true;
             record.dispatch.status = PlaneDispatchStatus::Claimed;
@@ -373,7 +385,7 @@ where
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
 
-        let issue = self
+        let (issue, etag) = self
             .plane
             .fetch_issue(&trigger.project_id, &record.dispatch.issue_id)
             .await
@@ -384,6 +396,7 @@ where
             }
             return self.mark_cancelled(trigger, record, now, "ticket moved externally").await;
         }
+        fabro_tracker::plane::strong_etag(etag.as_deref())?;
         let run_id = match record.dispatch.current_run_id.as_deref() {
             Some(id) => id.parse::<RunId>()?,
             None => {
@@ -438,7 +451,7 @@ where
                 .await;
         };
 
-        let issue = self
+        let (issue, _) = self
             .plane
             .fetch_issue(&trigger.project_id, &record.dispatch.issue_id)
             .await
@@ -558,14 +571,17 @@ where
         pr_url: &str,
     ) -> anyhow::Result<()> {
         record.dispatch.pull_request_url = Some(pr_url.to_string());
-        let issue = self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
+        let (issue, etag) = self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
         if issue.state != trigger.in_progress_state_id && issue.state != trigger.done_state_id {
             return self.mark_cancelled(trigger, record, now, "ticket moved externally").await;
         }
         if !record.effects.success_state_applied {
             if issue.state != trigger.done_state_id {
-                self.plane.update_state(&trigger.project_id, &record.dispatch.issue_id, &trigger.done_state_id)
-                    .await.context("moving Plane issue to configured completion state")?;
+                if !self.plane.update_state(&trigger.project_id, &record.dispatch.issue_id, &trigger.done_state_id, etag.as_deref())
+                    .await.context("moving Plane issue to configured completion state")?
+                {
+                    return self.record_state_conflict(record, now).await;
+                }
             }
             record.effects.success_state_applied = true;
             record.dispatch.updated_at = now;
@@ -590,6 +606,15 @@ where
         Ok(())
     }
 
+    async fn record_state_conflict(&self, record: &mut PlaneDispatchRecord, now: DateTime<Utc>) -> anyhow::Result<()> {
+        // Persist before any fallible reconciliation: a restart must never refresh
+        // the tag and blindly re-authorize the rejected transition.
+        record.dispatch.last_error = Some(PLANE_STATE_CONFLICT.into());
+        record.dispatch.updated_at = now;
+        self.store.save(record).await?;
+        Err(fabro_tracker::plane::PlaneStateConflict.into())
+    }
+
     async fn mark_cancelled(
         &self,
         trigger: &PlaneTrigger,
@@ -597,15 +622,22 @@ where
         now: DateTime<Utc>,
         reason: &str,
     ) -> anyhow::Result<()> {
+        let mut reason = reason;
         if reason != "ticket moved externally" && !record.effects.cancelled_state_applied {
-            self.plane
-                .update_state(
+            let (issue, etag) = self.plane.fetch_issue(&trigger.project_id, &record.dispatch.issue_id).await?;
+            if issue.state != trigger.in_progress_state_id {
+                reason = "ticket moved externally";
+            } else if !self.plane.update_state(
                     &trigger.project_id,
                     &record.dispatch.issue_id,
                     &trigger.cancelled_state_id,
+                    etag.as_deref(),
                 )
-                .await?;
-            record.effects.cancelled_state_applied = true;
+                .await? {
+                return self.record_state_conflict(record, now).await;
+            } else {
+                record.effects.cancelled_state_applied = true;
+            }
         }
         if !record.effects.cancelled_comment_posted {
             let comment = format!("<p>Fabro run cancelled: {reason}</p>");
@@ -763,8 +795,10 @@ impl PlanePort for LivePlanePort {
             .await
     }
 
-    async fn fetch_issue(&self, project_id: &str, issue_id: &str) -> anyhow::Result<Issue> {
-        self.client.fetch_issue(project_id, issue_id).await
+    async fn fetch_issue(&self, project_id: &str, issue_id: &str) -> anyhow::Result<(Issue, Option<String>)> {
+        let mut raw = self.client.fetch_issue_raw(project_id, issue_id).await?;
+        let etag = raw.etag.take();
+        Ok((self.client.normalize_issue(raw, project_id)?, etag))
     }
 
     async fn update_state(
@@ -772,10 +806,13 @@ impl PlanePort for LivePlanePort {
         project_id: &str,
         issue_id: &str,
         state_id: &str,
-    ) -> anyhow::Result<()> {
-        self.client
-            .update_state(project_id, issue_id, state_id)
-            .await
+        etag: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        match self.client.update_state(project_id, issue_id, state_id, etag).await {
+            Ok(()) => Ok(true),
+            Err(err) if err.is::<fabro_tracker::plane::PlaneStateConflict>() => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     async fn create_comment(
@@ -1011,6 +1048,7 @@ mod tests {
         candidate_fetches: Mutex<usize>,
         fail_fetch: Mutex<bool>,
         fail_label_once: Mutex<bool>,
+        conflict_state: Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -1034,13 +1072,14 @@ mod tests {
                 .collect())
         }
 
-        async fn fetch_issue(&self, _project_id: &str, issue_id: &str) -> anyhow::Result<Issue> {
+        async fn fetch_issue(&self, _project_id: &str, issue_id: &str) -> anyhow::Result<(Issue, Option<String>)> {
             self.issues
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|issue| issue.id == issue_id)
                 .cloned()
+                .map(|issue| { let etag = Some(format!("\"{}\"", issue.state)); (issue, etag) })
                 .context("missing issue")
         }
 
@@ -1049,16 +1088,22 @@ mod tests {
             _project_id: &str,
             issue_id: &str,
             state_id: &str,
-        ) -> anyhow::Result<()> {
+            etag: Option<&str>,
+        ) -> anyhow::Result<bool> {
             let mut issues = self.issues.lock().unwrap();
+            if let Some(state) = self.conflict_state.lock().unwrap().take() {
+                issues.iter_mut().find(|issue| issue.id == issue_id).unwrap().state = state;
+                return Ok(false);
+            }
             if let Some(issue) = issues.iter_mut().find(|issue| issue.id == issue_id) {
+                anyhow::ensure!(etag == Some(format!("\"{}\"", issue.state).as_str()), "wrong observed version");
                 issue.state = state_id.to_string();
             }
             self.states
                 .lock()
                 .unwrap()
                 .insert(issue_id.to_string(), state_id.to_string());
-            Ok(())
+            Ok(true)
         }
 
         async fn create_comment(
@@ -1681,5 +1726,49 @@ mod tests {
         assert_eq!(done.dispatch.status, PlaneDispatchStatus::Failed);
         assert!(done.effects.failure_label_applied);
         assert_eq!(runs.started.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_claim_is_not_reauthorized_after_restart() {
+        let (_dir, automation, store) = setup().await;
+        let plane = FakePlane::default();
+        *plane.issues.lock().unwrap() = vec![issue("iss", "T-1", Some(1), &[])];
+        // A concurrent metadata edit may leave the state unchanged. A new tag
+        // must still not silently authorize the rejected write.
+        *plane.conflict_state.lock().unwrap() = Some("ready".into());
+        let runs = FakeRuns { preflight_ok: Mutex::new(true), ..FakeRuns::default() };
+        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        assert!(dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.is_err());
+        let mut restarted = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        restarted.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
+        assert!(runs.started.lock().unwrap().is_empty());
+        assert!(plane.states.lock().unwrap().is_empty());
+        let record = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        assert_eq!(record.dispatch.status, PlaneDispatchStatus::Cancelled);
+        assert_eq!(plane.issues.lock().unwrap()[0].state, "ready");
+    }
+
+    #[tokio::test]
+    async fn stale_completion_preserves_human_transition() {
+        let (_dir, automation, store) = setup().await;
+        let plane = FakePlane::default();
+        *plane.issues.lock().unwrap() = vec![issue("iss", "T-1", Some(1), &[])];
+        let runs = FakeRuns { preflight_ok: Mutex::new(true), ..FakeRuns::default() };
+        let mut dispatcher = PlaneTicketDispatcher::new(store.clone(), &plane, &runs, "http://fabro");
+        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
+        let record = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        let id = record.dispatch.current_run_id.unwrap();
+        let mut observed = runs.observed.lock().unwrap();
+        let run = observed.get_mut(&id).unwrap();
+        run.status = RunStatus::Succeeded { reason: SuccessReason::Completed };
+        run.pull_request_url = Some("https://github.com/acme/widgets/pull/42".into());
+        drop(observed);
+        *plane.conflict_state.lock().unwrap() = Some("backlog".into());
+        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
+        dispatcher.tick_trigger(&automation, trigger(&automation), Utc::now()).await.unwrap();
+        let record = store.list_for_automation(&automation.id).await.unwrap().remove(0);
+        assert_eq!(record.dispatch.status, PlaneDispatchStatus::Cancelled);
+        assert!(!record.effects.success_state_applied);
+        assert_eq!(plane.issues.lock().unwrap()[0].state, "backlog");
     }
 }

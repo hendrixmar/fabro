@@ -119,6 +119,10 @@ pub enum PlaneLabelOrId {
 /// Raw issue representation from Plane API.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlaneIssue {
+    /// Strong row-version validator returned by the authoritative detail GET.
+    /// Never accepted from an issue JSON body.
+    #[serde(skip)]
+    pub etag: Option<String>,
     pub id:                   String,
     #[serde(default)]
     pub sequence_id:          Option<i64>,
@@ -159,6 +163,26 @@ pub struct PlaneComment {
     pub created_at:       Option<String>,
     #[serde(default)]
     pub updated_at:       Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PlaneStateConflict;
+
+impl std::fmt::Display for PlaneStateConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Plane issue changed since authorization; conditional write rejected")
+    }
+}
+
+impl std::error::Error for PlaneStateConflict {}
+
+/// Reject absent, weak, wildcard, malformed, or multiple mutation validators.
+pub fn strong_etag(etag: Option<&str>) -> anyhow::Result<&str> {
+    let etag = etag.context("Plane mutation requires a strong ETag; provider upgrade required")?;
+    anyhow::ensure!(etag.len() >= 3 && etag.starts_with('"') && etag.ends_with('"')
+        && etag.as_bytes()[1..etag.len()-1].iter().all(|b| (0x21..=0x7e).contains(b) && *b != b'"' && *b != b','),
+        "Plane mutation requires one strong ETag");
+    Ok(etag)
 }
 
 /// HTTP client for Plane REST API.
@@ -209,6 +233,17 @@ impl PlaneClient {
         subpath: &str,
         body: Option<&serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(method != Method::PATCH, "Plane PATCH requires an observed strong ETag");
+        self.request_with_version(method, subpath, body, None).await.map(|(body, _)| body)
+    }
+
+    async fn request_with_version(
+        &self,
+        method: Method,
+        subpath: &str,
+        body: Option<&serde_json::Value>,
+        if_match: Option<&str>,
+    ) -> anyhow::Result<(serde_json::Value, Option<String>)> {
         let url = self.api_endpoint(subpath);
         debug!(method = %method, url = %url, "Sending Plane API request");
         let mut req = self
@@ -218,6 +253,11 @@ impl PlaneClient {
             .header("Content-Type", "application/json")
             .header("User-Agent", "fabro")
             .timeout(std::time::Duration::from_secs(30));
+        // The validator names the provider row, not a compressed representation.
+        req = req.header(header::ACCEPT_ENCODING, "identity");
+        if let Some(etag) = if_match {
+            req = req.header(header::IF_MATCH, strong_etag(Some(etag))?);
+        }
 
         if let Some(b) = body {
             req = req.json(b);
@@ -233,6 +273,14 @@ impl PlaneClient {
         // Check for auth failures and redact bodies.
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             bail!("Plane authentication failed (HTTP {})", status.as_u16());
+        }
+        if status == StatusCode::PRECONDITION_FAILED {
+            return Err(PlaneStateConflict.into());
+        }
+        let etag = resp.headers().get(header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        if let Some(previous) = if_match.filter(|_| status.is_success()) {
+            let fresh = strong_etag(etag.as_deref()).context("Plane conditional response has no strong ETag")?;
+            anyhow::ensure!(fresh != previous, "Plane conditional response did not advance its ETag");
         }
 
         // Check for content-type HTML SPA fallback.
@@ -269,7 +317,7 @@ impl PlaneClient {
 
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            return Ok(serde_json::json!({}));
+            return Ok((serde_json::json!({}), etag));
         }
 
         if trimmed.starts_with('<') {
@@ -281,7 +329,7 @@ impl PlaneClient {
         let parsed: serde_json::Value =
             serde_json::from_str(&text).with_context(|| "Failed to parse Plane JSON response")?;
 
-        Ok(parsed)
+        Ok((parsed, etag))
     }
 
     /// Execute a cursor-paginated GET request across all pages.
@@ -411,15 +459,17 @@ impl PlaneClient {
         project_id: &str,
         issue_id: &str,
     ) -> anyhow::Result<PlaneIssue> {
-        let resp = self
-            .request(
+        let (resp, etag) = self
+            .request_with_version(
                 Method::GET,
                 &format!("projects/{project_id}/issues/{issue_id}/"),
                 None,
+                None,
             )
             .await?;
-        let issue: PlaneIssue =
+        let mut issue: PlaneIssue =
             serde_json::from_value(resp).with_context(|| "Failed to deserialize PlaneIssue")?;
+        issue.etag = etag;
         Ok(issue)
     }
 
@@ -429,12 +479,15 @@ impl PlaneClient {
         project_id: &str,
         issue_id: &str,
         state_id: &str,
+        etag: Option<&str>,
     ) -> anyhow::Result<()> {
+        let etag = strong_etag(etag)?;
         let body = serde_json::json!({ "state": state_id });
-        self.request(
+        self.request_with_version(
             Method::PATCH,
             &format!("projects/{project_id}/issues/{issue_id}/"),
             Some(&body),
+            Some(etag),
         )
         .await
         .with_context(|| {
@@ -488,10 +541,11 @@ impl PlaneClient {
         }
         label_ids.push(label_id.to_string());
         let body = serde_json::json!({ "labels": label_ids });
-        self.request(
+        self.request_with_version(
             Method::PATCH,
             &format!("projects/{project_id}/issues/{issue_id}/"),
             Some(&body),
+            Some(strong_etag(raw.etag.as_deref())?),
         )
         .await
         .with_context(|| format!("Failed to add label {label_id} to issue {issue_id} in Plane"))?;
@@ -651,8 +705,12 @@ impl Tracker for PlaneTracker {
                     state_name, self.project_id
                 )
             })?;
+        let mut current = self.client.fetch_issue_raw(&self.project_id, &issue.id).await?;
+        let etag = current.etag.take();
+        let current = self.client.normalize_issue(current, &self.project_id)?;
+        anyhow::ensure!(current.state == issue.state, "Plane issue changed since authorization");
         self.client
-            .update_state(&self.project_id, &issue.id, &state.id)
+            .update_state(&self.project_id, &issue.id, &state.id, etag.as_deref())
             .await
     }
 
@@ -770,6 +828,7 @@ mod tests {
         ));
 
         let plane_issue = PlaneIssue {
+            etag: None,
             id:                   "issue-uuid-1".to_string(),
             sequence_id:          Some(42),
             name:                 "Fix login button bug".to_string(),
@@ -832,6 +891,7 @@ mod tests {
         ));
 
         let plane_issue = PlaneIssue {
+            etag: None,
             id:                   "issue-2".to_string(),
             sequence_id:          Some(10),
             name:                 "HTML description issue".to_string(),
@@ -983,8 +1043,10 @@ mod tests {
         let patch_state = server.mock(|when, then| {
             when.method(PATCH)
                 .path("/api/v1/workspaces/test-workspace/projects/p1/issues/i1/")
+                .header("If-Match", "\"v1\"")
                 .json_body(json!({ "state": "s_in_progress" }));
             then.status(200)
+                .header("ETag", "\"v2\"")
                 .header("Content-Type", "application/json")
                 .json_body(json!({ "id": "i1", "state": "s_in_progress" }));
         });
@@ -1004,7 +1066,7 @@ mod tests {
         });
 
         client
-            .update_state("p1", "i1", "s_in_progress")
+            .update_state("p1", "i1", "s_in_progress", Some("\"v1\""))
             .await
             .unwrap();
         patch_state.assert();
@@ -1075,12 +1137,20 @@ mod tests {
         assert_eq!(candidates[0].id, "iss-1");
         assert_eq!(candidates[0].identifier, "TIERRA-101");
 
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/test-workspace/projects/proj-1/issues/iss-1/");
+            then.status(200).header("ETag", "\"observed\"").json_body(json!({
+                "id":"iss-1","name":"Ready ticket 1","state":"state-ready-id"
+            }));
+        });
         // Mock update state
         let update_mock = server.mock(|when, then| {
             when.method(PATCH)
                 .path("/api/v1/workspaces/test-workspace/projects/proj-1/issues/iss-1/")
+                .header("If-Match", "\"observed\"")
                 .json_body(json!({ "state": "state-in-prog-id" }));
             then.status(200)
+                .header("ETag", "\"updated\"")
                 .header("Content-Type", "application/json")
                 .json_body(json!({ "id": "iss-1", "state": "state-in-prog-id" }));
         });
@@ -1115,5 +1185,61 @@ mod tests {
                 .any(|cause| cause.contains("error sending request")),
             "expected reqwest source in chain, got {chain:#?}"
         );
+    }
+
+    #[tokio::test]
+    async fn conditional_state_uses_authoritative_etag() {
+        let server = MockServer::start_async().await;
+        let client = test_client(&server.url(""));
+        let get = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
+                .header("Accept-Encoding", "identity");
+            then.status(200).header("ETag", "\"original\"").json_body(json!({
+                "id":"i","name":"Ticket","state":"ready","etag":"\"untrusted-json-value\""
+            }));
+        });
+        let patch = server.mock(|when, then| {
+            when.method(PATCH).path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
+                .header("If-Match", "\"original\"").json_body(json!({"state":"progress"}));
+            then.status(200).header("ETag", "\"new\"").json_body(json!({"id":"i","state":"progress"}));
+        });
+        let raw = client.fetch_issue_raw("p", "i").await.unwrap();
+        assert_eq!(raw.etag.as_deref(), Some("\"original\""));
+        client.update_state("p", "i", "progress", raw.etag.as_deref()).await.unwrap();
+        get.assert();
+        patch.assert();
+    }
+
+    #[tokio::test]
+    async fn conditional_state_refuses_absent_or_invalid_tags_before_patch() {
+        let server = MockServer::start_async().await;
+        let client = test_client(&server.url(""));
+        let patch = server.mock(|when, then| {
+            when.method(PATCH);
+            then.status(200).header("ETag", "\"new\"").json_body(json!({}));
+        });
+        for tag in [None, Some("W/\"weak\""), Some("*"), Some("plain"), Some("\"one\", \"two\"")] {
+            assert!(client.update_state("p", "i", "progress", tag).await.is_err());
+        }
+        patch.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn conditional_state_surfaces_stale_write_without_refreshing_tag() {
+        let server = MockServer::start_async().await;
+        let client = test_client(&server.url(""));
+        let patch = server.mock(|when, then| {
+            when.method(PATCH).path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
+                .header("If-Match", "\"old\"");
+            then.status(412).header("ETag", "\"human\"").json_body(json!({"detail":"stale"}));
+        });
+        let get = server.mock(|when, then| {
+            when.method(GET);
+            then.status(200).header("ETag", "\"human\"").json_body(json!({"id":"i","name":"Human","state":"backlog"}));
+        });
+        let err = client.update_state("p", "i", "progress", Some("\"old\"")).await.unwrap_err();
+        assert!(err.is::<PlaneStateConflict>());
+        patch.assert();
+        get.assert_calls(0);
     }
 }

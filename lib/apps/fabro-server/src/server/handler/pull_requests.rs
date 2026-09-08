@@ -206,11 +206,18 @@ pub(in crate::server) async fn verified_draft_for_run(
     let Some(checkpoint) = projection.current_checkpoint() else {
         return Ok(None);
     };
-    let mut gates = projection.spec.graph.nodes.values().filter(|node| node.goal_gate()).peekable();
-    if gates.peek().is_none() || !gates.all(|node|
-        checkpoint.node_outcomes.get(&node.id).is_some_and(|outcome|
-            outcome.status == fabro_types::StageOutcome::Succeeded))
-    {
+    let mut has_gate = false;
+    for node in projection.spec.graph.nodes.values() {
+        if node.goal_gate() {
+            has_gate = true;
+            if !checkpoint.node_outcomes.get(&node.id).is_some_and(|outcome|
+                outcome.status == fabro_types::StageOutcome::Succeeded)
+            {
+                return Ok(None);
+            }
+        }
+    }
+    if !has_gate {
         return Ok(None);
     }
     let Some(record) = projection.pull_request.as_ref() else {
