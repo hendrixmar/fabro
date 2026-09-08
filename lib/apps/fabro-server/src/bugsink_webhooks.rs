@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::post;
 use fabro_types::Principal;
 use hmac::{Hmac, Mac as _};
+use mime_guess::mime::{APPLICATION, JSON};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Semaphore;
@@ -118,9 +119,7 @@ async fn receive(
     let content_type = single_header(&headers, header::CONTENT_TYPE.as_str())
         .and_then(|value| value.parse::<mime_guess::Mime>().ok());
     if !content_type.is_some_and(|value| {
-        value.type_() == mime_guess::mime::APPLICATION
-            && value.subtype() == mime_guess::mime::JSON
-            && value.suffix().is_none()
+        value.type_() == APPLICATION && value.subtype() == JSON && value.suffix().is_none()
     }) {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE;
     }
