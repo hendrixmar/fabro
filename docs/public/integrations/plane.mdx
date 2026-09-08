@@ -9,7 +9,7 @@ Plane is a first-class automation source. Fabro polls one operator-selected proj
 
 ```toml
 [server.integrations.plane]
-enabled = true
+enabled = false # Keep disabled until the provider concurrency-safety gate is satisfied.
 api_base = "https://plane.artesanosdigitales.cloud/api/v1"
 workspace = "artesanos-digitales-workspace"
 
@@ -31,12 +31,19 @@ Required Plane endpoints:
 - `GET /workspaces/{workspace}/projects/{id}/issues/`
 - `PATCH /workspaces/{workspace}/projects/{id}/issues/{issue_id}/`
 - `POST /workspaces/{workspace}/projects/{id}/issues/{issue_id}/comments/`
+- `GET /workspaces/{workspace}/projects/{id}/issues/{issue_id}/comments/` (paginated effect reconciliation)
 
 HTML SPA fallbacks on those `/api/*` paths are rejected.
 
 ## Lifecycle
 
-Configured Ready → In Progress on claim → Done only after a successful run and a linked draft PR. A cancelled Fabro run maps to the configured Cancelled state unless a human already moved the ticket.
+Only a human authorizes coding by moving Backlog to the configured **Ready for agent** state UUID. Generic Todo is not an alias. Fabro claims that exact state into the configured In Progress state; it re-reads authorization before claims, starts, retries, and completion, and cancels coding when it observes a human state change.
+
+Candidate polling follows `poll_interval_seconds` (60 seconds for the incident workflow), independently of the 15-second reconciliation tick. Failed polls also advance the next deadline. Restart may poll immediately, but durable ticket claims and reserved Run IDs prevent a new coding Run for an ambiguous start.
+
+Completion requires a successful Run conclusion, successful required `goal_gate` stages, the final commit SHA, and a live GitHub PR that is open, unmerged, draft, in the Run's repository, and whose head SHA matches that final commit. Pending or failed creation, unavailable GitHub verification, missing SHA, a stale head, and a non-draft PR cannot complete a ticket. Set `done_state_id` to the project's **In review** UUID; the name is retained for configuration compatibility, not permission to move tickets to Done. Done, merging, deployment, and incident closure remain human-controlled.
+
+When the same Run is Blocked at `clarification`, the dispatcher reads the validated `ticket-loop-out/clarification.json` object mirrored by `parse_clarity` into durable checkpoint `context_values.ticket_clarity`. It posts up to five bounded, HTML-escaped questions; invalid or absent artifacts are not replaced with invented questions. Human answers resume that same Run.
 
 Failure policy: two total attempts. After the second failure, leave the ticket In Progress, post a failure comment, mark the dispatch failed, and optionally apply the failure label.
 
@@ -46,4 +53,8 @@ Use an operator-controlled sandbox image that installs `codex-acp` and `omp`, th
 
 ## Single-server limitation
 
-v1 claiming is local to one Fabro server and its SQLite store. Multi-replica distributed claiming is out of scope.
+Claiming is local to one Fabro server and its SQLite store. Multi-replica distributed claiming is out of scope. Use concurrency one for the incident workflow.
+
+**Activation remains blocked on installed Plane concurrency safety.** The inspected Plane v1.4.1 issue handler fetches the issue and later saves a PATCH without a version/ETag precondition. GET-before-PATCH preserves edits already observed but is not atomic and cannot prevent a human edit between those operations; label read-modify-write has the same limitation. Do not enable automatic state-changing triggers until a provider-supported conditional mutation is proven against stale writes on an authorized scratch issue. No Plane fork or pretend compare-and-set support is included.
+
+Before repeating a comment whose acknowledgment may have been lost, Fabro reads all comment pages and looks for the exact deterministic body. This is reconciliation, not a provider-side atomic idempotency key. State and label effect flags advance only after a successful provider response, and provider errors remain retryable on reconciliation rather than being silently marked complete.
