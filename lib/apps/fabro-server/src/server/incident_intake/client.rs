@@ -10,17 +10,18 @@ pub(super) const ISSUES_PATH: &str = "/api/canonical/0/issues/";
 
 pub(super) struct BugsinkClient {
     pub origin: String,
-    http: reqwest::Client,
+    http: fabro_http::HttpClient,
     token: String,
 }
 
-pub(super) fn http_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy()
+pub(super) fn http_client() -> anyhow::Result<fabro_http::HttpClient> {
+    Ok(fabro_http::HttpClientBuilder::new().redirect(fabro_http::redirect::Policy::none())
+        .proxy_policy(fabro_http::ProxyPolicy::Disabled)
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(15)).build()?)
 }
 
-pub(super) async fn bounded_json(mut response: reqwest::Response) -> anyhow::Result<Value> {
+pub(super) async fn bounded_json(mut response: fabro_http::Response) -> anyhow::Result<Value> {
     ensure!(response.status().is_success(), "upstream_unavailable");
     ensure!(response.content_length().is_none_or(|n| n <= BODY_LIMIT as u64), "upstream_oversized");
     let mut bytes = Vec::new();
@@ -65,7 +66,7 @@ impl BugsinkClient {
 
     async fn get(&self, url: url::Url) -> anyhow::Result<Value> {
         let response = self.http.get(url).bearer_auth(&self.token).send().await?;
-        ensure!(response.status() != reqwest::StatusCode::NOT_FOUND, "upstream_not_found_or_retained");
+        ensure!(response.status() != fabro_http::StatusCode::NOT_FOUND, "upstream_not_found_or_retained");
         bounded_json(response).await
     }
 
