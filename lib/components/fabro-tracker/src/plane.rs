@@ -122,7 +122,7 @@ pub struct PlaneIssue {
     /// Strong row-version validator returned by the authoritative detail GET.
     /// Never accepted from an issue JSON body.
     #[serde(skip)]
-    pub etag: Option<String>,
+    pub etag:                 Option<String>,
     pub id:                   String,
     #[serde(default)]
     pub sequence_id:          Option<i64>,
@@ -179,9 +179,15 @@ impl std::error::Error for PlaneStateConflict {}
 /// Reject absent, weak, wildcard, malformed, or multiple mutation validators.
 pub fn strong_etag(etag: Option<&str>) -> anyhow::Result<&str> {
     let etag = etag.context("Plane mutation requires a strong ETag; provider upgrade required")?;
-    anyhow::ensure!(etag.len() >= 3 && etag.starts_with('"') && etag.ends_with('"')
-        && etag.as_bytes()[1..etag.len()-1].iter().all(|b| (0x21..=0x7e).contains(b) && *b != b'"' && *b != b','),
-        "Plane mutation requires one strong ETag");
+    anyhow::ensure!(
+        etag.len() >= 3
+            && etag.starts_with('"')
+            && etag.ends_with('"')
+            && etag.as_bytes()[1..etag.len() - 1]
+                .iter()
+                .all(|b| (0x21..=0x7e).contains(b) && *b != b'"' && *b != b','),
+        "Plane mutation requires one strong ETag"
+    );
     Ok(etag)
 }
 
@@ -233,8 +239,13 @@ impl PlaneClient {
         subpath: &str,
         body: Option<&serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
-        anyhow::ensure!(method != Method::PATCH, "Plane PATCH requires an observed strong ETag");
-        self.request_with_version(method, subpath, body, None).await.map(|(body, _)| body)
+        anyhow::ensure!(
+            method != Method::PATCH,
+            "Plane PATCH requires an observed strong ETag"
+        );
+        self.request_with_version(method, subpath, body, None)
+            .await
+            .map(|(body, _)| body)
     }
 
     async fn request_with_version(
@@ -277,10 +288,18 @@ impl PlaneClient {
         if status == StatusCode::PRECONDITION_FAILED {
             return Err(PlaneStateConflict.into());
         }
-        let etag = resp.headers().get(header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         if let Some(previous) = if_match.filter(|_| status.is_success()) {
-            let fresh = strong_etag(etag.as_deref()).context("Plane conditional response has no strong ETag")?;
-            anyhow::ensure!(fresh != previous, "Plane conditional response did not advance its ETag");
+            let fresh = strong_etag(etag.as_deref())
+                .context("Plane conditional response has no strong ETag")?;
+            anyhow::ensure!(
+                fresh != previous,
+                "Plane conditional response did not advance its ETag"
+            );
         }
 
         // Check for content-type HTML SPA fallback.
@@ -582,8 +601,14 @@ impl PlaneClient {
 
         // The expanded name remains available in PlaneIssue::state_detail;
         // authorization always compares the provider identity, never its display name.
-        let state_id = issue.state.as_ref()
-            .and_then(|state| state.as_str().or_else(|| state.get("id").and_then(|id| id.as_str())))
+        let state_id = issue
+            .state
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .as_str()
+                    .or_else(|| state.get("id").and_then(|id| id.as_str()))
+            })
             .or_else(|| issue.state_detail.as_ref().map(|detail| detail.id.as_str()))
             .context("Plane issue has no state identity")?
             .to_string();
@@ -705,10 +730,16 @@ impl Tracker for PlaneTracker {
                     state_name, self.project_id
                 )
             })?;
-        let mut current = self.client.fetch_issue_raw(&self.project_id, &issue.id).await?;
+        let mut current = self
+            .client
+            .fetch_issue_raw(&self.project_id, &issue.id)
+            .await?;
         let etag = current.etag.take();
         let current = self.client.normalize_issue(current, &self.project_id)?;
-        anyhow::ensure!(current.state == issue.state, "Plane issue changed since authorization");
+        anyhow::ensure!(
+            current.state == issue.state,
+            "Plane issue changed since authorization"
+        );
         self.client
             .update_state(&self.project_id, &issue.id, &state.id, etag.as_deref())
             .await
@@ -777,7 +808,8 @@ mod tests {
         let client = test_client(&server.url(""));
         let ready = "00000000-0000-0000-0000-000000000001";
         server.mock(|when, then| {
-            when.method(GET).path("/api/v1/workspaces/test-workspace/projects/p/issues/");
+            when.method(GET)
+                .path("/api/v1/workspaces/test-workspace/projects/p/issues/");
             then.status(200).json_body(json!({
                 "results": [
                     {"id":"authorized","name":"Fix","state":ready,
@@ -788,7 +820,13 @@ mod tests {
             }));
         });
         let issues = client.fetch_candidate_issues("p", ready).await.unwrap();
-        assert_eq!(issues.iter().map(|issue| issue.id.as_str()).collect::<Vec<_>>(), vec!["authorized"]);
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["authorized"]
+        );
         assert_eq!(issues[0].state, ready);
     }
 
@@ -828,7 +866,7 @@ mod tests {
         ));
 
         let plane_issue = PlaneIssue {
-            etag: None,
+            etag:                 None,
             id:                   "issue-uuid-1".to_string(),
             sequence_id:          Some(42),
             name:                 "Fix login button bug".to_string(),
@@ -891,7 +929,7 @@ mod tests {
         ));
 
         let plane_issue = PlaneIssue {
-            etag: None,
+            etag:                 None,
             id:                   "issue-2".to_string(),
             sequence_id:          Some(10),
             name:                 "HTML description issue".to_string(),
@@ -1138,10 +1176,13 @@ mod tests {
         assert_eq!(candidates[0].identifier, "TIERRA-101");
 
         server.mock(|when, then| {
-            when.method(GET).path("/api/v1/workspaces/test-workspace/projects/proj-1/issues/iss-1/");
-            then.status(200).header("ETag", "\"observed\"").json_body(json!({
-                "id":"iss-1","name":"Ready ticket 1","state":"state-ready-id"
-            }));
+            when.method(GET)
+                .path("/api/v1/workspaces/test-workspace/projects/proj-1/issues/iss-1/");
+            then.status(200)
+                .header("ETag", "\"observed\"")
+                .json_body(json!({
+                    "id":"iss-1","name":"Ready ticket 1","state":"state-ready-id"
+                }));
         });
         // Mock update state
         let update_mock = server.mock(|when, then| {
@@ -1192,20 +1233,30 @@ mod tests {
         let server = MockServer::start_async().await;
         let client = test_client(&server.url(""));
         let get = server.mock(|when, then| {
-            when.method(GET).path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
+            when.method(GET)
+                .path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
                 .header("Accept-Encoding", "identity");
-            then.status(200).header("ETag", "\"original\"").json_body(json!({
-                "id":"i","name":"Ticket","state":"ready","etag":"\"untrusted-json-value\""
-            }));
+            then.status(200)
+                .header("ETag", "\"original\"")
+                .json_body(json!({
+                    "id":"i","name":"Ticket","state":"ready","etag":"\"untrusted-json-value\""
+                }));
         });
         let patch = server.mock(|when, then| {
-            when.method(PATCH).path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
-                .header("If-Match", "\"original\"").json_body(json!({"state":"progress"}));
-            then.status(200).header("ETag", "\"new\"").json_body(json!({"id":"i","state":"progress"}));
+            when.method(PATCH)
+                .path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
+                .header("If-Match", "\"original\"")
+                .json_body(json!({"state":"progress"}));
+            then.status(200)
+                .header("ETag", "\"new\"")
+                .json_body(json!({"id":"i","state":"progress"}));
         });
         let raw = client.fetch_issue_raw("p", "i").await.unwrap();
         assert_eq!(raw.etag.as_deref(), Some("\"original\""));
-        client.update_state("p", "i", "progress", raw.etag.as_deref()).await.unwrap();
+        client
+            .update_state("p", "i", "progress", raw.etag.as_deref())
+            .await
+            .unwrap();
         get.assert();
         patch.assert();
     }
@@ -1216,10 +1267,23 @@ mod tests {
         let client = test_client(&server.url(""));
         let patch = server.mock(|when, then| {
             when.method(PATCH);
-            then.status(200).header("ETag", "\"new\"").json_body(json!({}));
+            then.status(200)
+                .header("ETag", "\"new\"")
+                .json_body(json!({}));
         });
-        for tag in [None, Some("W/\"weak\""), Some("*"), Some("plain"), Some("\"one\", \"two\"")] {
-            assert!(client.update_state("p", "i", "progress", tag).await.is_err());
+        for tag in [
+            None,
+            Some("W/\"weak\""),
+            Some("*"),
+            Some("plain"),
+            Some("\"one\", \"two\""),
+        ] {
+            assert!(
+                client
+                    .update_state("p", "i", "progress", tag)
+                    .await
+                    .is_err()
+            );
         }
         patch.assert_calls(0);
     }
@@ -1229,15 +1293,23 @@ mod tests {
         let server = MockServer::start_async().await;
         let client = test_client(&server.url(""));
         let patch = server.mock(|when, then| {
-            when.method(PATCH).path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
+            when.method(PATCH)
+                .path("/api/v1/workspaces/test-workspace/projects/p/issues/i/")
                 .header("If-Match", "\"old\"");
-            then.status(412).header("ETag", "\"human\"").json_body(json!({"detail":"stale"}));
+            then.status(412)
+                .header("ETag", "\"human\"")
+                .json_body(json!({"detail":"stale"}));
         });
         let get = server.mock(|when, then| {
             when.method(GET);
-            then.status(200).header("ETag", "\"human\"").json_body(json!({"id":"i","name":"Human","state":"backlog"}));
+            then.status(200)
+                .header("ETag", "\"human\"")
+                .json_body(json!({"id":"i","name":"Human","state":"backlog"}));
         });
-        let err = client.update_state("p", "i", "progress", Some("\"old\"")).await.unwrap_err();
+        let err = client
+            .update_state("p", "i", "progress", Some("\"old\""))
+            .await
+            .unwrap_err();
         assert!(err.is::<PlaneStateConflict>());
         patch.assert();
         get.assert_calls(0);

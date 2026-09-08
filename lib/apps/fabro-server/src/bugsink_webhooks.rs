@@ -20,7 +20,7 @@ const SIGNATURE_HEADER: &str = "sentry-hook-signature";
 const BODY_LIMIT: usize = 256 * 1024;
 
 struct ReceiverState {
-    app: Arc<AppState>,
+    app:     Arc<AppState>,
     ingress: Semaphore,
 }
 
@@ -29,7 +29,7 @@ pub(crate) fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(WEBHOOK_ROUTE, post(receive))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(Arc::new(ReceiverState {
-            app: state,
+            app:     state,
             ingress: Semaphore::new(16),
         }))
 }
@@ -54,8 +54,8 @@ pub(crate) fn verify_signature(secret: &[u8], body: &[u8], header: &str) -> bool
 // spellings of a key. Unknown canonical fields are skipped, never trusted.
 #[derive(Deserialize)]
 struct RoutingFields {
-    project: u64,
-    id: String,
+    project:      u64,
+    id:           String,
     alert_reason: String,
 }
 
@@ -66,7 +66,12 @@ pub(crate) fn normalize_alert(
 ) -> Result<AcceptedAlert, StatusCode> {
     // Derived struct deserializers also accept sequences; the wire contract is
     // an object with named routing fields, never positional JSON.
-    if body.iter().copied().find(|byte| !byte.is_ascii_whitespace()) != Some(b'{') {
+    if body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'{')
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     let fields: RoutingFields =
@@ -152,7 +157,8 @@ async fn receive(
         auth_slot.replace(RequestAuthContext::invalid());
         return StatusCode::UNAUTHORIZED;
     };
-    let alert = match normalize_alert(&body, signed_project, chrono::Utc::now().timestamp_millis()) {
+    let alert = match normalize_alert(&body, signed_project, chrono::Utc::now().timestamp_millis())
+    {
         Ok(alert) => alert,
         Err(status) => {
             auth_slot.replace(RequestAuthContext::invalid());
@@ -184,7 +190,6 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use fabro_automation::{AutomationDraft, AutomationId, AutomationStore, AutomationTarget};
@@ -192,16 +197,21 @@ mod tests {
     use fabro_vault::{SecretStore, SecretType};
     use tower::ServiceExt as _;
 
+    use super::*;
     use crate::principal_middleware::AuthContextSlot;
-    use crate::server::{AppStateConfig, RouterOptions, build_app_state, build_router_with_options};
+    use crate::server::{
+        AppStateConfig, RouterOptions, build_app_state, build_router_with_options,
+    };
     use crate::test_support::{
         TEST_DEV_TOKEN, default_test_server_settings, load_test_server_secrets,
-        resolved_runtime_settings_for_tests, test_auth_mode, test_secret_snapshot, test_store_bundle,
+        resolved_runtime_settings_for_tests, test_auth_mode, test_secret_snapshot,
+        test_store_bundle,
     };
 
     const KEY: &str = "isolated-test-signing-key";
     const TEST_BODY: &[u8] = br#"{"id":"497f6eca-6276-4993-bfeb-53cbbbba6f08","project":25,"alert_reason":"TEST","title":"untrusted","is_resolved":false}"#;
-    const NEW_BODY: &[u8] = br#"{"id":"497f6eca-6276-4993-bfeb-53cbbbba6f08","project":25,"alert_reason":"NEW"}"#;
+    const NEW_BODY: &[u8] =
+        br#"{"id":"497f6eca-6276-4993-bfeb-53cbbbba6f08","project":25,"alert_reason":"NEW"}"#;
 
     fn signature(body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(KEY.as_bytes()).unwrap();
@@ -220,32 +230,44 @@ mod tests {
     }
 
     struct Fixture {
-        app: Router,
+        app:   Router,
         state: Arc<AppState>,
-        pool: fabro_db::DbPool,
-        _dir: tempfile::TempDir,
+        pool:  fabro_db::DbPool,
+        _dir:  tempfile::TempDir,
     }
 
     async fn fixture(enabled: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let database = fabro_db::Database::connect(dir.path().join("fabro.db")).await.unwrap();
+        let database = fabro_db::Database::connect(dir.path().join("fabro.db"))
+            .await
+            .unwrap();
         database.migrate().await.unwrap();
         let pool = database.clone_pool();
         let vault = SecretStore::new(pool.clone());
-        for (name, value) in [("BUGSINK_API_TOKEN", "isolated-api-material"), ("BUGSINK_SIGNING_25", KEY), ("BUGSINK_SIGNING_26", "other-project-key")] {
-            vault.set(name, value, SecretType::Token, None).await.unwrap();
+        for (name, value) in [
+            ("BUGSINK_API_TOKEN", "isolated-api-material"),
+            ("BUGSINK_SIGNING_25", KEY),
+            ("BUGSINK_SIGNING_26", "other-project-key"),
+        ] {
+            vault
+                .set(name, value, SecretType::Token, None)
+                .await
+                .unwrap();
         }
-        AutomationStore::new(pool.clone()).create(AutomationDraft {
-            id: AutomationId::new("incident-loop").unwrap(),
-            name: "Incident intake".into(),
-            description: None,
-            target: AutomationTarget {
-                repository: "test/incident-workflows".into(),
-                ref_selector: "a".repeat(40),
-                workflow: "incident-loop".into(),
-            },
-            triggers: vec![],
-        }).await.unwrap();
+        AutomationStore::new(pool.clone())
+            .create(AutomationDraft {
+                id:          AutomationId::new("incident-loop").unwrap(),
+                name:        "Incident intake".into(),
+                description: None,
+                target:      AutomationTarget {
+                    repository:   "test/incident-workflows".into(),
+                    ref_selector: "a".repeat(40),
+                    workflow:     "incident-loop".into(),
+                },
+                triggers:    vec![],
+            })
+            .await
+            .unwrap();
         let mut settings = default_test_server_settings().with_storage_override(dir.path());
         settings.server.integrations.bugsink = BugsinkIntegrationSettings {
             enabled,
@@ -253,20 +275,35 @@ mod tests {
             origin: Some("https://bugsink.example".into()),
             api_token_secret: Some("BUGSINK_API_TOKEN".into()),
             projects: vec![
-                BugsinkProjectSettings { project_id: 25, automation_id: "incident-loop".into(), signing_secret: "BUGSINK_SIGNING_25".into() },
-                BugsinkProjectSettings { project_id: 26, automation_id: "incident-loop".into(), signing_secret: "BUGSINK_SIGNING_26".into() },
+                BugsinkProjectSettings {
+                    project_id:     25,
+                    automation_id:  "incident-loop".into(),
+                    signing_secret: "BUGSINK_SIGNING_25".into(),
+                },
+                BugsinkProjectSettings {
+                    project_id:     26,
+                    automation_id:  "incident-loop".into(),
+                    signing_secret: "BUGSINK_SIGNING_26".into(),
+                },
             ],
         };
         let (store, artifact_store) = test_store_bundle();
         let state = build_app_state(AppStateConfig {
-            resolved_settings: resolved_runtime_settings_for_tests(settings, fabro_config::RunLayer::default(), Default::default()),
+            resolved_settings: resolved_runtime_settings_for_tests(
+                settings,
+                fabro_config::RunLayer::default(),
+                Default::default(),
+            ),
             registry_factory_override: None,
             max_concurrent_runs: 5,
             store,
             artifact_store,
             db_pool: pool.clone(),
             preloaded_vault: test_secret_snapshot(pool.clone()).unwrap(),
-            server_secrets: load_test_server_secrets(dir.path().join("server.env"), Default::default()),
+            server_secrets: load_test_server_secrets(
+                dir.path().join("server.env"),
+                Default::default(),
+            ),
             env_lookup: Arc::new(|_| None),
             github_api_base_url: None,
             active_config_path: dir.path().join("settings.toml"),
@@ -276,12 +313,18 @@ mod tests {
             worker_control_bus: None,
             worker_runtime: None,
             automation_materializer_override: None,
-        }).unwrap();
+        })
+        .unwrap();
         let app = build_router_with_options(state.clone(), &test_auth_mode(), RouterOptions {
             web_enabled: false,
             ..RouterOptions::default()
         });
-        Fixture { app, state, pool, _dir: dir }
+        Fixture {
+            app,
+            state,
+            pool,
+            _dir: dir,
+        }
     }
 
     async fn assert_no_work(state: &AppState, deliveries: u64) {
@@ -289,7 +332,15 @@ mod tests {
         assert_eq!(snapshot["delivery_count"], deliveries);
         assert_eq!(snapshot["incidents"], serde_json::json!([]));
         assert_eq!(snapshot["runs"], serde_json::json!([]));
-        assert!(state.stores.runs.list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now()).await.unwrap().is_empty());
+        assert!(
+            state
+                .stores
+                .runs
+                .list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -297,9 +348,17 @@ mod tests {
         let body = br#"{"project":25,"alert_reason":"TEST"}"#;
         let digest = signature(body);
         assert!(verify_signature(KEY.as_bytes(), body, &digest));
-        assert!(!verify_signature(KEY.as_bytes(), br#"{"project":26,"alert_reason":"TEST"}"#, &digest));
+        assert!(!verify_signature(
+            KEY.as_bytes(),
+            br#"{"project":26,"alert_reason":"TEST"}"#,
+            &digest
+        ));
         assert!(!verify_signature(b"", body, &digest));
-        for invalid in [format!("sha256={digest}"), digest[..62].to_owned(), "z".repeat(64)] {
+        for invalid in [
+            format!("sha256={digest}"),
+            digest[..62].to_owned(),
+            "z".repeat(64),
+        ] {
             assert!(!verify_signature(KEY.as_bytes(), body, &invalid));
         }
     }
@@ -321,9 +380,15 @@ mod tests {
             r#"{}{}"#,
             r#"[25,"497f6eca-6276-4993-bfeb-53cbbbba6f08","TEST"]"#,
         ] {
-            assert_eq!(normalize_alert(body.as_bytes(), 25, 1).unwrap_err(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                normalize_alert(body.as_bytes(), 25, 1).unwrap_err(),
+                StatusCode::BAD_REQUEST
+            );
         }
-        assert_eq!(normalize_alert(NEW_BODY, 26, 1).unwrap_err(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            normalize_alert(NEW_BODY, 26, 1).unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]
@@ -336,27 +401,62 @@ mod tests {
             assert!(response.headers().contains_key("x-content-type-options"));
         }
         assert_no_work(&f.state, 1).await;
-        let management = HttpRequest::builder().uri("/api/v1/runs").body(Body::empty()).unwrap();
-        assert_eq!(f.app.oneshot(management).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let management = HttpRequest::builder()
+            .uri("/api/v1/runs")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            f.app.oneshot(management).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
     async fn signature_cannot_authorize_another_project_or_be_replaced_by_bearer() {
         let f = fixture(true).await;
         for project in [26, 99] {
-            let body = String::from_utf8(TEST_BODY.to_vec()).unwrap().replace("\"project\":25", &format!("\"project\":{project}"));
-            assert_eq!(f.app.clone().oneshot(request(body.as_bytes())).await.unwrap().status(), StatusCode::FORBIDDEN);
+            let body = String::from_utf8(TEST_BODY.to_vec())
+                .unwrap()
+                .replace("\"project\":25", &format!("\"project\":{project}"));
+            assert_eq!(
+                f.app
+                    .clone()
+                    .oneshot(request(body.as_bytes()))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
         }
         let mut tampered = request(TEST_BODY);
         *tampered.body_mut() = Body::from(NEW_BODY);
-        assert_eq!(f.app.clone().oneshot(tampered).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            f.app.clone().oneshot(tampered).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         let mut bearer = request(TEST_BODY);
         bearer.headers_mut().remove(SIGNATURE_HEADER);
-        bearer.headers_mut().insert(header::AUTHORIZATION, format!("Bearer {TEST_DEV_TOKEN}").parse().unwrap());
-        assert_eq!(f.app.clone().oneshot(bearer).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        bearer.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {TEST_DEV_TOKEN}").parse().unwrap(),
+        );
+        assert_eq!(
+            f.app.clone().oneshot(bearer).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         let mut duplicate_header = request(TEST_BODY);
-        duplicate_header.headers_mut().append(SIGNATURE_HEADER, signature(TEST_BODY).parse().unwrap());
-        assert_eq!(f.app.clone().oneshot(duplicate_header).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        duplicate_header
+            .headers_mut()
+            .append(SIGNATURE_HEADER, signature(TEST_BODY).parse().unwrap());
+        assert_eq!(
+            f.app
+                .clone()
+                .oneshot(duplicate_header)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         assert_no_work(&f.state, 0).await;
     }
 
@@ -375,48 +475,134 @@ mod tests {
         assert_eq!(snapshot["incidents"][0]["requested_generation"], 1);
         assert_eq!(snapshot["incidents"].as_array().unwrap().len(), 1);
         assert_eq!(snapshot["runs"], serde_json::json!([]));
-        assert!(f.state.stores.runs.list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now()).await.unwrap().is_empty());
+        assert!(
+            f.state
+                .stores
+                .runs
+                .list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn body_and_media_limits_fail_without_acceptance() {
         let f = fixture(true).await;
-        for content_type in [None, Some("text/plain"), Some("application/problem+json"), Some("application/json; broken")] {
+        for content_type in [
+            None,
+            Some("text/plain"),
+            Some("application/problem+json"),
+            Some("application/json; broken"),
+        ] {
             let mut req = request(TEST_BODY);
             req.headers_mut().remove(header::CONTENT_TYPE);
             if let Some(value) = content_type {
-                req.headers_mut().insert(header::CONTENT_TYPE, value.parse().unwrap());
+                req.headers_mut()
+                    .insert(header::CONTENT_TYPE, value.parse().unwrap());
             }
-            assert_eq!(f.app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(
+                f.app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
         }
         let mut duplicate_type = request(TEST_BODY);
-        duplicate_type.headers_mut().append(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        assert_eq!(f.app.clone().oneshot(duplicate_type).await.unwrap().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        assert_eq!(f.app.clone().oneshot(request(&vec![b' '; BODY_LIMIT + 1])).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(f.app.clone().oneshot(request(b"not json")).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        duplicate_type
+            .headers_mut()
+            .append(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        assert_eq!(
+            f.app
+                .clone()
+                .oneshot(duplicate_type)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            f.app
+                .clone()
+                .oneshot(request(&vec![b' '; BODY_LIMIT + 1]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            f.app
+                .clone()
+                .oneshot(request(b"not json"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
         let mut unauthenticated = request(b"not json");
         unauthenticated.headers_mut().remove(SIGNATURE_HEADER);
-        assert_eq!(f.app.clone().oneshot(unauthenticated).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            f.app
+                .clone()
+                .oneshot(unauthenticated)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         assert_no_work(&f.state, 0).await;
         let mut maximum_body = TEST_BODY.to_vec();
         maximum_body.resize(BODY_LIMIT, b' ');
-        assert_eq!(f.app.clone().oneshot(request(&maximum_body)).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            f.app
+                .clone()
+                .oneshot(request(&maximum_body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         let mut req = request(TEST_BODY);
-        req.headers_mut().insert(header::CONTENT_TYPE, "application/json; charset=utf-8".parse().unwrap());
+        req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/json; charset=utf-8".parse().unwrap(),
+        );
         assert_eq!(f.app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn disabled_missing_keys_and_closed_pool_fail_closed() {
         let disabled = fixture(false).await;
-        assert_eq!(disabled.app.oneshot(request(NEW_BODY)).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            disabled
+                .app
+                .oneshot(request(NEW_BODY))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
         assert_no_work(&disabled.state, 0).await;
         let f = fixture(true).await;
-        f.state.stores.vault.remove("BUGSINK_SIGNING_26").await.unwrap();
-        assert_eq!(f.app.clone().oneshot(request(TEST_BODY)).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        f.state
+            .stores
+            .vault
+            .remove("BUGSINK_SIGNING_26")
+            .await
+            .unwrap();
+        assert_eq!(
+            f.app
+                .clone()
+                .oneshot(request(TEST_BODY))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert_no_work(&f.state, 0).await;
         f.pool.close().await;
-        assert_eq!(f.app.oneshot(request(NEW_BODY)).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            f.app.oneshot(request(NEW_BODY)).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
@@ -424,21 +610,36 @@ mod tests {
         let f = fixture(true).await;
         sqlx::query("CREATE TRIGGER reject_incident BEFORE INSERT ON bugsink_incidents BEGIN SELECT RAISE(ABORT, 'isolated persistence failure'); END")
             .execute(&f.pool).await.unwrap();
-        assert_eq!(f.app.oneshot(request(NEW_BODY)).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            f.app.oneshot(request(NEW_BODY)).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert_no_work(&f.state, 0).await;
     }
 
     #[tokio::test]
     async fn saturated_ingress_rejects_before_reading_body() {
         let f = fixture(true).await;
-        let state = Arc::new(ReceiverState { app: f.state.clone(), ingress: Semaphore::new(16) });
+        let state = Arc::new(ReceiverState {
+            app:     f.state.clone(),
+            ingress: Semaphore::new(16),
+        });
         let _all_permits = state.ingress.try_acquire_many(16).unwrap();
         let mut req = request(TEST_BODY);
-        *req.body_mut() = Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        *req.body_mut() =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
         let headers = req.headers().clone();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), receive(
-            State(state.clone()), RequestAuth(AuthContextSlot::initial()), headers, req,
-        )).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            receive(
+                State(state.clone()),
+                RequestAuth(AuthContextSlot::initial()),
+                headers,
+                req,
+            ),
+        )
+        .await
+        .unwrap();
         assert_eq!(result, StatusCode::TOO_MANY_REQUESTS);
         assert_no_work(&f.state, 0).await;
     }

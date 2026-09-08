@@ -14,13 +14,8 @@
 
 
 
-/**
- * Git reference summary for a pull request.
- */
-export interface PullRequestRef {
-    'ref': string;
-    /**
-     * Exact Git revision when supplied by the provider; absent revisions are not verified.
-     */
-    'sha'?: string;
+export interface PlaneIntegrationSettings {
+    'enabled': boolean;
+    'api_base': string | null;
+    'workspace': string | null;
 }

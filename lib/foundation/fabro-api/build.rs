@@ -328,6 +328,21 @@ fn main() {
             &[],
         ),
         (
+            "PlaneIntegrationSettings",
+            "fabro_types::settings::server::PlaneIntegrationSettings",
+            &[],
+        ),
+        (
+            "BugsinkIntegrationSettings",
+            "fabro_types::settings::server::BugsinkIntegrationSettings",
+            &[],
+        ),
+        (
+            "BugsinkProjectSettings",
+            "fabro_types::settings::server::BugsinkProjectSettings",
+            &[],
+        ),
+        (
             "GithubIntegrationSettings",
             "fabro_types::settings::server::GithubIntegrationSettings",
             &[],

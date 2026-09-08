@@ -25,8 +25,9 @@ pub mod types {
         RunModelSettings,
     };
     pub use fabro_types::settings::server::{
-        GithubIntegrationSettings, GithubIntegrationStrategy, IntegrationWebhooksSettings,
-        LogDestination, ObjectStoreSettings, ServerApiSettings, ServerArtifactsSettings,
+        BugsinkIntegrationSettings, BugsinkProjectSettings, GithubIntegrationSettings,
+        GithubIntegrationStrategy, IntegrationWebhooksSettings, LogDestination,
+        ObjectStoreSettings, PlaneIntegrationSettings, ServerApiSettings, ServerArtifactsSettings,
         ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings,
         ServerListenSettings, ServerLoggingSettings, ServerSandboxProviderSettings,
         ServerSandboxProvidersSettings, ServerSandboxSettings, ServerSchedulerSettings,
