@@ -71,8 +71,8 @@ pub(super) async fn validate_enablement(state: &super::AppState) -> anyhow::Resu
     let mut names = std::collections::HashSet::new();
     let mut projects = std::collections::HashSet::new();
     for name in std::iter::once(token_name).chain(bugsink.projects.iter().map(|project| project.signing_secret.as_str())) {
-        ensure!(!name.is_empty() && name.trim() == name && !name.chars().any(char::is_control)
-            && names.insert(name), "Bugsink requires unique nonempty vault secret names");
+        ensure!(fabro_types::is_env_style_name(name) && names.insert(name),
+            "Bugsink requires unique valid vault token names");
         let secret = state.vault_secret(name).await.map_err(|_| anyhow::anyhow!("Bugsink vault lookup failed"))?;
         ensure!(secret.as_deref().is_some_and(|value| !value.trim().is_empty()), "Bugsink required vault secret is missing or empty");
     }
@@ -105,19 +105,19 @@ mod tests {
                 enabled: true,
                 dispatch_enabled: false,
                 origin: Some("https://bugsink.example".into()),
-                api_token_secret: Some("bugsink-api".into()),
+                api_token_secret: Some("BUGSINK_API_TOKEN".into()),
                 projects: vec![BugsinkProjectSettings {
                     project_id: 7,
                     automation_id: "incident-loop".into(),
-                    signing_secret: "bugsink-signing".into(),
+                    signing_secret: "BUGSINK_SIGNING".into(),
                 }],
             };
             let mut builder = TestAppStateBuilder::new()
                 .runtime_settings(settings, fabro_config::RunLayer::default());
             if with_keys {
                 builder = builder.vault_entries([
-                    ("bugsink-api", "test-api-material"),
-                    ("bugsink-signing", "test-signing-material"),
+                    ("BUGSINK_API_TOKEN", "test-api-material"),
+                    ("BUGSINK_SIGNING", "test-signing-material"),
                 ]);
             }
             let error = match builder.try_build() {

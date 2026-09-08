@@ -100,6 +100,7 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
     let mut resolved_unknown = BTreeSet::new();
     let mut inventories = BTreeMap::<String, String>::new();
     for (name, owner) in &config.owners {
+        ensure!(fabro_types::is_env_style_name(&owner.token_secret), "legacy_token_reference_invalid");
         origin(&owner.api_origin)?;
         ensure!(owner.state_file.is_absolute(), "legacy_source_must_be_absolute");
         let local = private_json(&owner.state_file).await?;

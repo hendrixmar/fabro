@@ -60,6 +60,7 @@ impl BugsinkClient {
         let config = &settings.server.integrations.bugsink;
         let origin = config.origin.clone().context("bugsink_not_configured")?;
         let name = config.api_token_secret.as_deref().context("bugsink_not_configured")?;
+        ensure!(fabro_types::is_env_style_name(name), "invalid_bugsink_token_reference");
         let token = state.vault_secret(name).await?.filter(|s| !s.trim().is_empty()).context("bugsink_credential_unavailable")?;
         Ok(Self { origin, http: http_client()?, token })
     }
