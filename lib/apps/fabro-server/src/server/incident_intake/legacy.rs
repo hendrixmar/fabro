@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, ensure};
-use fabro_types::{RunId, RunProjection};
+use fabro_types::{RunId, RunSpec, RunStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs::{self, File};
@@ -16,6 +16,14 @@ use super::worker_store::{digest, incident_key};
 // Persisted Run projections contain checkpoints and stage history, unlike
 // provider payloads.
 pub(super) const OWNER_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+// Import identity and terminal state, not version-specific stage/usage
+// metadata.
+#[derive(Deserialize)]
+struct LegacyRun {
+    spec:   RunSpec,
+    status: RunStatus,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,7 +155,7 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
         .context("bugsink_not_configured")?;
     let mut owners = serde_json::Map::new();
     let mut records = Vec::new();
-    let mut imported = BTreeMap::<String, (String, RunId, RunProjection)>::new();
+    let mut imported = BTreeMap::<String, (String, RunId, LegacyRun)>::new();
     let mut abandoned = BTreeMap::<String, String>::new();
     let mut resolved_unknown = BTreeSet::new();
     let mut inventories = BTreeMap::<String, String>::new();
@@ -217,7 +225,7 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
         owned.sort_by_key(|value| value["id"].as_str().unwrap_or_default().to_owned());
         let inventory_digest = digest(&owned)?;
         inventories.insert(name.clone(), inventory_digest.clone());
-        let mut runs = BTreeMap::<String, Vec<(RunId, RunProjection)>>::new();
+        let mut runs = BTreeMap::<String, Vec<(RunId, LegacyRun)>>::new();
         let mut seen = BTreeSet::new();
         let mut offset = 0;
         loop {
@@ -243,7 +251,7 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
                     .parse::<RunId>()?;
                 ensure!(seen.insert(run_id), "legacy_runs_repeated");
                 // Never classify an absent/stale list projection as authoritative RunNotFound.
-                let projection: RunProjection =
+                let projection: LegacyRun =
                     serde_json::from_value(get(format!("/runs/{run_id}/state")).await?)?;
                 ensure!(
                     projection.spec.run_id == run_id,
@@ -305,7 +313,7 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
                     .get(incident)
                     .is_some_and(|found| found.iter().any(|(id, _)| *id == run_id))
                 {
-                    let projection: RunProjection =
+                    let projection: LegacyRun =
                         serde_json::from_value(get(format!("/runs/{run_id}/state")).await?)?;
                     ensure!(
                         projection.spec.run_id == run_id
