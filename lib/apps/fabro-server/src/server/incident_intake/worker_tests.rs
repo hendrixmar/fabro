@@ -744,9 +744,39 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
             .path("/api/v1/automations");
         then.json_body(json!({"data":[]}));
     });
+    let unrelated_id = RunId::new();
+    let mut unrelated_settings = fabro_types::WorkflowSettings::default();
+    unrelated_settings.run.inputs.insert(
+        "incident".into(),
+        toml::Value::String("woodpecker:tierrapay:staging:188:5162d6e8854f".into()),
+    );
+    let unrelated = fabro_types::RunProjection::new(
+        "Unrelated CI investigation".into(),
+        fabro_types::RunSpec {
+            run_id:           unrelated_id,
+            settings:         unrelated_settings,
+            graph:            fabro_types::Graph::new("CIIncidentLoop"),
+            graph_source:     None,
+            workflow_slug:    Some("ci-incident-loop".into()),
+            automation:       None,
+            source_directory: None,
+            labels:           Default::default(),
+            provenance:       fabro_types::test_support::test_run_provenance(),
+            manifest_blob:    None,
+            definition_blob:  None,
+            git:              None,
+            fork_source_ref:  None,
+        },
+        chrono::Utc::now(),
+    );
+    remote.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path(format!("/api/v1/runs/{unrelated_id}/state"));
+        then.json_body(serde_json::to_value(&unrelated).unwrap());
+    });
     remote.mock(|when, then| {
         when.method(httpmock::Method::GET).path("/api/v1/runs");
-        then.json_body(json!({"data":[],"meta":{"has_more":false,"total":0}}));
+        then.json_body(json!({"data":[{"id":unrelated_id}],"meta":{"has_more":false,"total":1}}));
     });
     remote.mock(|when,then| {
         when.method(httpmock::Method::GET).path(format!("/api/v1/workspaces/workspace/projects/{project}/issues/"));
