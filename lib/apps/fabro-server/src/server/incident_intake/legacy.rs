@@ -255,7 +255,8 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
                     .run
                     .inputs
                     .get("incident")
-                    .and_then(toml::Value::as_str);
+                    .and_then(toml::Value::as_str)
+                    .filter(|incident| incident.starts_with("bugsink:"));
                 let owned_run = incident.is_some()
                     || projection
                         .spec
