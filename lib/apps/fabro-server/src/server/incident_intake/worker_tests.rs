@@ -769,10 +769,14 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
         },
         chrono::Utc::now(),
     );
+    let mut historical_projection = serde_json::to_value(&unrelated).unwrap();
+    historical_projection["stages"] = json!({
+        "historical-stage@1": {"usage": {"cache_count_method": "legacy-provider-format"}}
+    });
     remote.mock(|when, then| {
         when.method(httpmock::Method::GET)
             .path(format!("/api/v1/runs/{unrelated_id}/state"));
-        then.json_body(serde_json::to_value(&unrelated).unwrap());
+        then.json_body(historical_projection.clone());
     });
     remote.mock(|when, then| {
         when.method(httpmock::Method::GET).path("/api/v1/runs");
