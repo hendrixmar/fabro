@@ -24,20 +24,18 @@ pub(super) fn http_client() -> anyhow::Result<fabro_http::HttpClient> {
         .build()?)
 }
 
-pub(super) async fn bounded_json(mut response: fabro_http::Response) -> anyhow::Result<Value> {
+pub(super) async fn bounded_json(
+    mut response: fabro_http::Response,
+    limit: usize,
+) -> anyhow::Result<Value> {
     ensure!(response.status().is_success(), "upstream_unavailable");
     ensure!(
-        response
-            .content_length()
-            .is_none_or(|n| n <= BODY_LIMIT as u64),
+        response.content_length().is_none_or(|n| n <= limit as u64),
         "upstream_oversized"
     );
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        ensure!(
-            bytes.len() + chunk.len() <= BODY_LIMIT,
-            "upstream_oversized"
-        );
+        ensure!(bytes.len() + chunk.len() <= limit, "upstream_oversized");
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).context("upstream_malformed")
@@ -53,7 +51,11 @@ pub(super) struct Issue {
 }
 
 impl Issue {
-    pub(super) fn parse(value: &Value, project: u64, expected: Option<Uuid>) -> anyhow::Result<Self> {
+    pub(super) fn parse(
+        value: &Value,
+        project: u64,
+        expected: Option<Uuid>,
+    ) -> anyhow::Result<Self> {
         let id = value
             .get("id")
             .and_then(Value::as_str)
@@ -124,7 +126,7 @@ impl BugsinkClient {
             response.status() != fabro_http::StatusCode::NOT_FOUND,
             "upstream_not_found_or_retained"
         );
-        bounded_json(response).await
+        bounded_json(response, BODY_LIMIT).await
     }
 
     #[expect(

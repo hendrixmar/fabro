@@ -1,5 +1,5 @@
-use super::*;
 use super::client::ScanProgress;
+use super::*;
 
 #[test]
 fn repeated_events_are_not_new_work() {
@@ -789,6 +789,40 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
     assert_eq!(
         state.incident_store().snapshot().await.unwrap()["incidents"],
         snapshot["incidents"]
+    );
+}
+
+#[tokio::test]
+async fn owner_snapshots_can_exceed_provider_payloads_without_unbounded_reads() {
+    let remote = httpmock::MockServer::start();
+    remote.mock(|when, then| {
+        when.path("/run");
+        then.json_body(json!({"checkpoint":{"output":"x".repeat(300_000)}}));
+    });
+    let http = client::http_client().unwrap();
+    let response = http.get(remote.url("/run")).send().await.unwrap();
+    let snapshot = client::bounded_json(response, legacy::OWNER_BODY_LIMIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot["checkpoint"]["output"].as_str().unwrap().len(),
+        300_000
+    );
+    let response = http.get(remote.url("/run")).send().await.unwrap();
+    assert!(
+        client::bounded_json(response, client::BODY_LIMIT)
+            .await
+            .is_err()
+    );
+    remote.mock(|when, then| {
+        when.path("/oversized");
+        then.json_body(json!({"checkpoint":{"output":"x".repeat(2_097_152)}}));
+    });
+    let response = http.get(remote.url("/oversized")).send().await.unwrap();
+    assert!(
+        client::bounded_json(response, legacy::OWNER_BODY_LIMIT)
+            .await
+            .is_err()
     );
 }
 

@@ -10,8 +10,12 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::super::AppState;
-use super::client::{bounded_json, http_client};
+use super::client::{BODY_LIMIT, bounded_json, http_client};
 use super::worker_store::{digest, incident_key};
+
+// Persisted Run projections contain checkpoints and stage history, unlike
+// provider payloads.
+pub(super) const OWNER_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,6 +178,7 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
                         .bearer_auth(token)
                         .send()
                         .await?,
+                    OWNER_BODY_LIMIT,
                 )
                 .await
             }
@@ -386,7 +391,11 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
         if let Some(cursor) = &cursor {
             url.query_pairs_mut().append_pair("cursor", cursor);
         }
-        let page = bounded_json(http.get(url).header("X-Api-Key", &token).send().await?).await?;
+        let page = bounded_json(
+            http.get(url).header("X-Api-Key", &token).send().await?,
+            BODY_LIMIT,
+        )
+        .await?;
         for ticket in page
             .get("results")
             .and_then(Value::as_array)
@@ -446,6 +455,7 @@ pub(super) async fn import(state: &AppState) -> anyhow::Result<Value> {
                 .bearer_auth(token)
                 .send()
                 .await?,
+            OWNER_BODY_LIMIT,
         )
         .await?;
         let mut owned: Vec<_> = inventory
