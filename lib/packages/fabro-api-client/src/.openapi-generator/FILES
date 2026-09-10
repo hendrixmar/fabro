@@ -11,7 +11,6 @@ api/install-api.ts
 api/integrations-api.ts
 api/mcpservers-api.ts
 api/models-api.ts
-api/playground-api.ts
 api/repos-api.ts
 api/run-internals-api.ts
 api/run-outputs-api.ts
@@ -60,12 +59,12 @@ models/auth-session-user.ts
 models/auth-session.ts
 models/auth-sessions-response.ts
 models/automation-api-trigger.ts
+models/automation-git-workflow-source.ts
 models/automation-list-meta.ts
 models/automation-list-response.ts
 models/automation-plane-trigger.ts
 models/automation-ref.ts
 models/automation-schedule-trigger.ts
-models/automation-target.ts
 models/automation-trigger.ts
 models/automation.ts
 models/batch-delete-runs-request.ts
@@ -104,8 +103,8 @@ models/create-automation-request.ts
 models/create-completion-request.ts
 models/create-environment-request.ts
 models/create-mcp-server-request.ts
-models/create-playground-chat-request.ts
 models/create-run-pull-request-request.ts
+models/create-run-request.ts
 models/create-run-session-request.ts
 models/create-secret-request.ts
 models/create-variable-request.ts
@@ -156,11 +155,13 @@ models/failure-detail.ts
 models/failure-reason.ts
 models/file-checkpoint.ts
 models/file-diff.ts
+models/folder-run-target.ts
 models/fork-request.ts
 models/fork-response.ts
 models/fork-source-ref.ts
 models/git-author-settings.ts
 models/git-context.ts
+models/git-run-target.ts
 models/github-integration-settings.ts
 models/github-integration-strategy.ts
 models/health-response.ts
@@ -240,6 +241,7 @@ models/model-reference.ts
 models/model-test-mode.ts
 models/model-test-result.ts
 models/model.ts
+models/none-run-target.ts
 models/notification-provider-settings.ts
 models/notification-route-settings.ts
 models/object-store-local-settings.ts
@@ -345,6 +347,7 @@ models/replace-mcp-server-request.ts
 models/repo-check-response-permissions.ts
 models/repo-check-response.ts
 models/repository-ref.ts
+models/resolved-automation-git-workflow-source.ts
 models/review-target-kind.ts
 models/review-target.ts
 models/rewind-request.ts
@@ -386,6 +389,9 @@ models/run-goal-inline.ts
 models/run-goal.ts
 models/run-integrations-github-settings.ts
 models/run-integrations-settings.ts
+models/run-intent-args-inputs-value.ts
+models/run-intent-args.ts
+models/run-intent.ts
 models/run-interviews-settings.ts
 models/run-lifecycle.ts
 models/run-links.ts
@@ -428,6 +434,7 @@ models/run-status-submitted.ts
 models/run-status-succeeded.ts
 models/run-status.ts
 models/run-superseded-by-props.ts
+models/run-target.ts
 models/run-timestamps.ts
 models/run-timing.ts
 models/run.ts

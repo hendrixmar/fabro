@@ -22,7 +22,7 @@ fabro-auth = { path = "../../foundation/fabro-auth" }
 fabro-config = { path = "../../foundation/fabro-config" }
 fabro-environment = { path = "../../components/fabro-environment" }
 fabro-llm = { path = "../../components/fabro-llm" }
-fabro-model = { path = "../../foundation/fabro-model" }
+fabro-model = { path = "../../foundation/fabro-model", features = ["clap"] }
 fabro-oauth = { path = "../../foundation/fabro-oauth" }
 fabro-github = { path = "../../components/fabro-github" }
 fabro-agent = { path = "../../components/fabro-agent" }

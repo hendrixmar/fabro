@@ -183,8 +183,8 @@ async fn appending_run_archived_event_directly_is_rejected() {
     .await;
     let detail = body["errors"][0]["detail"].as_str().unwrap_or_default();
     assert!(
-        detail.contains("lifecycle event"),
-        "expected lifecycle rejection, got: {body}"
+        detail.contains("run.archived must be performed through its dedicated operation endpoint"),
+        "expected dedicated-operation rejection, got: {body}"
     );
 }
 

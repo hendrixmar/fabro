@@ -672,18 +672,22 @@ pub(crate) mod daytona {
             DaytonaState::Creating
             | DaytonaState::PendingBuild
             | DaytonaState::BuildingSnapshot
-            | DaytonaState::PullingSnapshot => SandboxState::Provisioning,
-            DaytonaState::Starting => SandboxState::Starting,
-            DaytonaState::Started => SandboxState::Running,
-            DaytonaState::Stopping | DaytonaState::Archiving => SandboxState::Stopping,
+            | DaytonaState::PullingSnapshot
+            | DaytonaState::Forking => SandboxState::Provisioning,
+            DaytonaState::Starting | DaytonaState::Resuming => SandboxState::Starting,
+            DaytonaState::Started | DaytonaState::Snapshotting => SandboxState::Running,
+            DaytonaState::Stopping | DaytonaState::Archiving | DaytonaState::Pausing => {
+                SandboxState::Stopping
+            }
             DaytonaState::Stopped => SandboxState::Stopped,
+            DaytonaState::Paused => SandboxState::Paused,
             DaytonaState::Restoring => SandboxState::Restoring,
             DaytonaState::Resizing => SandboxState::Resizing,
             DaytonaState::Archived => SandboxState::Archived,
             DaytonaState::Destroying => SandboxState::Deleting,
             DaytonaState::Destroyed => SandboxState::Deleted,
             DaytonaState::Error | DaytonaState::BuildFailed => SandboxState::Error,
-            DaytonaState::Unknown => SandboxState::Unknown,
+            DaytonaState::Unknown | DaytonaState::UnknownDefaultOpenApi => SandboxState::Unknown,
         }
     }
 
@@ -752,6 +756,22 @@ pub(crate) mod daytona {
             assert_eq!(
                 normalize_daytona_state(DaytonaState::Unknown),
                 SandboxState::Unknown
+            );
+        }
+
+        #[test]
+        fn pause_states_normalize_to_fabro_states() {
+            assert_eq!(
+                normalize_daytona_state(DaytonaState::Pausing),
+                SandboxState::Stopping
+            );
+            assert_eq!(
+                normalize_daytona_state(DaytonaState::Paused),
+                SandboxState::Paused
+            );
+            assert_eq!(
+                normalize_daytona_state(DaytonaState::Resuming),
+                SandboxState::Starting
             );
         }
 

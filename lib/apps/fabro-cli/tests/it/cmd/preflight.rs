@@ -76,9 +76,9 @@ fn preflight_rejects_unbound_template_inputs() {
     Goal: Demo
 
     error: [FIXTURES]/templated_unbound.fabro:2:26: undefined template variable `inputs.app_dir` in graph attribute `goal` (template_undefined_variable)
-      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
+      fix: bind `app_dir` via `[run.inputs]` in workflow.toml, or pass `--input app_dir=<value>`
     error: [FIXTURES]/templated_unbound.fabro:7:44: undefined template variable `inputs.app_dir` in node `work` attribute `prompt` [node: work] (template_undefined_variable)
-      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
+      fix: bind `app_dir` via `[run.inputs]` in workflow.toml, or pass `--input app_dir=<value>`
       × Validation failed
     ");
 }

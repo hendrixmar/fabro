@@ -37,6 +37,8 @@ import type { ProviderCredentialTestResponse } from '../models';
 import type { ProviderList } from '../models';
 // @ts-ignore
 import type { ProviderTestList } from '../models';
+// @ts-ignore
+import type { ReasoningEffort } from '../models';
 /**
  * ModelsApi - axios parameter creator
  */
@@ -140,10 +142,11 @@ export const ModelsApiAxiosParamCreator = function (configuration?: Configuratio
          * @param {string} id The canonical model ID or an alias.
          * @param {string} [provider] Pin the test to this provider\&#39;s offering. When omitted, the server selects among ready providers by catalog priority.
          * @param {ModelTestMode} [mode] Test mode for the single-model test endpoint. Defaults to &#x60;basic&#x60;.
+         * @param {ReasoningEffort} [reasoningEffort] Optional native reasoning-effort level for the model test.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        testModel: async (id: string, provider?: string, mode?: ModelTestMode, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        testModel: async (id: string, provider?: string, mode?: ModelTestMode, reasoningEffort?: ReasoningEffort, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             // verify required parameter 'id' is not null or undefined
             assertParamExists('testModel', 'id', id)
             const localVarPath = `/api/v1/models/{id}/test`
@@ -171,6 +174,10 @@ export const ModelsApiAxiosParamCreator = function (configuration?: Configuratio
 
             if (mode !== undefined) {
                 localVarQueryParameter['mode'] = mode;
+            }
+
+            if (reasoningEffort !== undefined) {
+                localVarQueryParameter['reasoning_effort'] = reasoningEffort;
             }
 
             localVarHeaderParameter['Accept'] = 'application/json';
@@ -308,11 +315,12 @@ export const ModelsApiFp = function(configuration?: Configuration) {
          * @param {string} id The canonical model ID or an alias.
          * @param {string} [provider] Pin the test to this provider\&#39;s offering. When omitted, the server selects among ready providers by catalog priority.
          * @param {ModelTestMode} [mode] Test mode for the single-model test endpoint. Defaults to &#x60;basic&#x60;.
+         * @param {ReasoningEffort} [reasoningEffort] Optional native reasoning-effort level for the model test.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async testModel(id: string, provider?: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<ModelTestResult>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.testModel(id, provider, mode, options);
+        async testModel(id: string, provider?: string, mode?: ModelTestMode, reasoningEffort?: ReasoningEffort, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<ModelTestResult>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.testModel(id, provider, mode, reasoningEffort, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['ModelsApi.testModel']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
@@ -380,11 +388,12 @@ export const ModelsApiFactory = function (configuration?: Configuration, basePat
          * @param {string} id The canonical model ID or an alias.
          * @param {string} [provider] Pin the test to this provider\&#39;s offering. When omitted, the server selects among ready providers by catalog priority.
          * @param {ModelTestMode} [mode] Test mode for the single-model test endpoint. Defaults to &#x60;basic&#x60;.
+         * @param {ReasoningEffort} [reasoningEffort] Optional native reasoning-effort level for the model test.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        testModel(id: string, provider?: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig): AxiosPromise<ModelTestResult> {
-            return localVarFp.testModel(id, provider, mode, options).then((request) => request(axios, basePath));
+        testModel(id: string, provider?: string, mode?: ModelTestMode, reasoningEffort?: ReasoningEffort, options?: RawAxiosRequestConfig): AxiosPromise<ModelTestResult> {
+            return localVarFp.testModel(id, provider, mode, reasoningEffort, options).then((request) => request(axios, basePath));
         },
         /**
          * Validates an LLM provider API key against the server\'s effective catalog without persisting it.
@@ -443,11 +452,12 @@ export class ModelsApi extends BaseAPI {
      * @param {string} id The canonical model ID or an alias.
      * @param {string} [provider] Pin the test to this provider\&#39;s offering. When omitted, the server selects among ready providers by catalog priority.
      * @param {ModelTestMode} [mode] Test mode for the single-model test endpoint. Defaults to &#x60;basic&#x60;.
+     * @param {ReasoningEffort} [reasoningEffort] Optional native reasoning-effort level for the model test.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */
-    public testModel(id: string, provider?: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig) {
-        return ModelsApiFp(this.configuration).testModel(id, provider, mode, options).then((request) => request(this.axios, this.basePath));
+    public testModel(id: string, provider?: string, mode?: ModelTestMode, reasoningEffort?: ReasoningEffort, options?: RawAxiosRequestConfig) {
+        return ModelsApiFp(this.configuration).testModel(id, provider, mode, reasoningEffort, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

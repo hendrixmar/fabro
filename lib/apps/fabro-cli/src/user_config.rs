@@ -3,10 +3,12 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow};
 pub(crate) use fabro_client::ServerTarget;
+use fabro_config::parse::{SettingsSource, validate_settings_source};
 pub(crate) use fabro_config::user::{active_settings_path, default_storage_dir};
 use fabro_config::user::{default_settings_path, default_socket_path};
 use fabro_config::{
-    CliLayer, LogFilter, ParseError, RunSettingsBuilder, ServerSettingsBuilder, UserSettingsBuilder,
+    CliLayer, LogFilter, ParseError, RunSettingsBuilder, ServerSettingsBuilder, SettingsLayer,
+    UserSettingsBuilder,
 };
 use fabro_static::EnvVars;
 use fabro_types::settings::RunNamespace;
@@ -15,18 +17,42 @@ use fabro_types::settings::server::LogDestination;
 use fabro_types::{ServerSettings, UserSettings};
 use fabro_util::error::SharedError;
 use fabro_util::version::FABRO_VERSION;
+use tokio::fs;
 use toml_edit::{DocumentMut, Item, Table, value};
 use tracing::debug;
 
 use crate::args::ServerTargetArgs;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunSettingsKeyPresence {
+    pub(crate) run:          bool,
+    pub(crate) environments: bool,
+}
+
+impl RunSettingsKeyPresence {
+    fn from_document(document: &toml::Value) -> Self {
+        Self {
+            run:          document.get("run").is_some(),
+            environments: document.get("environments").is_some(),
+        }
+    }
+
+    pub(crate) fn key_paths(self) -> Vec<&'static str> {
+        [(self.run, "run"), (self.environments, "environments")]
+            .into_iter()
+            .filter_map(|(present, key)| present.then_some(key))
+            .collect()
+    }
+}
+
 pub(crate) struct LoadedSettings {
-    pub(crate) storage_dir:            PathBuf,
-    pub(crate) config_log_level:       Option<LogFilter>,
-    pub(crate) config_log_destination: Option<LogDestination>,
-    pub(crate) run_settings:           std::result::Result<RunNamespace, SharedError>,
-    pub(crate) server_settings:        std::result::Result<ServerSettings, SharedError>,
-    pub(crate) user_settings:          UserSettings,
+    pub(crate) storage_dir:               PathBuf,
+    pub(crate) config_log_level:          Option<LogFilter>,
+    pub(crate) config_log_destination:    Option<LogDestination>,
+    pub(crate) run_settings:              std::result::Result<RunNamespace, SharedError>,
+    pub(crate) server_settings:           std::result::Result<ServerSettings, SharedError>,
+    pub(crate) user_settings:             UserSettings,
+    pub(crate) run_settings_key_presence: RunSettingsKeyPresence,
 }
 
 pub(crate) fn load_resolved_settings(
@@ -35,6 +61,7 @@ pub(crate) fn load_resolved_settings(
     cli_layer: Option<&CliLayer>,
 ) -> anyhow::Result<LoadedSettings> {
     let document = load_settings_document(config_path)?;
+    let run_settings_key_presence = RunSettingsKeyPresence::from_document(&document);
     let storage_override = storage_dir.map(Path::to_path_buf);
     let storage_dir = storage_dir_from_document(&document, storage_dir);
     let pre_tracing_config = pre_tracing_config_from_document(&document)?;
@@ -54,7 +81,23 @@ pub(crate) fn load_resolved_settings(
         run_settings,
         server_settings,
         user_settings,
+        run_settings_key_presence,
     })
+}
+
+pub(crate) async fn read_project_run_settings_key_presence(
+    path: &Path,
+) -> anyhow::Result<RunSettingsKeyPresence> {
+    let parse_error =
+        |source| fabro_config::Error::parse_file("Failed to parse settings file", path, source);
+    let source = fs::read_to_string(path)
+        .await
+        .map_err(|source| fabro_config::Error::read_file(path, source))?;
+    let document: toml::Value = toml::from_str(&source)
+        .map_err(|source| parse_error(ParseError::Toml(source.to_string())))?;
+    let layer = source.parse::<SettingsLayer>().map_err(parse_error)?;
+    validate_settings_source(&layer, SettingsSource::Project).map_err(parse_error)?;
+    Ok(RunSettingsKeyPresence::from_document(&document))
 }
 
 fn load_settings_document(config_path: Option<&Path>) -> anyhow::Result<toml::Value> {
@@ -333,6 +376,7 @@ pub(crate) fn load_resolved_settings_from_toml(
     cli_layer: Option<&CliLayer>,
 ) -> anyhow::Result<LoadedSettings> {
     let document: toml::Value = toml::from_str(source).context("failed to parse settings file")?;
+    let run_settings_key_presence = RunSettingsKeyPresence::from_document(&document);
     let storage_override = storage_dir.map(Path::to_path_buf);
     let storage_dir = storage_dir_from_document(&document, storage_dir);
     let pre_tracing_config = pre_tracing_config_from_document(&document)?;
@@ -359,6 +403,7 @@ pub(crate) fn load_resolved_settings_from_toml(
         run_settings,
         server_settings,
         user_settings,
+        run_settings_key_presence,
     })
 }
 
@@ -381,6 +426,73 @@ mod tests {
 
     fn parse_user_settings(source: &str) -> UserSettings {
         UserSettingsBuilder::from_toml(source).expect("fixture should resolve")
+    }
+
+    #[test]
+    fn run_settings_key_presence_distinguishes_absent_empty_and_populated_keys() {
+        let absent: toml::Value = toml::from_str("_version = 1\n").unwrap();
+        let empty_run: toml::Value = toml::from_str("_version = 1\n\n[run]\n").unwrap();
+        let empty_environments: toml::Value =
+            toml::from_str("_version = 1\n\n[environments]\n").unwrap();
+        let populated: toml::Value = toml::from_str(
+            "_version = 1\n\n[run.model]\nname = \"gpt-5\"\n\n[environments.cloud]\nprovider = \"docker\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            RunSettingsKeyPresence::from_document(&absent),
+            RunSettingsKeyPresence::default()
+        );
+        assert_eq!(
+            RunSettingsKeyPresence::from_document(&empty_run),
+            RunSettingsKeyPresence {
+                run:          true,
+                environments: false,
+            }
+        );
+        assert_eq!(
+            RunSettingsKeyPresence::from_document(&empty_environments),
+            RunSettingsKeyPresence {
+                run:          false,
+                environments: true,
+            }
+        );
+        assert_eq!(
+            RunSettingsKeyPresence::from_document(&populated),
+            RunSettingsKeyPresence {
+                run:          true,
+                environments: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn project_run_settings_key_presence_validates_the_same_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.toml");
+        fs::write(&path, "_version = 1\n\n[run]\n\n[environments]\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_project_run_settings_key_presence(&path).await.unwrap(),
+            RunSettingsKeyPresence {
+                run:          true,
+                environments: true,
+            }
+        );
+
+        fs::write(
+            &path,
+            "_version = 1\n\n[environments.cloud]\ncwd = \"/tmp\"\n",
+        )
+        .await
+        .unwrap();
+        let error = read_project_run_settings_key_presence(&path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(error.source().is_some());
     }
 
     #[test]

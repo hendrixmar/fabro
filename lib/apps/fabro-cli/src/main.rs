@@ -304,7 +304,7 @@ async fn main_inner(worker_token: Option<String>) -> (String, Result<()>) {
                 commands::dump::run(&args, &base_ctx).await?;
             }
             Commands::RunsCmd(cmd) => {
-                commands::runs::dispatch(cmd, &base_ctx).await?;
+                Box::pin(commands::runs::dispatch(cmd, &base_ctx)).await?;
             }
             Commands::Model { command } => {
                 commands::model::execute(command, &base_ctx).await?;
@@ -1307,20 +1307,6 @@ destination = "{destination}"
                 command: args::ParentCommand::Unlink(args),
             }) => {
                 assert_eq!(args.child_run, "child-run");
-            }
-            _ => panic!("unexpected command variant"),
-        }
-    }
-
-    #[test]
-    fn run_manifest_args_preserves_input_only_manifest_args() {
-        let cli = Cli::try_parse_from(["fabro", "run", "workflow.toml", "-I", "foo=bar"])
-            .expect("should parse");
-        match *cli.command.unwrap() {
-            Commands::RunCmd(RunCommands::Run(args)) => {
-                let manifest_args = manifest_args::run_manifest_args(&args)
-                    .expect("input-only args should be retained");
-                assert_eq!(manifest_args.input, vec!["foo=bar"]);
             }
             _ => panic!("unexpected command variant"),
         }

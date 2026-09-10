@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fabro_agent::cli::AgentArgs;
 use fabro_config::{CliLayer, CliLoggingLayer, CliOutputLayer, CliUpdatesLayer};
+use fabro_model::ReasoningEffort;
 use fabro_server::serve::DEFAULT_TCP_PORT;
 use fabro_static::EnvVars;
 use fabro_types::settings::cli::{OutputFormat, OutputVerbosity};
@@ -190,8 +191,13 @@ pub(crate) struct McpStartArgs {
     pub(crate) connection: ServerConnectionArgs,
 }
 
-#[derive(Args, Debug, Clone, Default)]
+#[derive(Args, Debug, Clone)]
 pub(crate) struct McpConfigArgs {
+    /// Name of the mcpServers entry; use distinct names to register multiple
+    /// Fabro servers
+    #[arg(long, value_name = "NAME", default_value = fabro_mcp_server::SERVER_NAME, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub(crate) name: String,
+
     #[command(flatten)]
     pub(crate) connection: ServerConnectionArgs,
 }
@@ -201,7 +207,7 @@ pub(crate) struct McpInitArgs {
     pub(crate) agent: McpAgent,
 
     #[command(flatten)]
-    pub(crate) connection: ServerConnectionArgs,
+    pub(crate) config: McpConfigArgs,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -226,7 +232,7 @@ pub(crate) struct RunArgs {
     #[command(flatten)]
     pub(crate) inputs: InputOverrideArgs,
 
-    /// Path to a .fabro workflow file or .toml task config
+    /// Local workflow name, checkout path, .fabro file, or workflow TOML
     #[arg(required = true)]
     pub(crate) workflow: Option<PathBuf>,
 
@@ -242,7 +248,7 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub(crate) goal: Option<String>,
 
-    /// Read the workflow goal from a file
+    /// Read a per-run goal value from a local file
     #[arg(long, conflicts_with = "goal")]
     pub(crate) goal_file: Option<PathBuf>,
 
@@ -1091,9 +1097,13 @@ pub(crate) struct ModelTestArgs {
     )]
     pub(crate) jobs: usize,
 
-    /// Run a multi-turn tool-use test (catches reasoning round-trip bugs)
-    #[arg(long)]
-    pub(crate) deep: bool,
+    /// Run a multi-turn tool-use test
+    #[arg(long, alias = "deep")]
+    pub(crate) tools: bool,
+
+    /// Request a reasoning-effort level
+    #[arg(long, value_enum)]
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Args)]
@@ -1126,9 +1136,9 @@ pub(crate) struct UpgradeArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RunCommands {
-    /// Launch a workflow run
+    /// Register a local workflow version, create a run, and start it
     Run(RunArgs),
-    /// Create a workflow run (allocate run dir, persist spec)
+    /// Register a local workflow version and create a submitted run
     Create(RunArgs),
     /// Start a created workflow run on the server
     Start(StartArgs),

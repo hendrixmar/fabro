@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -23,7 +24,7 @@ use fabro_store::EventEnvelope;
 use fabro_test::{TestContext, expect_reqwest_status};
 use fabro_types::test_support::test_principal;
 use fabro_types::{RunId, StageId};
-use httpmock::{Mock, MockServer};
+use httpmock::{HttpMockResponse, Mock, MockServer};
 use serde_json::Value;
 use shlex::try_quote;
 
@@ -139,6 +140,90 @@ pub(crate) fn mock_resolved_run<'a>(
                 "2026-04-05T12:00:00Z",
             ));
     })
+}
+
+/// Canonical environment response body for mock servers, matching the
+/// `GET /api/v1/environments/{id}` shape the run-intent create path reads.
+pub(crate) fn environment_json(id: &str, provider: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "revision": "0".repeat(64),
+        "provider": provider,
+        "image": { "docker": null, "dockerfile": null },
+        "resources": { "cpu": null, "memory": null, "disk": null },
+        "network": { "mode": "allow_all", "allow": [] },
+        "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": null
+        },
+        "labels": {},
+        "env": {}
+    })
+}
+
+pub(crate) fn mock_environment<'a>(server: &'a MockServer, id: &str, provider: &str) -> Mock<'a> {
+    server.mock(|when, then| {
+        when.method("GET")
+            .path(format!("/api/v1/environments/{id}"));
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(environment_json(id, provider));
+    })
+}
+
+pub(crate) fn mock_workflow_version_registrations(server: &MockServer) -> Mock<'_> {
+    mock_workflow_version_registrations_recording(server, Arc::new(Mutex::new(Vec::new())))
+}
+
+/// Accepts `POST /api/v1/workflow-versions`, echoing each version's
+/// content-derived ID back, and records every request body into
+/// `registrations` for later assertions.
+pub(crate) fn mock_workflow_version_registrations_recording(
+    server: &MockServer,
+    registrations: Arc<Mutex<Vec<Value>>>,
+) -> Mock<'_> {
+    server.mock(|when, then| {
+        when.method("POST").path("/api/v1/workflow-versions");
+        then.respond_with(move |request| {
+            let body: Value = serde_json::from_slice(request.body_ref())
+                .expect("workflow-version request body should be valid JSON");
+            let version: fabro_types::WorkflowVersion = serde_json::from_value(body.clone())
+                .expect("workflow-version request body should be a workflow version");
+            registrations.lock().unwrap().push(body);
+            HttpMockResponse::builder()
+                .status(201)
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "workflow_version_id": version
+                            .id()
+                            .expect("mocked workflow version should have a valid ID")
+                    })
+                    .to_string(),
+                )
+                .build()
+        });
+    })
+}
+
+/// Runs a `git` command in `path` for fixture setup, panicking on failure and
+/// returning trimmed stdout.
+pub(crate) fn run_git(path: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .expect("Git fixture command should execute");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Git fixture output should be UTF-8")
+        .trim()
+        .to_string()
 }
 
 /// Snapshot filter that scrubs short (12-char) ULID suffixes from output, used
@@ -397,7 +482,7 @@ pub(crate) fn setup_local_sandbox_run(context: &TestContext) -> WorkspaceRunSetu
 "#,
     );
     write_text_file(
-        &workspace_dir.join("run.toml"),
+        &workspace_dir.join("workflow.toml"),
         r#"_version = 1
 
 [workflow]
@@ -412,7 +497,7 @@ id = "local"
 "#,
     );
 
-    let run = run_local_workflow(context, &workspace_dir, "run.toml");
+    let run = run_local_workflow(context, &workspace_dir, "workflow.toml");
     assert!(run_state(&run.run_dir).sandbox.is_some());
 
     WorkspaceRunSetup { run, workspace_dir }

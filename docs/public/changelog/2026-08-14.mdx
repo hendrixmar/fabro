@@ -1,0 +1,15 @@
+---
+title: "Exact workflow lineage"
+date: "2026-08-14"
+---
+
+## More
+
+<Accordion title="API">
+- Run specifications and projections now preserve the exact immutable `workflow_version_id` used at admission
+- Workflow-version goals now include and validate the complete closure of child workflow dependencies
+</Accordion>
+
+<Accordion title="Fixes">
+- Clone-based sandboxes now verify an admitted exact commit instead of silently using a newer branch head
+</Accordion>

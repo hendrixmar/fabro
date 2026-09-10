@@ -5,9 +5,9 @@ use ::fabro_types::{
     FailureReason, ForkSourceRef, GitContext, PairId, PairMessageId, PairSystemMessageKind,
     PairTarget, ParallelBranchId, ParallelBranchResult, PendingReason, PermissionLevel, Principal,
     PullRequestCreationId, PullRequestLink, ReviewTarget, RunFailure, RunId, RunNoticeLevel,
-    RunPairEndedReason, RunPairFailedReason, RunProvenance, RunRunnableSource, RunTiming,
-    SandboxProviderKind, StageId, StageOutcome, StageTiming, SuccessReason,
-    run_event as fabro_types,
+    RunPairEndedReason, RunPairFailedReason, RunProvenance, RunRunnableSource, RunTarget,
+    RunTiming, SandboxProviderKind, StageId, StageOutcome, StageTiming, SuccessReason,
+    WorkflowVersionId, run_event as fabro_types,
 };
 use fabro_agent::{AgentEvent, SandboxEvent};
 use fabro_model::{ReasoningEffort, Speed};
@@ -24,32 +24,38 @@ use crate::outcome::{BilledModelUsage, FailureDetail, Outcome};
 )]
 pub enum Event {
     RunCreated {
-        run_id:           RunId,
-        title:            Option<String>,
-        settings:         serde_json::Value,
-        graph:            serde_json::Value,
+        run_id:              RunId,
+        title:               Option<String>,
+        settings:            serde_json::Value,
+        graph:               serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        workflow_source:  Option<String>,
-        labels:           BTreeMap<String, String>,
+        workflow_source:     Option<String>,
+        labels:              BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        source_directory: Option<String>,
+        source_directory:    Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        workflow_slug:    Option<String>,
+        workflow_slug:       Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        automation:       Option<AutomationRef>,
-        provenance:       RunProvenance,
+        workflow_version_id: Option<WorkflowVersionId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        manifest_blob:    Option<BlobHash>,
+        target:              Option<RunTarget>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        git:              Option<GitContext>,
+        automation:          Option<AutomationRef>,
+        provenance:          RunProvenance,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        fork_source_ref:  Option<ForkSourceRef>,
+        manifest_blob:       Option<BlobHash>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        retried_from:     Option<RunId>,
+        spec_blob:           Option<BlobHash>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_id:        Option<RunId>,
+        git:                 Option<GitContext>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        web_url:          Option<String>,
+        fork_source_ref:     Option<ForkSourceRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retried_from:        Option<RunId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id:           Option<RunId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        web_url:             Option<String>,
     },
     WorkflowRunStarted {
         name:         String,
@@ -432,6 +438,9 @@ pub enum Event {
         success:          bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_output_tail: Option<fabro_types::ExecOutputTail>,
+        /// Per-attempt history of the push operation.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attempts:         Vec<fabro_sandbox::PushAttempt>,
     },
     GitFetch {
         branch:  String,
@@ -1237,14 +1246,16 @@ impl Event {
                 branch,
                 success,
                 exec_output_tail,
+                attempts,
             } => {
                 if *success {
-                    debug!(branch, "Git push succeeded");
+                    debug!(branch, attempts = attempts.len(), "Git push succeeded");
                 } else {
                     let tail =
                         fabro_types::ExecOutputTail::trace_summary(exec_output_tail.as_ref());
                     warn!(
                         branch,
+                        attempts = attempts.len(),
                         exec_output_tail_present = tail.present,
                         exec_stdout_tail_bytes = tail.stdout_bytes,
                         exec_stderr_tail_bytes = tail.stderr_bytes,

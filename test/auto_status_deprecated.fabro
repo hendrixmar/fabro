@@ -1,0 +1,7 @@
+digraph DeprecatedAutoStatus {
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    scan [prompt="Scan the tree" auto_status=true]
+
+    start -> scan -> exit
+}

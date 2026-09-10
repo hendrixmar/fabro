@@ -134,6 +134,65 @@ async fn run_bound_session_is_created_as_run_event_and_resolves_by_flat_id() {
 }
 
 #[tokio::test]
+async fn generic_session_creation_requires_the_dedicated_operation_without_advancing_history() {
+    let app = fabro_server::test_support::build_test_router(test_app_state());
+    let run_id = create_run(&app).await;
+    let before_request = Request::builder()
+        .method("GET")
+        .uri(api(&format!("/runs/{run_id}/events")))
+        .body(Body::empty())
+        .expect("run-events request should build");
+    let before = response_json(
+        app.clone().oneshot(before_request).await.unwrap(),
+        StatusCode::OK,
+        format!("GET /api/v1/runs/{run_id}/events before rejected append"),
+    )
+    .await;
+
+    let session_id = fabro_types::SessionId::new();
+    let request = Request::builder()
+        .method("POST")
+        .uri(api(&format!("/runs/{run_id}/events")))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "id": ulid::Ulid::new().to_string(),
+                "ts": "2026-08-31T12:00:00Z",
+                "run_id": run_id,
+                "event": "run.session.created",
+                "session_id": session_id,
+                "properties": { "title": "Injected session" },
+            }))
+            .expect("session creation event should serialize"),
+        ))
+        .expect("append-event request should build");
+    let rejected = response_json(
+        app.clone().oneshot(request).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+        format!("POST /api/v1/runs/{run_id}/events with session creation"),
+    )
+    .await;
+    let detail = rejected["errors"][0]["detail"]
+        .as_str()
+        .expect("error response should include detail");
+    assert!(detail.contains("dedicated operation endpoint"));
+    assert!(detail.contains("run.session.created"));
+
+    let after_request = Request::builder()
+        .method("GET")
+        .uri(api(&format!("/runs/{run_id}/events")))
+        .body(Body::empty())
+        .expect("run-events request should build");
+    let after = response_json(
+        app.clone().oneshot(after_request).await.unwrap(),
+        StatusCode::OK,
+        format!("GET /api/v1/runs/{run_id}/events after rejected append"),
+    )
+    .await;
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
 async fn sessions_are_listed_only_under_their_owning_run() {
     let app = fabro_server::test_support::build_test_router(test_app_state());
     let first_run_id = create_run(&app).await;

@@ -16,7 +16,7 @@ mod generated {
 pub mod types {
     pub use fabro_automation::{
         Automation, AutomationDraft as CreateAutomationRequest,
-        AutomationReplace as ReplaceAutomationRequest, AutomationTarget, AutomationTrigger,
+        AutomationReplace as ReplaceAutomationRequest, AutomationTrigger,
     };
     pub use fabro_environment::Environment;
     pub use fabro_model::{
@@ -25,7 +25,10 @@ pub mod types {
         ReasoningEffortFeature, Speed as BillingSpeed, TokenCounts as CompletionUsage,
     };
     pub use fabro_types::run_event::AgentSessionActivatedProps;
-    pub use fabro_types::settings::run::{McpHttpProtocol, RunModelControls, RunModelSettings};
+    pub use fabro_types::settings::run::{
+        McpHttpProtocol, RunIntegrationsGithubSettings, RunIntegrationsSettings, RunModelControls,
+        RunModelSettings,
+    };
     pub use fabro_types::settings::server::{
         BugsinkIntegrationSettings, BugsinkProjectSettings, GithubIntegrationSettings,
         GithubIntegrationStrategy, IntegrationWebhooksSettings, LogDestination,
@@ -46,22 +49,23 @@ pub mod types {
         AgentToolsAvailableProps, AskFabro, AuthMethod, AutomationRef, BilledTokenCounts, BlobHash,
         CommandTermination, Conclusion, ContentPart, CreateVariableRequest, DiffStats, DiffSummary,
         DirtyStatus, EventEnvelope, ExecOutputTail, FailureCategory, FailureDetail,
-        FailureSignature, GitContext, IdpIdentity, IntegrationConnectionKind,
-        IntegrationConnectionState, IntegrationConnectionStatus, IntegrationProvider,
-        IntegrationStatus, InterviewOption, InterviewQuestionRecord, LlmOutputKind,
-        McpServerDraft as CreateMcpServerRequest, McpServerProjection,
-        McpServerReplace as ReplaceMcpServerRequest, McpServerStatus, McpServerView as McpServer,
-        McpTransportView, Message, PairId, PairMessageId, PairMessageRecord, PairMessageRequest,
-        PairRecord, PairStartRequest, PairStatus, PairTarget, PairTranscriptEntry,
-        PairTranscriptResponse, ParallelBranchId, ParallelBranchResult, PendingInterviewRecord,
-        PermissionLevel, Principal, PullRequest, PullRequestCreation, PullRequestCreationId,
-        PullRequestCreationStatus, PullRequestDetails, PullRequestDetailsStatus,
-        PullRequestDetailsUnavailableReason, PullRequestLink, PullRequestMeta, PullRequestResponse,
-        QuestionType, ReasoningOutput, RepositoryRef, ReviewTarget, ReviewTargetKind, Role, Run,
-        RunApproval, RunApprovalState, RunClientProvenance, RunEvent, RunEventDetailContentKind,
-        RunEventDetailResponse, RunFailure, RunPairStatusResponse, RunProjection, RunProvenance,
+        FailureSignature, GitContext, GitRunTarget, GitRunTarget as AutomationGitWorkflowSource,
+        IdpIdentity, IntegrationConnectionKind, IntegrationConnectionState,
+        IntegrationConnectionStatus, IntegrationProvider, IntegrationStatus, InterviewOption,
+        InterviewQuestionRecord, LlmOutputKind, McpServerDraft as CreateMcpServerRequest,
+        McpServerProjection, McpServerReplace as ReplaceMcpServerRequest, McpServerStatus,
+        McpServerView as McpServer, McpTransportView, Message, PairId, PairMessageId,
+        PairMessageRecord, PairMessageRequest, PairRecord, PairStartRequest, PairStatus,
+        PairTarget, PairTranscriptEntry, PairTranscriptResponse, ParallelBranchId,
+        ParallelBranchResult, PendingInterviewRecord, PermissionLevel, Principal, PullRequest,
+        PullRequestCreation, PullRequestCreationId, PullRequestCreationStatus, PullRequestDetails,
+        PullRequestDetailsStatus, PullRequestDetailsUnavailableReason, PullRequestLink,
+        PullRequestMeta, PullRequestResponse, QuestionType, ReasoningOutput, RepositoryRef,
+        ReviewTarget, ReviewTargetKind, Role, Run, RunApproval, RunApprovalState,
+        RunClientProvenance, RunEvent, RunEventDetailContentKind, RunEventDetailResponse,
+        RunFailure, RunIntent, RunIntentArgs, RunPairStatusResponse, RunProjection, RunProvenance,
         RunRunnableSource, RunSandbox, RunSandboxFailure, RunSandboxInstance, RunSandboxKind,
-        RunSandboxPlan, RunSandboxRuntime, RunServerProvenance, RunSize, SandboxDetails,
+        RunSandboxPlan, RunSandboxRuntime, RunServerProvenance, RunSize, RunTarget, SandboxDetails,
         SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxNetwork, SandboxNetworkPolicy,
         SandboxNetworkPolicyMode, SandboxProviderKind, SandboxProviderLookupError,
         SandboxResources, SandboxService, SandboxServiceListResponse, SandboxState,

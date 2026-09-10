@@ -1,0 +1,12 @@
+digraph ModelStylesheetUnbound {
+    graph [
+        model_stylesheet="
+            * { reasoning_effort: {{ inputs.effort }}; }
+        "
+    ]
+
+    start [shape=Mdiamond]
+    work [prompt="Do work"]
+    exit [shape=Msquare]
+    start -> work -> exit
+}

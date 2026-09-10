@@ -1,7 +1,9 @@
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use tokio::sync::broadcast;
 
+use crate::sandbox::OutputCaptureStats;
 use crate::tool_registry::AgentEventEmitter;
 use crate::types::{AgentEvent, SessionEvent};
 
@@ -62,9 +64,29 @@ impl Default for Emitter {
 /// when a subagent's events are forwarded through its parent.
 #[derive(Clone)]
 pub struct SessionBoundEmitter {
-    pub emitter:      Emitter,
-    pub session_id:   String,
-    pub tool_call_id: Option<String>,
+    emitter:           Emitter,
+    session_id:        String,
+    tool_call_id:      Option<String>,
+    tool_output_stats: Arc<Mutex<Option<OutputCaptureStats>>>,
+}
+
+impl SessionBoundEmitter {
+    #[must_use]
+    pub fn new(emitter: Emitter, session_id: String, tool_call_id: Option<String>) -> Self {
+        Self {
+            emitter,
+            session_id,
+            tool_call_id,
+            tool_output_stats: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn take_tool_output_stats(&self) -> Option<OutputCaptureStats> {
+        self.tool_output_stats
+            .lock()
+            .expect("tool output stats lock poisoned")
+            .take()
+    }
 }
 
 impl AgentEventEmitter for SessionBoundEmitter {
@@ -74,6 +96,13 @@ impl AgentEventEmitter for SessionBoundEmitter {
             event,
             self.tool_call_id.clone(),
         );
+    }
+
+    fn record_tool_output_stats(&self, stats: OutputCaptureStats) {
+        *self
+            .tool_output_stats
+            .lock()
+            .expect("tool output stats lock poisoned") = Some(stats);
     }
 }
 

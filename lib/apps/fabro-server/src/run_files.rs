@@ -1195,7 +1195,7 @@ async fn load_projection(
     state: &Arc<AppState>,
     run_id: &RunId,
 ) -> std::result::Result<Arc<fabro_store::RunProjection>, ApiError> {
-    Ok(state.cached_run(run_id).await?.projection)
+    state.load_run_projection(run_id).await
 }
 
 async fn reconnect_run_sandbox(
@@ -2376,19 +2376,22 @@ index 1111111..2222222 160000
         let mut projection = fabro_store::RunProjection::new(
             "Test run".to_string(),
             fabro_types::RunSpec {
-                run_id:           fabro_types::fixtures::RUN_1,
-                settings:         fabro_types::WorkflowSettings::default(),
-                graph:            fabro_types::Graph::new("test"),
-                graph_source:     None,
-                workflow_slug:    None,
-                automation:       None,
-                source_directory: None,
-                labels:           HashMap::default(),
-                provenance:       test_support::test_run_provenance(),
-                manifest_blob:    None,
-                definition_blob:  None,
-                git:              None,
-                fork_source_ref:  None,
+                run_id:              fabro_types::fixtures::RUN_1,
+                settings:            fabro_types::WorkflowSettings::default(),
+                graph:               fabro_types::Graph::new("test"),
+                graph_source:        None,
+                workflow_slug:       None,
+                workflow_version_id: None,
+                target:              None,
+                automation:          None,
+                source_directory:    None,
+                labels:              HashMap::default(),
+                provenance:          test_support::test_run_provenance(),
+                manifest_blob:       None,
+                definition_blob:     None,
+                spec_blob:           None,
+                git:                 None,
+                fork_source_ref:     None,
             },
             chrono::Utc::now(),
         );

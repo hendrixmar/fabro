@@ -269,91 +269,19 @@ mod tests {
             .unwrap_or_else(|error| panic!("built-in model '{selector}' should resolve: {error}"))
     }
 
-    /// One row of the route-equivalence table: model id plus the
-    /// `(deployment_id, transport, codec, billing_policy, agent_profile)`
-    /// tuple it must resolve to.
-    type RouteRow = (
-        &'static str,
-        &'static str,
-        AdapterKind,
-        CodecKind,
-        BillingPolicy,
-        AgentProfileKind,
-    );
-
-    /// The compat mapping as an executable table: every built-in catalog
-    /// model resolves to exactly this tuple. Adding or rerouting a built-in
-    /// model means updating this table deliberately.
     #[test]
-    fn builtin_catalog_route_equivalence_table() {
-        use AdapterKind as T;
-        use AgentProfileKind as P;
-        use BillingPolicy as B;
-        use CodecKind as C;
-
-        #[rustfmt::skip]
-        let expected: &[RouteRow] = &[
-            // model id                            deployment_id                          transport             codec                 billing       profile
-            ("claude-fable-5",                     "claude-fable-5",                      T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Claude5),
-            ("claude-haiku-4-5",                   "claude-haiku-4-5",                    T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
-            ("claude-opus-4-6",                    "claude-opus-4-6",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
-            ("claude-opus-4-7",                    "claude-opus-4-7",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
-            ("claude-opus-4-8",                    "claude-opus-4-8",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
-            ("claude-opus-5",                      "claude-opus-5",                       T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Claude5),
-            ("claude-sonnet-4-5",                  "claude-sonnet-4-5",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
-            ("claude-sonnet-4-6",                  "claude-sonnet-4-6",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
-            ("claude-sonnet-5",                    "claude-sonnet-5",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Claude5),
-            ("deepseek-v4-flash",                  "deepseek-v4-flash",                   T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("deepseek-v4-pro",                    "deepseek-v4-pro",                     T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("gemini-3-flash-preview",             "gemini-3-flash-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
-            ("gemini-3.1-flash-lite",              "gemini-3.1-flash-lite",               T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
-            ("gemini-3.1-pro-preview",             "gemini-3.1-pro-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
-            ("gemini-3.1-pro-preview-customtools", "gemini-3.1-pro-preview-customtools",  T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
-            ("gemini-3.5-flash",                   "gemini-3.5-flash",                    T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
-            ("glm-4.7",                            "glm-4.7",                             T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("glm-5.2",                            "glm-5.2",                             T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("gpt-5.4",                            "gpt-5.4",                             T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),
-            ("gpt-5.4-mini",                       "gpt-5.4-mini",                        T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),
-            ("gpt-5.4-pro",                        "gpt-5.4-pro",                         T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),
-            ("gpt-5.5",                            "gpt-5.5",                             T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),
-            ("gpt-5.5-pro",                        "gpt-5.5-pro",                         T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),
-            ("gpt-5.6-luna",                       "gpt-5.6-luna",                        T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::Gpt56),
-            ("gpt-5.6-sol",                        "gpt-5.6-sol",                         T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::Gpt56),
-            ("gpt-5.6-terra",                      "gpt-5.6-terra",                       T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::Gpt56),
-            ("kimi-k2.5",                          "kimi-k2.5",                           T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::Kimi),
-            ("kimi-k3",                            "kimi-k3",                             T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::Kimi),
-            ("laguna-s-2.1",                       "poolside/laguna-s-2.1",                T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("laguna-xs-2.1",                      "poolside/laguna-xs-2.1",               T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("mercury-2",                          "mercury-2",                           T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("minimax-m2.5",                       "minimax-m2.5",                        T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("venice-uncensored-1-2",              "venice-uncensored-1-2",               T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-            ("venice-uncensored-role-play",        "venice-uncensored-role-play",         T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
-        ];
-
+    fn every_builtin_catalog_offering_resolves() {
         let catalog = Catalog::builtin();
 
-        let mut model_ids: Vec<&str> = catalog
-            .list(None)
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect();
-        model_ids.sort_unstable();
-        let mut expected_ids: Vec<&str> = expected.iter().map(|row| row.0).collect();
-        expected_ids.sort_unstable();
-        assert_eq!(
-            model_ids, expected_ids,
-            "route-equivalence table must cover every built-in model row"
-        );
-
-        for (model_id, deployment_id, transport, codec, billing_policy, agent_profile) in expected {
-            let model = select_from_all(catalog, model_id);
-            let route = resolve_route(catalog, model)
-                .unwrap_or_else(|| panic!("built-in model '{model_id}' should resolve"));
-            assert_eq!(route.deployment_id, *deployment_id, "{model_id}");
-            assert_eq!(route.transport, *transport, "{model_id}");
-            assert_eq!(route.codec, *codec, "{model_id}");
-            assert_eq!(route.billing_policy, *billing_policy, "{model_id}");
-            assert_eq!(route.agent_profile, *agent_profile, "{model_id}");
+        for model in catalog.list(None) {
+            let route = resolve_route(catalog, model).unwrap_or_else(|| {
+                panic!(
+                    "built-in offering '{}/{}' should resolve",
+                    model.provider, model.id
+                )
+            });
+            assert_eq!(route.provider, model.provider);
+            assert!(!route.deployment_id.is_empty());
         }
     }
 

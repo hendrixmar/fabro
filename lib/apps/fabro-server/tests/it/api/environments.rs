@@ -695,6 +695,66 @@ async fn delete_environment_removes_non_default_and_default_is_deletable() {
 }
 
 #[tokio::test]
+async fn delete_environment_rejects_an_environment_used_by_an_automation() {
+    let (app, _temp_dir, _environment_dir) = environment_app();
+    let environment = create_environment(&app, "automation-env", "docker").await;
+    let revision = revision_from(&environment);
+    let automation = json!({
+        "id": "nightly",
+        "name": "Nightly",
+        "description": null,
+        "environment_id": "automation-env",
+        "target": {
+            "kind": "git",
+            "repo": "fabro-sh/fabro",
+            "branch": "main"
+        },
+        "workflow": "release",
+        "triggers": [{ "type": "api", "id": "manual", "enabled": true }]
+    });
+    let response = app
+        .clone()
+        .oneshot(json_request(Method::POST, "/automations", &automation))
+        .await
+        .expect("create automation should respond");
+    response_status(
+        response,
+        StatusCode::CREATED,
+        "POST /api/v1/automations using environment",
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(request_with_if_match(
+            Method::DELETE,
+            "/environments/automation-env",
+            revision,
+            None,
+        ))
+        .await
+        .expect("delete used environment should respond");
+    let error = response_json(
+        response,
+        StatusCode::CONFLICT,
+        "DELETE /api/v1/environments/automation-env in use",
+    )
+    .await;
+
+    assert_eq!(error["errors"][0]["code"], "environment_in_use");
+    let response = app
+        .oneshot(empty_request(Method::GET, "/environments/automation-env"))
+        .await
+        .expect("used environment should still exist");
+    response_status(
+        response,
+        StatusCode::OK,
+        "GET /api/v1/environments/automation-env after rejected delete",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn environment_routes_require_authenticated_user() {
     let temp_dir = tempfile::tempdir().expect("environment test tempdir should be created");
     let state = TestAppStateBuilder::new()

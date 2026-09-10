@@ -124,6 +124,8 @@ fn dry_run_create_start_attach_works_with_default_run_lookup() {
             "create",
             "--dry-run",
             "--auto-approve",
+            "--environment",
+            "local",
             workflow.to_str().unwrap(),
         ])
         .assert()
@@ -219,7 +221,7 @@ fn dry_run_detach_attach_works_with_default_run_lookup() {
 }
 
 #[test]
-fn completed_run_can_be_attached_by_workflow_slug() {
+fn completed_run_can_be_attached_by_entrypoint_slug() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
     let project = tempfile::tempdir().unwrap();
@@ -246,6 +248,8 @@ digraph BarBaz {
             "create",
             "--dry-run",
             "--auto-approve",
+            "--environment",
+            "local",
             workflow_path.to_str().unwrap(),
         ])
         .assert()
@@ -254,7 +258,7 @@ digraph BarBaz {
     context
         .command()
         .current_dir(project.path())
-        .args(["start", "sluggy"])
+        .args(["start", "workflow"])
         .assert()
         .success();
     context
@@ -267,7 +271,7 @@ digraph BarBaz {
     context
         .command()
         .current_dir(project.path())
-        .args(["attach", "sluggy"])
+        .args(["attach", "workflow"])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
         .success();
@@ -314,6 +318,8 @@ digraph FooWorkflow {
             "create",
             "--dry-run",
             "--auto-approve",
+            "--environment",
+            "local",
             workflow_path.to_str().unwrap(),
         ])
         .assert()

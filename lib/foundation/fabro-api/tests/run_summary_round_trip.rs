@@ -10,9 +10,9 @@ use fabro_api::types::{
 use fabro_types::status::{RunStatus, SuccessReason};
 use fabro_types::{
     AskFabro, AskFabroUnavailableReason, AutomationRef, DiffSummary, PullRequestLink,
-    RepositoryProvider, RepositoryRef, Run, RunApproval, RunApprovalState, RunBillingSummary,
-    RunId, RunLifecycle, RunLinks, RunOrigin, RunRunnableSource, RunSize, RunTimestamps, RunTiming,
-    WorkflowRef, fixtures, test_support,
+    RepositoryProvider, RepositoryRef, ResolvedAutomationGitWorkflowSource, Run, RunApproval,
+    RunApprovalState, RunBillingSummary, RunId, RunLifecycle, RunLinks, RunOrigin,
+    RunRunnableSource, RunSize, RunTimestamps, RunTiming, WorkflowRef, fixtures, test_support,
 };
 use serde_json::json;
 
@@ -79,9 +79,16 @@ fn run_summary_json_matches_openapi_shape() {
             edge_count: 9,
         },
         automation:       Some(AutomationRef {
-            id:         "nightly".to_string(),
-            name:       Some("Nightly".to_string()),
-            trigger_id: Some("schedule_1".to_string()),
+            id:              "nightly".to_string(),
+            name:            Some("Nightly".to_string()),
+            trigger_id:      Some("schedule_1".to_string()),
+            workflow_source: Some(Box::new(ResolvedAutomationGitWorkflowSource {
+                repo:         "fabro-sh/workflows".to_string(),
+                branch:       "context-only".to_string(),
+                tag:          Some("v1".to_string()),
+                sha:          Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                resolved_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            })),
         }),
         repository:       Some(RepositoryRef {
             name:       "fabro".to_string(),
@@ -154,7 +161,14 @@ fn run_summary_json_matches_openapi_shape() {
             "automation": {
                 "id": "nightly",
                 "name": "Nightly",
-                "trigger_id": "schedule_1"
+                "trigger_id": "schedule_1",
+                "workflow_source": {
+                    "repo": "fabro-sh/workflows",
+                    "branch": "context-only",
+                    "tag": "v1",
+                    "sha": "0123456789abcdef0123456789abcdef01234567",
+                    "resolved_sha": "0123456789abcdef0123456789abcdef01234567"
+                }
             },
             "repository": {
                 "name": "fabro",

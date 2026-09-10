@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,16 +46,32 @@ impl ModelTestOutcome {
 pub async fn run_model_test(
     info: &Model,
     mode: ModelTestMode,
+    reasoning_effort: Option<ReasoningEffort>,
     client: Arc<Client>,
 ) -> ModelTestOutcome {
     match mode {
-        ModelTestMode::Basic => run_basic_test(info, client).await,
-        ModelTestMode::Deep => run_deep_test(info, client).await,
+        ModelTestMode::Basic => run_basic_test(info, reasoning_effort, client).await,
+        ModelTestMode::Deep => run_tools_test(info, reasoning_effort, client).await,
     }
 }
 
-async fn run_basic_test(info: &Model, client: Arc<Client>) -> ModelTestOutcome {
-    run_basic_model_probe(info.id.as_str(), &info.provider, client).await
+/// Output budget for tests where reasoning or tool rounds consume completion
+/// tokens before the final answer.
+const EXPANDED_MAX_TOKENS: i64 = 1024;
+
+async fn run_basic_test(
+    info: &Model,
+    reasoning_effort: Option<ReasoningEffort>,
+    client: Arc<Client>,
+) -> ModelTestOutcome {
+    basic_probe(
+        info.id.as_str(),
+        info.provider.to_string(),
+        reasoning_effort,
+        client,
+        Duration::from_secs(ModelTestMode::Basic.timeout_secs()),
+    )
+    .await
 }
 
 /// Run the cheap single-prompt model availability probe without requiring a
@@ -64,26 +81,75 @@ pub async fn run_basic_model_probe(
     provider: impl ToString,
     client: Arc<Client>,
 ) -> ModelTestOutcome {
-    let params = GenerateParams::new(model_id, client)
-        .provider(provider.to_string())
-        .prompt("Say OK")
-        .max_tokens(16);
-
-    let result = time::timeout(
+    run_basic_model_probe_with_timeout(
+        model_id,
+        provider,
+        client,
         Duration::from_secs(ModelTestMode::Basic.timeout_secs()),
-        generate::generate(params),
     )
-    .await;
+    .await
+}
 
-    match result {
+pub async fn run_basic_model_probe_with_timeout(
+    model_id: &str,
+    provider: impl ToString,
+    client: Arc<Client>,
+    probe_timeout: Duration,
+) -> ModelTestOutcome {
+    basic_probe(model_id, provider.to_string(), None, client, probe_timeout).await
+}
+
+async fn basic_probe(
+    model_id: &str,
+    provider: String,
+    reasoning_effort: Option<ReasoningEffort>,
+    client: Arc<Client>,
+    probe_timeout: Duration,
+) -> ModelTestOutcome {
+    let params = build_basic_test_params(model_id, provider, reasoning_effort, client);
+    basic_model_probe_outcome(generate::generate(params), probe_timeout).await
+}
+
+fn build_basic_test_params(
+    model_id: &str,
+    provider: String,
+    reasoning_effort: Option<ReasoningEffort>,
+    client: Arc<Client>,
+) -> GenerateParams {
+    let max_tokens = if reasoning_effort.is_some() {
+        EXPANDED_MAX_TOKENS
+    } else {
+        16
+    };
+    let mut params = GenerateParams::new(model_id, client)
+        .provider(provider)
+        .prompt("Say OK")
+        .max_tokens(max_tokens);
+
+    if let Some(reasoning_effort) = reasoning_effort {
+        params = params.reasoning_effort(reasoning_effort);
+    }
+
+    params
+}
+
+async fn basic_model_probe_outcome<F>(probe: F, probe_timeout: Duration) -> ModelTestOutcome
+where
+    F: Future<Output = Result<GenerateResult, crate::Error>>,
+{
+    match time::timeout(probe_timeout, probe).await {
         Ok(Ok(_)) => ModelTestOutcome::ok(),
         Ok(Err(err)) => ModelTestOutcome::error(err.to_string()),
-        Err(_) => ModelTestOutcome::error("timeout (30s)"),
+        Err(_) => ModelTestOutcome::error(format!("timeout ({probe_timeout:?})")),
     }
 }
 
-async fn run_deep_test(info: &Model, client: Arc<Client>) -> ModelTestOutcome {
-    let Some(params) = build_deep_test_params(info, client) else {
+async fn run_tools_test(
+    info: &Model,
+    reasoning_effort: Option<ReasoningEffort>,
+    client: Arc<Client>,
+) -> ModelTestOutcome {
+    let Some(params) = build_tools_test_params(info, reasoning_effort, client) else {
         return ModelTestOutcome::error("model does not support tools");
     };
 
@@ -94,7 +160,7 @@ async fn run_deep_test(info: &Model, client: Arc<Client>) -> ModelTestOutcome {
     .await;
 
     match result {
-        Ok(Ok(gen_result)) => match validate_deep_result(&gen_result) {
+        Ok(Ok(gen_result)) => match validate_tools_result(&gen_result) {
             Ok(()) => ModelTestOutcome::ok(),
             Err(message) => ModelTestOutcome::error(message),
         },
@@ -103,7 +169,11 @@ async fn run_deep_test(info: &Model, client: Arc<Client>) -> ModelTestOutcome {
     }
 }
 
-fn build_deep_test_params(info: &Model, client: Arc<Client>) -> Option<GenerateParams> {
+fn build_tools_test_params(
+    info: &Model,
+    reasoning_effort: Option<ReasoningEffort>,
+    client: Arc<Client>,
+) -> Option<GenerateParams> {
     if !info.features.tools {
         return None;
     }
@@ -140,16 +210,16 @@ fn build_deep_test_params(info: &Model, client: Arc<Client>) -> Option<GenerateP
         )
         .tools(vec![add_tool])
         .max_tool_rounds(5)
-        .max_tokens(1024);
+        .max_tokens(EXPANDED_MAX_TOKENS);
 
-    if info.supports_reasoning_effort() {
-        params = params.reasoning_effort(ReasoningEffort::High);
+    if let Some(reasoning_effort) = reasoning_effort {
+        params = params.reasoning_effort(reasoning_effort);
     }
 
     Some(params)
 }
 
-fn validate_deep_result(result: &GenerateResult) -> Result<(), String> {
+fn validate_tools_result(result: &GenerateResult) -> Result<(), String> {
     if result.steps.len() < 2 {
         return Err("model did not call tool".to_string());
     }
@@ -224,7 +294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_model_test_deep_errors_when_model_lacks_tools() {
+    async fn run_model_test_tools_errors_when_model_lacks_tools() {
         let info = test_model_with(ModelFeatures {
             tools:                     false,
             vision:                    false,
@@ -235,7 +305,7 @@ mod tests {
             sampling_params:           true,
         });
 
-        let outcome = run_model_test(&info, ModelTestMode::Deep, empty_test_client()).await;
+        let outcome = run_model_test(&info, ModelTestMode::Deep, None, empty_test_client()).await;
 
         assert_eq!(outcome.status, ModelTestStatus::Error);
         assert_eq!(
@@ -244,26 +314,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deep_test_omits_effort_for_reasoning_without_effort_controls() {
-        let info = test_model_with(ModelFeatures {
-            tools:                     true,
-            vision:                    false,
-            reasoning:                 true,
-            reasoning_effort:          ReasoningEffortFeature::None,
-            prompt_cache:              true,
-            cache_control_breakpoints: false,
-            sampling_params:           true,
-        });
+    #[tokio::test]
+    async fn basic_model_probe_reports_configured_timeout() {
+        let outcome = basic_model_probe_outcome(
+            std::future::pending::<Result<GenerateResult, crate::Error>>(),
+            Duration::from_millis(1),
+        )
+        .await;
 
-        let params = build_deep_test_params(&info, empty_test_client())
-            .expect("tool-capable model should produce deep-test params");
-
-        assert_eq!(params.reasoning_effort, None);
+        assert_eq!(outcome.status, ModelTestStatus::Error);
+        assert_eq!(outcome.error_message.as_deref(), Some("timeout (1ms)"));
     }
 
     #[test]
-    fn deep_test_uses_high_effort_when_supported() {
+    fn basic_test_expands_output_budget_for_reasoning() {
+        let params = build_basic_test_params(
+            "test-model",
+            "anthropic".to_string(),
+            Some(ReasoningEffort::Max),
+            empty_test_client(),
+        );
+
+        assert_eq!(params.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(params.max_tokens, Some(1024));
+    }
+
+    #[test]
+    fn tools_test_omits_effort_when_not_requested() {
         let info = test_model_with(ModelFeatures {
             tools:                     true,
             vision:                    false,
@@ -274,14 +351,33 @@ mod tests {
             sampling_params:           true,
         });
 
-        let params = build_deep_test_params(&info, empty_test_client())
-            .expect("tool-capable model should produce deep-test params");
+        let params = build_tools_test_params(&info, None, empty_test_client())
+            .expect("tool-capable model should produce tools-test params");
 
-        assert_eq!(params.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(params.reasoning_effort, None);
     }
 
     #[test]
-    fn validate_deep_result_does_not_fail_only_for_missing_reasoning() {
+    fn tools_test_uses_requested_effort() {
+        let info = test_model_with(ModelFeatures {
+            tools:                     true,
+            vision:                    false,
+            reasoning:                 true,
+            reasoning_effort:          ReasoningEffortFeature::Levels,
+            prompt_cache:              true,
+            cache_control_breakpoints: false,
+            sampling_params:           true,
+        });
+
+        let params =
+            build_tools_test_params(&info, Some(ReasoningEffort::Low), empty_test_client())
+                .expect("tool-capable model should produce tools-test params");
+
+        assert_eq!(params.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn validate_tools_result_does_not_fail_only_for_missing_reasoning() {
         let tool_results = vec![ToolResult::success("call_1", serde_json::json!(42))];
         let first_step = StepResult {
             response:     response_with_text("tool step"),
@@ -299,6 +395,6 @@ mod tests {
             output: None,
         };
 
-        assert_eq!(validate_deep_result(&result), Ok(()));
+        assert_eq!(validate_tools_result(&result), Ok(()));
     }
 }

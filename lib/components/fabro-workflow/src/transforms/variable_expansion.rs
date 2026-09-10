@@ -38,12 +38,15 @@ pub enum RenderMode {
 
 #[derive(Clone)]
 pub(crate) struct TemplateRenderTarget {
-    pub source_name: Option<String>,
-    pub node_id:     Option<String>,
-    pub edge:        Option<(String, String)>,
-    pub owner:       String,
-    source_origin:   Option<TemplateSourceOrigin>,
-    template_store:  Option<TemplateRenderStore>,
+    pub source_name:          Option<String>,
+    pub node_id:              Option<String>,
+    pub edge:                 Option<(String, String)>,
+    pub owner:                String,
+    /// Fix text for undefined variables outside `inputs`/`vars`, set by
+    /// targets whose template context is a restricted projection.
+    restricted_namespace_fix: Option<String>,
+    source_origin:            Option<TemplateSourceOrigin>,
+    template_store:           Option<TemplateRenderStore>,
 }
 
 #[derive(Clone)]
@@ -83,6 +86,7 @@ impl TemplateRenderTarget {
             node_id: None,
             edge: None,
             owner: format!("graph attribute `{attr_name}`"),
+            restricted_namespace_fix: None,
             source_origin: None,
             template_store: None,
         }
@@ -101,6 +105,7 @@ impl TemplateRenderTarget {
             node_id: Some(node_id.clone()),
             edge: None,
             owner: format!("node `{node_id}` attribute `{attr_name}`"),
+            restricted_namespace_fix: None,
             source_origin: None,
             template_store: None,
         }
@@ -121,6 +126,7 @@ impl TemplateRenderTarget {
             node_id: None,
             edge: Some((from.clone(), to.clone())),
             owner: format!("edge `{from} -> {to}` attribute `{attr_name}`"),
+            restricted_namespace_fix: None,
             source_origin: None,
             template_store: None,
         }
@@ -147,11 +153,22 @@ impl TemplateRenderTarget {
     }
 
     #[must_use]
+    pub(crate) fn with_restricted_namespace_fix(mut self, fix: impl Into<String>) -> Self {
+        self.restricted_namespace_fix = Some(fix.into());
+        self
+    }
+
+    #[must_use]
     fn template_source_name(&self) -> String {
         self.source_name
             .clone()
             .unwrap_or_else(|| "workflow".to_string())
     }
+}
+
+pub(crate) enum TemplateRenderOutcome {
+    Rendered(String),
+    Unresolved,
 }
 
 pub(crate) fn render_template_for_target(
@@ -161,18 +178,34 @@ pub(crate) fn render_template_for_target(
     target: &TemplateRenderTarget,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<String, Error> {
+    match render_template_for_target_outcome(text, ctx, render_mode, target, diagnostics)? {
+        TemplateRenderOutcome::Rendered(rendered) => Ok(rendered),
+        TemplateRenderOutcome::Unresolved => {
+            render_template_with_mode(text, ctx, TemplateRenderMode::Lenient, target)
+                .map_err(|err| template_error_for_target(target, err))
+        }
+    }
+}
+
+pub(crate) fn render_template_for_target_outcome(
+    text: &str,
+    ctx: &TemplateContext,
+    render_mode: RenderMode,
+    target: &TemplateRenderTarget,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<TemplateRenderOutcome, Error> {
     match render_mode {
         RenderMode::Strict => {
             render_template_with_mode(text, ctx, TemplateRenderMode::Strict, target)
+                .map(TemplateRenderOutcome::Rendered)
                 .map_err(|err| template_error_for_target(target, err))
         }
         RenderMode::Structural => {
             match render_template_with_mode(text, ctx, TemplateRenderMode::Strict, target) {
-                Ok(rendered) => Ok(rendered),
+                Ok(rendered) => Ok(TemplateRenderOutcome::Rendered(rendered)),
                 Err(err @ TemplateError::UndefinedVariable { .. }) => {
                     diagnostics.push(template_diagnostic(&err, target));
-                    render_template_with_mode(text, ctx, TemplateRenderMode::Lenient, target)
-                        .map_err(|err| template_error_for_target(target, err))
+                    Ok(TemplateRenderOutcome::Unresolved)
                 }
                 Err(err) => Err(template_error_for_target(target, err)),
             }
@@ -210,7 +243,6 @@ fn template_error_for_target(target: &TemplateRenderTarget, err: TemplateError) 
 
 fn template_diagnostic(error: &TemplateError, target: &TemplateRenderTarget) -> Diagnostic {
     let expression = error.expression();
-    let name = expression.unwrap_or("<unknown>");
     let mut message = match expression {
         Some(expr) => format!("undefined template variable `{expr}`"),
         None => "undefined template variable".to_string(),
@@ -225,7 +257,7 @@ fn template_diagnostic(error: &TemplateError, target: &TemplateRenderTarget) -> 
         message,
         node_id: target.node_id.clone(),
         edge: target.edge.clone(),
-        fix: Some(input_binding_fix(name)),
+        fix: Some(template_variable_fix(expression, target)),
         source_path: location.source_name.or_else(|| target.source_name.clone()),
         line: location.line,
         column: location.column,
@@ -235,9 +267,35 @@ fn template_diagnostic(error: &TemplateError, target: &TemplateRenderTarget) -> 
     }
 }
 
+fn template_variable_fix(expression: Option<&str>, target: &TemplateRenderTarget) -> String {
+    let mut parts = expression.unwrap_or_default().split('.');
+    let namespace = parts.next().unwrap_or_default().parse::<Namespace>();
+    let name = parts.next().unwrap_or("<name>");
+
+    match (namespace, &target.restricted_namespace_fix) {
+        (Ok(Namespace::Inputs), _) => input_binding_fix(name),
+        (Ok(Namespace::Vars), _) => variable_binding_fix(name),
+        (_, Some(fix)) => fix.clone(),
+        (Ok(Namespace::Goal), None) => GOAL_BINDING_FIX.to_string(),
+        (Ok(namespace), None) => format!("`{namespace}` is not available in workflow templates"),
+        (Err(_), None) => {
+            format!(
+                "define `{}` in the template context",
+                expression.unwrap_or("the value")
+            )
+        }
+    }
+}
+
 fn input_binding_fix(name: &str) -> String {
     format!("bind `{name}` via `[run.inputs]` in workflow.toml, or pass `--input {name}=<value>`")
 }
+
+fn variable_binding_fix(name: &str) -> String {
+    format!("set it with `fabro variable set {name} <value>`")
+}
+
+const GOAL_BINDING_FIX: &str = "set a graph `goal` on the workflow";
 
 /// Substitutes `{{ goal }}`, `{{ inputs.* }}`, and `{{ vars.* }}` in one
 /// command node `script`.
@@ -351,7 +409,7 @@ fn script_interpolation_fix(err: &ResolveError, language: Option<&str>) -> Strin
     let name = &err.name;
     match err.namespace {
         Namespace::Inputs => input_binding_fix(name),
-        Namespace::Vars => format!("set it with `fabro variable set {name} <value>`"),
+        Namespace::Vars => variable_binding_fix(name),
         Namespace::Env if language == Some("python") => format!(
             "`script` does not interpolate environment variables; read it in Python as \
              `os.environ[\"{name}\"]` instead"
@@ -368,7 +426,7 @@ fn script_interpolation_fix(err: &ResolveError, language: Option<&str>) -> Strin
             "`script` does not interpolate secrets; expose `{name}` to the sandbox through \
              `[environments.<slug>.env]` and read it in the shell as `${name}`"
         ),
-        Namespace::Goal => "set a graph `goal` on the workflow".to_string(),
+        Namespace::Goal => GOAL_BINDING_FIX.to_string(),
     }
 }
 
@@ -382,16 +440,16 @@ fn detemplated_attribute_diagnostic(attr_name: &str, target: &TemplateRenderTarg
         severity: Severity::Warning,
         message: format!(
             "`{attr_name}` in {} is no longer a template; `{{{{ … }}}}` / `{{% … %}}` is treated \
-             as literal text. Only node `prompt` and graph `goal` support templating, and node \
-             command `script` supports `{{{{ goal }}}}`, `{{{{ inputs.* }}}}`, and \
-             `{{{{ vars.* }}}}` interpolation.",
+             as literal text. Node `prompt`, graph `goal`, and graph `model_stylesheet` support \
+             templating. Node command `script` supports `{{{{ goal }}}}`, \
+             `{{{{ inputs.* }}}}`, and `{{{{ vars.* }}}}` interpolation.",
             target.owner
         ),
         node_id: target.node_id.clone(),
         edge: target.edge.clone(),
         fix: Some(format!(
             "remove the template syntax from `{attr_name}`, or move the dynamic value into a \
-             `prompt`/`goal`"
+             `prompt`/`goal`/`model_stylesheet`"
         )),
         source_path: target.source_name.clone(),
         ..Diagnostic::default()
@@ -508,6 +566,12 @@ impl TemplateTransform {
                 // The graph `goal` is rendered separately and must not be
                 // re-rendered here.
                 if matches!(scope, AttributeScope::Graph) && attr_name == "goal" {
+                    continue;
+                }
+                // The root model stylesheet has its own restricted template
+                // pass after imports are expanded. Imported stylesheets stay
+                // ignored and are diagnosed by ImportTransform.
+                if matches!(scope, AttributeScope::Graph) && attr_name == "model_stylesheet" {
                     continue;
                 }
                 if attr_name == "stack.child_dot_source" {

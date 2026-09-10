@@ -30,7 +30,10 @@ pub(crate) const REFRESH_TOKEN_PREFIX: &str = "fabro_refresh_";
 
 pub(crate) use browser_shell::browser_shell;
 pub(crate) use cli_flow::web_routes;
-pub(crate) use fabro_store::{AuthCode, ConsumeOutcome, RefreshToken};
+pub(crate) use fabro_store::PendingCliAuthorization;
+pub(crate) use fabro_store::auth_session_store::{
+    AuthSessionRecord, InitialRefreshToken, RotateOutcome,
+};
 pub use github_endpoints::GithubEndpoints;
 pub(crate) use jwt::{JwtError, JwtSubject, issue, verify};
 pub(crate) use keys::{

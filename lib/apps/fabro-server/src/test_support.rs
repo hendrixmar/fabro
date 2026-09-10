@@ -22,7 +22,7 @@ use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ProviderId};
 use fabro_sandbox::SandboxProviderRegistry;
 use fabro_static::EnvVars;
-use fabro_store::{ArtifactStore, Database};
+use fabro_store::{ArtifactStore, Database, test_support as store_test_support};
 use fabro_types::settings::ServerAuthMethod;
 use fabro_types::settings::run::EnvironmentProvider;
 use fabro_types::{AuthMethod, IdpIdentity, ServerSettings};
@@ -33,7 +33,7 @@ use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use crate::automation_materializer::AutomationRunMaterializer;
+use crate::auth;
 pub use crate::automation_materializer::TestAutomationRunMaterializer;
 use crate::interp::process_env_var;
 use crate::jwt_auth::{AuthMode, ConfiguredAuth};
@@ -46,7 +46,6 @@ use crate::server::{
 use crate::server_secrets::ServerSecrets;
 #[cfg(test)]
 use crate::worker_runtime::WorkerRuntime;
-use crate::{auth, migrations};
 
 pub const TEST_DEV_TOKEN: &str =
     "fabro_dev_abababababababababababababababababababababababababababababababab";
@@ -102,7 +101,7 @@ pub struct TestAppStateBuilder {
     default_environment_provider: Option<EnvironmentProvider>,
     env_lookup:                   EnvLookup,
     llm_catalog_settings:         LlmCatalogSettings,
-    automation_materializer:      Option<Arc<dyn AutomationRunMaterializer>>,
+    automation_materializer:      Option<TestAutomationRunMaterializer>,
     #[cfg(test)]
     worker_runtime:               Option<Arc<dyn WorkerRuntime>>,
 }
@@ -184,7 +183,7 @@ impl TestAppStateBuilder {
     }
 
     pub fn automation_materializer(mut self, materializer: TestAutomationRunMaterializer) -> Self {
-        self.automation_materializer = Some(materializer.into_materializer());
+        self.automation_materializer = Some(materializer);
         self
     }
 
@@ -282,6 +281,11 @@ impl TestAppStateBuilder {
             server::automation_dir_for_active_config(&active_config_path),
         )?;
         let preloaded_vault = test_secret_snapshot(db_pool.clone())?;
+        let automation_materializer_override = self.automation_materializer.map(|materializer| {
+            materializer.into_materializer(fabro_workflow_version::WorkflowVersionStore::new(
+                store.blobs(),
+            ))
+        });
         build_app_state(AppStateConfig {
             resolved_settings: resolved_runtime_settings_for_tests(
                 self.server_settings,
@@ -307,7 +311,7 @@ impl TestAppStateBuilder {
             worker_control_bus: None,
             #[cfg(test)]
             worker_runtime: self.worker_runtime,
-            automation_materializer_override: self.automation_materializer,
+            automation_materializer_override,
         })
     }
 }
@@ -539,7 +543,7 @@ pub fn test_app_state_with_store(
 
 pub fn test_store_bundle() -> (Arc<Database>, ArtifactStore) {
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(MemoryObjectStore::new());
-    let store = Arc::new(fabro_store::Database::new(
+    let store = Arc::new(store_test_support::test_database(
         Arc::clone(&object_store),
         "",
         Duration::from_millis(1),
@@ -596,7 +600,6 @@ fn test_db_pool(
     default_environment_provider: Option<EnvironmentProvider>,
 ) -> anyhow::Result<DbPool> {
     std::thread::spawn(move || {
-        migrations::migrate_legacy_vault_file(&vault_path)?;
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()
             .build()?;

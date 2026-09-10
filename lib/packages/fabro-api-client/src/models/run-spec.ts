@@ -27,6 +27,9 @@ import type { GitContext } from './git-context';
 import type { RunProvenance } from './run-provenance';
 // May contain unused imports in some cases
 // @ts-ignore
+import type { RunTarget } from './run-target';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { WorkflowSettings } from './workflow-settings';
 
 /**
@@ -38,12 +41,18 @@ export interface RunSpec {
     'graph': { [key: string]: any; };
     'graph_source'?: string | null;
     'workflow_slug'?: string | null;
+    /**
+     * SHA-256 identity of validated canonical workflow-version bytes. Hex input is case-insensitive; Fabro emits the canonical lowercase form.
+     */
+    'workflow_version_id'?: string | null;
+    'target'?: RunTarget | null;
     'automation'?: AutomationRef | null;
     'source_directory'?: string | null;
     'labels'?: { [key: string]: string; };
     'provenance': RunProvenance;
     'manifest_blob'?: string | null;
     'definition_blob'?: string | null;
+    'spec_blob'?: string | null;
     'git'?: GitContext | null;
     'fork_source_ref'?: ForkSourceRef | null;
 }

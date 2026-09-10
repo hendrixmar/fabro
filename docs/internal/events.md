@@ -44,11 +44,18 @@ Emitted when the run record is created.
   "event": "run.created",
   "properties": {
     "workflow_slug": "my-workflow",
+    "workflow_version_id": "wv_...",
+    "target": {
+      "kind": "git",
+      "repo": "acme/my-project",
+      "branch": "main",
+      "sha": "0123456789abcdef0123456789abcdef01234567"
+    },
     "source_directory": "/home/user/src/my-project",
     "git": {
       "origin_url": "https://github.com/acme/my-project",
       "branch": "main",
-      "sha": "abc123",
+      "sha": "0123456789abcdef0123456789abcdef01234567",
       "dirty": "clean"
     },
     "fork_source_ref": null,
@@ -76,9 +83,11 @@ Emitted when the run record is created.
 | `labels` | object | Run labels |
 | `source_directory` | string? | Submitter-side source directory |
 | `workflow_slug` | string? | Workflow slug |
+| `workflow_version_id` | string? | Exact immutable root workflow version used for admission |
+| `target` | object? | Canonical accepted workspace target. Version-backed Git intent runs persist `kind`, `repo`, required `branch`, and optional normalized `sha`; legacy manifest runs omit it |
 | `provenance` | object | Actor and request provenance |
 | `manifest_blob` | string? | Blob hash for the submitted manifest |
-| `git` | object? | Git provenance observed before the run: normalized `origin_url`, `branch`, optional `sha`, and `dirty` status |
+| `git` | object? | Operational Git projection: normalized `origin_url`, `branch`, optional `sha`, and `dirty` status. For Git intent runs, `branch` is the submitted working branch and `sha` is the optional lowercase-normalized submitted commit; admission does not resolve it or prove branch ancestry. Legacy runs retain their observed optional-SHA semantics |
 | `fork_source_ref` | object? | Source run/checkpoint reference when this run was forked |
 | `in_place` | boolean | Whether the run was created with `--in-place` (no git checkpoints) |
 

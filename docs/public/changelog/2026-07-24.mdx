@@ -1,5 +1,5 @@
 ---
-title: "Shared-checkout parallelism, Fireworks, and resume history"
+title: "Shared-checkout parallelism, Fireworks, and agent chat"
 date: "2026-07-24"
 ---
 
@@ -34,9 +34,9 @@ Fireworks AI is now an opt-in built-in provider with a curated serverless catalo
 enabled = true
 ```
 
-## Resumed stages keep their history
+## Model-native Kimi agents and agent chat
 
-When a run resumes after a node was cancelled or lost mid-flight, the replay now starts a new stage execution such as `work@2` instead of clearing and reusing `work@1`. The earlier execution keeps its events, session, output, timing, billing, and terminal state, and the stage UI links the new execution back to the one it resumed from.
+Kimi K3 sessions now use a model-specific agent profile with Kimi Code tool names, descriptions, paging, and TODO behavior. The stage activity view also has a Chat tab that groups prompts, assistant messages, tool calls, and disclosed provider reasoning into a readable conversation.
 
 ## More
 
@@ -51,9 +51,12 @@ When a run resumes after a node was cancelled or lost mid-flight, the replay now
 - Preflight now prefers providers that are actually ready while preserving explicit provider pins and useful diagnostics for unavailable offerings
 - OpenAI-compatible agent providers now receive compatible file-edit and tool schemas
 - Large values inside parallel branch results now stay available to fan-in prompts through normal artifact storage
+- Agent compaction now preserves history when a summary is empty or exceeds the model's reasoning budget
+- Agent tool secrets now reach model-specific profiles, and OpenAI-compatible streaming usage is requested consistently
 </Accordion>
 
 <Accordion title="Improvements">
+- Resumed nodes now start a new execution such as `work@2`, preserving the earlier execution's events, output, timing, billing, and terminal state
 - Added `claude-opus-5` to the first-party Anthropic and optional OpenRouter model catalogs; the `opus` and `claude-opus` aliases now resolve to Opus 5
 - Added `gpt-sol`, `gpt-terra`, and `gpt-luna` aliases for GPT-5.6 offerings
 - Added portable `glm`, `glm52`, `glm5.2`, `deepseek`, and `deepseek-flash` aliases across direct and OpenRouter offerings

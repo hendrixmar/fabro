@@ -3,7 +3,9 @@
     reason = "CLI manifest builder: sync file I/O building install manifests"
 )]
 
+mod local_workflow_package;
 mod workflow_bundler;
+mod workflow_version_collector;
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -23,12 +25,19 @@ use fabro_template::validate_static_reference;
 use fabro_types::graph::ReferenceKind;
 use fabro_types::settings::interp::InterpString;
 use fabro_types::settings::run::{ApprovalMode, ResolvedGoalSource, ResolvedRunGoal, RunMode};
-use fabro_types::{DirtyStatus, GitContext, ManifestPath, WorkflowSettings};
-use fabro_workflow::git::{
-    GitSyncStatus, branch_needs_push, head_sha, push_branch_noninteractive, sync_status,
+use fabro_types::{
+    DirtyStatus, GitContext, GitHubRepositorySlug, GitRunTarget, ManifestPath, RunTarget,
+    WorkflowSettings,
 };
+use fabro_workflow::git::{self, GitSyncStatus};
 
+pub use crate::local_workflow_package::{
+    LocalWorkflowPackageError, ResolvedLocalWorkflowPackage, resolve_local_workflow_package,
+};
 use crate::workflow_bundler::WorkflowBundler;
+pub use crate::workflow_version_collector::{
+    CollectedWorkflowClosure, WorkflowVersionCollectError, collect_workflow_versions,
+};
 
 #[derive(Debug, Default)]
 pub struct ManifestBuildInput {
@@ -126,13 +135,7 @@ pub fn build_sparse_run_overrides(input: RunOverrideInput<'_>) -> Option<RunLaye
 }
 
 pub fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManifest> {
-    let root_location = WorkflowLocation::resolve(&input.workflow, &input.cwd)?;
-    if root_location.toml.is_none() && !root_location.graph.is_file() {
-        return Err(fabro_config::Error::WorkflowNotFound(
-            root_location.graph.display().to_string(),
-        )
-        .into());
-    }
+    let root_location = resolve_existing_workflow_location(&input.workflow, &input.cwd)?;
     let project_config = discover_project_config(&root_location.dir)?;
     let project_config_source = project_config
         .as_ref()
@@ -212,7 +215,7 @@ pub fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManifest> {
     )?;
 
     let configured_repo_origin_url = configured_repo_origin_url(&workflow_settings);
-    let git = build_git_context(&working_directory, configured_repo_origin_url.as_deref());
+    let git = build_legacy_git_context(&working_directory, configured_repo_origin_url.as_deref());
     let args = input.args.filter(|args| !manifest_args_is_empty(args));
 
     Ok(BuiltManifest {
@@ -303,13 +306,76 @@ fn resolved_goal_to_manifest(resolved: ResolvedRunGoal) -> types::ManifestGoal {
     }
 }
 
-fn build_git_context(
+/// Facts observed from one usable attached local Git checkout.
+///
+/// The optional target is absent when the checkout cannot be represented as a
+/// valid GitHub run target. Its SHA is present only when a successful push or
+/// a direct query of the remote proves that exact commit is available. The
+/// legacy projection retains the historical local SHA and normalized-origin
+/// behavior independently.
+#[derive(Clone, Debug)]
+pub struct GitRunTargetObservation {
+    pub run_target:         Option<GitRunTarget>,
+    pub legacy_git_context: GitContext,
+}
+
+/// Observe Git facts without choosing an environment or a non-Git target.
+///
+/// Outer `None` means `repo_path` is not a usable attached checkout. A
+/// returned observation with no target means Git facts were available but the
+/// effective origin or attached branch cannot be represented by a valid
+/// GitHub run target. For a valid target, this operation may contact the
+/// remote and may make one noninteractive best-effort push of the attached
+/// branch so clone-based execution can resolve the observed commit.
+#[must_use]
+pub fn observe_git_run_target(
     repo_path: &Path,
     configured_repo_origin_url: Option<&str>,
-) -> Option<GitContext> {
-    let (origin_url, branch) = detect_manifest_repo_info(repo_path)?;
-    let sha = head_sha(repo_path).ok();
-    let dirty = match sync_status(repo_path, "origin", Some(&branch)) {
+) -> Option<GitRunTargetObservation> {
+    let local = inspect_local_git(repo_path, configured_repo_origin_url)?;
+    let legacy_git_context = local.legacy_git_context;
+    let mut run_target = github_run_target(
+        &legacy_git_context.origin_url,
+        &legacy_git_context.branch,
+        None,
+    );
+    if let Some(target) = run_target.as_mut() {
+        let publish_status = publish_manifest_branch_best_effort(
+            repo_path,
+            &legacy_git_context.branch,
+            local.push_origin_url.as_deref(),
+            configured_repo_origin_url,
+        );
+        target.sha = remotely_available_sha(
+            repo_path,
+            &legacy_git_context.branch,
+            legacy_git_context.sha.as_deref(),
+            publish_status,
+        );
+    }
+
+    Some(GitRunTargetObservation {
+        run_target,
+        legacy_git_context,
+    })
+}
+
+struct LocalGitObservation {
+    push_origin_url:    Option<String>,
+    legacy_git_context: GitContext,
+}
+
+fn inspect_local_git(
+    repo_path: &Path,
+    configured_repo_origin_url: Option<&str>,
+) -> Option<LocalGitObservation> {
+    let ManifestRepoInfo {
+        origin_url,
+        push_origin_url,
+        branch,
+        sha,
+    } = detect_manifest_repo_info(repo_path)?;
+    let dirty = match git::sync_status(repo_path, "origin", Some(&branch)) {
         GitSyncStatus::Dirty => DirtyStatus::Dirty,
         GitSyncStatus::Synced | GitSyncStatus::Unsynced => DirtyStatus::Clean,
     };
@@ -323,18 +389,47 @@ fn build_git_context(
                 .filter(|url| !url.is_empty())
         })
         .unwrap_or_default();
-    push_manifest_branch_best_effort(
+
+    Some(LocalGitObservation {
+        push_origin_url,
+        legacy_git_context: GitContext {
+            origin_url: repo_origin_url,
+            branch,
+            sha,
+            dirty,
+        },
+    })
+}
+
+fn build_legacy_git_context(
+    repo_path: &Path,
+    configured_repo_origin_url: Option<&str>,
+) -> Option<GitContext> {
+    let local = inspect_local_git(repo_path, configured_repo_origin_url)?;
+    publish_manifest_branch_best_effort(
         repo_path,
-        &branch,
-        origin_url.as_deref(),
+        &local.legacy_git_context.branch,
+        local.push_origin_url.as_deref(),
         configured_repo_origin_url,
     );
-    Some(GitContext {
-        origin_url: repo_origin_url,
-        branch,
+    Some(local.legacy_git_context)
+}
+
+fn github_run_target(origin_url: &str, branch: &str, sha: Option<String>) -> Option<GitRunTarget> {
+    let (owner, repository) = fabro_github::parse_github_owner_repo(origin_url).ok()?;
+    let slug = GitHubRepositorySlug::try_new(&format!("{owner}/{repository}"))?;
+    let validated = RunTarget::Git(GitRunTarget {
+        repo: slug.to_string(),
+        branch: branch.to_owned(),
+        tag: None,
         sha,
-        dirty,
     })
+    .validate()
+    .ok()?;
+    let RunTarget::Git(target) = validated.target else {
+        unreachable!("a validated Git target must remain a Git target")
+    };
+    Some(target)
 }
 
 fn configured_repo_origin_url(settings: &WorkflowSettings) -> Option<String> {
@@ -356,28 +451,67 @@ fn configured_repo_origin_url(settings: &WorkflowSettings) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn detect_manifest_repo_info(repo_path: &Path) -> Option<(Option<String>, String)> {
+struct ManifestRepoInfo {
+    /// The `origin` URL as libgit2 reports it (after `insteadOf` rewrites).
+    origin_url:      Option<String>,
+    /// The raw configured `remote.origin.url`, used to compare repository
+    /// identity before pushing.
+    push_origin_url: Option<String>,
+    branch:          String,
+    sha:             Option<String>,
+}
+
+fn detect_manifest_repo_info(repo_path: &Path) -> Option<ManifestRepoInfo> {
     let repo = git2::Repository::discover(repo_path).ok()?;
-    let branch = repo.head().ok()?.shorthand().map(ToOwned::to_owned)?;
+    if repo.is_bare() {
+        return None;
+    }
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let branch = head.shorthand().map(ToOwned::to_owned)?;
+    let sha = head.target().map(|oid| oid.to_string());
     let origin_url = repo
         .find_remote("origin")
         .ok()
         .and_then(|remote| remote.url().map(ToOwned::to_owned));
-    Some((origin_url, branch))
+    // Keep the legacy observed URL above, but compare configured repository
+    // identity against the remote's raw config bytes. This lets a repository-
+    // local `url.*.insteadOf` redirect the existing push safely without making
+    // the rewrite target look like a different repository.
+    let push_origin_url = repo
+        .config()
+        .ok()
+        .and_then(|config| config.get_string("remote.origin.url").ok())
+        .or_else(|| origin_url.clone());
+    Some(ManifestRepoInfo {
+        origin_url,
+        push_origin_url,
+        branch,
+        sha,
+    })
 }
 
-/// Best-effort push of the local branch so clone-based execution can see
-/// local commits. A failed push must not fail manifest creation, and the
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchPublishStatus {
+    TrackingRefMatches,
+    Pushed,
+    Unavailable,
+}
+
+/// Best-effort publication of the local branch so clone-based execution can
+/// see local commits. A failed push must not fail manifest creation, and the
 /// discarded push error may contain raw Git stderr, so it is deliberately
 /// neither returned nor logged here.
-fn push_manifest_branch_best_effort(
+fn publish_manifest_branch_best_effort(
     repo_path: &Path,
     branch: &str,
     origin_url: Option<&str>,
     configured_repo_origin_url: Option<&str>,
-) {
+) -> BranchPublishStatus {
     let Some(origin_url) = origin_url else {
-        return;
+        return BranchPublishStatus::Unavailable;
     };
 
     if let Some(repo_origin_url) = configured_repo_origin_url
@@ -386,15 +520,59 @@ fn push_manifest_branch_best_effort(
     {
         let remote = fabro_github::normalize_repo_origin_url(origin_url);
         if remote != repo_origin_url {
-            return;
+            return BranchPublishStatus::Unavailable;
         }
     }
 
-    if !branch_needs_push(repo_path, "origin", branch) {
-        return;
+    if !git::branch_needs_push(repo_path, "origin", branch) {
+        return BranchPublishStatus::TrackingRefMatches;
     }
 
-    let _ = push_branch_noninteractive(repo_path, "origin", branch);
+    if git::push_branch_noninteractive(repo_path, "origin", branch).is_ok() {
+        BranchPublishStatus::Pushed
+    } else {
+        BranchPublishStatus::Unavailable
+    }
+}
+
+fn remotely_available_sha(
+    repo_path: &Path,
+    branch: &str,
+    local_sha: Option<&str>,
+    publish_status: BranchPublishStatus,
+) -> Option<String> {
+    let local_sha = local_sha?;
+    match publish_status {
+        BranchPublishStatus::Pushed => Some(local_sha.to_owned()),
+        BranchPublishStatus::TrackingRefMatches => {
+            git::remote_branch_sha_noninteractive(repo_path, "origin", branch)
+                .ok()
+                .flatten()
+                .filter(|remote_sha| remote_sha == local_sha)
+                .map(|_| local_sha.to_owned())
+        }
+        BranchPublishStatus::Unavailable => None,
+    }
+}
+
+/// Resolve a workflow reference and reject it when neither its config nor
+/// its graph exists on disk.
+/// A missing workflow surfaces as `fabro_config::Error::WorkflowNotFound`.
+#[expect(
+    clippy::result_large_err,
+    reason = "callers match on the concrete config error to classify missing workflows"
+)]
+fn resolve_existing_workflow_location(
+    workflow: &Path,
+    cwd: &Path,
+) -> Result<WorkflowLocation, fabro_config::Error> {
+    let location = WorkflowLocation::resolve(workflow, cwd)?;
+    if location.toml.is_none() && !location.graph.is_file() {
+        return Err(fabro_config::Error::WorkflowNotFound(
+            location.graph.display().to_string(),
+        ));
+    }
+    Ok(location)
 }
 
 fn normalize_absolute_path(base_dir: &Path, reference: &str) -> Option<PathBuf> {
@@ -449,6 +627,8 @@ pub(crate) mod test_fixtures {
 
 #[cfg(test)]
 mod tests {
+    use fabro_workflow::git::head_sha;
+
     use super::*;
 
     fn test_environment_defaults() -> MergeMap<EnvironmentLayer> {
@@ -1655,6 +1835,190 @@ exit 1
         });
 
         assert_eq!(std::fs::read_to_string(helper_log).unwrap(), "0\n");
+    }
+
+    #[test]
+    fn observes_synced_github_branch_as_an_exact_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare_origin = init_bare_origin(temp.path());
+        init_git_repo(&workspace, "feature", "https://github.com/acme/widgets.git");
+        let local_url = format!("file://{}", bare_origin.display());
+        run_git(&workspace, &[
+            "config",
+            &format!("url.{local_url}.insteadOf"),
+            "https://github.com/acme/widgets.git",
+        ]);
+        run_git(&workspace, &["push", "origin", "feature"]);
+
+        let observation =
+            observe_git_run_target(&workspace, Some("https://github.com/acme/widgets")).unwrap();
+        let target = observation.run_target.as_ref().unwrap();
+        let legacy = &observation.legacy_git_context;
+
+        assert_eq!(target.repo, "acme/widgets");
+        assert_eq!(target.branch, "feature");
+        assert_eq!(target.tag, None);
+        assert_eq!(target.sha, legacy.sha);
+        assert_eq!(legacy.dirty, DirtyStatus::Clean);
+        assert_eq!(legacy.origin_url, "https://github.com/acme/widgets");
+    }
+
+    #[test]
+    fn observes_exact_sha_only_after_a_successful_noninteractive_push() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare_origin = init_bare_origin(temp.path());
+        init_git_repo(&workspace, "feature", "https://github.com/acme/widgets");
+        let local_url = format!("file://{}", bare_origin.display());
+        run_git(&workspace, &[
+            "config",
+            &format!("url.{local_url}.insteadOf"),
+            "https://github.com/acme/widgets",
+        ]);
+
+        let observation =
+            observe_git_run_target(&workspace, Some("https://github.com/acme/widgets")).unwrap();
+        let target = observation.run_target.as_ref().unwrap();
+
+        assert_eq!(target.sha, observation.legacy_git_context.sha);
+        assert_eq!(bare_remote_branch_sha(&bare_origin, "feature"), target.sha);
+    }
+
+    #[test]
+    fn stale_matching_tracking_ref_produces_a_branch_only_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare_origin = init_bare_origin(temp.path());
+        init_git_repo(&workspace, "feature", "https://github.com/acme/widgets");
+        let local_url = format!("file://{}", bare_origin.display());
+        run_git(&workspace, &[
+            "config",
+            &format!("url.{local_url}.insteadOf"),
+            "https://github.com/acme/widgets",
+        ]);
+        run_git(&workspace, &["push", "origin", "feature"]);
+        run_git(&workspace, &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            "local-only",
+        ]);
+        mark_origin_branch_synced(&workspace, "feature");
+
+        let observation =
+            observe_git_run_target(&workspace, Some("https://github.com/acme/widgets")).unwrap();
+        let target = observation.run_target.as_ref().unwrap();
+
+        assert_eq!(target.sha, None);
+        assert!(observation.legacy_git_context.sha.is_some());
+        assert_ne!(
+            bare_remote_branch_sha(&bare_origin, "feature"),
+            observation.legacy_git_context.sha,
+        );
+    }
+
+    #[test]
+    fn branches_that_are_invalid_run_selectors_do_not_produce_git_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let invalid_branches = [
+            "heads/topic",
+            "tags/release",
+            "0123456789abcdef0123456789abcdef01234567",
+        ];
+
+        for (index, branch) in invalid_branches.into_iter().enumerate() {
+            let workspace = temp.path().join(format!("workspace-{index}"));
+            std::fs::create_dir_all(&workspace).unwrap();
+            init_git_repo(&workspace, branch, "https://github.com/acme/widgets");
+
+            let observation = observe_git_run_target(&workspace, None).unwrap();
+
+            assert_eq!(observation.run_target, None, "branch {branch}");
+            assert_eq!(observation.legacy_git_context.branch, branch);
+        }
+    }
+
+    #[test]
+    fn failed_push_and_origin_mismatch_produce_branch_only_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let failed_workspace = temp.path().join("failed");
+        std::fs::create_dir_all(&failed_workspace).unwrap();
+        init_git_repo(
+            &failed_workspace,
+            "feature",
+            "https://github.com/acme/widgets",
+        );
+        let missing_url = format!("file://{}/missing.git", temp.path().display());
+        run_git(&failed_workspace, &[
+            "config",
+            &format!("url.{missing_url}.insteadOf"),
+            "https://github.com/acme/widgets",
+        ]);
+
+        let failed =
+            observe_git_run_target(&failed_workspace, Some("https://github.com/acme/widgets"))
+                .unwrap();
+        assert_eq!(failed.run_target.as_ref().unwrap().sha, None);
+        assert!(failed.legacy_git_context.sha.is_some());
+        assert_eq!(failed.legacy_git_context.dirty, DirtyStatus::Clean);
+
+        let mismatched_workspace = temp.path().join("mismatched");
+        std::fs::create_dir_all(&mismatched_workspace).unwrap();
+        let bare_origin = init_bare_origin(&temp.path().join("other"));
+        init_git_repo(
+            &mismatched_workspace,
+            "feature",
+            bare_origin.to_str().unwrap(),
+        );
+
+        let mismatched = observe_git_run_target(
+            &mismatched_workspace,
+            Some("https://github.com/acme/configured"),
+        )
+        .unwrap();
+        let target = mismatched.run_target.as_ref().unwrap();
+        assert_eq!(target.repo, "acme/configured");
+        assert_eq!(target.sha, None);
+        assert_eq!(bare_remote_branch_sha(&bare_origin, "feature"), None);
+    }
+
+    #[test]
+    fn git_observation_distinguishes_dirty_unsupported_and_unusable_checkouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare_origin = init_bare_origin(temp.path());
+        init_git_repo(&workspace, "feature", bare_origin.to_str().unwrap());
+        std::fs::write(workspace.join("dirty.txt"), "dirty").unwrap();
+
+        let unsupported = observe_git_run_target(&workspace, None).unwrap();
+        assert!(unsupported.run_target.is_none());
+        assert_eq!(unsupported.legacy_git_context.dirty, DirtyStatus::Dirty);
+        assert_eq!(
+            unsupported.legacy_git_context.origin_url,
+            fabro_github::normalize_repo_origin_url(&bare_origin.to_string_lossy()),
+        );
+
+        let not_repo = temp.path().join("not-repo");
+        std::fs::create_dir_all(&not_repo).unwrap();
+        assert!(observe_git_run_target(&not_repo, None).is_none());
+
+        let unborn = temp.path().join("unborn");
+        std::fs::create_dir_all(&unborn).unwrap();
+        run_git(&unborn, &["init", "--quiet"]);
+        assert!(observe_git_run_target(&unborn, None).is_none());
+
+        run_git(&workspace, &["checkout", "--detach", "--quiet"]);
+        assert!(observe_git_run_target(&workspace, None).is_none());
     }
 
     fn init_git_repo(path: &Path, branch: &str, origin_url: &str) {

@@ -1,10 +1,6 @@
 // Pan/zoom viewport math for the run graph. There's no React in here, so it can be
 // unit-tested on its own. Zoom is a continuous percentage rather than a discrete step
 // index, which is what keeps cursor-anchored ⌘-scroll zoom smooth.
-//
-// The playground canvas (components/playground/canvas) has the same hand-rolled
-// pan/zoom but still uses a discrete step index. If it ever wants cursor-anchored
-// zoom, it can import this module.
 
 export const GRAPH_MIN_ZOOM = 25; // percent; the clamp bounds. Widen if you want more range.
 export const GRAPH_MAX_ZOOM_TB = 200; // top-down orientation

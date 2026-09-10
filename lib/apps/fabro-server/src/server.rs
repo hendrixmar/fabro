@@ -29,28 +29,27 @@ pub use fabro_api::types::{
     BatchRunLifecycleResponse, BatchRunLifecycleResult, BatchRunLifecycleResultOutcome,
     BatchRunLifecycleSummary, BillingByModel, BillingStageRef, CloseRunPullRequestResponse,
     CompletionResponse, CompletionToolChoiceMode, CompletionUsage, CreateCompletionRequest,
-    CreatePlaygroundChatRequest, CreateRunPullRequestRequest, CreateSecretRequest,
-    CreateVariableRequest, DeleteRunResponse, DeleteRunSandbox, DeleteSecretRequest,
-    DenyRunRequest, DiskUsageResponse, DiskUsageRunRow, DiskUsageSummaryRow, ErrorResponseEntry,
-    ForkRequest, ForkResponse, IntegrationConnectionKind, IntegrationConnectionState,
-    IntegrationConnectionStatus, IntegrationProvider, IntegrationStatus, LinkRunPullRequestRequest,
-    MergeRunPullRequestRequest, MergeRunPullRequestResponse, ModelReference, PaginatedEventList,
-    PaginatedRunList, PaginationMeta, PreflightResponse, PreviewUrlRequest, PreviewUrlResponse,
-    Provider, ProviderCredentialTestRequest, ProviderCredentialTestResponse, ProviderList,
-    PruneRunEntry, PruneRunsRequest, PruneRunsResponse, RenderWorkflowGraphDirection,
-    RenderWorkflowGraphRequest, RewindRequest, RewindResponse, Run, RunArtifactEntry,
-    RunArtifactListResponse, RunBilling, RunBillingStage, RunBillingTotals, RunError, RunManifest,
-    RunStage, SandboxDetails, SandboxFileEntry, SandboxFileListResponse, SandboxService,
-    SandboxServiceListResponse, SshAccessRequest, SshAccessResponse, StageHandler, StageState,
-    StartRunRequest, SubmitAnswerRequest, SystemCpuResourceScope, SystemCpuResources,
-    SystemDiskResourceScope, SystemDiskResources, SystemInfoResponse, SystemIntegrationStatus,
-    SystemIntegrationsResponse, SystemMemoryResourceScope, SystemMemoryResources,
-    SystemRepairRunIssue, SystemRepairRunsResponse, SystemResourcesResponse, SystemRunCounts,
-    TimelineEntryResponse, UpdateVariableRequest, VariableListResponse, VncPreviewResponse,
-    WriteBlobResponse,
+    CreateRunPullRequestRequest, CreateSecretRequest, CreateVariableRequest, DeleteRunResponse,
+    DeleteRunSandbox, DeleteSecretRequest, DenyRunRequest, DiskUsageResponse, DiskUsageRunRow,
+    DiskUsageSummaryRow, ErrorResponseEntry, ForkRequest, ForkResponse, IntegrationConnectionKind,
+    IntegrationConnectionState, IntegrationConnectionStatus, IntegrationProvider,
+    IntegrationStatus, LinkRunPullRequestRequest, MergeRunPullRequestRequest,
+    MergeRunPullRequestResponse, ModelReference, PaginatedEventList, PaginatedRunList,
+    PaginationMeta, PreflightResponse, PreviewUrlRequest, PreviewUrlResponse, Provider,
+    ProviderCredentialTestRequest, ProviderCredentialTestResponse, ProviderList, PruneRunEntry,
+    PruneRunsRequest, PruneRunsResponse, RenderWorkflowGraphDirection, RenderWorkflowGraphRequest,
+    RewindRequest, RewindResponse, Run, RunArtifactEntry, RunArtifactListResponse, RunBilling,
+    RunBillingStage, RunBillingTotals, RunError, RunManifest, RunStage, SandboxDetails,
+    SandboxFileEntry, SandboxFileListResponse, SandboxService, SandboxServiceListResponse,
+    SshAccessRequest, SshAccessResponse, StageHandler, StageState, StartRunRequest,
+    SubmitAnswerRequest, SystemCpuResourceScope, SystemCpuResources, SystemDiskResourceScope,
+    SystemDiskResources, SystemInfoResponse, SystemIntegrationStatus, SystemIntegrationsResponse,
+    SystemMemoryResourceScope, SystemMemoryResources, SystemRepairRunIssue,
+    SystemRepairRunsResponse, SystemResourcesResponse, SystemRunCounts, TimelineEntryResponse,
+    UpdateVariableRequest, VariableListResponse, VncPreviewResponse, WriteBlobResponse,
 };
 use fabro_auth::{CredentialSource, SqlVaultCredentialSource, auth_issue_message};
-use fabro_automation::{AutomationStore, PlaneDispatchStore};
+use fabro_automation::{self, AutomationStore, PlaneDispatchStore};
 use fabro_config::daemon::ServerDaemon;
 use fabro_config::{RunLayer, Storage, WorkflowSettingsBuilder};
 use fabro_db::DbPool;
@@ -85,8 +84,9 @@ use fabro_slack::threads::ThreadRegistry;
 use fabro_slack::{blocks as slack_blocks, connection as slack_connection};
 use fabro_static::EnvVars;
 use fabro_store::{
-    ArtifactKey, ArtifactStore, CachedRunProjection, Database, EventEnvelope, EventPayload,
-    KeyedMutex, NodeArtifact, PendingInterviewRecord, RunSummaryStore, StageArtifactEntry, StageId,
+    ArtifactKey, ArtifactStore, AuthCodeStore, AuthSessionStore, Database, EventEnvelope,
+    EventPayload, KeyedMutex, NodeArtifact, PendingInterviewRecord, RunSummaryStore,
+    StageArtifactEntry, StageId,
 };
 #[cfg(test)]
 use fabro_types::BlockedReason;
@@ -99,7 +99,7 @@ use fabro_types::{
     AgentBackend, AskFabro, AskFabroUnavailableReason, BlobHash, EventBody,
     InterviewQuestionRecord, PairId, PairMessageId, PairTarget, PendingReason, Principal,
     PullRequestLink, QuestionType, RunControlAction, RunEvent, RunId, RunRunnableSource,
-    SandboxProviderKind, ServerSettings, SessionCapability,
+    RunStatusKind, SandboxProviderKind, ServerSettings, SessionCapability,
 };
 use fabro_util::error::{
     SharedError, collect_causes, render_compact_with_causes, render_with_causes,
@@ -177,7 +177,7 @@ mod automation_scheduler;
 mod handler;
 pub(crate) mod incident_intake;
 mod pull_request_supervisor;
-mod resource_sampler;
+pub(crate) mod resource_sampler;
 mod session_runtime;
 
 pub(crate) use automation_plane::spawn_plane_dispatcher;
@@ -797,8 +797,8 @@ impl SlackService {
             return;
         };
         let event_name = event.body.event_name();
-        let projection = match state.stores.runs.get_cached_run(&event.run_id).await {
-            Ok(Some(cached)) => cached.projection,
+        let projection = match state.stores.runs.load_run_projection(&event.run_id).await {
+            Ok(Some(projection)) => projection,
             Ok(None) => {
                 warn!(
                     run_id = %event.run_id,
@@ -1126,6 +1126,7 @@ pub struct AppState {
     scheduler_notify: Notify,
     automation_scheduler_notify: Notify,
     pull_request_scheduler_notify: Notify,
+    pull_request_creation_queue: Mutex<pull_request_supervisor::PendingPullRequestCreationQueue>,
     global_event_tx: broadcast::Sender<EventEnvelope>,
     /// Per-run coalescing registry for `GET /runs/{id}/files`. Concurrent
     /// callers for the same run share one materialization; different runs
@@ -1157,6 +1158,8 @@ pub struct AppState {
 pub(crate) struct AppStores {
     pub(crate) runs:             Arc<Database>,
     pub(crate) run_summaries:    Arc<RunSummaryStore>,
+    pub(crate) auth_codes:       Arc<AuthCodeStore>,
+    pub(crate) auth_sessions:    Arc<AuthSessionStore>,
     pub(crate) automations:      Arc<AutomationStore>,
     pub(crate) plane_dispatches: Arc<PlaneDispatchStore>,
     pub(crate) incidents:        Arc<incident_intake::IncidentStore>,
@@ -1164,6 +1167,22 @@ pub(crate) struct AppStores {
     pub(crate) mcp_servers:      Arc<McpServerStore>,
     pub(crate) vault:            Arc<SecretStore>,
     pub(crate) variables:        Arc<VariableStore>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl AppState {
+    /// Access the auth session store so tests can seed CLI sessions against
+    /// the same SQLite pool the router reads from.
+    #[must_use]
+    pub fn test_auth_session_store(&self) -> &Arc<AuthSessionStore> {
+        &self.stores.auth_sessions
+    }
+
+    /// Access the auth-code store used by this router.
+    #[must_use]
+    pub fn test_auth_code_store(&self) -> &Arc<AuthCodeStore> {
+        &self.stores.auth_codes
+    }
 }
 
 impl AppState {
@@ -1200,13 +1219,13 @@ impl AppState {
         let credentials = self
             .github_credentials(&settings.server.integrations.github)
             .await
-            .map_err(|err| RunMaterializeError::Credentials(err.to_string()))?;
+            .map_err(|source| RunMaterializeError::LoadCredentials { source })?;
         ProductionAutomationRunMaterializer::new(
             credentials,
             self.github_api_base_url.clone(),
             self.http_client.clone(),
-            (*self.stores.environments.catalog_layer()).clone(),
             Arc::clone(&self.automation_repo_cache),
+            fabro_workflow_version::WorkflowVersionStore::new(self.store_ref().blobs()),
         )
         .materialize(input)
         .await
@@ -1470,6 +1489,15 @@ impl AppState {
         &self,
         api_key: String,
     ) -> anyhow::Result<daytona::DaytonaKeyCheck> {
+        self.check_daytona_api_key_with_timeout(api_key, daytona::DAYTONA_CREDENTIAL_PROBE_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn check_daytona_api_key_with_timeout(
+        &self,
+        api_key: String,
+        probe_timeout: Duration,
+    ) -> anyhow::Result<daytona::DaytonaKeyCheck> {
         let base_url = self
             .config_env_lookup(EnvVars::DAYTONA_API_URL)
             .or_else(|| self.config_env_lookup(EnvVars::DAYTONA_SERVER_URL))
@@ -1477,8 +1505,14 @@ impl AppState {
         let org_id = self.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
 
         let http_client = fabro_http::http_client().context("failed to build HTTP client")?;
-        daytona::check_daytona_api_key_with(&base_url, org_id.as_deref(), api_key, http_client)
-            .await
+        daytona::check_daytona_api_key_with_timeout(
+            &base_url,
+            org_id.as_deref(),
+            api_key,
+            http_client,
+            probe_timeout,
+        )
+        .await
     }
 
     /// Borrow the persistent store so sibling modules can open run readers
@@ -1487,27 +1521,16 @@ impl AppState {
         &self.stores.runs
     }
 
-    /// Current cached projection for `run_id`, with the standard HTTP error
+    /// Loads the current projection for `run_id`, with the standard HTTP error
     /// mapping: storage failures become 500s and a missing run becomes the
     /// canonical 404.
-    pub(crate) async fn cached_run(&self, run_id: &RunId) -> Result<CachedRunProjection, ApiError> {
-        self.stores
-            .runs
-            .get_cached_run(run_id)
-            .await
-            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-            .ok_or_else(|| ApiError::not_found("Run not found."))
-    }
-
-    /// Like [`Self::cached_run`], but returns only the shared projection —
-    /// no run summary clone or children count under the cache mutex.
-    pub(crate) async fn cached_run_projection(
+    pub(crate) async fn load_run_projection(
         &self,
         run_id: &RunId,
     ) -> Result<Arc<fabro_store::RunProjection>, ApiError> {
         self.stores
             .runs
-            .get_cached_projection(run_id)
+            .load_run_projection(run_id)
             .await
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
             .ok_or_else(|| ApiError::not_found("Run not found."))
@@ -2418,6 +2441,13 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         automation_materializer_override,
     } = config;
 
+    let automation_migration_pool = db_pool.clone();
+    load_store_blocking("automation environment migration", move || async move {
+        fabro_automation::backfill_environment_selectors(&automation_migration_pool)
+            .await
+            .map_err(anyhow::Error::new)
+    })
+    .context("backfill automation environment selectors")?;
     let automation_store = Arc::new(AutomationStore::new(db_pool.clone()));
     let plane_dispatch_store = Arc::new(PlaneDispatchStore::new(db_pool.clone()));
     let incident_store = Arc::new(incident_intake::IncidentStore::new(db_pool.clone()));
@@ -2437,8 +2467,9 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         })
         .context("load environments")?,
     );
-    let run_summaries =
-        store.attach_run_summary_store(Arc::new(RunSummaryStore::new(db_pool.clone())));
+    let run_summaries = store.run_summary_store();
+    let auth_codes = Arc::new(AuthCodeStore::new(db_pool.clone()));
+    let auth_sessions = Arc::new(AuthSessionStore::new(db_pool.clone()));
     let mcp_server_dir = mcp_server_dir_for_active_config(&active_config_path);
     let mcp_server_pool = db_pool.clone();
     let mcp_server_store = Arc::new(
@@ -2545,6 +2576,8 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         stores: AppStores {
             runs: store,
             run_summaries,
+            auth_codes,
+            auth_sessions,
             automations: automation_store,
             plane_dispatches: plane_dispatch_store,
             incidents: incident_store,
@@ -2567,6 +2600,9 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         scheduler_notify: Notify::new(),
         automation_scheduler_notify: Notify::new(),
         pull_request_scheduler_notify: Notify::new(),
+        pull_request_creation_queue: Mutex::new(
+            pull_request_supervisor::PendingPullRequestCreationQueue::default(),
+        ),
         global_event_tx,
         files_in_flight: new_files_in_flight(),
         pull_request_create_locks: KeyedMutex::new(),
@@ -2641,7 +2677,7 @@ async fn delete_run_internal(
     };
     let had_managed_run = managed_run.is_some();
     let durable_status = if managed_run.is_some() {
-        load_durable_run_status(state, &id).await
+        durable_run_status(state, id).await.ok().flatten()
     } else {
         None
     };
@@ -2706,11 +2742,6 @@ async fn delete_run_internal(
         SandboxDeleteOutcome::Absent if had_managed_run => Ok(DeleteRunOutcome::Deleted),
         SandboxDeleteOutcome::Absent => Ok(DeleteRunOutcome::AlreadyAbsent),
     }
-}
-
-async fn load_durable_run_status(state: &AppState, id: &RunId) -> Option<RunStatus> {
-    let cached = state.cached_run(id).await.ok()?;
-    Some(cached.projection.status)
 }
 
 async fn delete_run_sandbox_resource(
@@ -2829,7 +2860,7 @@ async fn reject_active_delete_without_force(
         return Ok(());
     }
 
-    match state.stores.runs.runs().find(run_id).await {
+    match state.stores.run_summaries.get(run_id, Utc::now()).await {
         Ok(Some(summary)) if summary.lifecycle.status.requires_force_to_delete() => {
             Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -3068,46 +3099,52 @@ struct LiveWorkerProcess {
     worker_ref: WorkerRef,
 }
 
-fn failure_for_incomplete_run(
+/// Pick the terminal failure for a run that never produced its own terminal
+/// event. A pending cancel wins over whatever failure the caller observed, so a
+/// run that was cancelled while its worker was launching or dying is recorded
+/// as cancelled rather than as broken.
+fn failure_honoring_pending_cancel(
     pending_control: Option<RunControlAction>,
-    terminated_message: String,
+    otherwise: impl FnOnce() -> (WorkflowError, FailureReason),
 ) -> (WorkflowError, FailureReason) {
     if pending_control == Some(RunControlAction::Cancel) {
         (WorkflowError::Cancelled, FailureReason::Cancelled)
     } else {
+        otherwise()
+    }
+}
+
+fn failure_for_incomplete_run(
+    pending_control: Option<RunControlAction>,
+    terminated_message: String,
+) -> (WorkflowError, FailureReason) {
+    failure_honoring_pending_cancel(pending_control, || {
         (
             WorkflowError::engine(terminated_message),
             FailureReason::Terminated,
         )
-    }
-}
-
-fn should_reconcile_run_on_startup(status: RunStatus) -> bool {
-    matches!(
-        status,
-        RunStatus::Starting
-            | RunStatus::Running
-            | RunStatus::Blocked { .. }
-            | RunStatus::Paused { .. }
-            | RunStatus::Removing
-    )
+    })
 }
 
 pub(crate) async fn reconcile_incomplete_runs_on_startup(
     state: &Arc<AppState>,
 ) -> anyhow::Result<usize> {
+    const RECONCILABLE_STATUSES: &[RunStatusKind] = &[
+        RunStatusKind::Runnable,
+        RunStatusKind::Starting,
+        RunStatusKind::Running,
+        RunStatusKind::Blocked,
+        RunStatusKind::Paused,
+        RunStatusKind::Removing,
+    ];
     let summaries = state
         .stores
-        .runs
-        .list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now())
+        .run_summaries
+        .list_by_statuses(RECONCILABLE_STATUSES, chrono::Utc::now())
         .await?;
     let mut reconciled = 0usize;
 
     for summary in summaries {
-        if !should_reconcile_run_on_startup(summary.lifecycle.status) {
-            continue;
-        }
-
         let run_store = state.stores.runs.open_run(&summary.id).await?;
         let (error, reason) = failure_for_incomplete_run(
             summary.lifecycle.pending_control,
@@ -3395,9 +3432,8 @@ async fn load_pending_control(
 ) -> anyhow::Result<Option<RunControlAction>> {
     Ok(state
         .stores
-        .runs
-        .runs()
-        .find(&run_id)
+        .run_summaries
+        .get(&run_id, Utc::now())
         .await?
         .and_then(|summary| summary.lifecycle.pending_control))
 }
@@ -3405,9 +3441,8 @@ async fn load_pending_control(
 async fn durable_run_status(state: &AppState, run_id: RunId) -> anyhow::Result<Option<RunStatus>> {
     Ok(state
         .stores
-        .runs
-        .runs()
-        .find(&run_id)
+        .run_summaries
+        .get(&run_id, Utc::now())
         .await?
         .map(|summary| summary.lifecycle.status))
 }
@@ -3603,18 +3638,40 @@ async fn fail_worker_launch(
     err: anyhow::Error,
 ) {
     tracing::error!(run_id = %run_id, error = %err, "Failed to spawn worker");
-    let message = format!("Failed to spawn worker: {err}");
+    let pending_control = match run_store.state().await {
+        Ok(run_state) => run_state.pending_control,
+        Err(state_err) => {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %state_err,
+                "Failed to load run state after worker launch failure"
+            );
+            None
+        }
+    };
+    let launch_message = format!("Failed to spawn worker: {err}");
+    let (error, reason) = failure_honoring_pending_cancel(pending_control, || {
+        (
+            WorkflowError::engine_with_anyhow("Failed to spawn worker", err),
+            FailureReason::LaunchFailed,
+        )
+    });
+    let message = if reason == FailureReason::Cancelled {
+        "Run cancelled before worker launch completed".to_string()
+    } else {
+        launch_message
+    };
     let failure_event = workflow_event::Event::workflow_run_failed_from_error(
-        &WorkflowError::engine_with_anyhow("Failed to spawn worker", err),
+        &error,
         fabro_types::RunTiming::default(),
-        FailureReason::LaunchFailed,
+        reason,
         None,
         None,
         None,
         None,
     );
     let _ = workflow_event::append_event(run_store, &run_id, &failure_event).await;
-    fail_managed_run(state, run_id, FailureReason::LaunchFailed, message);
+    fail_managed_run(state, run_id, reason, message);
     state.scheduler_notify.notify_one();
 }
 
@@ -3767,11 +3824,11 @@ async fn load_pending_interview(
     run_id: RunId,
     qid: &str,
 ) -> Result<LoadedPendingInterview, Response> {
-    let cached = state
-        .cached_run(&run_id)
+    let projection = state
+        .load_run_projection(&run_id)
         .await
         .map_err(IntoResponse::into_response)?;
-    let Some(record) = cached.projection.pending_interviews.get(qid) else {
+    let Some(record) = projection.pending_interviews.get(qid) else {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "Question no longer exists or was already answered.",
@@ -4112,15 +4169,15 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
             return;
         }
     };
-    let github_permissions = match persisted
+    let github_integration = match persisted
         .run_spec()
         .settings
         .run
         .integrations
         .github
-        .resolve_permissions()
+        .resolve_integration()
     {
-        Ok(permissions) => permissions,
+        Ok(integration) => integration,
         Err(err) => {
             tracing::error!(
                 run_id = %run_id,
@@ -4162,7 +4219,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         artifact_sink: Some(ArtifactSink::Store(state.artifact_store.clone())),
         run_control: None,
         github_app,
-        github_permissions,
+        github_integration,
         vault: Arc::new(AsyncRwLock::new(vault.into_vault())),
         catalog: state.catalog(),
         on_node: None,
@@ -4566,8 +4623,14 @@ async fn append_control_request(
 /// run is currently archived. Returns `None` otherwise (including when the run
 /// doesn't exist — the caller's own not-found handling will surface that).
 async fn reject_if_archived(state: &AppState, run_id: &RunId) -> Option<Response> {
-    let cached = state.cached_run(run_id).await.ok()?;
-    cached.projection.archived_at.is_some().then(|| {
+    let summary = state
+        .stores
+        .run_summaries
+        .get(run_id, Utc::now())
+        .await
+        .ok()
+        .flatten()?;
+    summary.lifecycle.archived_at.is_some().then(|| {
         ApiError::new(
             StatusCode::CONFLICT,
             operations::archived_rejection_message(run_id),

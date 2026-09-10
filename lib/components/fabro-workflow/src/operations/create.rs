@@ -13,17 +13,18 @@ use std::sync::Arc;
 use fabro_config::Storage;
 use fabro_graphviz::graph::{AttrValue, Graph};
 use fabro_model::{Catalog, ProviderId};
-use fabro_store::Database;
+use fabro_store::{BlobStore, Database};
 use fabro_template::TemplateContext;
 use fabro_types::{
-    AutomationRef, ForkSourceRef, GitContext, ManifestPath, RunId, RunProvenance, WorkflowSettings,
+    AutomationRef, BlobHash, ForkSourceRef, GitContext, ManifestPath, RunId, RunProvenance,
+    RunTarget, WorkflowSettings, WorkflowVersionId,
 };
 use fabro_util::json::normalize_json_value;
 use tokio::task::spawn_blocking;
 
 use super::source::{ResolveWorkflowInput, WorkflowInput, resolve_workflow};
 use crate::error::Error;
-use crate::event::{Event, append_event, to_run_event_at};
+use crate::event::{self, Event, append_event};
 use crate::pipeline::types::PersistOptions;
 use crate::pipeline::{self, Persisted, TransformOptions, Validated};
 use crate::records::RunSpec;
@@ -43,6 +44,7 @@ pub struct CreateRunInput {
     pub workflow_slug: Option<String>,
     pub workflow_path: Option<ManifestPath>,
     pub workflow_bundle: Option<WorkflowBundle>,
+    pub target: Option<RunTarget>,
     pub submitted_manifest_bytes: Option<Vec<u8>>,
     pub run_id: Option<RunId>,
     pub title: Option<String>,
@@ -74,6 +76,7 @@ impl CreateRunInput {
             workflow_slug,
             workflow_path,
             workflow_bundle,
+            target,
             submitted_manifest_bytes,
             run_id: _,
             title,
@@ -99,6 +102,8 @@ impl CreateRunInput {
                 run_id,
                 storage_root,
                 workflow_slug,
+                workflow_version_id: None,
+                target,
                 submitted_manifest_bytes,
                 title,
                 automation,
@@ -132,6 +137,8 @@ pub struct CreateRunPersistenceMetadata {
     pub run_id: RunId,
     pub storage_root: PathBuf,
     pub workflow_slug: Option<String>,
+    pub workflow_version_id: Option<WorkflowVersionId>,
+    pub target: Option<RunTarget>,
     pub submitted_manifest_bytes: Option<Vec<u8>>,
     pub title: Option<String>,
     pub automation: Option<AutomationRef>,
@@ -201,6 +208,8 @@ pub struct CreateRunPersistenceInput {
     run_id: RunId,
     run_dir: PathBuf,
     workflow_slug: Option<String>,
+    workflow_version_id: Option<WorkflowVersionId>,
+    target: Option<RunTarget>,
     submitted_manifest_bytes: Option<Vec<u8>>,
     title: Option<String>,
     automation: Option<AutomationRef>,
@@ -226,6 +235,10 @@ impl CreateRunPersistenceInput {
 
     pub fn workflow_slug(&self) -> Option<&str> {
         self.workflow_slug.as_deref()
+    }
+
+    pub fn workflow_version_id(&self) -> Option<WorkflowVersionId> {
+        self.workflow_version_id
     }
 
     pub fn submitted_manifest_bytes(&self) -> Option<&[u8]> {
@@ -396,6 +409,8 @@ pub fn assemble_create_run_persistence_input(
         run_id,
         storage_root,
         workflow_slug,
+        workflow_version_id,
+        target,
         submitted_manifest_bytes,
         title,
         automation,
@@ -416,6 +431,8 @@ pub fn assemble_create_run_persistence_input(
         run_id,
         run_dir,
         workflow_slug,
+        workflow_version_id,
+        target,
         submitted_manifest_bytes,
         title,
         automation,
@@ -437,6 +454,8 @@ pub async fn persist_create_run(
         run_id,
         run_dir,
         workflow_slug,
+        workflow_version_id,
+        target,
         submitted_manifest_bytes,
         title,
         automation,
@@ -456,6 +475,11 @@ pub async fn persist_create_run(
         source_directory,
         labels,
     } = materialized;
+    let (source_directory, git) = match target.as_ref() {
+        Some(RunTarget::None {}) => (None, None),
+        Some(RunTarget::Folder { path }) => (Some(path.clone()), git),
+        Some(RunTarget::Git(_)) | None => (Some(source_directory), git),
+    };
     let persisted_run_dir = run_dir.clone();
     let persisted = spawn_blocking(move || {
         let run_spec = RunSpec {
@@ -464,12 +488,15 @@ pub async fn persist_create_run(
             graph: validated.graph().clone(),
             graph_source: Some(validated.source().to_string()),
             workflow_slug,
+            workflow_version_id,
+            target,
             automation,
-            source_directory: Some(source_directory),
+            source_directory,
             labels,
             provenance,
             manifest_blob: None,
             definition_blob: None,
+            spec_blob: None,
             git,
             fork_source_ref,
         };
@@ -512,67 +539,57 @@ async fn persist_created_run(
     web_url: Option<String>,
 ) -> Result<(), Error> {
     let record = persisted.run_spec();
-    let run_store = store
-        .create_run(&record.run_id)
-        .await
-        .map_err(|err| Error::engine_with_source("failed to create run store", err))?;
-    let manifest_blob = match submitted_manifest_bytes {
-        Some(bytes) => Some(run_store.write_blob(bytes).await.map_err(store_error)?),
-        None => None,
-    };
-    let definition_blob = match accepted_definition {
-        Some(definition) => {
-            let bytes =
-                serde_json::to_vec(definition).map_err(|err| Error::engine(err.to_string()))?;
-            Some(run_store.write_blob(&bytes).await.map_err(store_error)?)
-        }
-        None => None,
-    };
+    let definition_bytes = accepted_definition
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|err| Error::engine_with_source("failed to serialize run definition", err))?;
+    let spec_bytes = serde_json::to_vec(record)
+        .map_err(|err| Error::engine_with_source("failed to serialize run spec", err))?;
+    let blob_store = store.blobs();
+    let (manifest_blob, definition_blob, spec_blob) = tokio::try_join!(
+        write_optional_blob(&blob_store, submitted_manifest_bytes),
+        write_optional_blob(&blob_store, definition_bytes.as_deref()),
+        async { blob_store.write(&spec_bytes).await.map_err(store_error) },
+    )?;
 
     let title = explicit_title.unwrap_or_else(|| fabro_types::infer_run_title(record.graph.goal()));
-    let stored = to_run_event_at(
+    let first_event = Event::RunCreated {
+        run_id: record.run_id,
+        title: Some(title),
+        settings: normalize_json_value(
+            serde_json::to_value(&record.settings).map_err(|err| Error::engine(err.to_string()))?,
+        ),
+        graph: normalize_json_value(
+            serde_json::to_value(&record.graph).map_err(|err| Error::engine(err.to_string()))?,
+        ),
+        workflow_source: (!workflow_source.is_empty()).then(|| workflow_source.to_string()),
+        labels: record
+            .labels
+            .clone()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+        source_directory: record.source_directory.clone(),
+        workflow_slug: record.workflow_slug.clone(),
+        workflow_version_id: record.workflow_version_id,
+        target: record.target.clone(),
+        automation: record.automation.clone(),
+        provenance: record.provenance.clone(),
+        manifest_blob,
+        spec_blob: Some(spec_blob),
+        git: record.git.clone(),
+        fork_source_ref: record.fork_source_ref.clone(),
+        retried_from: None,
+        parent_id,
+        web_url,
+    };
+    let run_store = event::create_run(
+        store,
         &record.run_id,
-        &Event::RunCreated {
-            run_id: record.run_id,
-            title: Some(title),
-            settings: normalize_json_value(
-                serde_json::to_value(&record.settings)
-                    .map_err(|err| Error::engine(err.to_string()))?,
-            ),
-            graph: normalize_json_value(
-                serde_json::to_value(&record.graph)
-                    .map_err(|err| Error::engine(err.to_string()))?,
-            ),
-            workflow_source: (!workflow_source.is_empty()).then(|| workflow_source.to_string()),
-            labels: record
-                .labels
-                .clone()
-                .into_iter()
-                .collect::<BTreeMap<_, _>>(),
-            source_directory: record.source_directory.clone(),
-            workflow_slug: record.workflow_slug.clone(),
-            automation: record.automation.clone(),
-            provenance: record.provenance.clone(),
-            manifest_blob,
-            git: record.git.clone(),
-            fork_source_ref: record.fork_source_ref.clone(),
-            retried_from: None,
-            parent_id,
-            web_url,
-        },
+        &first_event,
         record.run_id.created_at(),
-        None,
-    );
-    let payload = fabro_store::EventPayload::new(
-        serde_json::to_value(&stored).map_err(|err| Error::engine(err.to_string()))?,
-        &record.run_id,
     )
-    .map_err(store_error)?;
-    run_store
-        .append_event(&payload)
-        .await
-        .map(|_| ())
-        .map_err(store_error)?;
+    .await
+    .map_err(|err| Error::engine_with_source("failed to create run store", err))?;
     append_event(&run_store, &record.run_id, &Event::RunSubmitted {
         definition_blob,
     })
@@ -580,8 +597,18 @@ async fn persist_created_run(
     .map_err(store_error)
 }
 
-fn store_error(err: impl std::fmt::Display) -> Error {
-    Error::engine(err.to_string())
+async fn write_optional_blob(
+    blob_store: &BlobStore,
+    bytes: Option<&[u8]>,
+) -> Result<Option<BlobHash>, Error> {
+    match bytes {
+        Some(bytes) => blob_store.write(bytes).await.map(Some).map_err(store_error),
+        None => Ok(None),
+    }
+}
+
+fn store_error(err: impl Into<anyhow::Error>) -> Error {
+    Error::engine_with_source("run store operation failed", err)
 }
 
 /// Parse, transform, and validate `dot_source`.
@@ -674,7 +701,7 @@ mod tests {
     use crate::transforms::Transform;
     use crate::workflow_bundle::BundledWorkflow;
     fn memory_store() -> Arc<Database> {
-        Arc::new(Database::new(
+        Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -951,6 +978,50 @@ reasoning = false
         // Run-create promotes the same diagnostic to a hard error.
         validated.promote_template_undefined_variables_to_errors();
         assert!(validated.has_errors());
+    }
+
+    #[test]
+    fn unknown_input_in_model_stylesheet_warns_then_errors_at_run_create() {
+        let dot = r#"digraph Test {
+            graph [model_stylesheet="* { reasoning_effort: {{ inputs.effort }}; }"]
+            start [shape=Mdiamond, label="Start"]
+            exit  [shape=Msquare, label="Exit"]
+            work  [label="Work", prompt="Do work"]
+            start -> work -> exit
+        }"#;
+        let mut validated = validate_dot(dot, WorkflowSettings::default());
+
+        let diagnostic = validated
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.rule == TEMPLATE_UNDEFINED_VARIABLE_RULE)
+            .expect("expected a template_undefined_variable diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert!(
+            diagnostic
+                .message
+                .contains("graph attribute `model_stylesheet`"),
+            "message: {}",
+            diagnostic.message
+        );
+        assert!(
+            validated
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.rule != "stylesheet_syntax")
+        );
+
+        validated.promote_template_undefined_variables_to_errors();
+        assert!(validated.has_errors());
+        assert_eq!(
+            validated
+                .diagnostics()
+                .iter()
+                .find(|diagnostic| diagnostic.rule == TEMPLATE_UNDEFINED_VARIABLE_RULE)
+                .unwrap()
+                .severity,
+            Severity::Error
+        );
     }
 
     #[test]
@@ -1573,9 +1644,10 @@ reasoning = false
         let dir = tempfile::tempdir().unwrap();
         let storage_root = dir.path().join("storage");
         let automation = AutomationRef {
-            id:         "nightly".to_string(),
-            name:       Some("Nightly".to_string()),
-            trigger_id: Some("schedule_1".to_string()),
+            id:              "nightly".to_string(),
+            name:            Some("Nightly".to_string()),
+            trigger_id:      Some("schedule_1".to_string()),
+            workflow_source: None,
         };
         let request = CreateRunInput {
             workflow: WorkflowInput::DotSource {
@@ -1588,6 +1660,7 @@ reasoning = false
             workflow_slug: Some("request-slug".to_string()),
             workflow_path: None,
             workflow_bundle: None,
+            target: None,
             submitted_manifest_bytes: Some(b"submitted manifest".to_vec()),
             run_id: Some(fixtures::RUN_1),
             title: Some("Assembled run".to_string()),
@@ -1693,6 +1766,8 @@ reasoning = false
                 run_id: fixtures::RUN_1,
                 storage_root: PathBuf::from("/tmp/storage"),
                 workflow_slug: None,
+                workflow_version_id: None,
+                target: None,
                 submitted_manifest_bytes: None,
                 title: None,
                 automation: None,
@@ -1716,9 +1791,10 @@ reasoning = false
         let compiled_source = MINIMAL_DOT.replace("Build feature", "Compiled goal");
         std::fs::write(&dot_path, &compiled_source).unwrap();
         let automation = AutomationRef {
-            id:         "nightly".to_string(),
-            name:       Some("Nightly".to_string()),
-            trigger_id: Some("schedule_1".to_string()),
+            id:              "nightly".to_string(),
+            name:            Some("Nightly".to_string()),
+            trigger_id:      Some("schedule_1".to_string()),
+            workflow_source: None,
         };
         let request = CreateRunInput {
             workflow: WorkflowInput::Path(dot_path.clone()),
@@ -1728,6 +1804,7 @@ reasoning = false
             workflow_slug: Some("compiled-slug".to_string()),
             workflow_path: None,
             workflow_bundle: None,
+            target: None,
             submitted_manifest_bytes: Some(b"submitted manifest".to_vec()),
             run_id: Some(fixtures::RUN_2),
             title: Some("Compiled run".to_string()),
@@ -1745,7 +1822,9 @@ reasoning = false
         std::fs::write(&dot_path, "this is no longer a graph").unwrap();
 
         let materialized = materialize_create_run(compiled, catalog.as_ref()).unwrap();
-        let metadata = persistence_metadata(&request, fixtures::RUN_2, &storage_root);
+        let workflow_version_id = test_support::test_workflow_version_id();
+        let mut metadata = persistence_metadata(&request, fixtures::RUN_2, &storage_root);
+        metadata.workflow_version_id = Some(workflow_version_id);
         let input = assemble_create_run_persistence_input(materialized, metadata);
         let store = memory_store();
         let created = persist_create_run(store.as_ref(), input).await.unwrap();
@@ -1759,6 +1838,7 @@ reasoning = false
         let state = run_store.state().await.unwrap();
         assert_eq!(state.spec.graph.goal(), "Compiled goal");
         assert_eq!(state.spec.automation, Some(automation));
+        assert_eq!(state.spec.workflow_version_id, Some(workflow_version_id));
         let events = run_store.list_events().await.unwrap();
         assert_eq!(
             events
@@ -1774,6 +1854,7 @@ reasoning = false
             created.workflow_source.as_deref(),
             Some(compiled_source.as_str())
         );
+        assert_eq!(created.workflow_version_id, Some(workflow_version_id));
         let manifest_blob = created
             .manifest_blob
             .as_ref()
@@ -1811,6 +1892,7 @@ reasoning = false
                 workflow_slug: None,
                 workflow_path: None,
                 workflow_bundle: None,
+                target: None,
                 submitted_manifest_bytes: None,
                 run_id: None,
                 title: None,
@@ -1878,6 +1960,7 @@ reasoning = false
                 workflow_slug: Some("slug".to_string()),
                 workflow_path: None,
                 workflow_bundle: None,
+                target: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_1),
                 title: None,
@@ -2011,6 +2094,7 @@ reasoning = false
                         workflow_slug: None,
                         workflow_path: None,
                         workflow_bundle: None,
+                        target: None,
                         submitted_manifest_bytes: None,
                         run_id: None,
                         title: None,
@@ -2120,6 +2204,7 @@ reasoning = false
                 workflow_slug: Some("secret-source".to_string()),
                 workflow_path: None,
                 workflow_bundle: None,
+                target: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_1),
                 title: None,
@@ -2197,6 +2282,7 @@ reasoning = false
                 workflow_slug: None,
                 workflow_path: None,
                 workflow_bundle: None,
+                target: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_2),
                 title: None,
@@ -2221,6 +2307,114 @@ reasoning = false
     }
 
     #[tokio::test]
+    async fn create_none_target_omits_the_source_directory_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path().join("storage");
+        let store = memory_store();
+        let created = create(
+            &store,
+            CreateRunInput {
+                workflow: WorkflowInput::DotSource {
+                    source:   MINIMAL_DOT.to_string(),
+                    base_dir: None,
+                },
+                settings: test_default_settings(),
+                vars: HashMap::new(),
+                cwd: dir.path().to_path_buf(),
+                workflow_slug: None,
+                workflow_path: None,
+                workflow_bundle: None,
+                target: Some(RunTarget::None {}),
+                submitted_manifest_bytes: None,
+                run_id: Some(fixtures::RUN_2),
+                title: None,
+                automation: None,
+                git: None,
+                fork_source_ref: None,
+                parent_id: None,
+                provenance: test_support::test_run_provenance(),
+                configured_providers: test_provider_ids(),
+                web_url: None,
+            },
+            storage_root,
+            test_catalog(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(created.persisted.run_spec().source_directory, None);
+        assert_eq!(
+            created.persisted.run_spec().target,
+            Some(RunTarget::None {})
+        );
+        assert_eq!(created.persisted.run_spec().git, None);
+    }
+
+    #[tokio::test]
+    async fn create_folder_target_projects_its_path_over_the_compiler_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let canonical = workspace
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let storage_root = dir.path().join("storage");
+        let store = memory_store();
+        let git = fabro_types::GitContext {
+            origin_url: "https://github.com/fabro-sh/fabro".to_string(),
+            branch:     "main".to_string(),
+            sha:        None,
+            dirty:      fabro_types::DirtyStatus::Clean,
+        };
+        let created = create(
+            &store,
+            CreateRunInput {
+                workflow: WorkflowInput::DotSource {
+                    source:   MINIMAL_DOT.to_string(),
+                    base_dir: None,
+                },
+                settings: test_default_settings(),
+                vars: HashMap::new(),
+                cwd: dir.path().to_path_buf(),
+                workflow_slug: None,
+                workflow_path: None,
+                workflow_bundle: None,
+                target: Some(RunTarget::Folder {
+                    path: canonical.clone(),
+                }),
+                submitted_manifest_bytes: None,
+                run_id: Some(fixtures::RUN_2),
+                title: None,
+                automation: None,
+                git: Some(git.clone()),
+                fork_source_ref: None,
+                parent_id: None,
+                provenance: test_support::test_run_provenance(),
+                configured_providers: test_provider_ids(),
+                web_url: None,
+            },
+            storage_root,
+            test_catalog(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            created.persisted.run_spec().target,
+            Some(RunTarget::Folder {
+                path: canonical.clone(),
+            })
+        );
+        assert_eq!(
+            created.persisted.run_spec().source_directory.as_deref(),
+            Some(canonical.as_str())
+        );
+        assert_eq!(created.persisted.run_spec().git, Some(git));
+    }
+
+    #[tokio::test]
     async fn create_persists_repo_origin_url_from_request() {
         let dir = tempfile::tempdir().unwrap();
         let storage_root = dir.path().join("storage");
@@ -2238,6 +2432,7 @@ reasoning = false
                 workflow_slug: None,
                 workflow_path: None,
                 workflow_bundle: None,
+                target: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_2),
                 title: None,
@@ -2293,16 +2488,17 @@ reasoning = false
         std::fs::create_dir_all(storage_dir.join("store")).unwrap();
         let object_store =
             Arc::new(LocalFileSystem::new_with_prefix(storage_dir.join("store")).unwrap());
-        let store = Arc::new(Database::new(
+        let store = Arc::new(fabro_store::test_support::test_database(
             object_store,
             "",
             Duration::from_millis(1),
             None,
         ));
         let automation = fabro_types::AutomationRef {
-            id:         "nightly".to_string(),
-            name:       Some("Nightly".to_string()),
-            trigger_id: Some("schedule_1".to_string()),
+            id:              "nightly".to_string(),
+            name:            Some("Nightly".to_string()),
+            trigger_id:      Some("schedule_1".to_string()),
+            workflow_source: None,
         };
         let created = create(
             store.as_ref(),
@@ -2317,6 +2513,7 @@ reasoning = false
                 workflow_slug: Some("slug".to_string()),
                 workflow_path: None,
                 workflow_bundle: None,
+                target: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_3),
                 title: None,
@@ -2352,7 +2549,7 @@ reasoning = false
         std::fs::create_dir_all(storage_dir.join("store")).unwrap();
         let object_store =
             Arc::new(LocalFileSystem::new_with_prefix(storage_dir.join("store")).unwrap());
-        let store = Arc::new(Database::new(
+        let store = Arc::new(fabro_store::test_support::test_database(
             object_store,
             "",
             Duration::from_millis(1),
@@ -2371,6 +2568,7 @@ reasoning = false
                 workflow_slug: Some("slug".to_string()),
                 workflow_path: None,
                 workflow_bundle: None,
+                target: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_64),
                 title: None,

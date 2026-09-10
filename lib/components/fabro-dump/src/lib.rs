@@ -486,8 +486,7 @@ mod tests {
     use fabro_types::{
         Checkpoint, CheckpointRecord, Conclusion, RunDiff, RunSandbox, RunSandboxInstance,
         RunSandboxPlan, RunStatus, SandboxProviderKind, StageCompletion, StageModelUsage,
-        StageOutcome, StartRecord, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
-        test_support,
+        StageOutcome, StartRecord, SuccessReason, first_event_seq, fixtures, test_support,
     };
     use futures::executor;
 
@@ -495,24 +494,18 @@ mod tests {
 
     fn sample_run_spec() -> RunSpec {
         RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         WorkflowSettings::default(),
-            graph:            Graph::new("ship"),
-            graph_source:     Some("digraph Ship {}".to_string()),
-            workflow_slug:    Some("demo".to_string()),
-            automation:       None,
+            graph: Graph::new("ship"),
+            graph_source: Some("digraph Ship {}".to_string()),
+            workflow_slug: Some("demo".to_string()),
             source_directory: Some("/tmp/project".to_string()),
-            git:              Some(fabro_types::GitContext {
+            git: Some(fabro_types::GitContext {
                 origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
                 branch:     "main".to_string(),
                 sha:        None,
                 dirty:      fabro_types::DirtyStatus::Clean,
             }),
-            labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            fork_source_ref:  None,
+            labels: HashMap::from([("team".to_string(), "platform".to_string())]),
+            ..test_support::test_run_spec()
         }
     }
 

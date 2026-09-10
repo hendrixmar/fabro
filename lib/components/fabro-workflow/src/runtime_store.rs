@@ -112,15 +112,12 @@ impl RunStoreBackend for LocalRunStoreBackend {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
     use chrono::Utc;
-    use fabro_graphviz::graph::Graph;
-    use fabro_store::Database;
     use fabro_types::run_event::RunSubmittedProps;
-    use fabro_types::{EventBody, RunEvent, WorkflowSettings, fixtures, test_support};
+    use fabro_types::{EventBody, RunEvent, fixtures, test_support};
     use object_store::memory::InMemory;
 
     use super::RunStoreHandle;
@@ -128,7 +125,7 @@ mod tests {
     use crate::records::RunSpec;
 
     async fn test_run_store() -> fabro_store::RunDatabase {
-        let store = Arc::new(Database::new(
+        let store = Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -139,41 +136,34 @@ mod tests {
 
     fn test_run_spec() -> RunSpec {
         RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         WorkflowSettings::default(),
-            graph:            Graph::new("test"),
-            graph_source:     None,
-            workflow_slug:    Some("test".to_string()),
-            automation:       None,
+            workflow_slug: Some("test".to_string()),
             source_directory: Some("/tmp/test".to_string()),
-            git:              None,
-            labels:           HashMap::new(),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            fork_source_ref:  None,
+            ..test_support::test_run_spec()
         }
     }
 
     async fn append_created_event(run_store: &fabro_store::RunDatabase) {
         let record = test_run_spec();
         append_event(run_store, &fixtures::RUN_1, &Event::RunCreated {
-            run_id:           fixtures::RUN_1,
-            title:            None,
-            settings:         serde_json::to_value(&record.settings).unwrap(),
-            graph:            serde_json::to_value(&record.graph).unwrap(),
-            workflow_source:  Some("digraph test {}".to_string()),
-            labels:           std::collections::BTreeMap::new(),
-            source_directory: Some("/tmp/test".to_string()),
-            workflow_slug:    Some("test".to_string()),
-            automation:       None,
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            git:              None,
-            fork_source_ref:  None,
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            run_id:              fixtures::RUN_1,
+            title:               None,
+            settings:            serde_json::to_value(&record.settings).unwrap(),
+            graph:               serde_json::to_value(&record.graph).unwrap(),
+            workflow_source:     Some("digraph test {}".to_string()),
+            labels:              std::collections::BTreeMap::new(),
+            source_directory:    Some("/tmp/test".to_string()),
+            workflow_slug:       Some("test".to_string()),
+            workflow_version_id: None,
+            target:              None,
+            automation:          None,
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            spec_blob:           None,
+            git:                 None,
+            fork_source_ref:     None,
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .unwrap();

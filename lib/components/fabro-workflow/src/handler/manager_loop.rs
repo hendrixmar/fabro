@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_graphviz::graph::{AttrValue, Graph, Node};
-use fabro_store::{ArtifactStore, Database};
+use fabro_store::ArtifactStore;
 use fabro_template::validate_static_reference;
 use fabro_types::WorkflowSettings;
 use fabro_types::graph::ReferenceKind;
@@ -233,18 +233,8 @@ impl Handler for SubWorkflowHandler {
         let inputs = services.inputs.clone();
         let dry_run = services.dry_run;
         let workflow_bundle = services.workflow_bundle.clone();
-        let object_store = Arc::new(InMemory::new());
-        let store = Arc::new(Database::new(
-            object_store.clone(),
-            "",
-            Duration::from_millis(1),
-            None,
-        ));
-        let run_store = store
-            .create_run(&child_run_options.run_id)
-            .await
-            .map_err(|err| Error::engine(err.to_string()))?;
-        let artifact_store = ArtifactStore::new(object_store, "artifacts");
+        let run_store = services.run.run_store.clone();
+        let artifact_store = ArtifactStore::new(Arc::new(InMemory::new()), "artifacts");
 
         // Spawn child engine. Child runs receive a derived cancel token from
         // the parent run; parent cancellation propagates parent-to-child via
@@ -252,7 +242,7 @@ impl Handler for SubWorkflowHandler {
         let child_run_token_for_services = child_run_token.clone();
         let mut child_handle = tokio::spawn(async move {
             let child_run = parent_run
-                .with_run_store(run_store.into())
+                .with_run_store(run_store)
                 .with_cancel_token(child_run_token_for_services);
             let initialized = Initialized {
                 graph:         child_graph,
@@ -546,6 +536,81 @@ mod tests {
         assert_eq!(
             outcome.context_updates.get("review.echo"),
             Some(&serde_json::json!("src/main.rs"))
+        );
+    }
+
+    #[tokio::test]
+    async fn child_blob_writes_use_the_parent_run_store() {
+        const CHILD_BLOB: &[u8] = b"manager-child-shared-blob";
+
+        struct BlobWriter;
+
+        #[async_trait]
+        impl Handler for BlobWriter {
+            async fn execute(
+                &self,
+                _node: &Node,
+                _context: &Context,
+                _graph: &Graph,
+                _run_dir: &Path,
+                services: &EngineServices,
+            ) -> Result<Outcome, Error> {
+                services
+                    .run
+                    .run_store
+                    .write_blob(CHILD_BLOB)
+                    .await
+                    .map_err(|error| {
+                        Error::handler_with_source("manager child blob write failed", error)
+                    })?;
+                Ok(Outcome::success())
+            }
+        }
+
+        let mut registry = HandlerRegistry::new(Box::new(BlobWriter));
+        registry.register("start", Box::new(StartHandler));
+        registry.register("exit", Box::new(ExitHandler));
+        let mut services = EngineServices::test_default();
+        services.registry = Arc::new(registry);
+
+        let handler = SubWorkflowHandler;
+        let mut node = Node::new("manager");
+        node.attrs.insert(
+            "stack.child_dot_source".to_string(),
+            AttrValue::String(
+                "digraph Child { start [shape=Mdiamond]; work [shape=box]; exit [shape=Msquare]; start -> work -> exit }"
+                    .to_string(),
+            ),
+        );
+        node.attrs
+            .insert("manager.max_cycles".to_string(), AttrValue::Integer(100));
+        node.attrs.insert(
+            "manager.poll_interval".to_string(),
+            AttrValue::Duration(Duration::from_millis(10)),
+        );
+
+        let outcome = handler
+            .execute(
+                &node,
+                &Context::new(),
+                &Graph::new("test"),
+                tempfile::tempdir().unwrap().path(),
+                &services,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        let hash = fabro_types::BlobHash::new(CHILD_BLOB);
+        assert_eq!(
+            services
+                .run
+                .run_store
+                .read_blob(&hash)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(CHILD_BLOB)
         );
     }
 

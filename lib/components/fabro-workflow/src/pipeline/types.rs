@@ -8,7 +8,9 @@ use fabro_mcp::config::McpServerSettings;
 use fabro_model::{Catalog, ProviderId};
 use fabro_sandbox::SandboxSpec;
 use fabro_template::TemplateContext;
-use fabro_types::settings::run::{PullRequestSettings, RunModelControls};
+use fabro_types::settings::run::{
+    PullRequestSettings, ResolvedGithubIntegration, RunModelControls,
+};
 use fabro_types::{ManifestPath, RunId, RunProjection};
 use fabro_validate::{Diagnostic, Severity};
 use fabro_vault::Vault;
@@ -246,7 +248,10 @@ pub struct LlmSpec {
 #[derive(Clone)]
 pub struct SandboxEnvSpec {
     pub toml_env:           HashMap<String, String>,
-    pub github_permissions: Option<HashMap<String, String>>,
+    /// The resolved GitHub integration request (interpolated permissions
+    /// plus declared additional repositories). `None` when the run requests
+    /// no `GITHUB_TOKEN`.
+    pub github_integration: Option<ResolvedGithubIntegration>,
     pub origin_url:         Option<String>,
 }
 

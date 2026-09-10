@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use fabro_types::GitHubRepositorySlug;
 use fabro_types::settings::InterpString;
+use fabro_types::settings::interp::ResolveCtx;
 use fabro_types::settings::run::{
     ArtifactsSettings, GitAuthorSettings, HookDefinition, HookType, InterviewProviderSettings,
     McpServerSettings, McpTransport, MergeStrategy, NotificationProviderSettings,
@@ -17,9 +19,9 @@ use crate::{
     EnvironmentLayer, HookAgentMarker, HookEntry, HookTlsMode, InterviewProviderLayer,
     InterviewsLayer, McpEntryLayer, MergeMap, ModelRefOrSplice, NotificationProviderLayer,
     NotificationRouteLayer, RunAgentLayer, RunArtifactsLayer, RunCheckpointLayer, RunCloneLayer,
-    RunExecutionLayer, RunGitLayer, RunGoalLayer, RunIntegrationsLayer, RunLayer,
-    RunMetaBranchLayer, RunModelLayer, RunPrepareLayer, RunPullRequestLayer, RunRunBranchLayer,
-    RunScmLayer, StickyMap, StringOrSplice,
+    RunExecutionLayer, RunGitLayer, RunGoalLayer, RunIntegrationsGithubLayer, RunIntegrationsLayer,
+    RunLayer, RunMetaBranchLayer, RunModelLayer, RunPrepareLayer, RunPullRequestLayer,
+    RunRunBranchLayer, RunScmLayer, StickyMap, StringOrSplice,
 };
 
 pub fn resolve_run(
@@ -28,7 +30,7 @@ pub fn resolve_run(
     mcp_server_catalog: &HashMap<String, McpServerSettings>,
     errors: &mut Vec<ResolveError>,
 ) -> RunNamespace {
-    let clone = resolve_clone(layer.clone.as_ref());
+    let clone = resolve_clone(layer.clone.as_ref(), errors);
     let run_branch = resolve_run_branch(layer.run_branch.as_ref());
     let mut meta_branch = resolve_meta_branch(layer.meta_branch.as_ref());
     if !run_branch.enabled {
@@ -85,21 +87,138 @@ pub fn resolve_run(
         scm: resolve_scm(layer.scm.as_ref()),
         pull_request,
         artifacts: resolve_artifacts(layer.artifacts.as_ref(), errors),
-        integrations: resolve_integrations(layer.integrations.as_ref()),
+        integrations: resolve_integrations(layer.integrations.as_ref(), errors),
     }
 }
 
-fn resolve_integrations(layer: Option<&RunIntegrationsLayer>) -> RunIntegrationsSettings {
+fn resolve_integrations(
+    layer: Option<&RunIntegrationsLayer>,
+    errors: &mut Vec<ResolveError>,
+) -> RunIntegrationsSettings {
     let github = layer
         .and_then(|integrations| integrations.github.as_ref())
-        .map(|github| RunIntegrationsGithubSettings {
-            // Collapse `Option<HashMap<...>>` -> `HashMap<...>`: both `None`
-            // and `Some({})` resolve to an empty map (no token requested).
-            // The presence distinction is only meaningful at merge time.
-            permissions: github.permissions.clone().unwrap_or_default(),
-        })
+        .map(|github| resolve_integrations_github(github, errors))
         .unwrap_or_default();
     RunIntegrationsSettings { github }
+}
+
+/// GitHub caps one installation token at 500 repositories; the implicit run
+/// origin takes one slot.
+const MAX_ADDITIONAL_REPOSITORIES: usize = 499;
+
+fn resolve_integrations_github(
+    github: &RunIntegrationsGithubLayer,
+    errors: &mut Vec<ResolveError>,
+) -> RunIntegrationsGithubSettings {
+    // Collapse `Option<HashMap<...>>` -> `HashMap<...>`: both `None`
+    // and `Some({})` resolve to an empty map (no token requested).
+    // The presence distinction is only meaningful at merge time. The same
+    // collapse applies to `additional_repositories` (`Some(vec![])` is an
+    // explicit clear that resolves to the empty set).
+    let permissions = github.permissions.clone().unwrap_or_default();
+    let raw_repositories = github
+        .additional_repositories
+        .as_deref()
+        .unwrap_or_default();
+
+    if raw_repositories.len() > MAX_ADDITIONAL_REPOSITORIES {
+        errors.push(ResolveError::Invalid {
+            path:   "run.integrations.github.additional_repositories".to_string(),
+            reason: format!(
+                "at most {MAX_ADDITIONAL_REPOSITORIES} additional repositories are supported (the \
+                 run origin takes the remaining slot of GitHub's 500-repository token limit), got \
+                 {}",
+                raw_repositories.len()
+            ),
+        });
+    }
+
+    let mut additional_repositories: BTreeSet<GitHubRepositorySlug> = BTreeSet::new();
+    for (index, value) in raw_repositories.iter().enumerate() {
+        let path = format!("run.integrations.github.additional_repositories[{index}]");
+        let Ok(slug) = value.parse::<GitHubRepositorySlug>() else {
+            errors.push(ResolveError::Invalid {
+                path,
+                reason: format!(
+                    "`{value}` is not a full GitHub `owner/repository` slug (no scheme, host, \
+                     ref, or extra path component)"
+                ),
+            });
+            continue;
+        };
+        if let Some(existing) = additional_repositories.get(&slug) {
+            errors.push(ResolveError::Invalid {
+                path,
+                reason: format!(
+                    "`{value}` duplicates `{existing}` (repository identity is case-insensitive)"
+                ),
+            });
+            continue;
+        }
+        if let Some(first) = additional_repositories.first() {
+            if !first.same_owner(&slug) {
+                errors.push(ResolveError::Invalid {
+                    path,
+                    reason: format!(
+                        "`{value}` has owner `{}` but `{first}` has owner `{}`; all repositories \
+                         must share one owner because one GitHub App installation covers one \
+                         account",
+                        slug.owner(),
+                        first.owner()
+                    ),
+                });
+                continue;
+            }
+        }
+        additional_repositories.insert(slug);
+    }
+
+    if !additional_repositories.is_empty() {
+        validate_additional_repository_permissions(&permissions, errors);
+    }
+
+    RunIntegrationsGithubSettings {
+        permissions,
+        additional_repositories,
+    }
+}
+
+/// A non-empty additional-repository set needs a token that can reach
+/// repository contents. Only a literal `contents` value is checked here; a
+/// templated value is re-checked after interpolation at the runtime boundary.
+fn validate_additional_repository_permissions(
+    permissions: &HashMap<String, InterpString>,
+    errors: &mut Vec<ResolveError>,
+) {
+    if permissions.is_empty() {
+        errors.push(ResolveError::Invalid {
+            path:   "run.integrations.github.additional_repositories".to_string(),
+            reason: "additional repositories require [run.integrations.github.permissions] with \
+                     a `contents` permission; a higher layer may have cleared the permissions"
+                .to_string(),
+        });
+        return;
+    }
+    let Some(contents) = permissions.get("contents") else {
+        errors.push(ResolveError::Invalid {
+            path:   "run.integrations.github.permissions".to_string(),
+            reason: "additional repositories require the `contents` permission (`read` or \
+                     `write`)"
+                .to_string(),
+        });
+        return;
+    };
+    if let Ok(literal) = contents.resolve_with(&mut ResolveCtx::new()) {
+        if !RunIntegrationsGithubSettings::contents_permission_allows_repository_access(&literal) {
+            errors.push(ResolveError::Invalid {
+                path:   "run.integrations.github.permissions.contents".to_string(),
+                reason: format!(
+                    "additional repositories require `contents = \"read\"` or `contents = \
+                     \"write\"`, got `{literal}`"
+                ),
+            });
+        }
+    }
 }
 
 fn resolve_goal(goal: Option<&RunGoalLayer>) -> Option<RunGoal> {
@@ -244,9 +363,24 @@ fn resolve_checkpoint(checkpoint: Option<&RunCheckpointLayer>) -> RunCheckpointS
     }
 }
 
-fn resolve_clone(clone: Option<&RunCloneLayer>) -> RunCloneSettings {
+fn resolve_clone(
+    clone: Option<&RunCloneLayer>,
+    errors: &mut Vec<ResolveError>,
+) -> RunCloneSettings {
+    let mut depth = clone
+        .and_then(|clone| clone.depth)
+        .unwrap_or(RunCloneSettings::DEFAULT_DEPTH);
+    if depth < 0 {
+        errors.push(ResolveError::Invalid {
+            path:   "run.clone.depth".to_string(),
+            reason: "depth must be at least 0".to_string(),
+        });
+        depth = RunCloneSettings::DEFAULT_DEPTH;
+    }
+
     RunCloneSettings {
         enabled: clone.and_then(|clone| clone.enabled).unwrap_or(true),
+        depth,
     }
 }
 

@@ -236,7 +236,7 @@ mod tests {
     }
 
     fn test_store() -> Arc<Database> {
-        Arc::new(Database::new(
+        Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -267,23 +267,26 @@ mod tests {
             run_store,
             &fixtures::RUN_1,
             &crate::event::Event::RunCreated {
-                run_id:           fixtures::RUN_1,
-                title:            None,
-                settings:         serde_json::to_value(fabro_types::WorkflowSettings::default())
+                run_id:              fixtures::RUN_1,
+                title:               None,
+                settings:            serde_json::to_value(fabro_types::WorkflowSettings::default())
                     .unwrap(),
-                graph:            serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
-                workflow_source:  None,
-                labels:           std::collections::BTreeMap::default(),
-                source_directory: None,
-                workflow_slug:    None,
-                automation:       None,
-                provenance:       test_support::test_run_provenance(),
-                manifest_blob:    None,
-                git:              None,
-                fork_source_ref:  None,
-                retried_from:     None,
-                parent_id:        None,
-                web_url:          None,
+                graph:               serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
+                workflow_source:     None,
+                labels:              std::collections::BTreeMap::default(),
+                source_directory:    None,
+                workflow_slug:       None,
+                workflow_version_id: None,
+                target:              None,
+                automation:          None,
+                provenance:          test_support::test_run_provenance(),
+                manifest_blob:       None,
+                spec_blob:           None,
+                git:                 None,
+                fork_source_ref:     None,
+                retried_from:        None,
+                parent_id:           None,
+                web_url:             None,
             },
         )
         .await
@@ -568,7 +571,7 @@ mod tests {
             .execute(&node, &context, &graph, tmp.path(), &services)
             .await
             .unwrap();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let state = run_store.state().await.unwrap();
         let node_state = state.stage(&StageId::new("classify", 1)).unwrap();

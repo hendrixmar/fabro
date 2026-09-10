@@ -17,8 +17,8 @@ pub use dependency::{
     extract_template_dependencies,
 };
 pub use static_reference::{
-    GraphReference, GraphReferenceError, StaticReferenceError, validate_static_reference,
-    visit_graph_references,
+    GraphPosition, GraphReference, GraphReferenceError, StaticReferenceError,
+    validate_static_reference, visit_graph_references,
 };
 pub use store::{
     BundleTemplateStore, CachedTemplateStore, FilesystemTemplateStore, RecordingTemplateStore,
@@ -92,6 +92,21 @@ impl TemplateContext {
     pub fn with_vars(mut self, vars: HashMap<String, String>) -> Self {
         self.vars = Value::from_serialize(vars);
         self
+    }
+
+    /// Context exposed to a graph `model_stylesheet` template.
+    ///
+    /// Stylesheets can use typed run inputs and run-scoped variables, but they
+    /// cannot read the rendered graph goal. Keep this as an explicit
+    /// projection so callers do not depend on when the goal enters the wider
+    /// workflow template context.
+    #[must_use]
+    pub fn for_model_stylesheet(&self) -> Self {
+        Self {
+            goal:   None,
+            inputs: self.inputs.clone(),
+            vars:   self.vars.clone(),
+        }
     }
 
     /// Context that interpolates inputs but leaves `{{ goal }}` as a literal
@@ -865,6 +880,42 @@ mod tests {
             ctx.var("STAGE"),
             Some(render("{{ vars.STAGE }}", &ctx).unwrap())
         );
+    }
+
+    #[test]
+    fn model_stylesheet_context_exposes_only_inputs_and_vars() {
+        let ctx = TemplateContext::new()
+            .with_goal("Ship it")
+            .with_inputs(HashMap::from([(
+                "policy".to_string(),
+                toml::Value::Table(Map::from_iter([(
+                    "effort".to_string(),
+                    toml::Value::String("high".to_string()),
+                )])),
+            )]))
+            .with_vars(HashMap::from([("MODEL".to_string(), "sonnet".to_string())]));
+        let stylesheet_ctx = ctx.for_model_stylesheet();
+
+        assert_eq!(
+            render(
+                "{{ inputs.policy.effort }} {{ vars.MODEL }}",
+                &stylesheet_ctx,
+            )
+            .unwrap(),
+            "high sonnet"
+        );
+        assert!(matches!(
+            render("{{ goal }}", &stylesheet_ctx),
+            Err(TemplateError::UndefinedVariable { .. })
+        ));
+    }
+
+    #[test]
+    fn model_stylesheet_context_preserves_template_locals_and_control_flow() {
+        let ctx = TemplateContext::new().for_model_stylesheet();
+        let template = "{% set efforts = ['low', 'high'] %}{% for effort in efforts %}{{ loop.index }}={{ effort }}{% if not loop.last %};{% endif %}{% endfor %}";
+
+        assert_eq!(render(template, &ctx).unwrap(), "1=low;2=high");
     }
 
     #[test]

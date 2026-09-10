@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, anyhow};
 use serde_json::map::Entry;
 use serde_json::{Map, Value, json};
 
-use crate::{McpAgent, McpConfigSettings, McpInitSettings, SERVER_NAME};
+use crate::{McpAgent, McpConfigSettings, McpInitSettings};
 
 pub fn config_json(settings: &McpConfigSettings) -> Result<String> {
     serde_json::to_string_pretty(&generic_config(settings))
@@ -18,19 +18,16 @@ pub fn config_json(settings: &McpConfigSettings) -> Result<String> {
 }
 
 pub fn init_agent(settings: &McpInitSettings) -> Result<()> {
-    let entry = server_entry(&settings.config);
     for path in agent_config_paths(settings.agent, &settings.home_dir) {
-        merge_server_entry(&path, entry.clone())?;
+        merge_server_entry(&path, &settings.config)?;
     }
     Ok(())
 }
 
 fn generic_config(settings: &McpConfigSettings) -> Value {
-    json!({
-        "mcpServers": {
-            SERVER_NAME: server_entry(settings)
-        }
-    })
+    let mut servers = Map::new();
+    servers.insert(settings.name.clone(), server_entry(settings));
+    json!({ "mcpServers": servers })
 }
 
 fn server_entry(settings: &McpConfigSettings) -> Value {
@@ -53,7 +50,7 @@ fn start_args(settings: &McpConfigSettings) -> Vec<String> {
     args
 }
 
-fn merge_server_entry(path: &Path, entry: Value) -> Result<()> {
+fn merge_server_entry(path: &Path, settings: &McpConfigSettings) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -80,7 +77,7 @@ fn merge_server_entry(path: &Path, entry: Value) -> Result<()> {
             path.display()
         )
     })?;
-    servers_object.insert(SERVER_NAME.to_string(), entry);
+    servers_object.insert(settings.name.clone(), server_entry(settings));
 
     let rendered = serde_json::to_string_pretty(&root)
         .map(|json| format!("{json}\n"))

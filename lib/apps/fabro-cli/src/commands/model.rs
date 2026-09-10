@@ -254,14 +254,15 @@ fn model_test_row_from_status(model: &Model, status: &str, result_color: Color) 
 )]
 async fn test_models_via_server(
     client: &server_client::Client,
-    provider: Option<&str>,
-    model: Option<&str>,
-    deep: bool,
-    jobs: usize,
+    args: &ModelTestArgs,
     styles: &Styles,
     json_output: bool,
 ) -> Result<()> {
-    let request_mode = deep.then_some(ModelTestMode::Deep);
+    let provider = args.provider.as_deref();
+    let model = args.model.as_deref();
+    let jobs = args.jobs;
+    let reasoning_effort = args.reasoning_effort;
+    let request_mode = args.tools.then_some(ModelTestMode::Deep);
 
     let use_color = styles.use_color;
     let mut title = models_title(use_color);
@@ -288,7 +289,12 @@ async fn test_models_via_server(
             } else {
                 Some(
                     client
-                        .test_model(model_id, requested_provider.as_ref(), request_mode)
+                        .test_model(
+                            model_id,
+                            requested_provider.as_ref(),
+                            request_mode,
+                            reasoning_effort,
+                        )
                         .await,
                 )
             };
@@ -375,7 +381,12 @@ async fn test_models_via_server(
                 let client = client.clone();
                 async move {
                     let result = client
-                        .test_model(info.id.as_str(), Some(&info.provider), request_mode)
+                        .test_model(
+                            info.id.as_str(),
+                            Some(&info.provider),
+                            request_mode,
+                            reasoning_effort,
+                        )
                         .await;
                     if !json_output {
                         eprintln!("Testing {}... done", info.id);
@@ -486,23 +497,8 @@ async fn run_models(
                 print_models_table(&models, &styles);
             }
         }
-        ModelsCommand::Test(ModelTestArgs {
-            provider,
-            model,
-            deep,
-            jobs,
-            ..
-        }) => {
-            test_models_via_server(
-                client,
-                provider.as_deref(),
-                model.as_deref(),
-                deep,
-                jobs,
-                &styles,
-                json_output,
-            )
-            .await?;
+        ModelsCommand::Test(args) => {
+            test_models_via_server(client, &args, &styles, json_output).await?;
         }
     }
 
@@ -518,7 +514,8 @@ impl Default for ModelsCommand {
 #[cfg(test)]
 mod tests {
     use fabro_model::{
-        ModelControls, ModelCosts, ModelFeatures, ModelLimits, ReasoningEffortFeature,
+        ModelControls, ModelCosts, ModelFeatures, ModelLimits, ReasoningEffort,
+        ReasoningEffortFeature,
     };
 
     use super::*;
@@ -674,20 +671,24 @@ mod tests {
             .await;
 
         let client = test_client(&server.url(""));
-        let response = client.test_model("test-model", None, None).await.unwrap();
+        let response = client
+            .test_model("test-model", None, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(response.status, api_types::ModelTestResultStatus::Ok);
         assert!(response.error_message.is_none());
     }
 
     #[tokio::test]
-    async fn test_model_via_server_passes_mode_and_parses_error() {
+    async fn test_model_via_server_passes_mode_and_reasoning_effort() {
         let server = httpmock::MockServer::start_async().await;
         server
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/api/v1/models/test-model/test")
-                    .query_param("mode", "deep");
+                    .query_param("mode", "deep")
+                    .query_param("reasoning_effort", "high");
                 then.status(200)
                     .header("Content-Type", "application/json")
                     .body(
@@ -704,7 +705,12 @@ mod tests {
 
         let client = test_client(&server.url(""));
         let response = client
-            .test_model("test-model", None, Some(ModelTestMode::Deep))
+            .test_model(
+                "test-model",
+                None,
+                Some(ModelTestMode::Deep),
+                Some(ReasoningEffort::High),
+            )
             .await
             .unwrap();
 
@@ -732,7 +738,10 @@ mod tests {
             .await;
 
         let client = test_client(&server.url(""));
-        let response = client.test_model("kimi-k2.5", None, None).await.unwrap();
+        let response = client
+            .test_model("kimi-k2.5", None, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(response.status, api_types::ModelTestResultStatus::Skip);
         assert!(response.error_message.is_none());
@@ -756,7 +765,7 @@ mod tests {
             .await;
 
         let client = test_client(&server.url(""));
-        let result = client.test_model("bad-model", None, None).await;
+        let result = client.test_model("bad-model", None, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Model not found"));
     }
@@ -800,17 +809,14 @@ mod tests {
 
         let client = test_client(&server.url(""));
 
-        test_models_via_server(
-            &client,
-            None,
-            Some("venice-large"),
-            false,
-            1,
-            &Styles::new(false),
-            true,
-        )
-        .await
-        .unwrap();
+        let args = ModelTestArgs {
+            model: Some("venice-large".to_string()),
+            jobs: 1,
+            ..ModelTestArgs::default()
+        };
+        test_models_via_server(&client, &args, &Styles::new(false), true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -871,12 +877,13 @@ mod tests {
             })
             .await;
 
+        let args = ModelTestArgs {
+            jobs: 2,
+            ..ModelTestArgs::default()
+        };
         test_models_via_server(
             &test_client(&server.url("")),
-            None,
-            None,
-            false,
-            2,
+            &args,
             &Styles::new(false),
             true,
         )

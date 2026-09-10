@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use chrono::Utc;
 use fabro_store::Database;
 use fabro_types::{RunId, RunProvenance, RunSpec, RunStatus};
 
@@ -48,12 +49,15 @@ pub async fn retry_run(
         graph,
         graph_source,
         workflow_slug,
+        workflow_version_id,
+        target,
         automation,
         source_directory,
         labels,
         provenance: _,
         manifest_blob,
         definition_blob,
+        spec_blob,
         git,
         fork_source_ref,
     } = source.spec;
@@ -61,12 +65,7 @@ pub async fn retry_run(
     let settings = serde_json::to_value(&settings).map_err(|err| Error::engine(err.to_string()))?;
     let graph = serde_json::to_value(&graph).map_err(|err| Error::engine(err.to_string()))?;
 
-    let retry_store = store
-        .create_run(&new_run_id)
-        .await
-        .map_err(|err| Error::engine(err.to_string()))?;
-
-    event::append_event(&retry_store, &new_run_id, &Event::RunCreated {
+    let first_event = Event::RunCreated {
         run_id: new_run_id,
         title: Some(title),
         settings,
@@ -75,17 +74,23 @@ pub async fn retry_run(
         labels: labels.into_iter().collect::<BTreeMap<_, _>>(),
         source_directory,
         workflow_slug,
+        workflow_version_id,
+        target,
         automation,
         provenance: input.provenance.clone(),
         manifest_blob,
+        // Blobs are content-addressed, so the retried run reads the source
+        // run's unredacted spec bytes through the same id.
+        spec_blob,
         git,
         fork_source_ref,
         retried_from: Some(source_run_id),
         parent_id,
         web_url: input.web_url.clone(),
-    })
-    .await
-    .map_err(|err| Error::engine(err.to_string()))?;
+    };
+    let retry_store = event::create_run(store, &new_run_id, &first_event, Utc::now())
+        .await
+        .map_err(|err| Error::engine(err.to_string()))?;
 
     event::append_event(&retry_store, &new_run_id, &Event::RunSubmitted {
         definition_blob,
@@ -118,15 +123,15 @@ mod tests {
     use fabro_store::{Database, RunProjectionReducer};
     use fabro_types::{
         AuthMethod, BlobHash, DirtyStatus, FailureReason, ForkSourceRef, GitContext, Graph,
-        IdpIdentity, Principal, PullRequestLink, RunRunnableSource, RunServerProvenance, RunTiming,
-        WorkflowSettings, fixtures,
+        IdpIdentity, Principal, PullRequestLink, RunRunnableSource, RunServerProvenance, RunTarget,
+        RunTiming, WorkflowSettings, fixtures, test_support,
     };
     use object_store::memory::InMemory;
 
     use super::*;
 
     fn memory_store() -> Database {
-        Database::new(
+        fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -154,11 +159,20 @@ mod tests {
 
     fn git_context() -> GitContext {
         GitContext {
-            origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
+            origin_url: "https://github.com/fabro-sh/fabro".to_string(),
             branch:     "main".to_string(),
-            sha:        Some("abc123".to_string()),
+            sha:        Some("abcdef0123456789abcdef0123456789abcdef01".to_string()),
             dirty:      DirtyStatus::Clean,
         }
+    }
+
+    fn run_target() -> RunTarget {
+        RunTarget::Git(fabro_types::GitRunTarget {
+            repo:   "fabro-sh/fabro".to_string(),
+            branch: "main".to_string(),
+            tag:    None,
+            sha:    Some("abcdef0123456789abcdef0123456789abcdef01".to_string()),
+        })
     }
 
     async fn append_created(
@@ -182,9 +196,12 @@ mod tests {
             labels: labels.into_iter().collect(),
             source_directory: Some("/workspace/source".to_string()),
             workflow_slug: Some("retry-source".to_string()),
+            workflow_version_id: Some(test_support::test_workflow_version_id()),
+            target: Some(run_target()),
             automation: None,
             provenance: provenance("source-user"),
             manifest_blob,
+            spec_blob: None,
             git: Some(git_context()),
             fork_source_ref,
             retried_from: None,
@@ -389,10 +406,15 @@ mod tests {
         );
         assert_eq!(retry_state.spec.graph.name, "retry_source");
         assert_eq!(
+            retry_state.spec.workflow_version_id,
+            Some(test_support::test_workflow_version_id())
+        );
+        assert_eq!(
             retry_state.spec.graph_source.as_deref(),
             Some("digraph retry_source { start -> exit }")
         );
         assert_eq!(retry_state.spec.git, Some(git_context()));
+        assert_eq!(retry_state.spec.target, Some(run_target()));
         assert_eq!(retry_state.spec.manifest_blob, manifest_blob);
         assert_eq!(retry_state.spec.definition_blob, definition_blob);
         assert_eq!(retry_state.spec.fork_source_ref, Some(fork_source_ref));
@@ -426,6 +448,126 @@ mod tests {
                 reason: FailureReason::WorkflowError,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_none_target_without_git_or_source_directory() {
+        let store = memory_store();
+        let source_run_id = fixtures::RUN_1;
+        let source_store = store.create_run(&source_run_id).await.unwrap();
+        event::append_event(&source_store, &source_run_id, &Event::RunCreated {
+            run_id:              source_run_id,
+            title:               Some("None target".to_string()),
+            settings:            serde_json::to_value(WorkflowSettings::default()).unwrap(),
+            graph:               serde_json::to_value(Graph::new("none_target_retry")).unwrap(),
+            workflow_source:     Some("digraph none_target_retry { start -> exit }".to_string()),
+            labels:              BTreeMap::new(),
+            source_directory:    None,
+            workflow_slug:       Some("none-target-retry".to_string()),
+            workflow_version_id: Some(test_support::test_workflow_version_id()),
+            target:              Some(RunTarget::None {}),
+            automation:          None,
+            provenance:          provenance("source-user"),
+            manifest_blob:       None,
+            spec_blob:           None,
+            git:                 None,
+            fork_source_ref:     None,
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
+        })
+        .await
+        .unwrap();
+        event::append_event(&source_store, &source_run_id, &Event::RunSubmitted {
+            definition_blob: None,
+        })
+        .await
+        .unwrap();
+        append_failed(&source_store, source_run_id, FailureReason::WorkflowError).await;
+
+        let source_state = source_store.state().await.unwrap();
+        assert_eq!(source_state.status, RunStatus::Failed {
+            reason: FailureReason::WorkflowError,
+        });
+        assert_eq!(source_state.spec.target, Some(RunTarget::None {}));
+        assert_eq!(source_state.spec.git, None);
+        assert_eq!(source_state.spec.source_directory, None);
+
+        let outcome = retry_run(&store, &RetryRunInput {
+            source_run_id,
+            new_run_id: RunId::new(),
+            provenance: provenance("retry-user"),
+            web_url: None,
+        })
+        .await
+        .unwrap();
+
+        let retry_store = store.open_run(&outcome.new_run_id).await.unwrap();
+        let retry_events = retry_store.list_events().await.unwrap();
+        let retry_state = fabro_store::RunProjection::apply_events(&retry_events).unwrap();
+        assert_eq!(retry_events.len(), 2);
+        assert_eq!(retry_state.status, RunStatus::Submitted);
+        assert_eq!(retry_state.retried_from, Some(source_run_id));
+        assert_eq!(retry_state.spec.target, Some(RunTarget::None {}));
+        assert_eq!(retry_state.spec.git, None);
+        assert_eq!(retry_state.spec.source_directory, None);
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_folder_target_and_source_directory_without_git() {
+        let store = memory_store();
+        let source_run_id = fixtures::RUN_1;
+        let source_store = store.create_run(&source_run_id).await.unwrap();
+        let path = "/canonical/local/folder".to_string();
+        let target = RunTarget::Folder { path: path.clone() };
+        event::append_event(&source_store, &source_run_id, &Event::RunCreated {
+            run_id:              source_run_id,
+            title:               Some("Folder target".to_string()),
+            settings:            serde_json::to_value(WorkflowSettings::default()).unwrap(),
+            graph:               serde_json::to_value(Graph::new("folder_target_retry")).unwrap(),
+            workflow_source:     Some("digraph folder_target_retry { start -> exit }".to_string()),
+            labels:              BTreeMap::new(),
+            source_directory:    Some(path.clone()),
+            workflow_slug:       Some("folder-target-retry".to_string()),
+            workflow_version_id: Some(test_support::test_workflow_version_id()),
+            target:              Some(target.clone()),
+            automation:          None,
+            provenance:          provenance("source-user"),
+            manifest_blob:       None,
+            spec_blob:           None,
+            git:                 None,
+            fork_source_ref:     None,
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
+        })
+        .await
+        .unwrap();
+        event::append_event(&source_store, &source_run_id, &Event::RunSubmitted {
+            definition_blob: None,
+        })
+        .await
+        .unwrap();
+        append_failed(&source_store, source_run_id, FailureReason::WorkflowError).await;
+
+        let outcome = retry_run(&store, &RetryRunInput {
+            source_run_id,
+            new_run_id: RunId::new(),
+            provenance: provenance("retry-user"),
+            web_url: None,
+        })
+        .await
+        .unwrap();
+
+        let retry_store = store.open_run(&outcome.new_run_id).await.unwrap();
+        let retry_state = retry_store.state().await.unwrap();
+        assert_eq!(retry_state.status, RunStatus::Submitted);
+        assert_eq!(retry_state.spec.target, Some(target));
+        assert_eq!(
+            retry_state.spec.source_directory.as_deref(),
+            Some(path.as_str())
+        );
+        assert_eq!(retry_state.spec.git, None);
     }
 
     #[tokio::test]

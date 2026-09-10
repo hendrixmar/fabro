@@ -79,6 +79,10 @@ impl<M: OutcomeMeta> ExecutionState<M> {
         graph.get_node(&self.current_node_id)
     }
 
+    pub fn visits(&self, node_id: &str) -> usize {
+        self.node_visits.get(node_id).copied().unwrap_or(0)
+    }
+
     pub fn increment_visits(&mut self, node_id: &str) -> usize {
         let count = self.node_visits.entry(node_id.to_string()).or_insert(0);
         *count += 1;

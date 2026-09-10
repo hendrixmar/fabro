@@ -672,7 +672,7 @@ pub(crate) async fn run_diagnostics(
                         { "name": "GitHub App", "status": "pass", "summary": "demo configured", "details": [], "remediation": null },
                         { "name": "Docker Sandbox", "status": "pass", "summary": "disabled", "details": [{ "text": "server.sandbox.providers.docker.enabled = false", "warn": false }], "remediation": null },
                         { "name": "Cloud Sandbox", "status": "warning", "summary": "not configured", "details": [], "remediation": "Set DAYTONA_API_KEY to enable cloud sandbox execution" },
-                        { "name": "Brave Search", "status": "warning", "summary": "not configured", "details": [], "remediation": "Set BRAVE_SEARCH_API_KEY to enable web search" }
+                        { "name": "Web Search", "status": "warning", "summary": "optional, not configured", "details": [], "remediation": "Set BRAVE_SEARCH_API_KEY or VENICE_API_KEY to enable web search" }
                     ]
                 },
                 {
@@ -1531,6 +1531,9 @@ mod runs {
                     output:       serde_json::json!("[redis]\nhost = \"redis-prod.internal\"\nport = 6379"),
                     is_error:     false,
                     visit:        1,
+                    output_bytes_observed: None,
+                    output_bytes_retained: None,
+                    output_bytes_omitted:  None,
                     tool_result:  None,
                     turn_id:      None,
                 }),
@@ -1557,6 +1560,9 @@ mod runs {
                     output:       serde_json::json!("[redis]\nhost = \"redis-staging.internal\"\nport = 6379"),
                     is_error:     false,
                     visit:        1,
+                    output_bytes_observed: None,
+                    output_bytes_retained: None,
+                    output_bytes_omitted:  None,
                     tool_result:  None,
                     turn_id:      None,
                 }),

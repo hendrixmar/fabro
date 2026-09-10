@@ -156,6 +156,8 @@ fn persisted_workflow(graph: Graph, source: String, run_dir: &Path, run_id: RunI
             graph,
             graph_source: None,
             workflow_slug: Some("test".to_string()),
+            workflow_version_id: None,
+            target: None,
             automation: None,
             source_directory: Some(
                 std::env::current_dir()
@@ -173,6 +175,7 @@ fn persisted_workflow(graph: Graph, source: String, run_dir: &Path, run_id: RunI
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             definition_blob: None,
+            spec_blob: None,
             fork_source_ref: None,
         },
     )
@@ -192,7 +195,7 @@ fn test_lifecycle(setup_commands: Vec<&str>) -> LifecycleOptions {
 }
 
 async fn test_run_store(run_id: &RunId) -> fabro_store::RunDatabase {
-    let store: Arc<Database> = Arc::new(Database::new(
+    let store: Arc<Database> = Arc::new(fabro_store::test_support::test_database(
         Arc::new(InMemory::new()),
         "",
         Duration::from_millis(1),
@@ -207,22 +210,25 @@ async fn seed_created_and_starting(
     graph: &Graph,
 ) {
     append_event(run_store, &run_options.run_id, &Event::RunCreated {
-        run_id:           run_options.run_id,
-        title:            None,
-        settings:         serde_json::to_value(&run_options.settings).unwrap(),
-        graph:            serde_json::to_value(graph).unwrap(),
-        workflow_source:  None,
-        labels:           run_options.labels.clone().into_iter().collect(),
-        source_directory: Some(std::env::current_dir().unwrap().display().to_string()),
-        workflow_slug:    run_options.workflow_slug.clone(),
-        automation:       None,
-        provenance:       test_support::test_run_provenance(),
-        manifest_blob:    None,
-        git:              run_options.pre_run_git.clone(),
-        fork_source_ref:  run_options.fork_source_ref.clone(),
-        retried_from:     None,
-        parent_id:        None,
-        web_url:          None,
+        run_id:              run_options.run_id,
+        title:               None,
+        settings:            serde_json::to_value(&run_options.settings).unwrap(),
+        graph:               serde_json::to_value(graph).unwrap(),
+        workflow_source:     None,
+        labels:              run_options.labels.clone().into_iter().collect(),
+        source_directory:    Some(std::env::current_dir().unwrap().display().to_string()),
+        workflow_slug:       run_options.workflow_slug.clone(),
+        workflow_version_id: None,
+        target:              None,
+        automation:          None,
+        provenance:          test_support::test_run_provenance(),
+        manifest_blob:       None,
+        spec_blob:           None,
+        git:                 run_options.pre_run_git.clone(),
+        fork_source_ref:     run_options.fork_source_ref.clone(),
+        retried_from:        None,
+        parent_id:           None,
+        web_url:             None,
     })
     .await
     .unwrap();
@@ -283,7 +289,7 @@ async fn execute_test_run_with_options(
             hooks: HookSettings { hooks: vec![] },
             sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::new(),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             vault: auth_test_support::empty_vault(),
@@ -300,7 +306,7 @@ async fn execute_test_run_with_options(
     .unwrap();
 
     let executed = execute(initialized).await;
-    store_logger.flush().await;
+    store_logger.flush().await.unwrap();
     executed
 }
 
@@ -345,7 +351,7 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
             hooks: HookSettings { hooks: vec![] },
             sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::new(),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             vault: auth_test_support::empty_vault(),
@@ -484,7 +490,7 @@ async fn resumed_in_flight_node_starts_a_new_stage_execution() {
             hooks: HookSettings { hooks: vec![] },
             sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::new(),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             vault: auth_test_support::empty_vault(),
@@ -595,7 +601,7 @@ async fn run_with_lifecycle(
             hooks: HookSettings { hooks: vec![] },
             sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::new(),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             vault: auth_test_support::empty_vault(),

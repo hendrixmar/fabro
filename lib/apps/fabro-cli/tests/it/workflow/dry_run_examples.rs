@@ -14,12 +14,6 @@ fn dry_run_branching() {
     exit_code: 0
     ----- stdout -----
     ----- stderr -----
-    Workflow: Branch (6 nodes, 6 edges)
-    Graph: [GRAPH_PATH]
-    Goal: Implement and validate a feature
-
-    warning [node: implement]: Node 'implement' has goal_gate=true but no retry_target or fallback_retry_target (goal_gate_has_retry)
-      fix: Add retry_target or fallback_retry_target attribute
         Run: [ULID]
         Web UI: http://localhost:3000/runs/[ULID]
         Sandbox: local (ready in [TIME])
@@ -52,10 +46,6 @@ fn dry_run_conditions() {
     exit_code: 0
     ----- stdout -----
     ----- stderr -----
-    Workflow: Conditions (5 nodes, 5 edges)
-    Graph: [GRAPH_PATH]
-    Goal: Test condition evaluation with OR and parentheses
-
         Run: [ULID]
         Web UI: http://localhost:3000/runs/[ULID]
         Sandbox: local (ready in [TIME])
@@ -88,10 +78,6 @@ fn dry_run_parallel() {
     exit_code: 0
     ----- stdout -----
     ----- stderr -----
-    Workflow: Parallel (7 nodes, 7 edges)
-    Graph: [GRAPH_PATH]
-    Goal: Test parallel and fan-in execution
-
         Run: [ULID]
         Web UI: http://localhost:3000/runs/[ULID]
         Sandbox: local (ready in [TIME])
@@ -125,10 +111,6 @@ fn dry_run_styled() {
     exit_code: 0
     ----- stdout -----
     ----- stderr -----
-    Workflow: Styled (5 nodes, 4 edges)
-    Graph: [GRAPH_PATH]
-    Goal: Build a styled pipeline
-
         Run: [ULID]
         Web UI: http://localhost:3000/runs/[ULID]
         Sandbox: local (ready in [TIME])
@@ -160,10 +142,6 @@ fn dry_run_inferred_command() {
     exit_code: 0
     ----- stdout -----
     ----- stderr -----
-    Workflow: InferredCommand (3 nodes, 2 edges)
-    Graph: [GRAPH_PATH]
-    Goal: Verify a shapeless script node runs as a command
-
         Run: [ULID]
         Web UI: http://localhost:3000/runs/[ULID]
         Sandbox: local (ready in [TIME])

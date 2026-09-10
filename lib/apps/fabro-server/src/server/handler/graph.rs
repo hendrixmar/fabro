@@ -243,10 +243,9 @@ async fn load_run_dot_source(state: &AppState, id: &RunId) -> Result<String, Res
         Some(dot)
     } else {
         state
-            .cached_run(id)
+            .load_run_projection(id)
             .await
             .map_err(IntoResponse::into_response)?
-            .projection
             .spec
             .graph_source
             .clone()

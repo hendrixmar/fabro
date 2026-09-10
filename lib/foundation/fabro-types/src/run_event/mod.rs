@@ -20,7 +20,15 @@ pub use session::*;
 pub use stage::*;
 pub use todo::*;
 
-use crate::{ParallelBranchId, Principal, RunId, StageId};
+use crate::{ParallelBranchId, Principal, RunId, StageId, UsdMicros};
+
+/// Maximum accepted body size for `POST /runs/{id}/events`.
+///
+/// Producers that embed large payloads in an event (serialized tool output in
+/// particular) must budget against this limit, leaving headroom for the rest
+/// of the event envelope. The agent layer reserves half of it for serialized
+/// tool output.
+pub const MAX_RUN_EVENT_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -754,7 +762,8 @@ fn is_known_event_name(event: &str) -> bool {
 }
 
 impl RunEvent {
-    pub fn from_value(value: Value) -> serde_json::Result<Self> {
+    pub fn from_value(mut value: Value) -> serde_json::Result<Self> {
+        normalize_legacy_event(&mut value);
         let raw: RunEventRaw = serde_json::from_value(value)?;
         Self::from_parts(RunEventParts {
             id:                 raw.id,
@@ -803,10 +812,11 @@ impl RunEvent {
         let event = obj.get("event").and_then(Value::as_str).ok_or_else(|| {
             <serde_json::Error as DeError>::custom("missing or non-string field: event")
         })?;
-        let properties = obj
+        let mut properties = obj
             .get("properties")
             .cloned()
             .unwrap_or_else(default_properties);
+        normalize_legacy_event_properties(event, &mut properties);
         Self::from_parts(RunEventParts {
             id: id.to_string(),
             ts,
@@ -913,6 +923,291 @@ impl RunEvent {
     }
 }
 
+/// Upgrades historical wire shapes only in the value being decoded. Legacy
+/// importers still retain and compare the original stored JSON.
+fn normalize_legacy_event(value: &mut Value) {
+    let Some(event) = value
+        .get("event")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(properties) = value.get_mut("properties") else {
+        return;
+    };
+    normalize_legacy_event_properties(&event, properties);
+}
+
+fn normalize_legacy_event_properties(event: &str, properties: &mut Value) {
+    let Some(object) = properties.as_object_mut() else {
+        return;
+    };
+    match event {
+        "agent.message" => normalize_legacy_agent_message(object),
+        "run.completed" => normalize_legacy_timing(object, false),
+        "run.failed" => {
+            normalize_legacy_run_failure(object);
+            normalize_legacy_timing(object, false);
+        }
+        "stage.completed" => {
+            normalize_legacy_usage_field(object);
+            normalize_legacy_billing_field(object, "billing");
+            normalize_legacy_timing(object, true);
+        }
+        "stage.failed" => normalize_legacy_billing_field(object, "billing"),
+        "prompt.completed" => {
+            normalize_legacy_usage_field(object);
+            normalize_legacy_billing_field(object, "billing");
+        }
+        "checkpoint.completed" => normalize_legacy_checkpoint_billing(object),
+        "sandbox.initialized" => normalize_legacy_sandbox_id(object),
+        _ => {}
+    }
+}
+
+fn normalize_legacy_agent_message(properties: &mut Map<String, Value>) {
+    let speed = properties
+        .get("usage")
+        .and_then(Value::as_object)
+        .and_then(|usage| usage.get("speed"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(model_id) = properties.get("model").and_then(Value::as_str) {
+        let mut model = Map::from_iter([
+            (
+                "provider".to_owned(),
+                Value::String(legacy_provider_for_model(model_id).to_owned()),
+            ),
+            ("model_id".to_owned(), Value::String(model_id.to_owned())),
+        ]);
+        if let Some(speed @ ("standard" | "fast")) = speed.as_deref() {
+            model.insert("speed".to_owned(), Value::String(speed.to_owned()));
+        }
+        properties.insert("model".to_owned(), Value::Object(model));
+    }
+    if !properties.contains_key("billing") {
+        if let Some(usage) = properties.remove("usage") {
+            properties.insert("billing".to_owned(), usage);
+        }
+    }
+}
+
+fn normalize_legacy_usage_field(properties: &mut Map<String, Value>) {
+    if !properties.contains_key("billing") {
+        if let Some(usage) = properties.remove("usage") {
+            properties.insert("billing".to_owned(), usage);
+        }
+    }
+}
+
+fn normalize_legacy_billing_field(properties: &mut Map<String, Value>, field: &str) {
+    if let Some(billing) = properties.get_mut(field) {
+        normalize_legacy_billing_values(billing);
+    }
+}
+
+fn normalize_legacy_checkpoint_billing(properties: &mut Map<String, Value>) {
+    let Some(outcomes) = properties
+        .get_mut("node_outcomes")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for outcome in outcomes.values_mut().filter_map(Value::as_object_mut) {
+        normalize_legacy_billing_field(outcome, "usage");
+    }
+}
+
+fn normalize_legacy_timing(properties: &mut Map<String, Value>, stage: bool) {
+    if properties.contains_key("timing") {
+        return;
+    }
+    let Some(wall_time_ms) = properties.get("duration_ms").and_then(Value::as_u64) else {
+        return;
+    };
+    let timing = json!({
+        "wall_time_ms": wall_time_ms,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0,
+    });
+    properties.insert("timing".to_owned(), timing);
+    if stage {
+        properties.remove("duration_ms");
+    }
+}
+
+fn normalize_legacy_run_failure(properties: &mut Map<String, Value>) {
+    if !properties.contains_key("failure") {
+        if let (Some(message), Some(reason)) = (
+            properties.get("error").cloned(),
+            properties.get("reason").cloned(),
+        ) {
+            let causes = properties
+                .get("causes")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            properties.insert(
+                "failure".to_owned(),
+                json!({
+                    "reason": reason,
+                    "detail": {
+                        "message": message,
+                        "causes": causes,
+                        "category": "deterministic",
+                    }
+                }),
+            );
+        }
+    }
+    if !properties.contains_key("final_git_commit_sha") {
+        if let Some(commit) = properties.get("git_commit_sha").cloned() {
+            properties.insert("final_git_commit_sha".to_owned(), commit);
+        }
+    }
+}
+
+fn normalize_legacy_sandbox_id(properties: &mut Map<String, Value>) {
+    if properties.contains_key("id") {
+        return;
+    }
+    let id = properties
+        .get("identifier")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    properties.insert("id".to_owned(), Value::String(id.to_owned()));
+}
+
+fn normalize_legacy_billing_values(value: &mut Value) {
+    if legacy_stage_usage(value) {
+        let legacy = std::mem::take(value);
+        *value = normalized_legacy_stage_usage(&legacy);
+        return;
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_legacy_billing_values(value);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(facts) = object.get_mut("facts").and_then(Value::as_object_mut) {
+                if !facts.contains_key("algorithm") {
+                    let provider = facts
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(provider) = provider {
+                        facts.remove("provider");
+                        facts.insert(
+                            "algorithm".to_owned(),
+                            Value::String(legacy_billing_algorithm(&provider).to_owned()),
+                        );
+                    }
+                }
+            }
+            for value in object.values_mut() {
+                normalize_legacy_billing_values(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn legacy_stage_usage(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.get("model").is_some_and(Value::is_string)
+        && object.get("input_tokens").is_some_and(Value::is_number)
+        && object.get("output_tokens").is_some_and(Value::is_number)
+}
+
+fn normalized_legacy_stage_usage(legacy: &Value) -> Value {
+    let object = legacy
+        .as_object()
+        .expect("legacy stage usage was validated as an object");
+    let model_id = object
+        .get("model")
+        .and_then(Value::as_str)
+        .expect("legacy stage usage was validated with a string model");
+    let provider = legacy_provider_for_model(model_id);
+    let mut model = json!({
+        "provider": provider,
+        "model_id": model_id,
+    });
+    if let Some(speed @ ("standard" | "fast")) = object.get("speed").and_then(Value::as_str) {
+        model["speed"] = Value::String(speed.to_owned());
+    }
+    let input_tokens = object
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = object
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let reasoning_tokens = object
+        .get("reasoning_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_read_tokens = object
+        .get("cache_read_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_write_tokens = object
+        .get("cache_write_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let mut normalized = json!({
+        "input": {
+            "usage": {
+                "model": model,
+                "tokens": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_write_tokens": cache_write_tokens,
+                }
+            },
+            "facts": {
+                "algorithm": legacy_billing_algorithm(provider),
+            }
+        }
+    });
+    if let Some(cost) = object.get("cost").and_then(Value::as_f64) {
+        normalized["total_usd_micros"] = Value::from(UsdMicros::from_usd(cost).0);
+    }
+    normalized
+}
+
+fn legacy_provider_for_model(model_id: &str) -> &'static str {
+    if model_id.starts_with("claude-") {
+        "anthropic"
+    } else if model_id.starts_with("gemini-") {
+        "gemini"
+    } else if model_id.starts_with("gpt-")
+        || model_id.starts_with("chatgpt-")
+        || model_id.starts_with("o1")
+        || model_id.starts_with("o3")
+        || model_id.starts_with("o4")
+    {
+        "openai"
+    } else {
+        "legacy"
+    }
+}
+
+fn legacy_billing_algorithm(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "anthropic",
+        "gemini" => "gemini",
+        _ => "openai",
+    }
+}
+
 impl Serialize for RunEvent {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -950,6 +1245,16 @@ mod tests {
             login.to_string(),
             AuthMethod::Github,
         )
+    }
+
+    fn stored_event(event: &str, properties: &Value) -> Value {
+        json!({
+            "id": format!("evt_{event}"),
+            "ts": "2026-04-04T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "event": event,
+            "properties": properties,
+        })
     }
 
     #[test]
@@ -1047,6 +1352,212 @@ mod tests {
         assert_eq!(props.attempt, None);
         assert_eq!(props.requested_reasoning_effort, None);
         assert_eq!(props.effective_reasoning_effort, None);
+    }
+
+    #[test]
+    fn historical_run_created_defaults_new_run_settings() {
+        let mut settings = serde_json::to_value(WorkflowSettings::default()).unwrap();
+        let run = settings["run"].as_object_mut().unwrap();
+        for field in ["clone", "run_branch", "integrations"] {
+            run.remove(field);
+        }
+        let line = stored_event(
+            "run.created",
+            &json!({
+                "settings": settings,
+                "graph": Graph::new("test"),
+                "labels": {},
+                "source_directory": "/tmp/run",
+                "provenance": test_support::test_run_provenance()
+            }),
+        );
+
+        let parsed = RunEvent::from_value(line).unwrap();
+        let EventBody::RunCreated(props) = parsed.body else {
+            panic!("expected run.created");
+        };
+
+        assert_eq!(props.settings.run, WorkflowSettings::default().run);
+    }
+
+    #[test]
+    fn historical_agent_message_accepts_string_model() {
+        let line = stored_event(
+            "agent.message",
+            &json!({
+                "text": "done",
+                "model": "gemini-3.1-pro-preview",
+                "billing": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                },
+                "tool_call_count": 0,
+                "visit": 1
+            }),
+        );
+
+        let parsed = RunEvent::from_value(line).unwrap();
+        let normalized = parsed.to_value().unwrap();
+
+        assert_eq!(normalized["properties"]["model"]["provider"], "gemini");
+        assert_eq!(
+            normalized["properties"]["model"]["model_id"],
+            "gemini-3.1-pro-preview"
+        );
+    }
+
+    #[test]
+    fn historical_stage_usage_and_duration_are_upgraded() {
+        let line = stored_event(
+            "stage.completed",
+            &json!({
+                "index": 0,
+                "duration_ms": 42,
+                "status": "succeeded",
+                "usage": {
+                    "model": "claude-sonnet-4-6",
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_tokens": 7,
+                    "cache_write_tokens": 3,
+                    "reasoning_tokens": 2,
+                    "speed": "fast",
+                    "cost": 0.012_345
+                },
+                "attempt": 1,
+                "max_attempts": 1
+            }),
+        );
+
+        let parsed = RunEvent::from_value(line).unwrap();
+        let normalized = parsed.to_value().unwrap();
+        let properties = &normalized["properties"];
+
+        assert_eq!(properties["timing"]["wall_time_ms"], 42);
+        assert_eq!(
+            properties["billing"]["input"]["facts"]["algorithm"],
+            "anthropic"
+        );
+        assert_eq!(
+            properties["billing"]["input"]["usage"]["model"]["speed"],
+            "fast"
+        );
+        assert_eq!(properties["billing"]["total_usd_micros"], 12_345);
+        assert!(properties.get("duration_ms").is_none());
+        assert!(properties.get("usage").is_none());
+    }
+
+    #[test]
+    fn historical_billing_provider_tags_are_upgraded() {
+        let legacy_billing = json!({
+            "input": {
+                "usage": {
+                    "model": {
+                        "provider": "anthropic",
+                        "model_id": "claude-sonnet-4-6"
+                    },
+                    "tokens": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "reasoning_tokens": 0,
+                        "cache_read_tokens": 7,
+                        "cache_write_tokens": 3
+                    }
+                },
+                "facts": {
+                    "provider": "anthropic",
+                    "cache_write_5m_tokens": 3,
+                    "cache_write_1h_tokens": 0
+                }
+            },
+            "total_usd_micros": 123
+        });
+        let prompt = stored_event(
+            "prompt.completed",
+            &json!({
+                "response": "done",
+                "model": "claude-sonnet-4-6",
+                "provider": "anthropic",
+                "billing": legacy_billing.clone()
+            }),
+        );
+        let checkpoint = stored_event(
+            "checkpoint.completed",
+            &json!({
+                "status": "succeeded",
+                "current_node": "build",
+                "node_outcomes": {
+                    "build": {
+                        "status": "succeeded",
+                        "usage": legacy_billing
+                    }
+                }
+            }),
+        );
+
+        let prompt = RunEvent::from_value(prompt).unwrap().to_value().unwrap();
+        let checkpoint = RunEvent::from_value(checkpoint)
+            .unwrap()
+            .to_value()
+            .unwrap();
+
+        assert_eq!(
+            prompt["properties"]["billing"]["input"]["facts"]["algorithm"],
+            "anthropic"
+        );
+        assert_eq!(
+            checkpoint["properties"]["node_outcomes"]["build"]["usage"]["input"]["facts"]["algorithm"],
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn historical_terminal_and_sandbox_events_are_upgraded() {
+        let completed = stored_event(
+            "run.completed",
+            &json!({
+                "duration_ms": 123,
+                "artifact_count": 0,
+                "status": "succeeded",
+                "reason": "completed"
+            }),
+        );
+        let failed = stored_event(
+            "run.failed",
+            &json!({
+                "error": "cancelled by user",
+                "causes": ["interrupt requested"],
+                "duration_ms": 456,
+                "reason": "cancelled",
+                "git_commit_sha": "abc123"
+            }),
+        );
+        let sandbox = stored_event(
+            "sandbox.initialized",
+            &json!({
+                "provider": "local",
+                "working_directory": "/tmp/run"
+            }),
+        );
+
+        let completed = RunEvent::from_value(completed).unwrap().to_value().unwrap();
+        let failed = RunEvent::from_value(failed).unwrap().to_value().unwrap();
+        let sandbox = RunEvent::from_value(sandbox).unwrap().to_value().unwrap();
+
+        assert_eq!(completed["properties"]["timing"]["wall_time_ms"], 123);
+        assert_eq!(failed["properties"]["failure"]["reason"], "cancelled");
+        assert_eq!(
+            failed["properties"]["failure"]["detail"]["message"],
+            "cancelled by user"
+        );
+        assert_eq!(
+            failed["properties"]["failure"]["detail"]["causes"],
+            json!(["interrupt requested"])
+        );
+        assert_eq!(failed["properties"]["timing"]["wall_time_ms"], 456);
+        assert_eq!(failed["properties"]["final_git_commit_sha"], "abc123");
+        assert_eq!(sandbox["properties"]["id"], "");
     }
 
     #[test]
@@ -1957,6 +2468,7 @@ mod tests {
                 branch:           "refs/heads/run:refs/heads/run".to_string(),
                 success:          false,
                 exec_output_tail: Some(tail.clone()),
+                attempts:         Vec::new(),
             }),
         ] {
             let value = serde_json::to_value(&body).unwrap();
@@ -1988,6 +2500,7 @@ mod tests {
                 branch:           "refs/heads/run:refs/heads/run".to_string(),
                 success:          false,
                 exec_output_tail: None,
+                attempts:         Vec::new(),
             }),
         ] {
             let value = serde_json::to_value(&body).unwrap();
@@ -2459,6 +2972,9 @@ mod tests {
                 "duration_ms": 12,
                 "streams_separated": true,
                 "exec_output_tail": {"stdout": "out", "stderr": "err"},
+                "output_bytes_observed": 150,
+                "output_bytes_retained": 100,
+                "output_bytes_omitted": 50,
                 "visit": 1
             }
         });
@@ -2473,6 +2989,9 @@ mod tests {
         assert_eq!(props.termination, CommandTermination::Exited);
         assert_eq!(props.duration_ms, 12);
         assert!(props.streams_separated);
+        assert_eq!(props.output_bytes_observed, Some(150));
+        assert_eq!(props.output_bytes_retained, Some(100));
+        assert_eq!(props.output_bytes_omitted, Some(50));
         assert_eq!(
             props.exec_output_tail.as_ref().unwrap().stdout.as_deref(),
             Some("out")
@@ -2484,12 +3003,15 @@ mod tests {
     #[test]
     fn agent_tool_process_completed_omits_absent_exit_code_and_output_tail() {
         let body = EventBody::AgentToolProcessCompleted(AgentToolProcessCompletedProps {
-            exit_code:         None,
-            termination:       CommandTermination::TimedOut,
-            duration_ms:       10_000,
-            streams_separated: false,
-            exec_output_tail:  None,
-            visit:             1,
+            exit_code:             None,
+            termination:           CommandTermination::TimedOut,
+            duration_ms:           10_000,
+            streams_separated:     false,
+            exec_output_tail:      None,
+            output_bytes_observed: None,
+            output_bytes_retained: None,
+            output_bytes_omitted:  None,
+            visit:                 1,
         });
 
         let value = serde_json::to_value(&body).unwrap();
@@ -2500,6 +3022,9 @@ mod tests {
         let properties = value["properties"].as_object().unwrap();
         assert!(!properties.contains_key("exit_code"));
         assert!(!properties.contains_key("exec_output_tail"));
+        assert!(!properties.contains_key("output_bytes_observed"));
+        assert!(!properties.contains_key("output_bytes_retained"));
+        assert!(!properties.contains_key("output_bytes_omitted"));
 
         let parsed: EventBody = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, body);

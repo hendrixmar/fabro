@@ -37,7 +37,8 @@ use fabro_model::{Catalog, ProviderId};
 use fabro_types::settings::interp::{InterpString, ResolveError};
 use fabro_types::settings::run::{McpServerSettings, RunGoal};
 use fabro_types::{
-    AutomationRef, GitContext, ManifestPath, RunId, RunProvenance, WorkflowSettings,
+    AutomationRef, GitContext, ManifestPath, RunId, RunProvenance, RunTarget, WorkflowSettings,
+    WorkflowVersionId,
 };
 use fabro_util::workspace_glob::{WorkspaceGlob, WorkspaceGlobError};
 use fabro_workflow::Error as WorkflowError;
@@ -79,7 +80,7 @@ pub(crate) struct RawRunCompilerInput {
     pub(crate) server_run_defaults: RunLayer,
     pub(crate) server_environment_defaults: MergeMap<EnvironmentLayer>,
     pub(crate) server_mcp_catalog: HashMap<String, McpServerSettings>,
-    pub(crate) project_settings: Vec<ProjectSettingsSource>,
+    pub(crate) settings_input: RunCompilerSettingsInput,
     pub(crate) user_toml: Vec<String>,
     pub(crate) run_overrides: Option<RunLayer>,
     pub(crate) cli_overrides: Option<CliLayer>,
@@ -91,10 +92,24 @@ pub(crate) struct RawRunCompilerInput {
     pub(crate) git: Option<GitContext>,
     pub(crate) storage_root: PathBuf,
     pub(crate) workflow_slug: Option<String>,
+    pub(crate) workflow_version_id: Option<WorkflowVersionId>,
+    pub(crate) target: Option<RunTarget>,
     pub(crate) provenance: RunProvenance,
     pub(crate) web_url: Option<String>,
     pub(crate) submitted_manifest_bytes: Option<Vec<u8>>,
     pub(crate) automation: Option<AutomationRef>,
+}
+
+/// Settings already admitted by the caller, or the unchanged legacy manifest
+/// inputs that still need their historical parsing and lookup behavior.
+#[derive(Debug)]
+pub(crate) enum RunCompilerSettingsInput {
+    LegacyManifest {
+        project_settings: Vec<ProjectSettingsSource>,
+    },
+    Admitted {
+        workflow_layer: Option<Box<SettingsLayer>>,
+    },
 }
 
 /// Stage-one output: the selected bundled workflow and all client settings
@@ -121,6 +136,8 @@ struct RunMetadata {
     run_id: Option<RunId>,
     storage_root: PathBuf,
     workflow_slug: Option<String>,
+    workflow_version_id: Option<WorkflowVersionId>,
+    target: Option<RunTarget>,
     submitted_manifest_bytes: Option<Vec<u8>>,
     title: Option<String>,
     automation: Option<AutomationRef>,
@@ -152,6 +169,16 @@ pub(crate) struct PreparedRun {
 impl PreparedRun {
     pub(crate) fn settings(&self) -> &WorkflowSettings {
         &self.layered.settings
+    }
+
+    pub(crate) fn with_target_and_git(
+        mut self,
+        target: RunTarget,
+        git: Option<GitContext>,
+    ) -> Self {
+        self.layered.metadata.target = Some(target);
+        self.layered.metadata.git = git;
+        self
     }
 
     pub(crate) fn with_identity(
@@ -302,7 +329,7 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
         server_run_defaults,
         server_environment_defaults,
         server_mcp_catalog,
-        project_settings,
+        settings_input,
         user_toml,
         run_overrides,
         cli_overrides,
@@ -314,6 +341,8 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
         git,
         storage_root,
         workflow_slug,
+        workflow_version_id,
+        target,
         provenance,
         web_url,
         submitted_manifest_bytes,
@@ -327,32 +356,40 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
         })?;
     workflow.path = entrypoint.clone();
 
-    let workflow_layer = workflow
-        .config
-        .as_ref()
-        .map(|config| {
-            settings_layer_with_resolved_dockerfiles(
-                &config.source,
-                &config.path,
-                &workflow.files,
-                SettingsSource::Workflow,
-            )
-        })
-        .transpose()?;
-    let project_layers = project_settings
-        .into_iter()
-        .map(|project| {
-            let path = project
-                .path
-                .map_err(|source| invalid_settings(InvalidSettingsError::ProjectPath { source }))?;
-            settings_layer_with_resolved_dockerfiles(
-                &project.toml,
-                &path,
-                &workflow.files,
-                SettingsSource::Project,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let (workflow_layer, project_layers) = match settings_input {
+        RunCompilerSettingsInput::LegacyManifest { project_settings } => {
+            let workflow_layer = workflow
+                .config
+                .as_ref()
+                .map(|config| {
+                    settings_layer_with_resolved_dockerfiles(
+                        &config.source,
+                        &config.path,
+                        &workflow.files,
+                        SettingsSource::Workflow,
+                    )
+                })
+                .transpose()?;
+            let project_layers = project_settings
+                .into_iter()
+                .map(|project| {
+                    let path = project.path.map_err(|source| {
+                        invalid_settings(InvalidSettingsError::ProjectPath { source })
+                    })?;
+                    settings_layer_with_resolved_dockerfiles(
+                        &project.toml,
+                        &path,
+                        &workflow.files,
+                        SettingsSource::Project,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (workflow_layer, project_layers)
+        }
+        RunCompilerSettingsInput::Admitted { workflow_layer } => {
+            (workflow_layer.map(|layer| *layer), Vec::new())
+        }
+    };
 
     Ok(NormalizedRun {
         workflow_bundle,
@@ -373,6 +410,8 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
             run_id,
             storage_root,
             workflow_slug,
+            workflow_version_id,
+            target,
             submitted_manifest_bytes,
             title,
             automation,
@@ -533,6 +572,8 @@ pub(crate) fn assemble_run(pinned: PinnedRun) -> CreateRunPersistenceInput {
         run_id,
         storage_root,
         workflow_slug,
+        workflow_version_id,
+        target,
         submitted_manifest_bytes,
         title,
         automation,
@@ -545,6 +586,8 @@ pub(crate) fn assemble_run(pinned: PinnedRun) -> CreateRunPersistenceInput {
         run_id: run_id.expect("run ID should be resolved before compilation"),
         storage_root,
         workflow_slug,
+        workflow_version_id,
+        target,
         submitted_manifest_bytes,
         title,
         automation,
@@ -699,7 +742,9 @@ mod tests {
             server_run_defaults: RunLayer::default(),
             server_environment_defaults: fabro_environment::seeded_catalog_layer(),
             server_mcp_catalog: HashMap::new(),
-            project_settings: Vec::new(),
+            settings_input: RunCompilerSettingsInput::LegacyManifest {
+                project_settings: Vec::new(),
+            },
             user_toml: Vec::new(),
             run_overrides: None,
             cli_overrides: None,
@@ -711,6 +756,8 @@ mod tests {
             git: None,
             storage_root: PathBuf::from("/tmp/fabro-storage"),
             workflow_slug: None,
+            workflow_version_id: None,
+            target: None,
             provenance: provenance(),
             web_url: None,
             submitted_manifest_bytes: None,
@@ -835,7 +882,12 @@ target = "workflow"
 include = ["reports/{{ vars.owner }}/*.json"]
 "#;
         let mut input = raw_input(Some(workflow_toml), HashMap::new());
-        input.project_settings.push(ProjectSettingsSource {
+        let RunCompilerSettingsInput::LegacyManifest { project_settings } =
+            &mut input.settings_input
+        else {
+            panic!("test fixture should use legacy manifest settings");
+        };
+        project_settings.push(ProjectSettingsSource {
             path: Ok(manifest_path(".fabro/project.toml")),
             toml: r#"
 _version = 1
@@ -973,16 +1025,19 @@ include = ["reports/{{ vars.path }}/*.json"]
         let run_id = RunId::new();
         let parent_id = RunId::new();
         let automation = AutomationRef {
-            id:         "nightly".to_string(),
-            name:       Some("Nightly".to_string()),
-            trigger_id: Some("schedule".to_string()),
+            id:              "nightly".to_string(),
+            name:            Some("Nightly".to_string()),
+            trigger_id:      Some("schedule".to_string()),
+            workflow_source: None,
         };
         let submitted = b"submitted manifest".to_vec();
+        let workflow_version_id = fabro_types::test_support::test_workflow_version_id();
         let mut input = raw_input(None, HashMap::new());
         input.run_id = Some(run_id);
         input.parent_id = Some(parent_id);
         input.title = Some("Compiler boundary".to_string());
         input.workflow_slug = Some("compiler-boundary".to_string());
+        input.workflow_version_id = Some(workflow_version_id);
         input.web_url = Some(format!("https://fabro.test/runs/{run_id}"));
         input.submitted_manifest_bytes = Some(submitted.clone());
         input.automation = Some(automation.clone());
@@ -1005,6 +1060,7 @@ include = ["reports/{{ vars.path }}/*.json"]
 
         assert_eq!(persistence.run_id(), run_id);
         assert_eq!(persistence.workflow_slug(), Some("compiler-boundary"));
+        assert_eq!(persistence.workflow_version_id(), Some(workflow_version_id));
         assert_eq!(
             persistence.submitted_manifest_bytes(),
             Some(submitted.as_slice())

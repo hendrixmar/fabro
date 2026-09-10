@@ -9,7 +9,7 @@ import type { Environment } from "@qltysh/fabro-api-client";
 import { ApiError, apiData, environmentsApi } from "../lib/api-client";
 import { useEnvironments, useServerSettings } from "../lib/queries";
 import { queryKeys } from "../lib/query-keys";
-import { CREATABLE_PROVIDERS } from "../components/environment-form";
+import { CREATABLE_PROVIDERS, providerLabel } from "../lib/environment-providers";
 import {
   Badge,
   Muted,
@@ -61,10 +61,6 @@ export default function SettingsEnvironments() {
 
 const NEW_BUTTON_CLASS =
   "inline-flex items-center gap-1.5 rounded-md border border-line bg-panel/80 px-2.5 py-1 text-sm font-medium text-fg-3 transition-colors hover:border-line-strong hover:bg-panel hover:text-fg disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:border-line disabled:hover:bg-panel/80 disabled:hover:text-fg-3";
-
-function providerLabel(provider: string): string {
-  return provider.charAt(0).toUpperCase() + provider.slice(1);
-}
 
 // "New environment" is a provider picker: each enabled sandbox provider opens
 // the create form pre-set to that provider, which is then fixed for the

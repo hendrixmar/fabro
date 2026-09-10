@@ -14,7 +14,7 @@ use fabro_config::{
 };
 use fabro_graphviz::parser;
 use fabro_template::{
-    BundleTemplateStore, GraphReference, GraphReferenceError, StaticReferenceError,
+    BundleTemplateStore, GraphPosition, GraphReference, GraphReferenceError, StaticReferenceError,
     TemplateDiscoveryError, TemplateSource, discover_static_dependency_closure,
     validate_static_reference, visit_graph_references,
 };
@@ -107,6 +107,31 @@ impl ValidatedWorkflowVersion {
     pub fn into_version(self) -> WorkflowVersion {
         self.0
     }
+
+    /// Content of the run-goal file selected by this version's
+    /// `workflow.toml`, when the config declares a file-form goal.
+    ///
+    /// Resolution reuses the exact grammar [`Self::new`] certified, so
+    /// goal-file resolution has one owner: consumers that inline the goal at
+    /// run-admission time read the same bytes validation proved present.
+    #[must_use]
+    pub fn resolved_goal_file_content(&self) -> Option<&str> {
+        let config_path = self.0.config_path();
+        let source = self.0.files().get(&config_path)?;
+        let layer: SettingsLayer = source.parse().expect("validated workflow.toml must parse");
+        let RunGoalLayer::File { file } = layer.run.as_ref().and_then(|run| run.goal.as_ref())?
+        else {
+            return None;
+        };
+        let (_, content) = validate_config_file_reference(
+            &self.0,
+            &config_path,
+            ReferenceKind::RunGoalFile,
+            &unresolved_source(file),
+        )
+        .expect("validated goal-file reference must resolve");
+        Some(content)
+    }
 }
 
 /// Template sources that anchor static dependency discovery, all rooted at
@@ -138,8 +163,7 @@ fn validate_config(
     version: &WorkflowVersion,
     template_roots: &mut TemplateRoots,
 ) -> Result<(), WorkflowVersionError> {
-    let config_path =
-        WorkflowPath::new("workflow.toml").expect("the static workflow config path must be valid");
+    let config_path = version.config_path();
     let Some(source) = version.files().get(&config_path) else {
         return Ok(());
     };
@@ -252,8 +276,13 @@ fn validate_graph_closure(
             path: path.clone(),
             source,
         })?;
+        let position = if &path == version.entrypoint() {
+            GraphPosition::Entrypoint
+        } else {
+            GraphPosition::Imported
+        };
 
-        visit_graph_references(&graph, |reference| match reference {
+        visit_graph_references(&graph, position, |reference| match reference {
             GraphReference::GoalFile { reference } => {
                 let target = resolve_reference(&path, ReferenceKind::GraphGoalFile, reference)?;
                 let content =
@@ -261,7 +290,9 @@ fn validate_graph_closure(
                 template_roots.push(&target, content);
                 Ok(())
             }
-            GraphReference::GoalInline { content } | GraphReference::InlinePrompt { content } => {
+            GraphReference::GoalInline { content }
+            | GraphReference::InlinePrompt { content }
+            | GraphReference::ModelStylesheetInline { content } => {
                 template_roots.push(&path, content);
                 Ok(())
             }
@@ -616,7 +647,7 @@ mod tests {
                     BTreeMap::from([
                         (path("graphs/main.fabro"), "digraph W {}".to_owned()),
                         (
-                            path("workflow.toml"),
+                            path("graphs/workflow.toml"),
                             "_version = 1\n[run]\ngoal = \"{% include \\\"shared.md\\\" %}\"\n"
                                 .to_owned(),
                         ),
@@ -642,6 +673,38 @@ mod tests {
                         TemplateDiscoveryError::Missing { reference, .. } if reference == "shared.md"
                     )
         ));
+    }
+
+    #[test]
+    fn discovers_workflow_config_beside_a_nested_entrypoint() {
+        let version = ValidatedWorkflowVersion::new(
+            WorkflowVersion::new(
+                path(".fabro/workflows/demo/workflow.fabro"),
+                BTreeMap::from([
+                    (
+                        path(".fabro/workflows/demo/workflow.fabro"),
+                        "digraph W {}".to_owned(),
+                    ),
+                    (
+                        path(".fabro/workflows/demo/workflow.toml"),
+                        "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n[run.goal]\nfile = \"goal.md\"\n"
+                            .to_owned(),
+                    ),
+                    (
+                        path(".fabro/workflows/demo/goal.md"),
+                        "Ship the nested workflow".to_owned(),
+                    ),
+                ]),
+                BTreeMap::new(),
+            )
+            .expect("nested workflow version should be structurally valid"),
+        )
+        .expect("entrypoint-adjacent workflow config should validate");
+
+        assert_eq!(
+            version.resolved_goal_file_content(),
+            Some("Ship the nested workflow")
+        );
     }
 
     #[test]
@@ -724,6 +787,69 @@ mod tests {
                 ..
             } if parent.to_string() == "workflow.fabro"
         ));
+    }
+
+    #[test]
+    fn validates_root_model_stylesheet_template_closure() {
+        let version = version_with(
+            [
+                (
+                    "workflow.fabro",
+                    r#"digraph W {
+                        graph [model_stylesheet="{% include 'styles/base.css' %}"]
+                    }"#,
+                ),
+                ("styles/base.css", "{% include 'nested.css' %}"),
+                ("styles/nested.css", "* { reasoning_effort: low; }"),
+            ],
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(version.version().files().len(), 3);
+
+        for template in [
+            "{% include 'missing.css' %}",
+            "{% include inputs.stylesheet %}",
+            "{% include '../outside.css' %}",
+        ] {
+            let graph = format!(r#"digraph W {{ graph [model_stylesheet="{template}"] }}"#);
+            let error = ValidatedWorkflowVersion::new(
+                WorkflowVersion::new(
+                    path("workflow.fabro"),
+                    BTreeMap::from([(path("workflow.fabro"), graph)]),
+                    BTreeMap::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, WorkflowVersionError::Template { .. }),
+                "template: {template}; error: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_imported_model_stylesheet_template_closure() {
+        let version = version_with(
+            [
+                (
+                    "workflow.fabro",
+                    r#"digraph W { imported [import="child.fabro"] }"#,
+                ),
+                (
+                    "child.fabro",
+                    r#"digraph I {
+                        graph [model_stylesheet="{% include 'missing.css' %}"]
+                    }"#,
+                ),
+            ],
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(version.version().files().len(), 2);
     }
 
     #[test]

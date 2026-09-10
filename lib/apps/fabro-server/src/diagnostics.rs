@@ -5,8 +5,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fabro_auth::auth_issue_message;
+use fabro_http::Response;
 use fabro_llm::client::Client as LlmClient;
-use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe};
+use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe_with_timeout};
 use fabro_model::{Catalog, ProviderId};
 use fabro_redact::redact_string;
 use fabro_sandbox::{DockerSandboxProvider, daytona};
@@ -19,9 +20,13 @@ use fabro_util::session_secret;
 use fabro_util::version::FABRO_VERSION;
 use futures_util::future::join_all;
 use serde::Serialize;
+use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 
 use crate::server::AppState;
+
+const EXTERNAL_SERVICE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const DOCKER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn http_client_or_check(
     name: &str,
@@ -89,12 +94,12 @@ fn validate_session_secret(value: &str) -> Result<(), String> {
 }
 
 pub async fn run_all(state: &AppState) -> DiagnosticsReport {
-    let (llm, github, docker_sandbox, cloud_sandbox, brave, crypto) = tokio::join!(
+    let (llm, github, docker_sandbox, cloud_sandbox, web_search, crypto) = tokio::join!(
         check_llm_providers(state),
         check_github_app(state),
         check_docker_sandbox(state),
         check_cloud_sandbox(state),
-        check_brave_search(state),
+        check_web_search(state),
         check_crypto(state),
     );
 
@@ -103,7 +108,7 @@ pub async fn run_all(state: &AppState) -> DiagnosticsReport {
         sections: vec![
             CheckSection {
                 title:  "Credentials".to_string(),
-                checks: vec![llm, github, docker_sandbox, cloud_sandbox, brave],
+                checks: vec![llm, github, docker_sandbox, cloud_sandbox, web_search],
             },
             CheckSection {
                 title:  "Configuration".to_string(),
@@ -252,13 +257,20 @@ async fn probe_single_provider(
             None,
         );
     };
-    let model_id = model.id.clone();
+    let model_id = model.id.to_string();
 
-    let outcome = run_basic_model_probe(model_id.as_str(), &provider, client).await;
+    let outcome = run_basic_model_probe_with_timeout(
+        &model_id,
+        &provider,
+        client,
+        EXTERNAL_SERVICE_PROBE_TIMEOUT,
+    )
+    .await;
+
     match outcome.status {
         ModelTestStatus::Ok => ProviderProbeResult {
             provider,
-            model_id: Some(model_id.to_string()),
+            model_id: Some(model_id),
             status: ProviderProbeStatus::Ok,
             error_message: None,
             diagnostic_detail: None,
@@ -267,12 +279,7 @@ async fn probe_single_provider(
             let raw = outcome
                 .error_message
                 .unwrap_or_else(|| "provider probe failed".to_string());
-            provider_probe_error(
-                provider,
-                Some(model_id.to_string()),
-                redact_string(&raw),
-                None,
-            )
+            provider_probe_error(provider, Some(model_id), redact_string(&raw), None)
         }
     }
 }
@@ -388,7 +395,7 @@ async fn check_github_app(state: &AppState) -> CheckResult {
             Err(result) => return result,
         };
         let probe = timeout(
-            Duration::from_secs(15),
+            EXTERNAL_SERVICE_PROBE_TIMEOUT,
             http.get(format!("{}/user", fabro_github::github_api_base_url()))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Accept", "application/vnd.github+json")
@@ -538,7 +545,7 @@ async fn check_github_app(state: &AppState) -> CheckResult {
         Err(result) => return result,
     };
     let auth_result = timeout(
-        Duration::from_secs(15),
+        EXTERNAL_SERVICE_PROBE_TIMEOUT,
         fabro_github::get_authenticated_app(&http, &jwt, &fabro_github::github_api_base_url()),
     )
     .await;
@@ -581,7 +588,7 @@ async fn check_docker_sandbox(state: &AppState) -> CheckResult {
                 .await
                 .map_err(|err| err.display_with_causes())
         },
-        Duration::from_secs(5),
+        DOCKER_PROBE_TIMEOUT,
     )
     .await
 }
@@ -656,7 +663,14 @@ async fn check_cloud_sandbox(state: &AppState) -> CheckResult {
         };
     };
 
-    match state.check_daytona_api_key(api_key).await {
+    let probe = state
+        .check_daytona_api_key_with_timeout(api_key, EXTERNAL_SERVICE_PROBE_TIMEOUT)
+        .await;
+    cloud_sandbox_probe_check(probe)
+}
+
+fn cloud_sandbox_probe_check(probe: anyhow::Result<daytona::DaytonaKeyCheck>) -> CheckResult {
+    match probe {
         Ok(check) if check.ok() => CheckResult {
             name:        "Cloud Sandbox".to_string(),
             status:      CheckStatus::Pass,
@@ -678,13 +692,29 @@ async fn check_cloud_sandbox(state: &AppState) -> CheckResult {
                 daytona::required_perms_display()
             )),
         },
-        Err(err) => CheckResult {
-            name:        "Cloud Sandbox".to_string(),
-            status:      CheckStatus::Error,
-            summary:     "Daytona credential rejected".to_string(),
-            details:     vec![CheckDetail::new(format!("{err:#}"))],
-            remediation: Some("Verify DAYTONA_API_KEY value and Daytona reachability".to_string()),
-        },
+        Err(err) => {
+            if let Some(timeout) = err.downcast_ref::<daytona::DaytonaCredentialProbeTimeout>() {
+                return CheckResult {
+                    name:        "Cloud Sandbox".to_string(),
+                    status:      CheckStatus::Error,
+                    summary:     format!("timeout ({:?})", timeout.timeout()),
+                    details:     vec![CheckDetail::new("Daytona probe timed out".to_string())],
+                    remediation: Some(
+                        "Verify DAYTONA_API_KEY value and Daytona reachability".to_string(),
+                    ),
+                };
+            }
+
+            CheckResult {
+                name:        "Cloud Sandbox".to_string(),
+                status:      CheckStatus::Error,
+                summary:     "Daytona credential rejected".to_string(),
+                details:     vec![CheckDetail::new(format!("{err:#}"))],
+                remediation: Some(
+                    "Verify DAYTONA_API_KEY value and Daytona reachability".to_string(),
+                ),
+            }
+        }
     }
 }
 
@@ -727,30 +757,50 @@ fn check_storage_dir_path(path: &std::path::Path) -> CheckResult {
     }
 }
 
-async fn check_brave_search(state: &AppState) -> CheckResult {
-    let api_key =
-        match diagnostic_secret(state, "Web Search (Brave)", EnvVars::BRAVE_SEARCH_API_KEY).await {
+async fn check_web_search(state: &AppState) -> CheckResult {
+    let brave_api_key = match diagnostic_secret(
+        state,
+        WEB_SEARCH_CHECK_NAME,
+        EnvVars::BRAVE_SEARCH_API_KEY,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if let Some(api_key) = brave_api_key {
+        return check_brave_search(api_key).await;
+    }
+
+    let venice_api_key =
+        match diagnostic_secret(state, WEB_SEARCH_CHECK_NAME, EnvVars::VENICE_API_KEY).await {
             Ok(value) => value,
             Err(result) => return result,
         };
-    let Some(api_key) = api_key else {
-        return CheckResult {
-            name:        "Web Search (Brave)".to_string(),
-            status:      CheckStatus::Warning,
-            summary:     "optional, not configured".to_string(),
-            details:     Vec::new(),
-            remediation: Some(
-                "Run `fabro secret set BRAVE_SEARCH_API_KEY` to enable web search".to_string(),
-            ),
-        };
-    };
+    if let Some(api_key) = venice_api_key {
+        return check_venice_search(api_key).await;
+    }
 
-    let http = match http_client_or_check("Web Search (Brave)", CheckStatus::Warning) {
+    CheckResult {
+        name:        WEB_SEARCH_CHECK_NAME.to_string(),
+        status:      CheckStatus::Warning,
+        summary:     "optional, not configured".to_string(),
+        details:     Vec::new(),
+        remediation: Some(
+            "Run `fabro secret set BRAVE_SEARCH_API_KEY` or `fabro secret set VENICE_API_KEY` to enable web search".to_string(),
+        ),
+    }
+}
+
+const WEB_SEARCH_CHECK_NAME: &str = "Web Search";
+
+async fn check_brave_search(api_key: String) -> CheckResult {
+    let http = match http_client_or_check(WEB_SEARCH_CHECK_NAME, CheckStatus::Warning) {
         Ok(http) => http,
         Err(result) => return result,
     };
 
-    let probe = timeout(Duration::from_secs(15), async move {
+    let probe = timeout(EXTERNAL_SERVICE_PROBE_TIMEOUT, async move {
         http.get("https://api.search.brave.com/res/v1/web/search?q=test&count=1")
             .header("X-Subscription-Token", api_key)
             .send()
@@ -759,36 +809,67 @@ async fn check_brave_search(state: &AppState) -> CheckResult {
     })
     .await;
 
+    match_web_search_probe(probe, "brave", "BRAVE_SEARCH_API_KEY")
+}
+
+async fn check_venice_search(api_key: String) -> CheckResult {
+    let http = match http_client_or_check(WEB_SEARCH_CHECK_NAME, CheckStatus::Warning) {
+        Ok(http) => http,
+        Err(result) => return result,
+    };
+
+    let probe = timeout(EXTERNAL_SERVICE_PROBE_TIMEOUT, async move {
+        http.post("https://api.venice.ai/api/v1/augment/search")
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "query": "test",
+                "limit": 1,
+                "search_provider": "brave",
+            }))
+            .send()
+            .await
+            .map_err(anyhow::Error::new)
+    })
+    .await;
+
+    match_web_search_probe(probe, "venice", "VENICE_API_KEY")
+}
+
+fn match_web_search_probe(
+    probe: Result<anyhow::Result<Response>, Elapsed>,
+    provider: &str,
+    secret_name: &str,
+) -> CheckResult {
     match probe {
         Ok(Ok(response)) if response.status().is_success() => CheckResult {
-            name:        "Web Search (Brave)".to_string(),
+            name:        WEB_SEARCH_CHECK_NAME.to_string(),
             status:      CheckStatus::Pass,
-            summary:     "configured and reachable".to_string(),
+            summary:     format!("{provider}: configured and reachable"),
             details:     Vec::new(),
             remediation: None,
         },
         Ok(Ok(response)) => CheckResult {
-            name:        "Web Search (Brave)".to_string(),
+            name:        WEB_SEARCH_CHECK_NAME.to_string(),
             status:      CheckStatus::Warning,
-            summary:     format!("HTTP {}", response.status()),
+            summary:     format!("{provider}: HTTP {}", response.status()),
             details:     Vec::new(),
-            remediation: Some("Check BRAVE_SEARCH_API_KEY and network connectivity".to_string()),
+            remediation: Some(format!("Check {secret_name} and network connectivity")),
         },
         Ok(Err(err)) => CheckResult {
-            name:        "Web Search (Brave)".to_string(),
+            name:        WEB_SEARCH_CHECK_NAME.to_string(),
             status:      CheckStatus::Warning,
-            summary:     "connectivity error".to_string(),
+            summary:     format!("{provider}: connectivity error"),
             details:     vec![CheckDetail::new(format!("{err:#}"))],
-            remediation: Some("Check BRAVE_SEARCH_API_KEY and network connectivity".to_string()),
+            remediation: Some(format!("Check {secret_name} and network connectivity")),
         },
         Err(_) => CheckResult {
-            name:        "Web Search (Brave)".to_string(),
+            name:        WEB_SEARCH_CHECK_NAME.to_string(),
             status:      CheckStatus::Warning,
-            summary:     "timeout".to_string(),
-            details:     vec![CheckDetail::new(
-                "Web Search (Brave) probe timed out".to_string(),
-            )],
-            remediation: Some("Check BRAVE_SEARCH_API_KEY and network connectivity".to_string()),
+            summary:     format!("{provider}: timeout"),
+            details:     vec![CheckDetail::new(format!(
+                "Web Search ({provider}) probe timed out"
+            ))],
+            remediation: Some(format!("Check {secret_name} and network connectivity")),
         },
     }
 }
@@ -1154,22 +1235,87 @@ enabled = false
         );
     }
 
+    #[test]
+    fn check_cloud_sandbox_reports_timeout() {
+        let result = cloud_sandbox_probe_check(Err(anyhow::Error::new(
+            daytona::DaytonaCredentialProbeTimeout::new(Duration::from_millis(1)),
+        )));
+
+        assert_eq!(result.name, "Cloud Sandbox");
+        assert_eq!(result.status, CheckStatus::Error);
+        assert_eq!(result.summary, "timeout (1ms)");
+        assert_eq!(result.details[0].text, "Daytona probe timed out");
+    }
+
     #[tokio::test]
-    async fn check_brave_search_ignores_env_backed_api_key() {
+    async fn check_web_search_ignores_env_backed_brave_api_key() {
         let state = TestAppStateBuilder::new()
             .env_lookup(|name| {
                 (name == EnvVars::BRAVE_SEARCH_API_KEY).then(|| "brave-from-env".to_string())
             })
             .build();
 
-        let result = check_brave_search(&state).await;
+        let result = check_web_search(&state).await;
 
+        assert_eq!(result.name, "Web Search");
         assert_eq!(result.status, CheckStatus::Warning);
         assert_eq!(result.summary, "optional, not configured");
         assert_eq!(
             result.remediation.as_deref(),
-            Some("Run `fabro secret set BRAVE_SEARCH_API_KEY` to enable web search")
+            Some(
+                "Run `fabro secret set BRAVE_SEARCH_API_KEY` or `fabro secret set VENICE_API_KEY` to enable web search"
+            )
         );
+    }
+
+    #[tokio::test]
+    async fn check_web_search_ignores_env_backed_venice_api_key() {
+        let state = TestAppStateBuilder::new()
+            .env_lookup(|name| {
+                (name == EnvVars::VENICE_API_KEY).then(|| "venice-from-env".to_string())
+            })
+            .build();
+
+        let result = check_web_search(&state).await;
+
+        assert_eq!(result.name, "Web Search");
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.summary, "optional, not configured");
+        assert_eq!(
+            result.remediation.as_deref(),
+            Some(
+                "Run `fabro secret set BRAVE_SEARCH_API_KEY` or `fabro secret set VENICE_API_KEY` to enable web search"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn check_web_search_prefers_brave_when_both_vault_keys_exist() {
+        let state = TestAppStateBuilder::new()
+            .vault_entries([
+                (EnvVars::BRAVE_SEARCH_API_KEY, "invalid\n"),
+                (EnvVars::VENICE_API_KEY, "invalid\n"),
+            ])
+            .build();
+
+        let result = check_web_search(&state).await;
+
+        assert_eq!(result.name, "Web Search");
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.summary, "brave: connectivity error");
+    }
+
+    #[tokio::test]
+    async fn check_web_search_uses_venice_when_brave_vault_key_is_absent() {
+        let state = TestAppStateBuilder::new()
+            .vault_entries([(EnvVars::VENICE_API_KEY, "invalid\n")])
+            .build();
+
+        let result = check_web_search(&state).await;
+
+        assert_eq!(result.name, "Web Search");
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.summary, "venice: connectivity error");
     }
 
     #[tokio::test]

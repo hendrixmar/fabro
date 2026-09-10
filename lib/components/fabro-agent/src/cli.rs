@@ -39,11 +39,12 @@ use crate::{
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "Standalone agent CLI explicitly passes the Brave Search process-env credential into tool configuration."
+    reason = "Standalone agent CLI explicitly passes search process-env credentials into tool configuration."
 )]
 fn cli_tool_secrets() -> ToolSecrets {
     ToolSecrets {
         brave_search_api_key: std::env::var(EnvVars::BRAVE_SEARCH_API_KEY).ok(),
+        venice_api_key:       std::env::var(EnvVars::VENICE_API_KEY).ok(),
     }
 }
 

@@ -1,5 +1,7 @@
 use bytes::Bytes;
+#[cfg(test)]
 use serde::Serialize;
+#[cfg(test)]
 use serde::de::DeserializeOwned;
 
 use crate::{Error, Result};
@@ -10,8 +12,10 @@ pub(crate) trait Codec<R>: Send + Sync + 'static {
     fn decode(bytes: &[u8]) -> Result<R>;
 }
 
+#[cfg(test)]
 pub(crate) struct JsonCodec;
 
+#[cfg(test)]
 impl<R> Codec<R> for JsonCodec
 where
     R: Serialize + DeserializeOwned,

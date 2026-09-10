@@ -98,8 +98,15 @@ impl SandboxProvider for DockerSandboxProvider {
             ));
         };
 
-        let sandbox =
-            DockerSandbox::new(config, github_app, run_id, clone_origin_url, clone_branch)?;
+        let sandbox = DockerSandbox::new(
+            config,
+            github_app.as_ref(),
+            run_id,
+            clone_origin_url,
+            clone_branch,
+            None,
+            None,
+        )?;
         sandbox.initialize().await?;
         let container_id = sandbox.container_identifier()?.to_string();
         self.get(&container_id).await?.ok_or_else(|| {

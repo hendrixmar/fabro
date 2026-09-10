@@ -52,12 +52,11 @@
 //!     async fn get(&self, id: &str) -> Result<Option<Session>> {
 //!         self.repo.get(&id.to_string()).await
 //!     }
-//!
-//!     async fn gc_expired(&self, now: DateTime<Utc>) -> Result<u64> {
-//!         self.repo.gc(|session| session.expires_at <= now).await
-//!     }
 //! }
 //! ```
+//!
+//! `JsonCodec` is currently compiled only for tests; un-gate it when the
+//! first production JSON-encoded record type appears.
 //!
 //! Keep `Repository<R>` internal. Domain-specific invariants such as consume
 //! locks, token rotation, or marker-only behavior belong in the named store
@@ -69,7 +68,7 @@ use std::sync::Arc;
 
 use futures::stream::{self};
 use futures::{Stream, StreamExt};
-use slatedb::{Db, KeyValue, WriteBatch};
+use slatedb::{Db, KeyValue};
 
 use super::{Codec, Record, RecordId};
 use crate::{Error, Result, keys};
@@ -77,9 +76,8 @@ use crate::{Error, Result, keys};
 /// Generic typed key/value operations shared by the simple record-backed
 /// stores.
 ///
-/// This type is intentionally `pub(crate)`: callers should interact through a
-/// named store such as `AuthCodeStore` or `RefreshTokenStore`, which can add
-/// domain-specific behavior on top of the generic storage primitives here.
+/// Test-only: production stores are SQLite-backed, so this exists solely to
+/// exercise the retired Slate layout from tests.
 pub(crate) struct Repository<R: Record> {
     db:      Arc<Db>,
     _record: PhantomData<R>,
@@ -94,6 +92,7 @@ impl<R: Record> Repository<R> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn get(&self, id: &R::Id) -> Result<Option<R>> {
         self.db
             .get(key_for_id::<R>(id)?)
@@ -102,6 +101,7 @@ impl<R: Record> Repository<R> {
             .transpose()
     }
 
+    #[cfg(test)]
     pub(crate) async fn put(&self, record: &R) -> Result<()> {
         let id = record.id();
         self.put_at(&id, record).await
@@ -119,6 +119,7 @@ impl<R: Record> Repository<R> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn exists(&self, id: &R::Id) -> Result<bool> {
         Ok(self.db.get(key_for_id::<R>(id)?).await?.is_some())
     }
@@ -158,29 +159,6 @@ impl<R: Record> Repository<R> {
             })),
             Err(err) => Box::pin(stream::once(async move { Err(err) })),
         }
-    }
-
-    pub(crate) async fn gc<F>(&self, predicate: F) -> Result<u64>
-    where
-        F: Fn(&R) -> bool + Send + Sync,
-    {
-        let mut iter = self.db.scan_prefix(prefix_key::<R>(&[])?).await?;
-        let mut batch = WriteBatch::new();
-        let mut deletes = 0_u64;
-
-        while let Some(entry) = iter.next().await? {
-            let value = R::Codec::decode(&entry.value)?;
-            if predicate(&value) {
-                batch.delete(entry.key);
-                deletes += 1;
-            }
-        }
-
-        if deletes > 0 {
-            self.db.write(batch).await?;
-        }
-
-        Ok(deletes)
     }
 }
 
@@ -464,25 +442,6 @@ mod tests {
 
         repo.delete(&saved.id()).await.unwrap();
         assert!(repo.get(&saved.id()).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn gc_deletes_matching_records() {
-        let repo = Repository::<TestRecord>::new(db().await);
-        for record in [
-            record("bucket-a", "keep", false),
-            record("bucket-a", "delete", true),
-            record("bucket-b", "keep", false),
-            record("bucket-b", "delete", true),
-        ] {
-            repo.put(&record).await.unwrap();
-        }
-
-        assert_eq!(repo.gc(|record| record.delete_me).await.unwrap(), 2);
-
-        let remaining = repo.scan_stream().try_collect::<Vec<_>>().await.unwrap();
-        assert_eq!(remaining.len(), 2);
-        assert!(remaining.iter().all(|(_, record)| !record.delete_me));
     }
 
     #[tokio::test]

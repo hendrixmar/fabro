@@ -151,8 +151,8 @@ async fn load_pull_request_record(
     state: &Arc<AppState>,
     id: &RunId,
 ) -> Result<PullRequestLink, ApiError> {
-    let cached = state.cached_run(id).await?;
-    cached.projection.pull_request.clone().ok_or_else(|| {
+    let projection = state.load_run_projection(id).await?;
+    projection.pull_request.clone().ok_or_else(|| {
         ApiError::with_code(
             StatusCode::NOT_FOUND,
             format!("No pull request found in store. Create one first with: fabro pr create {id}"),
@@ -399,7 +399,7 @@ async fn create_run_pull_request(
     let Ok(run_store) = state.stores.runs.open_run(&id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
-    let run_state = match state.cached_run_projection(&id).await {
+    let run_state = match state.load_run_projection(&id).await {
         Ok(run_state) => run_state,
         Err(err) => return err.into_response(),
     };
@@ -452,7 +452,7 @@ async fn create_run_pull_request(
         }
     };
 
-    let run_state = match state.cached_run_projection(&id).await {
+    let run_state = match state.load_run_projection(&id).await {
         Ok(run_state) => run_state,
         Err(err) => return err.into_response(),
     };
@@ -481,6 +481,7 @@ async fn create_run_pull_request(
         )
         .into_response();
     };
+    state.enqueue_pull_request_creation(id, creation.requested_at);
     state.notify_pull_request_scheduler();
     accepted_pull_request_creation_response(&id, creation)
 }
@@ -506,7 +507,7 @@ async fn get_run_pull_request_creation(
     RequireRunScoped(id): RequireRunScoped,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let run_state = match state.cached_run_projection(&id).await {
+    let run_state = match state.load_run_projection(&id).await {
         Ok(run_state) => run_state,
         Err(err) => return err.into_response(),
     };
@@ -552,7 +553,7 @@ async fn unlink_run_pull_request(
     let Ok(run_store) = state.stores.runs.open_run(&id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
-    let run_state = match state.cached_run_projection(&id).await {
+    let run_state = match state.load_run_projection(&id).await {
         Ok(run_state) => run_state,
         Err(err) => return err.into_response(),
     };

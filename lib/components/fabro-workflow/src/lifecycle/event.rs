@@ -493,6 +493,7 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
                     branch:           push.branch.clone(),
                     success:          push.success,
                     exec_output_tail: push.exec_output_tail.clone(),
+                    attempts:         push.attempts.clone(),
                 });
             }
         }

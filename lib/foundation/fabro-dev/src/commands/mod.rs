@@ -148,6 +148,24 @@ pub(crate) fn capture_command(cwd: &Path, planned: &PlannedCommand) -> Result<Ou
         .with_context(|| format!("running {}", planned.to_shell_line()))
 }
 
+pub(crate) fn resolve_git_revision(root: &Path, revision: &str) -> Result<String> {
+    let command = PlannedCommand::new("git")
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg(revision);
+    let output = capture_command(root, &command)?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-parse --verify {revision} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)
+        .with_context(|| format!("git rev-parse --verify {revision} returned non-UTF-8"))?
+        .trim()
+        .to_string())
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "dev CLI sanitizes inherited Cargo build-script env before spawning nested cargo"

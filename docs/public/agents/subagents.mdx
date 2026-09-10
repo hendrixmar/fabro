@@ -16,9 +16,9 @@ Sub-agent management is exposed through four built-in tools:
 | Tool | Description |
 |---|---|
 | `spawn_agent` | Create a new sub-agent with a task prompt |
-| `send_input` | Send follow-up input to a running sub-agent |
+| `send_input` | Send follow-up input to a running or completed sub-agent |
 | `wait` | Block until a sub-agent completes and return its result |
-| `close_agent` | Cancel and remove a running sub-agent |
+| `close_agent` | Close a running or completed sub-agent |
 
 These tools are registered automatically when the session starts. They inherit the parent's permissions.
 
@@ -31,6 +31,12 @@ Each sub-agent runs in its own session:
 - **Concurrent execution** -- the parent can continue working before calling `wait`
 
 The parent can spawn multiple sub-agents and synchronize with them later.
+
+## Continue a completed session
+
+A completed sub-agent remains available until the parent closes it. Calling `send_input` starts another turn in the same child session, so the child keeps its conversation history. A message sent while the child is still running is queued for a safe turn boundary instead.
+
+Call `wait` again to receive the new turn's result. Call `close_agent` when the child is no longer needed; a closed child cannot accept more input.
 
 ## Depth limits
 

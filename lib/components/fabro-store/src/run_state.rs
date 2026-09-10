@@ -19,7 +19,7 @@ use fabro_types::{
     RunStatus, RunTimestamps, SandboxProviderKind, StageCompletion, StageHandler, StageId,
     StageInferenceProjection, StageModelUsage, StageOutcome, StageProjection, StageState,
     StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
-    TodoProjection, WorkflowRef, first_event_seq, timing,
+    TodoProjection, WorkflowRef, billing_rollup, first_event_seq, timing,
 };
 use fabro_util::error::render_compact_with_causes;
 
@@ -28,9 +28,48 @@ use crate::{Error, EventEnvelope, Result};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EventProjectionCache {
     pub last_seq: u32,
-    // Arc-shared with the shared projection cache so opening a run does not
-    // deep-copy the projection; mutated copy-on-write via `Arc::make_mut`.
+    // Arc-shared with readers so a snapshot never deep-copies the projection;
+    // mutated copy-on-write via `Arc::make_mut`.
     pub state:    Option<Arc<RunProjection>>,
+}
+
+/// A run's projection at its committed head. `RunSummaryStore` replays it
+/// from SQLite history and derives summary rows from it; `RunDatabase` builds
+/// it from a newly committed event and seeds its in-memory cache with it.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectedRun {
+    pub(crate) run_id:     RunId,
+    pub(crate) projection: Arc<RunProjection>,
+    pub(crate) last_seq:   u32,
+}
+
+impl ProjectedRun {
+    pub(crate) fn new(run_id: RunId, projection: Arc<RunProjection>, last_seq: u32) -> Self {
+        Self {
+            run_id,
+            projection,
+            last_seq,
+        }
+    }
+
+    /// Replays a run's full history; the last event's `seq` becomes the head.
+    pub(crate) fn replay(run_id: RunId, events: &[EventEnvelope]) -> Result<Self> {
+        let projection = RunProjection::apply_events(events)?;
+        let last_seq = events
+            .last()
+            .expect("a successfully replayed history contains at least one event")
+            .seq;
+        Ok(Self::new(run_id, Arc::new(projection), last_seq))
+    }
+}
+
+impl From<ProjectedRun> for EventProjectionCache {
+    fn from(projected: ProjectedRun) -> Self {
+        Self {
+            last_seq: projected.last_seq,
+            state:    Some(projected.projection),
+        }
+    }
 }
 
 pub trait RunProjectionReducer {
@@ -50,6 +89,31 @@ impl RunProjectionReducer for RunProjection {
         };
         let mut state = projection_from_created(first)?;
         for event in rest {
+            // Runs written before the runnable state was introduced can move
+            // directly from submitted to starting. Replay that historical
+            // shape through the equivalent current transition while keeping
+            // live single-event transitions strict.
+            if matches!(event.event.body, EventBody::RunStarting(_))
+                && matches!(state.status, RunStatus::Submitted)
+            {
+                state.try_apply_status(RunStatus::Runnable, event.event.ts)?;
+            }
+            if let EventBody::RunFailed(props) = &event.event.body {
+                let failed = RunStatus::Failed {
+                    reason: props.failure.reason,
+                };
+                if !state.status.can_transition_to(failed) {
+                    if matches!(
+                        state.status,
+                        RunStatus::Submitted | RunStatus::Pending { .. }
+                    ) {
+                        state.try_apply_status(RunStatus::Runnable, event.event.ts)?;
+                    }
+                    if matches!(state.status, RunStatus::Runnable) {
+                        state.try_apply_status(RunStatus::Starting, event.event.ts)?;
+                    }
+                }
+            }
             state.apply_event(event)?;
         }
         Ok(state)
@@ -183,7 +247,7 @@ impl RunProjectionReducer for RunProjection {
                     ts,
                 )?;
                 self.pending_control = None;
-                self.conclusion = Some(conclusion_from_completed(props, ts)?);
+                self.conclusion = Some(conclusion_from_completed(self, props, ts)?);
                 self.pending_interviews.clear();
             }
             EventBody::RunFailed(props) => {
@@ -194,7 +258,7 @@ impl RunProjectionReducer for RunProjection {
                     ts,
                 )?;
                 self.pending_control = None;
-                self.conclusion = Some(conclusion_from_failed(props, ts));
+                self.conclusion = Some(conclusion_from_failed(self, props, ts));
                 self.pending_interviews.clear();
                 finalize_unfinished_stages_after_run_failed(self, props, ts);
             }
@@ -1040,12 +1104,15 @@ fn projection_from_created(event: &EventEnvelope) -> Result<RunProjection> {
         graph: props.graph.clone(),
         graph_source: props.workflow_source.clone(),
         workflow_slug: props.workflow_slug.clone(),
+        workflow_version_id: props.workflow_version_id,
+        target: props.target.clone(),
         automation: props.automation.clone(),
         source_directory: props.source_directory.clone(),
         labels,
         provenance: props.provenance.clone(),
         manifest_blob: props.manifest_blob,
         definition_blob: None,
+        spec_blob: props.spec_blob,
         git: props.git.clone(),
         fork_source_ref: props.fork_source_ref.clone(),
     };
@@ -1360,8 +1427,7 @@ pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> Run {
         .conclusion
         .as_ref()
         .map(|conclusion| conclusion.timing);
-    let terminal_total = terminal_total_usd_micros(state);
-    let current_total = projected_billing(state).total_usd_micros;
+    let total_usd_micros = projected_billing(state).total_usd_micros;
 
     Run {
         id: *run_id,
@@ -1405,10 +1471,10 @@ pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> Run {
             completed_at,
         },
         timing: run_timing,
-        billing: terminal_total.map(|total_usd_micros| RunBillingSummary {
+        billing: total_usd_micros.map(|total_usd_micros| RunBillingSummary {
             total_usd_micros: Some(total_usd_micros),
         }),
-        size: RunSize::from_total_usd_micros(current_total),
+        size: RunSize::from_total_usd_micros(total_usd_micros),
         ask_fabro: AskFabro::default(),
         diff: diff_summary,
         pull_request: state.pull_request.clone(),
@@ -1419,14 +1485,6 @@ pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> Run {
             web: state.web_url.clone(),
         },
     }
-}
-
-fn terminal_total_usd_micros(state: &RunProjection) -> Option<i64> {
-    state
-        .conclusion
-        .as_ref()
-        .and_then(|conclusion| conclusion.billing.as_ref())
-        .and_then(|billing| billing.total_usd_micros)
 }
 
 pub(crate) fn projected_billing(state: &RunProjection) -> BilledTokenCounts {
@@ -1502,9 +1560,12 @@ fn diff_from_checkpoint_props(props: &CheckpointCompletedProps) -> RunDiff {
 }
 
 fn conclusion_from_completed(
+    projection: &RunProjection,
     props: &RunCompletedProps,
     timestamp: DateTime<Utc>,
 ) -> Result<Conclusion> {
+    let (stages, total_retries) = billing_rollup::billing_rollup_from_projection(projection, None)
+        .conclusion_stages(projection);
     Ok(Conclusion {
         timestamp,
         status: StageOutcome::from_str(&props.status)
@@ -1512,9 +1573,9 @@ fn conclusion_from_completed(
         timing: props.timing,
         failure: None,
         final_git_commit_sha: props.final_git_commit_sha.clone(),
-        stages: Vec::new(),
+        stages,
         billing: props.billing.clone(),
-        total_retries: 0,
+        total_retries,
         diff: RunDiff {
             patch:   props.final_patch.clone(),
             summary: props.diff_summary,
@@ -1522,7 +1583,13 @@ fn conclusion_from_completed(
     })
 }
 
-fn conclusion_from_failed(props: &RunFailedProps, timestamp: DateTime<Utc>) -> Conclusion {
+fn conclusion_from_failed(
+    projection: &RunProjection,
+    props: &RunFailedProps,
+    timestamp: DateTime<Utc>,
+) -> Conclusion {
+    let (stages, total_retries) = billing_rollup::billing_rollup_from_projection(projection, None)
+        .conclusion_stages(projection);
     Conclusion {
         timestamp,
         status: StageOutcome::Failed {
@@ -1531,9 +1598,9 @@ fn conclusion_from_failed(props: &RunFailedProps, timestamp: DateTime<Utc>) -> C
         timing: props.timing,
         failure: Some(props.failure.clone()),
         final_git_commit_sha: props.final_git_commit_sha.clone(),
-        stages: Vec::new(),
+        stages,
         billing: props.billing.clone(),
-        total_retries: 0,
+        total_retries,
         diff: RunDiff {
             patch:   props.final_patch.clone(),
             summary: props.diff_summary,
@@ -1694,11 +1761,12 @@ mod tests {
         CommandTermination, EventBody, FailureCategory, FailureDetail, FailureReason, Graph,
         McpServerStatus, Node, Outcome, ParallelBranchId, PendingReason, PermissionLevel,
         PullRequestCreationStatus, PullRequestLink, QuestionType, ReasoningEffort,
-        RunApprovalState, RunControlAction, RunDiff, RunEvent, RunSize, RunSpec, RunStatus, Speed,
-        StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
-        StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowWarning,
-        StageHandler, StageModelUsage, StageOutcome, StageState, StageTiming, SubAgentStatus,
-        SuccessReason, WorkflowSettings, first_event_seq, fixtures, test_support,
+        RunApprovalState, RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunSize, RunSpec,
+        RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
+        StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
+        StageContextWindowWarning, StageHandler, StageModelUsage, StageOutcome, StageState,
+        StageTiming, SubAgentStatus, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
+        test_support,
     };
     use serde_json::json;
 
@@ -1767,13 +1835,16 @@ mod tests {
 
         fn tool_completed(tool_call_id: &str) -> EventBody {
             EventBody::AgentToolCompleted(AgentToolCompletedProps {
-                tool_name:    "Bash".to_string(),
-                tool_call_id: tool_call_id.to_string(),
-                output:       json!("ok"),
-                is_error:     false,
-                visit:        1,
-                tool_result:  None,
-                turn_id:      None,
+                tool_name:             "Bash".to_string(),
+                tool_call_id:          tool_call_id.to_string(),
+                output:                json!("ok"),
+                is_error:              false,
+                visit:                 1,
+                output_bytes_observed: None,
+                output_bytes_retained: None,
+                output_bytes_omitted:  None,
+                tool_result:           None,
+                turn_id:               None,
             })
         }
 
@@ -2281,19 +2352,8 @@ mod tests {
 
     fn test_run_spec() -> RunSpec {
         RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         WorkflowSettings::default(),
-            graph:            Graph::new("test"),
-            graph_source:     Some("digraph test {}".to_string()),
-            workflow_slug:    None,
-            automation:       None,
-            source_directory: None,
-            labels:           HashMap::new(),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            git:              None,
-            fork_source_ref:  None,
+            graph_source: Some("digraph test {}".to_string()),
+            ..test_support::test_run_spec()
         }
     }
 
@@ -2385,9 +2445,34 @@ mod tests {
 
         let projection = RunProjection::apply_events(&[event]).unwrap();
         assert_eq!(projection.retried_from, None);
+        assert_eq!(projection.spec.workflow_version_id, None);
         assert_eq!(
             build_summary(&projection, &fixtures::RUN_1).retried_from,
             None
+        );
+    }
+
+    #[test]
+    fn run_created_projects_workflow_version_id_into_spec() {
+        let workflow_version_id = test_support::test_workflow_version_id();
+        let event = test_raw_event(
+            1,
+            "run.created",
+            &json!({
+                "settings": WorkflowSettings::default(),
+                "graph": Graph::new("test"),
+                "workflow_version_id": workflow_version_id,
+                "labels": {},
+                "provenance": test_support::test_run_provenance()
+            }),
+            None,
+        );
+
+        let projection = RunProjection::apply_events(&[event]).unwrap();
+
+        assert_eq!(
+            projection.spec.workflow_version_id,
+            Some(workflow_version_id)
         );
     }
 
@@ -2436,9 +2521,10 @@ mod tests {
     #[test]
     fn run_created_projects_automation_into_spec_and_summary() {
         let automation = AutomationRef {
-            id:         "nightly".to_string(),
-            name:       Some("Nightly".to_string()),
-            trigger_id: Some("schedule_1".to_string()),
+            id:              "nightly".to_string(),
+            name:            Some("Nightly".to_string()),
+            trigger_id:      Some("schedule_1".to_string()),
+            workflow_source: None,
         };
         let event = test_raw_event(
             1,
@@ -2650,6 +2736,71 @@ mod tests {
             }))
             .unwrap(),
         }
+    }
+
+    fn historical_created_event() -> EventEnvelope {
+        test_raw_event(
+            1,
+            "run.created",
+            &json!({
+                "settings": WorkflowSettings::default(),
+                "graph": Graph::new("historical"),
+                "labels": {},
+                "provenance": test_support::test_run_provenance()
+            }),
+            None,
+        )
+    }
+
+    #[test]
+    fn historical_submitted_to_starting_transition_replays() {
+        let state = RunProjection::apply_events(&[
+            historical_created_event(),
+            test_raw_event(2, "run.submitted", &json!({}), None),
+            test_raw_event(3, "run.starting", &json!({}), None),
+        ])
+        .unwrap();
+
+        assert_eq!(state.status, RunStatus::Starting);
+    }
+
+    #[test]
+    fn historical_runnable_to_terminated_transition_replays() {
+        let state = RunProjection::apply_events(&[
+            historical_created_event(),
+            test_raw_event(2, "run.submitted", &json!({}), None),
+            test_raw_event(
+                3,
+                "run.runnable",
+                &json!({ "source": "start_requested" }),
+                None,
+            ),
+            test_raw_event(
+                4,
+                "run.failed",
+                &json!({
+                    "failure": {
+                        "reason": "terminated",
+                        "detail": {
+                            "message": "worker stopped before startup",
+                            "category": "deterministic"
+                        }
+                    },
+                    "timing": {
+                        "wall_time_ms": 1,
+                        "inference_time_ms": 0,
+                        "tool_time_ms": 0,
+                        "active_time_ms": 0
+                    }
+                }),
+                None,
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(state.status, RunStatus::Failed {
+            reason: FailureReason::Terminated,
+        });
     }
 
     #[test]
@@ -4086,19 +4237,9 @@ mod tests {
     fn summary_synthesizes_submitted_when_run_exists_without_status() {
         let mut state = initialized_projection();
         state.spec = fabro_types::RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         WorkflowSettings::default(),
-            graph:            fabro_types::Graph::new("test"),
-            graph_source:     None,
-            workflow_slug:    Some("test".to_string()),
-            automation:       None,
+            workflow_slug: Some("test".to_string()),
             source_directory: Some("/tmp/repo".to_string()),
-            git:              None,
-            labels:           HashMap::new(),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            fork_source_ref:  None,
+            ..test_support::test_run_spec()
         };
 
         let summary_json = serde_json::to_value(build_summary(&state, &fixtures::RUN_1)).unwrap();
@@ -4112,19 +4253,10 @@ mod tests {
     fn summary_preserves_absent_workflow_name_and_reports_graph_name() {
         let mut state = initialized_projection();
         state.spec = fabro_types::RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         WorkflowSettings::default(),
-            graph:            fabro_types::Graph::new("GraphName"),
-            graph_source:     None,
-            workflow_slug:    Some("release-flow".to_string()),
-            automation:       None,
+            graph: fabro_types::Graph::new("GraphName"),
+            workflow_slug: Some("release-flow".to_string()),
             source_directory: Some("/tmp/repo".to_string()),
-            git:              None,
-            labels:           HashMap::new(),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            fork_source_ref:  None,
+            ..test_support::test_run_spec()
         };
 
         let summary = build_summary(&state, &fixtures::RUN_1);
@@ -4291,6 +4423,170 @@ mod tests {
             value["spec"]["definition_blob"],
             events[1].event.properties().unwrap()["definition_blob"]
         );
+    }
+
+    #[test]
+    fn terminal_conclusion_replays_stage_summaries_without_metadata() {
+        for terminal_name in ["run.completed", "run.failed"] {
+            let mut settings = WorkflowSettings::default();
+            settings.run.meta_branch.enabled = false;
+            let mut events = vec![
+                test_raw_event(
+                    1,
+                    "run.created",
+                    &json!({
+                        "settings": settings,
+                        "graph": { "name": "test", "nodes": {}, "edges": [], "attrs": {} },
+                        "labels": {},
+                        "provenance": test_support::test_run_provenance()
+                    }),
+                    None,
+                ),
+                test_raw_event(
+                    2,
+                    "run.runnable",
+                    &json!({ "source": "start_requested" }),
+                    None,
+                ),
+                test_raw_event(3, "run.starting", &json!({}), None),
+                test_raw_event(4, "run.running", &json!({}), None),
+            ];
+            // Two executions of zebra share one conclusion row. First-event
+            // order differs from checkpoint order, and skipped has no completion.
+            for (seq, node, visit, millis, tokens) in [
+                (5, "zebra", 1, 1200, 100),
+                (6, "apple", 1, 300, 20),
+                (7, "zebra", 2, 800, 200),
+            ] {
+                let mut props = completed_props(millis, StageOutcome::Succeeded);
+                props.billing = Some(test_usage("test-model", tokens, 10));
+                events.push(test_stage_event(
+                    seq,
+                    EventBody::StageCompleted(props),
+                    StageId::new(node, visit),
+                ));
+            }
+            events.push(test_raw_event(8, "checkpoint.completed", &json!({
+                "status": "succeeded",
+                "current_node": "zebra",
+                "completed_nodes": ["apple", "zebra", "zebra"],
+                "node_retries": { "zebra": 3, "apple": 1 },
+                "node_outcomes": {
+                    "apple": Outcome::<Option<BilledModelUsage>>::success(),
+                    "zebra": Outcome::<Option<BilledModelUsage>>::success(),
+                    "skipped": Outcome::<Option<BilledModelUsage>>::skipped("condition was false")
+                },
+                "context_values": {},
+                "node_visits": { "zebra": 2, "apple": 1, "skipped": 1 },
+                "git_commit_sha": "checkpoint-sha"
+            }), Some("zebra")));
+            let terminal_billing = usage_counts(&test_usage("test-model", 320, 30));
+            let terminal_props = if terminal_name == "run.completed" {
+                json!({
+                    "status": "succeeded", "reason": "completed",
+                    "timing": fabro_types::RunTiming::wall_only(9000),
+                    "artifact_count": 0, "billing": terminal_billing,
+                    "final_git_commit_sha": "final-sha", "final_patch": "final patch"
+                })
+            } else {
+                let mut props = run_failed_props(FailureReason::WorkflowError);
+                props.timing = fabro_types::RunTiming::wall_only(9000);
+                props.billing = Some(terminal_billing.clone());
+                props.final_git_commit_sha = Some("final-sha".to_string());
+                props.final_patch = Some("final patch".to_string());
+                serde_json::to_value(props).unwrap()
+            };
+            events.push(test_raw_event(9, terminal_name, &terminal_props, None));
+            for event in &mut events {
+                event.event.ts = test_dt("2026-04-07T12:00:00Z")
+                    + chrono::Duration::seconds(i64::from(event.seq));
+            }
+
+            // Cross the persisted wire boundary before both incremental and full replay.
+            let events: Vec<EventEnvelope> =
+                serde_json::from_slice(&serde_json::to_vec(&events).unwrap()).unwrap();
+            let mut live = RunProjection::apply_events(&events[..1]).unwrap();
+            for event in &events[1..] {
+                live.apply_event(event).unwrap();
+            }
+            let replayed = RunProjection::apply_events(&events).unwrap();
+            let conclusion = replayed.conclusion.as_ref().unwrap();
+            assert_eq!(
+                serde_json::to_value(&live.conclusion).unwrap(),
+                serde_json::to_value(conclusion).unwrap(),
+            );
+            assert_eq!(conclusion.timestamp, events.last().unwrap().event.ts);
+            assert_eq!(conclusion.timing.wall_time_ms, 9000);
+            assert_eq!(conclusion.billing, Some(terminal_billing));
+            assert_eq!(
+                conclusion.final_git_commit_sha.as_deref(),
+                Some("final-sha")
+            );
+            assert_eq!(conclusion.diff.patch.as_deref(), Some("final patch"));
+            assert_eq!(conclusion.failure.is_some(), terminal_name == "run.failed");
+            insta::allow_duplicates! {
+                insta::assert_snapshot!(serde_json::to_string_pretty(&json!({
+                    "stages": conclusion.stages,
+                    "total_retries": conclusion.total_retries,
+                })).unwrap(), @r###"
+                {
+                  "stages": [
+                    {
+                      "stage_id": "zebra",
+                      "stage_label": "zebra",
+                      "timing": {
+                        "wall_time_ms": 2000,
+                        "inference_time_ms": 0,
+                        "tool_time_ms": 0,
+                        "active_time_ms": 0
+                      },
+                      "billing_usd_micros": 320,
+                      "retries": 2
+                    },
+                    {
+                      "stage_id": "apple",
+                      "stage_label": "apple",
+                      "timing": {
+                        "wall_time_ms": 300,
+                        "inference_time_ms": 0,
+                        "tool_time_ms": 0,
+                        "active_time_ms": 0
+                      },
+                      "billing_usd_micros": 30,
+                      "retries": 0
+                    },
+                    {
+                      "stage_id": "skipped",
+                      "stage_label": "skipped",
+                      "timing": {
+                        "wall_time_ms": 0,
+                        "inference_time_ms": 0,
+                        "tool_time_ms": 0,
+                        "active_time_ms": 0
+                      },
+                      "retries": 0
+                    }
+                  ],
+                  "total_retries": 2
+                }
+                "###);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_conclusion_without_checkpoint_has_no_stage_summaries() {
+        let mut state = running_projection();
+        let terminal = test_event(
+            4,
+            EventBody::RunFailed(run_failed_props(FailureReason::WorkflowError)),
+            None,
+        );
+        state.apply_event(&terminal).unwrap();
+        let conclusion = state.conclusion.unwrap();
+        assert!(conclusion.stages.is_empty());
+        assert_eq!(conclusion.total_retries, 0);
+        assert_eq!(conclusion.timestamp, terminal.event.ts);
     }
 
     #[test]
@@ -5351,7 +5647,12 @@ mod tests {
 
         let summary = build_summary(&state, &fixtures::RUN_1);
         assert_eq!(summary.size, RunSize::S);
-        assert_eq!(summary.billing, None);
+        assert_eq!(
+            summary.billing,
+            Some(RunBillingSummary {
+                total_usd_micros: Some(20_000_001),
+            })
+        );
     }
 
     #[test]

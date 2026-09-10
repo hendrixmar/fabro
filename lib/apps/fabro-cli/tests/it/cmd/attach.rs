@@ -364,6 +364,8 @@ fn attach_replays_completed_detached_run() {
             "--dry-run",
             "--auto-approve",
             "--detach",
+            "--environment",
+            "local",
             workflow.to_str().unwrap(),
         ])
         .assert()
@@ -884,7 +886,6 @@ fn attach_json_errors_without_prompting_for_human_input() {
               }
             }
           },
-          "manifest_blob": "[BLOB_HASH]",
           "provenance": {
             "client": {
               "name": "fabro-cli",
@@ -924,6 +925,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
                 "skip_git_hooks": false
               },
               "clone": {
+                "depth": 100,
                 "enabled": true
               },
               "environment": {
@@ -1012,10 +1014,16 @@ fn attach_json_errors_without_prompting_for_human_input() {
             }
           },
           "source_directory": "[TEMP_DIR]",
+          "spec_blob": "[BLOB_HASH]",
+          "target": {
+            "kind": "folder",
+            "path": "[TEMP_DIR]"
+          },
           "title": "Wait for approval",
           "web_url": "http://localhost:3000/runs/[ULID]",
           "workflow_slug": "human-gate",
-          "workflow_source": "digraph HumanGate {/n  graph [goal=\"Wait for approval\"]/n  start [shape=Mdiamond, label=\"Start\"]/n  exit  [shape=Msquare, label=\"Exit\"]/n  approve [shape=hexagon, label=\"Approve?\"]/n  ship   [shape=parallelogram, script=\"echo shipped\"]/n  revise [shape=parallelogram, script=\"echo revised\"]/n  start -> approve/n  approve -> ship   [label=\"[A] Approve\"]/n  approve -> revise [label=\"[R] Revise\"]/n  ship -> exit/n  revise -> exit/n}/n"
+          "workflow_source": "digraph HumanGate {/n  graph [goal=\"Wait for approval\"]/n  start [shape=Mdiamond, label=\"Start\"]/n  exit  [shape=Msquare, label=\"Exit\"]/n  approve [shape=hexagon, label=\"Approve?\"]/n  ship   [shape=parallelogram, script=\"echo shipped\"]/n  revise [shape=parallelogram, script=\"echo revised\"]/n  start -> approve/n  approve -> ship   [label=\"[A] Approve\"]/n  approve -> revise [label=\"[R] Revise\"]/n  ship -> exit/n  revise -> exit/n}/n",
+          "workflow_version_id": "fc1611d3be115f2db472e4ac05a5034f449743089259566b18f204ff961a0c18"
         },
         "run_id": "[ULID]",
         "ts": "[TIMESTAMP]"

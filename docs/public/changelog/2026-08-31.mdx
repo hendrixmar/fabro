@@ -1,0 +1,38 @@
+---
+title: "Immutable workflow versions for CLI runs"
+date: "2026-08-31"
+---
+
+`fabro run` and `fabro create` now resolve and package local workflows,
+register their immutable workflow versions and dependencies, and create runs
+by intent. Source parsing or packaging failures remain local and stop before
+registration, while full effective-intent validation is authoritative at
+server admission. Use `fabro preflight` for explicit local validation without
+creating a run. `fabro create` leaves the run submitted; `fabro run` starts it
+with a separate request.
+
+Workflows can still be selected by project name, from user workflow storage,
+from another local checkout, or as loose local files. The workflow source is
+independent from the execution target: local environments use the directory
+where Fabro was invoked, while Docker and Daytona derive a GitHub target from
+that directory. Clone-based runs invoked from a Git checkout require a
+non-bare checkout with an attached branch and at least one commit; detached
+HEAD and unborn checkouts fail before workflow registration instead of being
+treated as empty workspaces. A directory outside Git still selects an empty
+workspace. Remote Git workflow acquisition is not included.
+
+CLI input overrides retain string, Boolean, integer, and finite-float types,
+and Boolean flags remain sparse. `--goal-file` is read locally and sent by
+value as a per-run override; goal files referenced by `workflow.toml` remain
+part of the immutable workflow.
+
+Project and CLI-machine `[run]` and `[environments]` settings are no longer
+transmitted during intent creation. Fabro warns with only the affected file and
+key names. Move workflow behavior—including `[run.pull_request]`—to
+`workflow.toml`, and configure placement with server-managed environments.
+Malformed or unreadable active configuration still fails before creation.
+
+New repositories now place their default automatic pull-request policy in the
+starter workflow rather than `.fabro/project.toml`. Intent-created runs also
+derive their display slug from the immutable workflow entrypoint. These
+changes require no API schema update.

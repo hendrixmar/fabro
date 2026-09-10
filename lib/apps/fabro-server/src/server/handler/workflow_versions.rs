@@ -38,14 +38,7 @@ async fn create_workflow_version(
             INVALID_VERSION_CODE,
         )
     })?;
-    let blobs = state.store_ref().blobs().await.map_err(|err| {
-        tracing::error!(
-            error = %err,
-            error_chain = ?error::collect_chain(&err),
-            "Failed to open workflow version storage"
-        );
-        internal_store_error()
-    })?;
+    let blobs = state.store_ref().blobs();
     let store = WorkflowVersionStore::new(blobs);
     let workflow_version_id = store.put(&version).await.map_err(store_error)?;
 
@@ -197,8 +190,6 @@ mod tests {
             state
                 .store_ref()
                 .blobs()
-                .await
-                .unwrap()
                 .read(&id.into())
                 .await
                 .unwrap()
@@ -260,16 +251,7 @@ mod tests {
         .await;
 
         assert_eq!(error_code(&body), INVALID_VERSION_CODE);
-        assert!(
-            !state
-                .store_ref()
-                .blobs()
-                .await
-                .unwrap()
-                .exists(&id.into())
-                .await
-                .unwrap()
-        );
+        assert!(!state.store_ref().blobs().exists(&id.into()).await.unwrap());
     }
 
     #[tokio::test]
@@ -303,8 +285,6 @@ mod tests {
             state
                 .store_ref()
                 .blobs()
-                .await
-                .unwrap()
                 .write(b"not a workflow version")
                 .await
                 .unwrap(),

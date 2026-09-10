@@ -208,6 +208,19 @@ fn main() {
         ("DiffSummary", "fabro_types::DiffSummary", &[]),
         ("RepositoryRef", "fabro_types::RepositoryRef", &[]),
         ("WorkflowSettings", "fabro_types::WorkflowSettings", &[]),
+        // Run-level GitHub integration settings reuse the canonical resolved
+        // types instead of generating parallel API DTOs; the wire shape is
+        // identical (InterpString serializes as its source string).
+        (
+            "RunIntegrationsSettings",
+            "fabro_types::settings::run::RunIntegrationsSettings",
+            &[],
+        ),
+        (
+            "RunIntegrationsGithubSettings",
+            "fabro_types::settings::run::RunIntegrationsGithubSettings",
+            &[],
+        ),
         ("ServerSettings", "fabro_types::ServerSettings", &[]),
         (
             "ServerNamespace",
@@ -690,9 +703,12 @@ fn main() {
         ("SandboxTimestamps", "fabro_types::SandboxTimestamps", &[]),
         ("AskFabro", "fabro_types::AskFabro", &[]),
         ("Automation", "fabro_automation::Automation", &[]),
+        (
+            "AutomationGitWorkflowSource",
+            "fabro_types::GitRunTarget",
+            &[],
+        ),
         ("AutomationRef", "fabro_types::AutomationRef", &[]),
-        ("AutomationTarget", "fabro_automation::AutomationTarget", &[
-        ]),
         (
             "AutomationTrigger",
             "fabro_automation::AutomationTrigger",
@@ -778,6 +794,10 @@ fn main() {
         ("CompletionMessageRole", "fabro_types::Role", &[]),
         ("CompletionContentPart", "fabro_types::ContentPart", &[]),
         ("WorkflowVersion", "fabro_types::WorkflowVersion", &[]),
+        ("RunIntent", "fabro_types::RunIntent", &[]),
+        ("RunIntentArgs", "fabro_types::RunIntentArgs", &[]),
+        ("RunTarget", "fabro_types::RunTarget", &[]),
+        ("GitRunTarget", "fabro_types::GitRunTarget", &[]),
         ("WorkflowPath", "fabro_types::WorkflowPath", &[]),
         ("WorkflowVersionId", "fabro_types::WorkflowVersionId", &[]),
         ("BlobHash", "fabro_types::BlobHash", &[]),

@@ -1,0 +1,22 @@
+---
+title: "Model-keyed fallback policies"
+date: "2026-07-30"
+---
+
+## Fallback policy follows the requested model
+
+You can now define a separate ordered fallback chain for each requested model. Fabro selects the chain once from the original request and does not jump into another model's policy while failing over.
+
+```toml title="run.toml"
+[run.model.fallbacks]
+"kimi-k3" = ["moonshot:kimi-k3", "openrouter:kimi-k3", "claude-opus"]
+```
+
+## More
+
+<Accordion title="Fixes">
+- Forked runs now create a fresh sandbox when they resume
+- Stored run events from older Fabro releases remain readable after event schema changes
+- Modal reasoning-token usage is now included in billing totals
+- Fallback resolution errors now report the underlying unavailable model or provider
+</Accordion>

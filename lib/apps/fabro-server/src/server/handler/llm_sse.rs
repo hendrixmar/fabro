@@ -1,12 +1,10 @@
-//! Shared SSE plumbing for endpoints that proxy LLM `StreamEvent`s.
+//! SSE plumbing for the completion endpoint's LLM `StreamEvent`s.
 //!
-//! `POST /api/v1/completions` and `POST /api/v1/playground/chat` both run an
-//! LLM stream and forward every `StreamEvent` to the browser as a
-//! `stream_event` SSE frame. This module owns that framing so the two
-//! endpoints cannot drift: serialization failures and stream errors are
-//! shaped into the same `{"type": "error", ...}` frame vocabulary, the
-//! stream ends when the LLM stream ends or the server shuts down, and a
-//! `ping` keep-alive frame goes out every 15 seconds.
+//! `POST /api/v1/completions` forwards every `StreamEvent` to the browser as a
+//! `stream_event` SSE frame. Serialization failures and stream errors are
+//! shaped into the same `{"type": "error", ...}` frame vocabulary, the stream
+//! ends when the LLM stream ends or the server shuts down, and a `ping`
+//! keep-alive frame goes out every 15 seconds.
 
 use std::convert::Infallible;
 use std::time::Duration;

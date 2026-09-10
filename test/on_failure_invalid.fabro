@@ -1,0 +1,8 @@
+digraph InvalidOnFailure {
+    graph [on_failure="stop"]
+
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+
+    start -> exit
+}

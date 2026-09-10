@@ -63,12 +63,6 @@ fn repo_init_creates_project_toml_and_hello_workflow() {
     # https://docs.fabro.computer/getting-started/quick-start
 
     _version = 1
-
-    # Auto-create pull requests on successful workflow runs.
-    [run.pull_request]
-    enabled = true
-    draft = true
-    # auto_merge = true
     "###
     );
     assert_snapshot!(
@@ -96,6 +90,12 @@ fn repo_init_creates_project_toml_and_hello_workflow() {
 
     [workflow]
     graph = "workflow.fabro"
+
+    # Auto-create pull requests on successful workflow runs.
+    [run.pull_request]
+    enabled = true
+    draft = true
+    # auto_merge = true
     "###
     );
 }

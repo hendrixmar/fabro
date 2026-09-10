@@ -184,14 +184,6 @@ async fn create_run_session(
 
     let session_id = SessionId::new();
     let now = Utc::now();
-    if let Err(err) = state
-        .store_ref()
-        .put_session_run_index(&session_id, &run_id)
-        .await
-    {
-        return store_error(&err).into_response();
-    }
-
     let event = match append_run_session_event(
         &run_store,
         run_id,
@@ -1169,7 +1161,10 @@ async fn drive_agent_session(
             result = &mut process => {
                 while let Ok(event) = receiver.try_recv() {
                     record_turn_output(output, &event);
-                    persist_agent_event(run_store, run_id, session_id, turn_id, event, sender).await?;
+                    Box::pin(persist_agent_event(
+                        run_store, run_id, session_id, turn_id, event, sender,
+                    ))
+                    .await?;
                 }
                 return Ok(result);
             }
@@ -1177,7 +1172,10 @@ async fn drive_agent_session(
                 match event {
                     Ok(event) => {
                         record_turn_output(output, &event);
-                        persist_agent_event(run_store, run_id, session_id, turn_id, event, sender).await?;
+                        Box::pin(persist_agent_event(
+                            run_store, run_id, session_id, turn_id, event, sender,
+                        ))
+                        .await?;
                     }
                     Err(RecvError::Lagged(_) | RecvError::Closed) => {}
                 }
@@ -1271,6 +1269,9 @@ fn agent_event_payload(event_turn_id: TurnId, event: AgentEvent) -> Option<Event
             tool_call_id,
             output,
             is_error,
+            output_bytes_observed,
+            output_bytes_retained,
+            output_bytes_omitted,
         } => Some(EventBody::RunSessionToolCallCompleted(
             RunSessionToolCallCompletedProps {
                 turn_id: event_turn_id,
@@ -1278,6 +1279,13 @@ fn agent_event_payload(event_turn_id: TurnId, event: AgentEvent) -> Option<Event
                 tool_call_id,
                 output,
                 is_error,
+                output_bytes_observed: Some(
+                    u64::try_from(output_bytes_observed).unwrap_or(u64::MAX),
+                ),
+                output_bytes_retained: Some(
+                    u64::try_from(output_bytes_retained).unwrap_or(u64::MAX),
+                ),
+                output_bytes_omitted: Some(u64::try_from(output_bytes_omitted).unwrap_or(u64::MAX)),
             },
         )),
         _ => None,
@@ -1372,7 +1380,7 @@ async fn load_session(
     state: &AppState,
     session_id: SessionId,
 ) -> Result<(RunId, RunDatabase, ProjectedRunSession), Response> {
-    let run_id = match state.store_ref().get_session_run_id(&session_id).await {
+    let run_id = match state.store_ref().find_session_owner(&session_id).await {
         Ok(Some(run_id)) => run_id,
         Ok(None) => return Err(ApiError::not_found("Session not found.").into_response()),
         Err(err) => return Err(store_error(&err).into_response()),
@@ -1392,7 +1400,7 @@ async fn load_session_read(
     state: &AppState,
     session_id: SessionId,
 ) -> Result<(RunId, ProjectedRunSession), Response> {
-    let run_id = match state.store_ref().get_session_run_id(&session_id).await {
+    let run_id = match state.store_ref().find_session_owner(&session_id).await {
         Ok(Some(run_id)) => run_id,
         Ok(None) => return Err(ApiError::not_found("Session not found.").into_response()),
         Err(err) => return Err(store_error(&err).into_response()),
@@ -1412,7 +1420,7 @@ async fn load_session_run_reader(
     state: &AppState,
     session_id: SessionId,
 ) -> Result<(RunId, RunDatabase), Response> {
-    let run_id = match state.store_ref().get_session_run_id(&session_id).await {
+    let run_id = match state.store_ref().find_session_owner(&session_id).await {
         Ok(Some(run_id)) => run_id,
         Ok(None) => return Err(ApiError::not_found("Session not found.").into_response()),
         Err(err) => return Err(store_error(&err).into_response()),
@@ -1917,12 +1925,15 @@ reasoning = false
             graph,
             graph_source: None,
             workflow_slug: None,
+            workflow_version_id: None,
+            target: None,
             automation: None,
             source_directory: None,
             labels: HashMap::default(),
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             definition_blob: None,
+            spec_blob: None,
             git: None,
             fork_source_ref: None,
         };

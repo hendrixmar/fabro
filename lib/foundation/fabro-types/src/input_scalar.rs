@@ -17,6 +17,46 @@ pub enum JsonScalarToTomlError {
     NumberOutOfRange,
 }
 
+/// The reason a parsed TOML value cannot be represented as a JSON scalar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TomlScalarToJsonError {
+    /// The TOML float is not finite, and JSON numbers must be finite.
+    #[error("must be a finite float")]
+    NonFiniteFloat,
+    /// TOML datetimes are outside the scalar-only conversion contract.
+    #[error("must be a scalar value")]
+    Datetime,
+    /// TOML arrays are outside the scalar-only conversion contract.
+    #[error("must be a scalar value")]
+    Array,
+    /// TOML tables are outside the scalar-only conversion contract.
+    #[error("must be a scalar value")]
+    Table,
+}
+
+/// Converts an already-parsed TOML scalar into a JSON value.
+///
+/// The inverse of [`json_scalar_to_toml_value`]: strings, booleans, and
+/// integers map directly, and finite floats become JSON numbers.
+///
+/// # Errors
+///
+/// Returns [`TomlScalarToJsonError`] for TOML datetimes, arrays, tables, or a
+/// non-finite float (JSON numbers must be finite).
+pub fn toml_scalar_to_json_value(value: &toml::Value) -> Result<Value, TomlScalarToJsonError> {
+    match value {
+        toml::Value::String(value) => Ok(Value::String(value.clone())),
+        toml::Value::Integer(value) => Ok(Value::Number((*value).into())),
+        toml::Value::Float(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .ok_or(TomlScalarToJsonError::NonFiniteFloat),
+        toml::Value::Boolean(value) => Ok(Value::Bool(*value)),
+        toml::Value::Datetime(_) => Err(TomlScalarToJsonError::Datetime),
+        toml::Value::Array(_) => Err(TomlScalarToJsonError::Array),
+        toml::Value::Table(_) => Err(TomlScalarToJsonError::Table),
+    }
+}
+
 /// Converts an already-parsed JSON scalar into a TOML value.
 ///
 /// Numbers are converted to a signed integer first and then to a float. As a
@@ -50,7 +90,81 @@ pub fn json_scalar_to_toml_value(value: &Value) -> Result<toml::Value, JsonScala
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{JsonScalarToTomlError, json_scalar_to_toml_value};
+    use super::{
+        JsonScalarToTomlError, TomlScalarToJsonError, json_scalar_to_toml_value,
+        toml_scalar_to_json_value,
+    };
+
+    #[test]
+    fn converts_toml_scalars_to_json_values() -> Result<(), TomlScalarToJsonError> {
+        let cases = [
+            (toml::Value::String("hello".to_string()), json!("hello")),
+            (toml::Value::Integer(42), json!(42)),
+            (toml::Value::Float(1.25), json!(1.25)),
+            (toml::Value::Boolean(true), json!(true)),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(toml_scalar_to_json_value(&input)?, expected);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_scalar_toml_values_with_typed_errors() {
+        let datetime: toml::Value = "value = 1979-05-27T07:32:00Z"
+            .parse::<toml::Table>()
+            .unwrap()
+            .remove("value")
+            .unwrap();
+        let cases = [
+            (datetime, TomlScalarToJsonError::Datetime),
+            (
+                toml::Value::Array(vec![toml::Value::Integer(1)]),
+                TomlScalarToJsonError::Array,
+            ),
+            (
+                toml::Value::Table(toml::Table::new()),
+                TomlScalarToJsonError::Table,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(toml_scalar_to_json_value(&input), Err(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_toml_floats() {
+        for input in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                toml_scalar_to_json_value(&toml::Value::Float(input)),
+                Err(TomlScalarToJsonError::NonFiniteFloat)
+            );
+        }
+    }
+
+    #[test]
+    fn toml_scalars_round_trip_through_json() -> Result<(), TomlScalarToJsonError> {
+        let scalars = [
+            toml::Value::String("hello".to_string()),
+            toml::Value::Integer(i64::MIN),
+            toml::Value::Integer(i64::MAX),
+            toml::Value::Float(1.25),
+            toml::Value::Boolean(false),
+        ];
+
+        for input in scalars {
+            let json = toml_scalar_to_json_value(&input)?;
+            assert_eq!(
+                json_scalar_to_toml_value(&json).expect("round trip should stay scalar"),
+                input
+            );
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn converts_strings_to_toml_strings() -> Result<(), JsonScalarToTomlError> {

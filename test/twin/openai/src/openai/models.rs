@@ -526,8 +526,10 @@ pub fn normalize_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Accepts all known OpenAI Chat Completions API fields. Unknown top-level
+/// fields are ignored via `#[serde(flatten)]` so the twin stays compatible as
+/// clients add request options.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionsRequest {
     pub model:           String,
     pub messages:        Vec<ChatMessage>,
@@ -539,6 +541,13 @@ pub struct ChatCompletionsRequest {
     pub tool_choice:     Option<Value>,
     pub response_format: Option<ChatResponseFormat>,
     pub stop:            Option<Value>,
+    /// Catch-all for fields the twin doesn't use (temperature, top_p, etc.)
+    #[allow(
+        dead_code,
+        reason = "Serde captures unknown request fields for forward compatibility."
+    )]
+    #[serde(flatten)]
+    extra:               Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

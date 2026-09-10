@@ -746,6 +746,7 @@ mod tests {
             )
             .with_tool_secrets(ToolSecrets {
                 brave_search_api_key: Some("configured-key".to_string()),
+                ..ToolSecrets::default()
             });
             // Built twice: one configured builder must outfit both a root
             // session and the child sessions it spawns.

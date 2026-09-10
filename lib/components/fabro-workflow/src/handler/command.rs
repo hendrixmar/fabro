@@ -363,19 +363,22 @@ mod tests {
             Ok(RunProjection::new(
                 "Test run".to_string(),
                 RunSpec {
-                    run_id:           fixtures::RUN_1,
-                    settings:         WorkflowSettings::default(),
-                    graph:            Graph::new("test"),
-                    graph_source:     None,
-                    workflow_slug:    None,
-                    automation:       None,
-                    source_directory: None,
-                    labels:           std::collections::HashMap::default(),
-                    provenance:       test_support::test_run_provenance(),
-                    manifest_blob:    None,
-                    definition_blob:  None,
-                    git:              None,
-                    fork_source_ref:  None,
+                    run_id:              fixtures::RUN_1,
+                    settings:            WorkflowSettings::default(),
+                    graph:               Graph::new("test"),
+                    graph_source:        None,
+                    workflow_slug:       None,
+                    workflow_version_id: None,
+                    target:              None,
+                    automation:          None,
+                    source_directory:    None,
+                    labels:              std::collections::HashMap::default(),
+                    provenance:          test_support::test_run_provenance(),
+                    manifest_blob:       None,
+                    definition_blob:     None,
+                    spec_blob:           None,
+                    git:                 None,
+                    fork_source_ref:     None,
                 },
                 chrono::Utc::now(),
             ))
@@ -432,7 +435,7 @@ mod tests {
     }
 
     fn test_store() -> Arc<Database> {
-        Arc::new(Database::new(
+        Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -463,22 +466,25 @@ mod tests {
             run_store,
             &fixtures::RUN_1,
             &crate::event::Event::RunCreated {
-                run_id:           fixtures::RUN_1,
-                title:            None,
-                settings:         serde_json::to_value(WorkflowSettings::default()).unwrap(),
-                graph:            serde_json::to_value(Graph::new("test")).unwrap(),
-                workflow_source:  None,
-                labels:           std::collections::BTreeMap::default(),
-                source_directory: None,
-                workflow_slug:    None,
-                automation:       None,
-                provenance:       test_support::test_run_provenance(),
-                manifest_blob:    None,
-                git:              None,
-                fork_source_ref:  None,
-                retried_from:     None,
-                parent_id:        None,
-                web_url:          None,
+                run_id:              fixtures::RUN_1,
+                title:               None,
+                settings:            serde_json::to_value(WorkflowSettings::default()).unwrap(),
+                graph:               serde_json::to_value(Graph::new("test")).unwrap(),
+                workflow_source:     None,
+                labels:              std::collections::BTreeMap::default(),
+                source_directory:    None,
+                workflow_slug:       None,
+                workflow_version_id: None,
+                target:              None,
+                automation:          None,
+                provenance:          test_support::test_run_provenance(),
+                manifest_blob:       None,
+                spec_blob:           None,
+                git:                 None,
+                fork_source_ref:     None,
+                retried_from:        None,
+                parent_id:           None,
+                web_url:             None,
             },
         )
         .await
@@ -1073,7 +1079,7 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
@@ -1104,7 +1110,7 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
@@ -1131,7 +1137,7 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
@@ -1158,7 +1164,7 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
@@ -1183,7 +1189,7 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
@@ -1208,7 +1214,7 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
@@ -1238,7 +1244,7 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap_err();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
@@ -1265,7 +1271,7 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let snapshot = run_store.state().await.unwrap();
         let node = snapshot
@@ -1693,7 +1699,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::github_token_source::IatMinter for RefreshingMinter {
+    impl fabro_github::test_support::InstallationTokenMinter for RefreshingMinter {
         async fn mint(&self) -> anyhow::Result<fabro_github::InstallationToken> {
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             Ok(fabro_github::InstallationToken {
@@ -1834,8 +1840,9 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut services = make_sandbox_services(spy.clone());
-        services.github_token = Some(std::sync::Arc::new(
-            crate::github_token_source::GitHubTokenSource::mintable(minter.clone()),
+        services.github_token = Some(fabro_github::test_support::installation_token_source(
+            "owner/repo",
+            minter.clone(),
         ));
 
         let handler = CommandHandler;

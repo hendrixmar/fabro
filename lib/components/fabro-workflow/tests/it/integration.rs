@@ -32,9 +32,10 @@ use fabro_interview::{
 };
 use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ProviderId};
-use fabro_store::{ArtifactKey, ArtifactStore, Database};
+use fabro_store::{ArtifactKey, ArtifactStore};
 use fabro_types::{EventBody, RunEvent, RunId, StageId, WorkflowSettings, parse_blob_ref};
 use fabro_validate::{Severity, validate, validate_or_raise};
+use fabro_workflow::artifact;
 use fabro_workflow::context::Context;
 use fabro_workflow::error::{Error, FailureSignatureExt};
 use fabro_workflow::event::{Emitter, Event};
@@ -54,6 +55,7 @@ use fabro_workflow::model_fallback::ModelFallbackPolicy;
 use fabro_workflow::outcome::{Outcome, OutcomeExt, StageOutcome};
 use fabro_workflow::records::{Checkpoint, CheckpointExt};
 use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
+use fabro_workflow::runtime_store::RunStoreHandle;
 use fabro_workflow::test_support::{
     WorkflowRunner, collect_events, run_graph_with_hooks, test_store_dir,
 };
@@ -115,12 +117,13 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
     } else {
         test_store_dir(&run_dir)
     };
-    let object_store = Arc::new(LocalFileSystem::new_with_prefix(store_dir)?);
-    let store = Arc::new(Database::new(
+    let object_store = Arc::new(LocalFileSystem::new_with_prefix(&store_dir)?);
+    let store = Arc::new(fabro_store::test_support::test_database_at(
         object_store,
         "",
         Duration::from_millis(1),
         None,
+        &store_dir,
     ));
     let state = if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::spawn(
@@ -128,27 +131,23 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                let run_id =
-                    if uses_shared_store {
-                        run_dir
-                            .file_name()
-                            .ok_or("run dir should have file name")?
-                            .to_string_lossy()
-                            .rsplit('-')
-                            .next()
-                            .ok_or("run dir should contain run id suffix")?
-                            .parse()?
-                    } else {
-                        runtime
-                            .block_on(store.list_runs(
-                                &fabro_store::ListRunsQuery::default(),
-                                chrono::Utc::now(),
-                            ))?
-                            .into_iter()
-                            .next()
-                            .ok_or("test store should contain one run")?
-                            .id
-                    };
+                let run_id = if uses_shared_store {
+                    run_dir
+                        .file_name()
+                        .ok_or("run dir should have file name")?
+                        .to_string_lossy()
+                        .rsplit('-')
+                        .next()
+                        .ok_or("run dir should contain run id suffix")?
+                        .parse()?
+                } else {
+                    runtime
+                        .block_on(store.run_summary_store().list_all(chrono::Utc::now()))?
+                        .into_iter()
+                        .next()
+                        .ok_or("test store should contain one run")?
+                        .id
+                };
                 let run = runtime.block_on(store.open_run_reader(&run_id))?;
                 let state = runtime.block_on(async {
                     for attempt in 0..20 {
@@ -181,9 +180,7 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
                 .parse()?
         } else {
             runtime
-                .block_on(
-                    store.list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now()),
-                )?
+                .block_on(store.run_summary_store().list_all(chrono::Utc::now()))?
                 .into_iter()
                 .next()
                 .ok_or("test store should contain one run")?
@@ -233,10 +230,11 @@ fn resolve_checkpoint_text(
     let Some(current) = value.as_str() else {
         return Ok(value.to_string());
     };
-    let Some(blob_hash) = parse_blob_ref(current) else {
+    if parse_blob_ref(current).is_none() {
         return Ok(current.to_string());
-    };
+    }
 
+    let current = current.to_string();
     let run_dir = run_dir.to_path_buf();
     let (store_dir, uses_shared_store) = run_store_dir_and_mode(&run_dir)?;
     std::thread::spawn(
@@ -244,12 +242,13 @@ fn resolve_checkpoint_text(
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let object_store = Arc::new(LocalFileSystem::new_with_prefix(store_dir)?);
-            let store = Arc::new(Database::new(
+            let object_store = Arc::new(LocalFileSystem::new_with_prefix(&store_dir)?);
+            let store = Arc::new(fabro_store::test_support::test_database_at(
                 object_store,
                 "",
                 Duration::from_millis(1),
                 None,
+                &store_dir,
             ));
             let run_id = if uses_shared_store {
                 run_dir
@@ -262,19 +261,15 @@ fn resolve_checkpoint_text(
                     .parse()?
             } else {
                 runtime
-                    .block_on(
-                        store.list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now()),
-                    )?
+                    .block_on(store.run_summary_store().list_all(chrono::Utc::now()))?
                     .into_iter()
                     .next()
                     .ok_or("test store should contain one run")?
                     .id
             };
             let run = runtime.block_on(store.open_run_reader(&run_id))?;
-            let bytes = runtime
-                .block_on(run.read_blob(&blob_hash))?
-                .ok_or("checkpoint blob should exist")?;
-            Ok(serde_json::from_slice::<String>(&bytes)?)
+            let run_store = RunStoreHandle::from(run);
+            Ok(runtime.block_on(artifact::resolve_text_or_blob_ref_str(&current, &run_store))?)
         },
     )
     .join()
@@ -1124,6 +1119,323 @@ impl Handler for AlwaysFailHandler {
     }
 }
 
+struct OnFailureRecordingHandler {
+    visits: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Handler for OnFailureRecordingHandler {
+    async fn execute(
+        &self,
+        node: &Node,
+        _context: &fabro_workflow::context::Context,
+        _graph: &Graph,
+        _run_dir: &Path,
+        _services: &fabro_workflow::handler::EngineServices,
+    ) -> Result<Outcome, fabro_workflow::error::Error> {
+        self.visits.lock().unwrap().push(node.id.clone());
+        if node.id == "work" {
+            let mut outcome = Outcome::fail_classify("forced work failure");
+            outcome
+                .context_updates
+                .insert("recovery_ready".to_string(), serde_json::json!(true));
+            Ok(outcome)
+        } else {
+            Ok(Outcome::success())
+        }
+    }
+}
+
+/// Builds the linear on_failure test graph, splicing `extra` statements
+/// (policy attribute, recovery edges, node attributes) into the DOT source so
+/// tests exercise the real parser path for the `on_failure` attribute.
+fn on_failure_graph(extra: &str) -> Graph {
+    let input = format!(
+        r"digraph OnFailureTest {{
+        {extra}
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        work
+        downstream
+        start -> work -> downstream -> exit
+    }}"
+    );
+    parse(&input).expect("on_failure test graph should parse")
+}
+
+fn on_failure_registry(visits: Arc<std::sync::Mutex<Vec<String>>>) -> HandlerRegistry {
+    let mut registry = HandlerRegistry::new(Box::new(OnFailureRecordingHandler { visits }));
+    registry.register("start", Box::new(StartHandler));
+    registry.register("exit", Box::new(ExitHandler));
+    registry
+}
+
+struct OnFailureRun {
+    outcome:  Outcome,
+    state:    fabro_store::RunProjection,
+    visits:   Arc<std::sync::Mutex<Vec<String>>>,
+    _run_dir: tempfile::TempDir,
+}
+
+async fn run_on_failure(graph: &Graph, emitter: Emitter) -> OnFailureRun {
+    let visits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine = WorkflowRunner::new(
+        on_failure_registry(Arc::clone(&visits)),
+        Arc::new(emitter),
+        local_env(),
+    );
+    let run_dir = tempfile::tempdir().expect("temporary run dir should be created");
+    let (outcome, state) = engine
+        .run_with_state(graph, &make_run_options(run_dir.path()))
+        .await
+        .expect("on_failure run should complete without engine errors");
+    OnFailureRun {
+        outcome,
+        state,
+        visits,
+        _run_dir: run_dir,
+    }
+}
+
+#[tokio::test]
+async fn on_failure_exit_stops_linear_workflow_and_records_failed_lifecycle() {
+    let graph = on_failure_graph(r#"graph [on_failure="exit"]"#);
+    let emitter = Emitter::default();
+    let events = collect_events(&emitter);
+    let run = run_on_failure(&graph, emitter).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Failed {
+        retry_requested: false,
+    });
+    assert_eq!(
+        run.outcome.failure_reason(),
+        Some("stage work failed and graph on_failure=exit stopped routing")
+    );
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work"]);
+
+    let checkpoint = run
+        .state
+        .current_checkpoint()
+        .expect("failed work should be checkpointed");
+    assert_eq!(checkpoint.current_node, "work");
+    assert_eq!(checkpoint.next_node_id, None);
+    assert!(!checkpoint.node_outcomes.contains_key("downstream"));
+
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.body, EventBody::RunFailed(_)))
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.body,
+            EventBody::CheckpointCompleted(properties)
+                if properties.current_node == "work" && properties.next_node_id.is_none()
+        )
+    }));
+    assert!(!events.iter().any(|event| {
+        matches!(
+            &event.body,
+            EventBody::EdgeSelected(properties) if properties.from_node == "work"
+        )
+    }));
+}
+
+#[tokio::test]
+async fn on_failure_route_and_absent_policy_preserve_unconditional_fallback() {
+    for policy_attr in ["", r#"graph [on_failure="route"]"#] {
+        let graph = on_failure_graph(policy_attr);
+        let run = run_on_failure(&graph, Emitter::default()).await;
+
+        assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+        assert_eq!(*run.visits.lock().unwrap(), vec!["work", "downstream"]);
+        assert!(
+            run.state
+                .current_checkpoint()
+                .expect("downstream should be checkpointed")
+                .node_outcomes
+                .contains_key("downstream")
+        );
+    }
+}
+
+#[tokio::test]
+async fn on_failure_exit_allows_explicit_failure_recovery_edge() {
+    let graph = on_failure_graph(
+        r#"graph [on_failure="exit"]
+        recovery
+        work -> recovery [condition="outcome=failed"]
+        recovery -> exit"#,
+    );
+    let run = run_on_failure(&graph, Emitter::default()).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work", "recovery"]);
+}
+
+#[tokio::test]
+async fn on_failure_exit_uses_retry_target_instead_of_unconditional_edge() {
+    let graph = on_failure_graph(
+        r#"graph [on_failure="exit"]
+        work [retry_target="recovery"]
+        recovery
+        recovery -> exit"#,
+    );
+    let run = run_on_failure(&graph, Emitter::default()).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work", "recovery"]);
+}
+
+#[tokio::test]
+async fn node_on_failure_exit_overrides_graph_route_policy() {
+    let graph = on_failure_graph(r#"work [on_failure="exit"]"#);
+    let run = run_on_failure(&graph, Emitter::default()).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Failed {
+        retry_requested: false,
+    });
+    assert_eq!(
+        run.outcome.failure_reason(),
+        Some("stage work failed and node on_failure=exit stopped routing")
+    );
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work"]);
+}
+
+#[tokio::test]
+async fn node_on_failure_route_overrides_graph_exit_policy() {
+    let graph = on_failure_graph(
+        r#"graph [on_failure="exit"]
+        work [on_failure="route"]"#,
+    );
+    let run = run_on_failure(&graph, Emitter::default()).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work", "downstream"]);
+}
+
+#[tokio::test]
+async fn node_on_failure_succeed_promotes_failed_node_and_keeps_failure_in_events() {
+    let graph = on_failure_graph(
+        r#"graph [on_failure="exit"]
+        work [on_failure="succeed"]"#,
+    );
+    let emitter = Emitter::default();
+    let events = collect_events(&emitter);
+    let run = run_on_failure(&graph, emitter).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work", "downstream"]);
+
+    let checkpoint = run
+        .state
+        .current_checkpoint()
+        .expect("downstream should be checkpointed");
+    let work = &checkpoint.node_outcomes["work"];
+    assert_eq!(work.status, StageOutcome::Succeeded);
+    assert_eq!(work.failure_reason(), Some("forced work failure"));
+    assert_eq!(
+        work.notes.as_deref(),
+        Some("node on_failure=succeed promoted a failed outcome to succeeded")
+    );
+
+    let events = events.lock().unwrap();
+    let completed = events
+        .iter()
+        .find_map(|event| match &event.body {
+            EventBody::StageCompleted(props) if event.node_id.as_deref() == Some("work") => {
+                Some(props.clone())
+            }
+            _ => None,
+        })
+        .expect("promoted work stage should emit stage.completed");
+    assert_eq!(completed.status, StageOutcome::Succeeded);
+    assert_eq!(
+        completed
+            .failure
+            .as_ref()
+            .map(|failure| failure.message.as_str()),
+        Some("forced work failure")
+    );
+    assert!(!events.iter().any(|event| {
+        matches!(&event.body, EventBody::StageFailed(_)) && event.node_id.as_deref() == Some("work")
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.body, EventBody::RunCompleted(_)))
+    );
+}
+
+#[tokio::test]
+async fn auto_status_true_is_an_alias_for_on_failure_succeed() {
+    let graph = on_failure_graph(
+        r#"graph [on_failure="exit"]
+        work [auto_status=true]"#,
+    );
+    let run = run_on_failure(&graph, Emitter::default()).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work", "downstream"]);
+    let checkpoint = run
+        .state
+        .current_checkpoint()
+        .expect("downstream should be checkpointed");
+    assert_eq!(
+        checkpoint.node_outcomes["work"].status,
+        StageOutcome::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn node_on_failure_succeed_prefers_explicit_failure_edge() {
+    let graph = on_failure_graph(
+        r#"work [on_failure="succeed"]
+        recovery
+        work -> recovery [condition="outcome=failed"]
+        recovery -> exit"#,
+    );
+    let run = run_on_failure(&graph, Emitter::default()).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work", "recovery"]);
+    let checkpoint = run
+        .state
+        .current_checkpoint()
+        .expect("recovery should be checkpointed");
+    assert!(checkpoint.node_outcomes["work"].status.is_failure());
+}
+
+#[tokio::test]
+async fn node_on_failure_succeed_tests_recovery_edge_with_pending_result_context() {
+    let graph = on_failure_graph(
+        r#"work [on_failure="succeed"]
+        recovery
+        work -> recovery [condition="outcome=failed && context.recovery_ready=true && context.failure_class=deterministic"]
+        recovery -> exit"#,
+    );
+    let run = run_on_failure(&graph, Emitter::default()).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work", "recovery"]);
+    let checkpoint = run
+        .state
+        .current_checkpoint()
+        .expect("recovery should be checkpointed");
+    assert!(checkpoint.node_outcomes["work"].status.is_failure());
+}
+
+#[tokio::test]
+async fn node_on_failure_succeed_satisfies_goal_gate_without_retry_target() {
+    let graph =
+        on_failure_graph(r#"work [on_failure="succeed" goal_gate=true retry_target="start"]"#);
+    let run = run_on_failure(&graph, Emitter::default()).await;
+
+    assert_eq!(run.outcome.status, StageOutcome::Succeeded);
+    assert_eq!(*run.visits.lock().unwrap(), vec!["work", "downstream"]);
+}
+
 #[tokio::test]
 async fn goal_gate_routes_to_retry_target_on_failure() {
     // Pipeline:
@@ -1520,6 +1832,66 @@ fn stylesheet_comments_apply_via_parsed_graph() {
     assert_eq!(
         graph.nodes["exit"].attrs.get("model"),
         Some(&AttrValue::String("sonnet".to_string()))
+    );
+}
+
+#[test]
+fn model_stylesheet_template_renders_through_pipeline() {
+    use fabro_workflow::pipeline::{TransformOptions, transform, validate};
+
+    let input = r#"digraph StyleTemplate {
+        graph [
+            goal="Review the change",
+            model_stylesheet="
+                * { reasoning_effort: low; }
+                {% for effort in inputs.efforts %}
+                .tier-{{ loop.index }} { reasoning_effort: {{ effort }}; }
+                {% endfor %}
+            "
+        ]
+        start [shape=Mdiamond]
+        baseline [prompt="Baseline"]
+        selected [prompt="Selected", class="tier-2"]
+        exit [shape=Msquare]
+        start -> baseline -> selected -> exit
+    }"#;
+    let parsed = fabro_workflow::pipeline::parse(input).expect("parse should succeed");
+    let transformed = transform(parsed, &TransformOptions {
+        current_dir:       None,
+        file_resolver:     None,
+        template_context:  fabro_template::TemplateContext::new().with_inputs(
+            std::collections::HashMap::from([(
+                "efforts".to_string(),
+                toml::Value::Array(vec![
+                    toml::Value::String("medium".to_string()),
+                    toml::Value::String("high".to_string()),
+                ]),
+            )]),
+        ),
+        source_name:       Some("style-template.fabro".to_string()),
+        render_mode:       fabro_workflow::operations::RenderMode::Structural,
+        custom_transforms: vec![],
+        model_resolution:  None,
+    })
+    .expect("transform should succeed");
+    let validated = validate(transformed, None, &[]);
+    validated
+        .raise_on_errors()
+        .expect("rendered stylesheet should validate");
+
+    assert_eq!(
+        validated.graph().nodes["baseline"]
+            .attrs
+            .get("reasoning_effort")
+            .and_then(AttrValue::as_str),
+        Some("low")
+    );
+    assert_eq!(
+        validated.graph().nodes["selected"]
+            .attrs
+            .get("reasoning_effort")
+            .and_then(AttrValue::as_str),
+        Some("high")
     );
 }
 
@@ -7820,11 +8192,12 @@ async fn workflow_run_with_vault_only_openai_codex_builds_pr_body() {
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
     let store_dir = test_store_dir(&run_options.run_dir);
-    let store = Arc::new(Database::new(
+    let store = Arc::new(fabro_store::test_support::test_database_at(
         Arc::new(LocalFileSystem::new_with_prefix(&store_dir).unwrap()),
         "",
         Duration::from_millis(1),
         None,
+        &store_dir,
     ));
     let run_store = store.open_run_reader(&run_options.run_id).await.unwrap();
     let run_store_handle: fabro_workflow::runtime_store::RunStoreHandle = run_store.into();
@@ -10059,14 +10432,16 @@ async fn large_context_values_are_offloaded_to_artifact_store() {
         .expect("context should have response.big_output");
     let pointer_str = pointer_value.as_str().expect("pointer should be a string");
 
-    let expected_blob_hash = fabro_types::BlobHash::new(
-        &serde_json::to_vec(&serde_json::json!("x".repeat(150 * 1024)))
-            .expect("large value should serialize"),
-    );
-    assert_eq!(
-        pointer_str,
-        fabro_types::format_blob_ref(&expected_blob_hash),
+    assert!(
+        parse_blob_ref(pointer_str).is_some(),
         "value should be a durable blob ref"
+    );
+    let resolved = resolve_checkpoint_text(dir.path(), pointer_value)
+        .expect("offloaded value should resolve through the run store");
+    assert_eq!(
+        resolved,
+        "x".repeat(150 * 1024),
+        "offloaded value should round-trip through the run store"
     );
 
     // WorkflowRunCompleted artifact_count now tracks captured artifacts, not
@@ -10128,6 +10503,10 @@ impl fabro_agent::Sandbox for RemoteMockEnv {
 
     async fn file_exists(&self, path: &str) -> fabro_sandbox::Result<bool> {
         Ok(self.existing_paths.lock().unwrap().contains(path))
+    }
+
+    fn runtime_directory(&self) -> Option<&str> {
+        Some("/tmp/fabro/runtime")
     }
 
     async fn list_directory(
@@ -10258,14 +10637,16 @@ async fn artifact_pointers_rewritten_for_remote_sandbox() {
         .get("response.big_output")
         .expect("context should have response.big_output");
     let pointer_str = pointer_value.as_str().expect("pointer should be a string");
-    let expected_blob_hash = fabro_types::BlobHash::new(
-        &serde_json::to_vec(&serde_json::json!("x".repeat(150 * 1024)))
-            .expect("large value should serialize"),
-    );
-    assert_eq!(
-        pointer_str,
-        fabro_types::format_blob_ref(&expected_blob_hash),
+    assert!(
+        parse_blob_ref(pointer_str).is_some(),
         "checkpoint should persist a blob ref"
+    );
+    let resolved = resolve_checkpoint_text(dir.path(), pointer_value)
+        .expect("offloaded value should resolve through the run store");
+    assert_eq!(
+        resolved,
+        "x".repeat(150 * 1024),
+        "offloaded value should round-trip through the run store"
     );
 
     let written = remote_env.written.lock().unwrap();
@@ -10339,14 +10720,18 @@ async fn downstream_local_execution_resolves_response_blob_refs_as_text() {
         .expect("pipeline should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
+    // The downstream handler saw the full inline text, so resolution itself
+    // did not swap the value for a file reference. Prompt-preamble demotion
+    // materializes the oversized response for preamble use, confined to the
+    // run's blob directory.
     let captured_value = captured.lock().unwrap().first().cloned().unwrap();
     assert_eq!(captured_value, "x".repeat(150 * 1024));
     assert!(
-        !RunScratch::new(dir.path())
+        RunScratch::new(dir.path())
             .runtime_dir()
             .join("blobs")
             .exists(),
-        "textual response values should resolve without file materialization"
+        "prompt demotion materializes the oversized response under runtime/blobs"
     );
 }
 
@@ -10415,11 +10800,28 @@ async fn downstream_remote_execution_resolves_response_blob_refs_as_text() {
         .expect("pipeline should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
+    // The downstream handler saw the full inline text, so resolution itself
+    // did not swap the value for a file reference. Prompt-preamble demotion
+    // may still materialize the oversized response into the sandbox blob
+    // directory, but nowhere else.
     let captured_value = captured.lock().unwrap().first().cloned().unwrap();
     assert_eq!(captured_value, "x".repeat(150 * 1024));
+    let written = remote_env.written.lock().unwrap();
     assert!(
-        remote_env.written.lock().unwrap().is_empty(),
-        "textual response values should resolve without sandbox file materialization"
+        !written.is_empty(),
+        "prompt demotion materializes the oversized response into the sandbox"
+    );
+    assert!(
+        written
+            .iter()
+            .all(|(path, _)| path.starts_with("/tmp/fabro/runtime/blobs/")),
+        "nothing is written outside the sandbox runtime blob directory"
+    );
+    assert!(
+        written
+            .iter()
+            .all(|(path, _)| !path.starts_with("/sandbox")),
+        "nothing is written inside the repository checkout"
     );
 }
 
@@ -13327,7 +13729,7 @@ async fn asset_collection_docker_sandbox() {
         ..Default::default()
     };
     let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::new(
-        fabro_agent::DockerSandbox::new(config, None, None, None, None)
+        fabro_agent::DockerSandbox::new(config, None, None, None, None, None, None)
             .expect("Docker not available"),
     );
     sandbox.initialize().await.expect("Docker init failed");

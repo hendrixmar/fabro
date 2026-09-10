@@ -42,7 +42,7 @@ pub(crate) async fn dispatch(
         RunCommands::Create(args) => {
             let styles: &'static Styles = Box::leak(Box::new(Styles::detect_stderr()));
             let ctx = base_ctx.with_target(&args.target)?;
-            let created_run = Box::pin(create::create_run(&ctx, &args, styles, true)).await?;
+            let created_run = Box::pin(create::create_run(&ctx, &args, styles)).await?;
             if ctx.json_output() {
                 print_json_pretty(&serde_json::json!({ "run_id": created_run.run_id }))?;
             } else {

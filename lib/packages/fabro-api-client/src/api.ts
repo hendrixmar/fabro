@@ -26,7 +26,6 @@ export * from './api/install-api';
 export * from './api/integrations-api';
 export * from './api/mcpservers-api';
 export * from './api/models-api';
-export * from './api/playground-api';
 export * from './api/repos-api';
 export * from './api/run-internals-api';
 export * from './api/run-outputs-api';

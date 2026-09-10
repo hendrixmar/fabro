@@ -12,9 +12,10 @@ doctest = false
 workspace = true
 
 [features]
-test-support = []
+test-support = ["dep:fabro-db"]
 
 [dependencies]
+fabro-db = { path = "../../foundation/fabro-db", optional = true }
 fabro-types = { path = "../../foundation/fabro-types" }
 fabro-util = { path = "../../foundation/fabro-util" }
 hex.workspace = true
@@ -27,6 +28,7 @@ tokio-stream.workspace = true
 dashmap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 strum.workspace = true
 chrono = { workspace = true, features = ["serde"] }

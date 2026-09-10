@@ -3,18 +3,21 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use fabro_types::OnFailure;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::Context;
 use crate::error::{Error, Result, VisitLimitSource};
-use crate::graph::{EdgeSpec, Graph, NodeSpec};
+use crate::graph::{EdgeSelection, EdgeSpec, Graph, NodeSpec};
 use crate::handler::NodeHandler;
 use crate::lifecycle::{
     AttemptContext, AttemptResultContext, EdgeContext, EdgeDecision, NodeDecision, NoopLifecycle,
     RunLifecycle,
 };
-use crate::outcome::{NodeResult, NodeResultExt, Outcome, OutcomeMeta};
+use crate::outcome::{
+    FailureDetail, NodeResult, NodeResultExt, Outcome, OutcomeMeta, StageOutcome,
+};
 use crate::state::ExecutionState;
 
 /// Build a [`NodeResult`] from an attempt outcome, pulling the inference and
@@ -63,6 +66,34 @@ enum NextStep {
     Jump(String),
     LoopRestart(String),
     End,
+}
+
+#[derive(PartialEq)]
+struct RoutingFingerprint {
+    status:             StageOutcome,
+    preferred_label:    Option<String>,
+    suggested_next_ids: Vec<String>,
+    context_updates:    std::collections::HashMap<String, serde_json::Value>,
+    jump_to_node:       Option<String>,
+    failure:            Option<FailureDetail>,
+}
+
+impl<M: OutcomeMeta> From<&Outcome<M>> for RoutingFingerprint {
+    fn from(outcome: &Outcome<M>) -> Self {
+        Self {
+            status:             outcome.status,
+            preferred_label:    outcome.preferred_label.clone(),
+            suggested_next_ids: outcome.suggested_next_ids.clone(),
+            context_updates:    outcome.context_updates.clone(),
+            jump_to_node:       outcome.jump_to_node.clone(),
+            failure:            outcome.failure.clone(),
+        }
+    }
+}
+
+struct PreparedEdgeSelection<G: Graph> {
+    fingerprint: RoutingFingerprint,
+    selection:   Option<EdgeSelection<G>>,
 }
 
 pub struct ExecutorBuilder<G: Graph> {
@@ -179,8 +210,11 @@ impl<G: Graph + 'static> Executor<G> {
                 }
             }
 
-            // Check visit limits (>= matches fabro-workflow semantics)
-            let visits = state.increment_visits(node.id());
+            // Check visit limits before entry: a node with a limit of N may
+            // execute N times, matching the documented contract. The count
+            // covers previously admitted entries, so the refused visit is
+            // not reported as one.
+            let visits = state.visits(node.id());
             if let Some(max) = node.max_visits() {
                 if visits >= max {
                     return Err(Error::VisitLimitExceeded {
@@ -201,49 +235,59 @@ impl<G: Graph + 'static> Executor<G> {
                     });
                 }
             }
+            state.increment_visits(node.id());
 
             // before_node lifecycle
-            let node_result = match self.lifecycle.before_node(&node, &state).await? {
-                NodeDecision::Skip(outcome) => {
-                    let mut result = NodeResult::from_skip(*outcome);
-                    self.lifecycle
-                        .after_node(&node, &mut result, &state)
-                        .await?;
-                    result
-                }
-                NodeDecision::Block(msg) => {
-                    return Err(Error::blocked(msg));
-                }
-                NodeDecision::Continue => {
-                    // Execute with retry, racing against stall token
-                    let execution_result = if let Some(ref stall) = self.options.stall_token {
-                        tokio::select! {
-                            r = self.execute_with_retry(&node, &state, graph) => r,
-                            () = stall.cancelled() => {
-                                return Err(Error::StallTimeout {
-                                    node_id: node.id().to_string(),
-                                });
+            let (node_result, prepared_selection) =
+                match self.lifecycle.before_node(&node, &state).await? {
+                    NodeDecision::Skip(outcome) => {
+                        let mut result = NodeResult::from_skip(*outcome);
+                        self.lifecycle
+                            .after_node(&node, &mut result, &state)
+                            .await?;
+                        (result, None)
+                    }
+                    NodeDecision::Block(msg) => {
+                        return Err(Error::blocked(msg));
+                    }
+                    NodeDecision::Continue => {
+                        // Execute with retry, racing against stall token
+                        let execution_result = if let Some(ref stall) = self.options.stall_token {
+                            tokio::select! {
+                                r = self.execute_with_retry(&node, &state, graph) => r,
+                                () = stall.cancelled() => {
+                                    return Err(Error::StallTimeout {
+                                        node_id: node.id().to_string(),
+                                    });
+                                }
                             }
+                        } else {
+                            self.execute_with_retry(&node, &state, graph).await
+                        };
+                        let mut result = match execution_result {
+                            Ok(result) => result,
+                            Err(Error::Cancelled) => {
+                                state.cancelled = true;
+                                let outcome = Outcome::fail("run cancelled");
+                                self.lifecycle.on_run_end(&outcome, &state).await;
+                                return Err(Error::Cancelled);
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        let mut prepared_selection = self
+                            .apply_succeed_policy(&node, &mut result, &state, graph)
+                            .await?;
+                        self.lifecycle
+                            .after_node(&node, &mut result, &state)
+                            .await?;
+                        if prepared_selection.as_ref().is_some_and(|prepared| {
+                            prepared.fingerprint != RoutingFingerprint::from(&result.outcome)
+                        }) {
+                            prepared_selection = None;
                         }
-                    } else {
-                        self.execute_with_retry(&node, &state, graph).await
-                    };
-                    let mut result = match execution_result {
-                        Ok(result) => result,
-                        Err(Error::Cancelled) => {
-                            state.cancelled = true;
-                            let outcome = Outcome::fail("run cancelled");
-                            self.lifecycle.on_run_end(&outcome, &state).await;
-                            return Err(Error::Cancelled);
-                        }
-                        Err(err) => return Err(err),
-                    };
-                    self.lifecycle
-                        .after_node(&node, &mut result, &state)
-                        .await?;
-                    result
-                }
-            };
+                        (result, prepared_selection)
+                    }
+                };
 
             state.record(node.id(), &node_result);
             self.lifecycle
@@ -253,7 +297,7 @@ impl<G: Graph + 'static> Executor<G> {
             // Determine next step
             let last_outcome = &state.node_outcomes[node.id()];
             let next = self
-                .resolve_next_step(&node, last_outcome, &state, graph)
+                .resolve_next_step(&node, last_outcome, &state, graph, prepared_selection)
                 .await?;
 
             // Checkpoint AFTER edge selection so next_node_id is known
@@ -278,10 +322,21 @@ impl<G: Graph + 'static> Executor<G> {
                 NextStep::End => {
                     let mut outcome = last_outcome.clone();
                     if outcome.status.is_failure() {
-                        outcome = Outcome::fail(&format!(
-                            "stage {} failed with no outgoing fail edge",
-                            node.id()
-                        ));
+                        let resolved = graph.resolve_on_failure(&node);
+                        let message = match resolved.policy() {
+                            // A failed outcome under `succeed` only reaches
+                            // the end when an explicit route matched but
+                            // produced no next node, which mirrors `route`.
+                            OnFailure::Route | OnFailure::Succeed => {
+                                format!("stage {} failed with no outgoing fail edge", node.id())
+                            }
+                            OnFailure::Exit => format!(
+                                "stage {} failed and {} on_failure=exit stopped routing",
+                                node.id(),
+                                resolved.scope()
+                            ),
+                        };
+                        outcome = Outcome::fail(&message);
                     }
                     self.lifecycle.on_run_end(&outcome, &state).await;
                     return Ok((outcome, state));
@@ -410,12 +465,65 @@ impl<G: Graph + 'static> Executor<G> {
         unreachable!("loop always returns or continues")
     }
 
+    /// Applies the `on_failure="succeed"` policy to a failed node result.
+    ///
+    /// This runs before the lifecycle observes the result, so the recorded
+    /// outcome, context keys, goal gates, events, and routing all see the
+    /// effective outcome. Explicit recovery routes take priority: a failed
+    /// outcome that carries a jump, or that an explicit edge would route,
+    /// stays `failed`.
+    async fn apply_succeed_policy(
+        &self,
+        node: &G::Node,
+        result: &mut NodeResult<G::Meta>,
+        state: &ExecutionState<G::Meta>,
+        graph: &G,
+    ) -> Result<Option<PreparedEdgeSelection<G>>> {
+        let outcome = &result.outcome;
+        if !outcome.status.is_failure() || outcome.jump_to_node.is_some() {
+            return Ok(None);
+        }
+        let resolved = graph.resolve_on_failure(node);
+        if resolved.policy() != OnFailure::Succeed {
+            return Ok(None);
+        }
+        let projected_context = state.context.fork();
+        projected_context.apply_updates(&result.outcome.context_updates);
+        graph.project_result_context(node, result, &projected_context);
+        let routing_context = self
+            .handler
+            .context_for_edge_selection(&projected_context, graph)
+            .await?;
+        if let Some(selection) = graph
+            .select_edge(node, outcome, &routing_context)
+            .filter(|selection| selection.reason.is_explicit())
+        {
+            return Ok(Some(PreparedEdgeSelection {
+                fingerprint: RoutingFingerprint::from(&result.outcome),
+                selection:   Some(selection),
+            }));
+        }
+        if result.outcome.apply_on_failure(resolved) {
+            tracing::debug!(
+                node = %node.id(),
+                scope = %resolved.scope(),
+                "on_failure=succeed promoted failed outcome"
+            );
+        }
+        graph.project_result_context(node, result, &routing_context);
+        Ok(Some(PreparedEdgeSelection {
+            fingerprint: RoutingFingerprint::from(&result.outcome),
+            selection:   graph.select_edge(node, &result.outcome, &routing_context),
+        }))
+    }
+
     async fn resolve_next_step(
         &self,
         node: &G::Node,
         outcome: &Outcome<G::Meta>,
         state: &ExecutionState<G::Meta>,
         graph: &G,
+        prepared_selection: Option<PreparedEdgeSelection<G>>,
     ) -> Result<NextStep> {
         // Jump takes priority
         if let Some(ref target) = outcome.jump_to_node {
@@ -434,14 +542,26 @@ impl<G: Graph + 'static> Executor<G> {
             }
         }
 
-        // Normal edge selection
-        let routing_context = self
-            .handler
-            .context_for_edge_selection(&state.context, graph)
-            .await?;
-        if let Some(selection) = graph.select_edge(node, outcome, &routing_context) {
+        // Normal edge selection. A failed `succeed` result prepared this
+        // decision while its original failure context was still available.
+        let selection = if let Some(prepared) = prepared_selection {
+            prepared.selection
+        } else {
+            let routing_context = self
+                .handler
+                .context_for_edge_selection(&state.context, graph)
+                .await?;
+            graph.select_edge(node, outcome, &routing_context)
+        }
+        .filter(|selection| {
+            !outcome.status.is_failure()
+                || selection.reason.is_explicit()
+                || graph.resolve_on_failure(node).policy() == OnFailure::Route
+        });
+        if let Some(selection) = selection {
             let target = selection.edge.target().to_string();
             let is_restart = selection.edge.is_loop_restart();
+            let reason: &'static str = selection.reason.into();
 
             let ctx = EdgeContext {
                 from: node.id(),
@@ -449,7 +569,7 @@ impl<G: Graph + 'static> Executor<G> {
                 edge: Some(selection.edge.clone()),
                 is_jump: false,
                 outcome,
-                reason: selection.reason,
+                reason,
             };
             match self.lifecycle.on_edge_selected(&ctx, state).await? {
                 EdgeDecision::Continue => {
@@ -807,7 +927,8 @@ mod tests {
 
     #[tokio::test]
     async fn executor_visit_limit_per_node() {
-        // Node with max_visits=2, loops back — fails on 2nd visit (>= semantics)
+        // Node with max_visits=2, loops back — executes exactly twice, then
+        // the third entry is refused. The error reports completed visits.
         let g = TestGraph::new(
             vec![
                 TestNode::new("loop_node").with_max_visits(2),
@@ -821,11 +942,20 @@ mod tests {
             "loop_node",
         );
         let state = ExecutionState::new(&g).unwrap();
+        let handler = Arc::new(CountingHandler::new(vec![]));
         let executor =
-            ExecutorBuilder::new(Arc::new(AlwaysSucceedHandler) as Arc<dyn NodeHandler<TestGraph>>)
-                .build();
+            ExecutorBuilder::new(Arc::clone(&handler) as Arc<dyn NodeHandler<TestGraph>>).build();
         let result = executor.run(&g, state).await;
-        assert!(matches!(result, Err(Error::VisitLimitExceeded { .. })));
+        match result {
+            Err(Error::VisitLimitExceeded { visits, limit, .. }) => {
+                assert_eq!(visits, 2);
+                assert_eq!(limit, 2);
+            }
+            Err(other) => panic!("expected VisitLimitExceeded, got {other:?}"),
+            Ok(_) => panic!("expected VisitLimitExceeded, got success"),
+        }
+        // Two full loop_node -> other iterations ran before the refusal.
+        assert_eq!(handler.calls(), 4);
     }
 
     #[tokio::test]
@@ -2164,6 +2294,452 @@ mod tests {
         let (result, _) = executor.run(&g, state).await.unwrap();
         assert_eq!(result.status, StageOutcome::Succeeded);
         assert_eq!(handler.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn executor_exit_policy_ends_failed_run_with_policy_message_and_no_next_node() {
+        #[derive(Default)]
+        struct ExitPolicyLog {
+            checkpoints: Vec<(String, Option<String>)>,
+            run_end:     Option<Outcome>,
+        }
+
+        struct ExitPolicyLifecycle(Arc<Mutex<ExitPolicyLog>>);
+
+        #[async_trait]
+        impl RunLifecycle<TestGraph> for ExitPolicyLifecycle {
+            async fn on_checkpoint(
+                &self,
+                node: &TestNode,
+                _result: &NodeResult,
+                next_node_id: Option<&str>,
+                _state: &ExecutionState,
+            ) -> Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .checkpoints
+                    .push((node.id().to_string(), next_node_id.map(ToOwned::to_owned)));
+                Ok(())
+            }
+
+            async fn on_run_end(&self, outcome: &Outcome, _state: &ExecutionState) {
+                self.0.lock().unwrap().run_end = Some(outcome.clone());
+            }
+        }
+
+        let graph = TestGraph::new(
+            vec![
+                TestNode::new("work"),
+                TestNode::new("downstream"),
+                TestNode::terminal("end"),
+            ],
+            vec![
+                TestEdge::new("work", "downstream"),
+                TestEdge::new("downstream", "end"),
+            ],
+            "work",
+        )
+        .with_on_failure(OnFailure::Exit);
+        let state = ExecutionState::new(&graph).unwrap();
+        let log = Arc::new(Mutex::new(ExitPolicyLog::default()));
+        let executor = ExecutorBuilder::new(
+            Arc::new(AlwaysFailHandler::new("boom")) as Arc<dyn NodeHandler<TestGraph>>
+        )
+        .lifecycle(Box::new(ExitPolicyLifecycle(Arc::clone(&log))))
+        .build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        assert_eq!(
+            outcome
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
+            Some("stage work failed and graph on_failure=exit stopped routing")
+        );
+        assert!(state.node_outcomes.contains_key("work"));
+        assert!(!state.node_outcomes.contains_key("downstream"));
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.checkpoints, vec![("work".to_string(), None)]);
+        assert_eq!(log.run_end.as_ref(), Some(&outcome));
+    }
+
+    #[tokio::test]
+    async fn executor_node_exit_policy_overrides_graph_route_and_names_node_scope() {
+        let graph = TestGraph::new(
+            vec![
+                TestNode::new("work").with_on_failure(OnFailure::Exit),
+                TestNode::new("downstream"),
+                TestNode::terminal("end"),
+            ],
+            vec![
+                TestEdge::new("work", "downstream"),
+                TestEdge::new("downstream", "end"),
+            ],
+            "work",
+        );
+        let state = ExecutionState::new(&graph).unwrap();
+        let executor = ExecutorBuilder::new(
+            Arc::new(AlwaysFailHandler::new("boom")) as Arc<dyn NodeHandler<TestGraph>>
+        )
+        .build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        assert_eq!(
+            outcome
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
+            Some("stage work failed and node on_failure=exit stopped routing")
+        );
+        assert!(!state.node_outcomes.contains_key("downstream"));
+    }
+
+    #[tokio::test]
+    async fn executor_node_route_policy_overrides_graph_exit() {
+        let graph = TestGraph::new(
+            vec![
+                TestNode::new("work").with_on_failure(OnFailure::Route),
+                TestNode::new("downstream"),
+                TestNode::terminal("end"),
+            ],
+            vec![
+                TestEdge::new("work", "downstream"),
+                TestEdge::new("downstream", "end"),
+            ],
+            "work",
+        )
+        .with_on_failure(OnFailure::Exit);
+        let state = ExecutionState::new(&graph).unwrap();
+        let handler = DispatchHandler::new(Arc::new(AlwaysSucceedHandler))
+            .with_handler("work", Arc::new(AlwaysFailHandler::new("boom")));
+        let executor =
+            ExecutorBuilder::new(Arc::new(handler) as Arc<dyn NodeHandler<TestGraph>>).build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert!(state.node_outcomes.contains_key("downstream"));
+    }
+
+    /// Records the outcome status each lifecycle callback observed, so tests
+    /// can prove the `succeed` policy is applied before `after_node`.
+    struct StatusCaptureLifecycle(Arc<Mutex<Vec<(String, StageOutcome)>>>);
+
+    #[async_trait]
+    impl RunLifecycle<TestGraph> for StatusCaptureLifecycle {
+        async fn after_node(
+            &self,
+            node: &TestNode,
+            result: &mut NodeResult,
+            _state: &ExecutionState,
+        ) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((node.id().to_string(), result.outcome.status));
+            Ok(())
+        }
+    }
+
+    fn succeed_policy_graph() -> TestGraph {
+        TestGraph::new(
+            vec![
+                TestNode::new("work").with_on_failure(OnFailure::Succeed),
+                TestNode::new("downstream"),
+                TestNode::terminal("end"),
+            ],
+            vec![
+                TestEdge::new("work", "downstream"),
+                TestEdge::new("downstream", "end"),
+            ],
+            "work",
+        )
+    }
+
+    fn fail_work_handler() -> Arc<dyn NodeHandler<TestGraph>> {
+        Arc::new(
+            DispatchHandler::new(Arc::new(AlwaysSucceedHandler))
+                .with_handler("work", Arc::new(AlwaysFailHandler::new("boom"))),
+        )
+    }
+
+    #[tokio::test]
+    async fn executor_succeed_policy_promotes_failed_node_before_lifecycle_and_continues() {
+        let graph = succeed_policy_graph();
+        let state = ExecutionState::new(&graph).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let executor = ExecutorBuilder::new(fail_work_handler())
+            .lifecycle(Box::new(StatusCaptureLifecycle(Arc::clone(&seen))))
+            .build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        let work = &state.node_outcomes["work"];
+        assert_eq!(work.status, StageOutcome::Succeeded);
+        assert_eq!(
+            work.failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
+            Some("boom"),
+            "the original failure stays on the recorded outcome"
+        );
+        assert_eq!(
+            work.notes.as_deref(),
+            Some("node on_failure=succeed promoted a failed outcome to succeeded")
+        );
+        assert!(state.node_outcomes.contains_key("downstream"));
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                ("work".to_string(), StageOutcome::Succeeded),
+                ("downstream".to_string(), StageOutcome::Succeeded),
+            ],
+            "after_node observes the effective outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_succeed_policy_resolves_routing_context_once_per_node() {
+        struct CountingHandler(Arc<AtomicU32>);
+
+        #[async_trait]
+        impl NodeHandler<TestGraph> for CountingHandler {
+            async fn execute(
+                &self,
+                node: &TestNode,
+                _context: &Context,
+                _graph: &TestGraph,
+            ) -> Result<Outcome> {
+                if node.id() == "work" {
+                    Ok(Outcome::fail("boom"))
+                } else {
+                    Ok(Outcome::success())
+                }
+            }
+
+            async fn context_for_edge_selection(
+                &self,
+                context: &Context,
+                _graph: &TestGraph,
+            ) -> Result<Context> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(context.clone())
+            }
+        }
+
+        let graph = succeed_policy_graph();
+        let state = ExecutionState::new(&graph).unwrap();
+        let calls = Arc::new(AtomicU32::new(0));
+        let executor = ExecutorBuilder::new(Arc::new(CountingHandler(Arc::clone(&calls)))).build();
+
+        let (outcome, _) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn executor_succeed_policy_keeps_failed_outcome_when_explicit_route_matches() {
+        let graph = TestGraph::new(
+            vec![
+                TestNode::new("work").with_on_failure(OnFailure::Succeed),
+                TestNode::new("recovery"),
+                TestNode::new("downstream"),
+                TestNode::terminal("end"),
+            ],
+            vec![
+                TestEdge::new("work", "recovery").with_label("failed"),
+                TestEdge::new("work", "downstream"),
+                TestEdge::new("recovery", "end"),
+                TestEdge::new("downstream", "end"),
+            ],
+            "work",
+        );
+        let state = ExecutionState::new(&graph).unwrap();
+        let executor = ExecutorBuilder::new(fail_work_handler()).build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(state.node_outcomes["work"].status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        assert!(state.node_outcomes.contains_key("recovery"));
+        assert!(!state.node_outcomes.contains_key("downstream"));
+    }
+
+    #[tokio::test]
+    async fn executor_succeed_policy_keeps_failed_outcome_with_jump() {
+        struct FailWithJump;
+
+        #[async_trait]
+        impl NodeHandler<TestGraph> for FailWithJump {
+            async fn execute(
+                &self,
+                _node: &TestNode,
+                _context: &Context,
+                _graph: &TestGraph,
+            ) -> Result<Outcome> {
+                let mut outcome = Outcome::fail("boom");
+                outcome.jump_to_node = Some("recovery".to_string());
+                Ok(outcome)
+            }
+        }
+
+        let graph = TestGraph::new(
+            vec![
+                TestNode::new("work").with_on_failure(OnFailure::Succeed),
+                TestNode::new("recovery"),
+                TestNode::new("downstream"),
+                TestNode::terminal("end"),
+            ],
+            vec![
+                TestEdge::new("work", "downstream"),
+                TestEdge::new("recovery", "end"),
+                TestEdge::new("downstream", "end"),
+            ],
+            "work",
+        );
+        let state = ExecutionState::new(&graph).unwrap();
+        let handler = DispatchHandler::new(Arc::new(AlwaysSucceedHandler))
+            .with_handler("work", Arc::new(FailWithJump));
+        let executor =
+            ExecutorBuilder::new(Arc::new(handler) as Arc<dyn NodeHandler<TestGraph>>).build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert!(state.node_outcomes["work"].status.is_failure());
+        assert!(state.node_outcomes.contains_key("recovery"));
+        assert!(!state.node_outcomes.contains_key("downstream"));
+    }
+
+    #[tokio::test]
+    async fn executor_succeed_policy_satisfies_goal_gate() {
+        let graph = TestGraph::new(
+            vec![
+                TestNode::new("work").with_on_failure(OnFailure::Succeed),
+                TestNode::terminal("end").with_goal_gate("work", StageOutcome::Succeeded),
+            ],
+            vec![TestEdge::new("work", "end")],
+            "work",
+        );
+        let state = ExecutionState::new(&graph).unwrap();
+        let executor = ExecutorBuilder::new(fail_work_handler()).build();
+
+        let (outcome, _state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn executor_succeed_policy_skips_retry_target() {
+        let graph = TestGraph::new(
+            vec![
+                TestNode::new("work").with_on_failure(OnFailure::Succeed),
+                TestNode::new("downstream"),
+                TestNode::new("retry_only"),
+                TestNode::terminal("end"),
+            ],
+            vec![
+                TestEdge::new("work", "downstream"),
+                TestEdge::new("downstream", "end"),
+                TestEdge::new("retry_only", "end"),
+            ],
+            "work",
+        )
+        .with_retry_target("work", "retry_only");
+        let state = ExecutionState::new(&graph).unwrap();
+        let executor = ExecutorBuilder::new(fail_work_handler()).build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert!(state.node_outcomes.contains_key("downstream"));
+        assert!(
+            !state.node_outcomes.contains_key("retry_only"),
+            "a promoted outcome is not failed, so retry targets do not apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_graph_succeed_policy_promotes_every_failed_node() {
+        let graph = TestGraph::new(
+            vec![
+                TestNode::new("work"),
+                TestNode::new("downstream"),
+                TestNode::terminal("end"),
+            ],
+            vec![
+                TestEdge::new("work", "downstream"),
+                TestEdge::new("downstream", "end"),
+            ],
+            "work",
+        )
+        .with_on_failure(OnFailure::Succeed);
+        let state = ExecutionState::new(&graph).unwrap();
+        let executor = ExecutorBuilder::new(
+            Arc::new(AlwaysFailHandler::new("boom")) as Arc<dyn NodeHandler<TestGraph>>
+        )
+        .build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        for node_id in ["work", "downstream"] {
+            let recorded = &state.node_outcomes[node_id];
+            assert_eq!(recorded.status, StageOutcome::Succeeded);
+            assert_eq!(
+                recorded.notes.as_deref(),
+                Some("graph on_failure=succeed promoted a failed outcome to succeeded")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_succeed_policy_leaves_partial_outcome_unchanged() {
+        struct PartialHandler;
+
+        #[async_trait]
+        impl NodeHandler<TestGraph> for PartialHandler {
+            async fn execute(
+                &self,
+                _node: &TestNode,
+                _context: &Context,
+                _graph: &TestGraph,
+            ) -> Result<Outcome> {
+                let mut outcome = Outcome::success();
+                outcome.status = StageOutcome::PartiallySucceeded;
+                Ok(outcome)
+            }
+        }
+
+        let graph = succeed_policy_graph();
+        let state = ExecutionState::new(&graph).unwrap();
+        let handler = DispatchHandler::new(Arc::new(AlwaysSucceedHandler))
+            .with_handler("work", Arc::new(PartialHandler));
+        let executor =
+            ExecutorBuilder::new(Arc::new(handler) as Arc<dyn NodeHandler<TestGraph>>).build();
+
+        let (outcome, state) = executor.run(&graph, state).await.unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            state.node_outcomes["work"].status,
+            StageOutcome::PartiallySucceeded
+        );
+        assert_eq!(state.node_outcomes["work"].notes, None);
     }
 
     #[tokio::test]

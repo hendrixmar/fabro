@@ -125,6 +125,12 @@ pub(super) struct ApiResponse {
     pub model:   String,
     pub choices: Vec<ApiChoice>,
     pub usage:   Option<ApiUsage>,
+    pub cost:    Option<ApiCost>,
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct ApiCost {
+    pub usd: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -377,6 +383,7 @@ pub(super) struct StreamChunk {
     pub model:   Option<String>,
     pub choices: Option<Vec<StreamChoice>>,
     pub usage:   Option<ApiUsage>,
+    pub cost:    Option<ApiCost>,
 }
 
 #[derive(serde::Deserialize)]

@@ -46,6 +46,8 @@ fn start_by_run_id_starts_created_run() {
             "create",
             "--dry-run",
             "--auto-approve",
+            "--environment",
+            "local",
             workflow.to_str().unwrap(),
         ])
         .assert()
@@ -96,6 +98,8 @@ fn start_by_run_id_starts_created_run_without_run_json_or_status_json() {
             "create",
             "--dry-run",
             "--auto-approve",
+            "--environment",
+            "local",
             workflow.to_str().unwrap(),
         ])
         .assert()

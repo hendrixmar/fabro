@@ -237,7 +237,7 @@ Captured stage artifacts such as screenshots, videos, reports, and traces still 
 
 For remote sandboxes (Docker, Daytona), execution-time file access happens inside the sandbox filesystem.
 
-- Blob refs are materialized into `{working_directory}/.fabro/blobs/{blob_hash}.json`
+- Blob refs are materialized into the sandbox runtime directory, `{runtime_directory}/blobs/{blob_hash}.json`. This directory lives outside the repository checkout, so materialized blobs never show up in `git status` or in checkpoint commits.
 - Explicit non-blob `file://` refs keep the existing copy-on-demand behavior and are copied into `{working_directory}/.fabro/artifacts/{filename}` when needed
 
 In both cases, downstream handlers and agents continue to consume ordinary `file://` pointers during execution.
@@ -277,6 +277,10 @@ Patterns are rooted at the sandbox working directory. `*` and `?` stay within on
 
 Fabro prunes dependency, cache, and build directories including `.git`, `node_modules`, `target`, `.venv`, `.cache`, and `dist`.
 
+### Browse and download captures
+
+The Artifacts page groups captures by file path. Expand a file to see and download earlier versions. **Download all** creates a ZIP archive with the latest captured version of each path. Fabro uses stage order, retry number, and stage ID to choose the latest version, and it excludes captures from the graph's start and exit nodes.
+
 ## Observability
 
 Outputs and artifacts appear in several observability surfaces:
@@ -285,6 +289,6 @@ Outputs and artifacts appear in several observability surfaces:
 |---|---|
 | `StageCompleted` event | `files_touched` list for the stage |
 | `WorkflowRunCompleted` event | `artifact_count` -- total number of offloaded artifacts across the run |
-| Web UI | Run stage output, stage artifacts, and downloadable artifact files |
+| Web UI | Run stage output, artifact version history, individual downloads, and a ZIP of the latest files |
 | [Preambles](/execution/context#preamble-construction) | File list and artifact pointer references for completed stages |
 | Stage logs | `status.json` in each stage's run directory contains the full outcome including `files_touched` |

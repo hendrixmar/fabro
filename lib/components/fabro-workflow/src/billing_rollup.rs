@@ -1,137 +1,14 @@
-use std::collections::HashMap;
-
-use fabro_model::Catalog;
-use fabro_types::{BilledTokenCounts, ModelRef, RunProjection, RunTiming, StageTiming};
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectionBillingStage {
-    pub node_id: String,
-    pub billing: BilledTokenCounts,
-    /// Per-node timing summed across every visit of that node within this
-    /// projection. `wall_time_ms`, `inference_time_ms`, `tool_time_ms`, and
-    /// `active_time_ms` are all summed in lockstep.
-    pub timing:  StageTiming,
-    pub model:   Option<ModelRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectionBillingByModel {
-    pub model:   ModelRef,
-    pub stages:  i64,
-    pub billing: BilledTokenCounts,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ProjectionBillingRollup {
-    pub stages:             Vec<ProjectionBillingStage>,
-    pub totals:             BilledTokenCounts,
-    pub by_model:           Vec<ProjectionBillingByModel>,
-    /// Run-level timing summed across every stage visit. `wall_time_ms` is
-    /// the sum of stage visit wall times (not the run clock duration).
-    pub timing:             RunTiming,
-    pub billed_visit_count: usize,
-}
-
-impl ProjectionBillingRollup {
-    #[must_use]
-    pub fn billing_if_present(&self) -> Option<BilledTokenCounts> {
-        (self.billed_visit_count > 0).then(|| self.totals.clone())
-    }
-}
-
-#[must_use]
-pub fn billing_rollup_from_projection(
-    projection: &RunProjection,
-    catalog: Option<&Catalog>,
-) -> ProjectionBillingRollup {
-    let mut stage_indices = HashMap::<String, usize>::new();
-    let mut stages = Vec::<ProjectionBillingStage>::new();
-    let mut by_model = HashMap::<ModelRef, ProjectionBillingByModel>::new();
-    let mut totals = BilledTokenCounts::default();
-    let mut run_timing = RunTiming::default();
-    let mut billed_visit_count = 0_usize;
-
-    for (stage_id, stage) in projection.iter_stages() {
-        if projection.is_boundary_stage(stage_id.node_id()) {
-            continue;
-        }
-        let usage = stage.billed_usage(catalog);
-        let usage = usage.as_ref();
-        if stage.completion.is_none() && stage.timing.is_none() && usage.is_zero() {
-            continue;
-        }
-
-        let node_id = stage_id.node_id();
-        let index = *stage_indices.entry(node_id.to_string()).or_insert_with(|| {
-            let index = stages.len();
-            stages.push(ProjectionBillingStage {
-                node_id: node_id.to_string(),
-                billing: BilledTokenCounts::default(),
-                timing:  StageTiming::default(),
-                model:   None,
-            });
-            index
-        });
-        let row = &mut stages[index];
-
-        if let Some(timing) = stage.timing {
-            row.timing = row.timing.saturating_add(&timing);
-            run_timing = run_timing.saturating_add(&RunTiming::from(timing));
-        }
-
-        if !usage.is_zero() {
-            billed_visit_count += 1;
-            row.billing.add_counts(usage);
-            totals.add_counts(usage);
-
-            if let Some(model) = &stage.model {
-                row.model = Some(model.clone());
-                let model_entry =
-                    by_model
-                        .entry(model.clone())
-                        .or_insert_with(|| ProjectionBillingByModel {
-                            model:   model.clone(),
-                            stages:  0,
-                            billing: BilledTokenCounts::default(),
-                        });
-                model_entry.stages += 1;
-                model_entry.billing.add_counts(usage);
-            }
-        }
-    }
-
-    let mut by_model = by_model.into_values().collect::<Vec<_>>();
-    by_model.sort_by(|left, right| {
-        let left_provider = left.model.provider.to_string();
-        let right_provider = right.model.provider.to_string();
-        left_provider
-            .cmp(&right_provider)
-            .then_with(|| left.model.model_id.cmp(&right.model.model_id))
-            .then_with(|| {
-                left.model
-                    .speed
-                    .map(<&'static str>::from)
-                    .cmp(&right.model.speed.map(<&'static str>::from))
-            })
-    });
-
-    ProjectionBillingRollup {
-        stages,
-        totals,
-        by_model,
-        timing: run_timing,
-        billed_visit_count,
-    }
-}
+pub use fabro_types::billing_rollup::{
+    ProjectionBillingByModel, ProjectionBillingRollup, ProjectionBillingStage,
+    billing_rollup_from_projection,
+};
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use fabro_model::{Catalog, ModelRef, ProviderId};
     use fabro_types::{
         AttrValue, BilledTokenCounts, Graph, Node, RunProjection, RunSpec, StageCompletion,
-        StageOutcome, WorkflowSettings, first_event_seq, fixtures, test_support,
+        StageOutcome, first_event_seq, test_support,
     };
 
     use super::billing_rollup_from_projection;
@@ -311,19 +188,8 @@ mod tests {
         });
 
         RunSpec {
-            run_id: fixtures::RUN_1,
-            settings: WorkflowSettings::default(),
             graph,
-            graph_source: None,
-            workflow_slug: None,
-            automation: None,
-            source_directory: None,
-            labels: HashMap::new(),
-            provenance: test_support::test_run_provenance(),
-            manifest_blob: None,
-            definition_blob: None,
-            git: None,
-            fork_source_ref: None,
+            ..test_support::test_run_spec()
         }
     }
 }

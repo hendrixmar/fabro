@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
     strum::IntoStaticStr,
     strum::VariantArray,
 )]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "clap", clap(rename_all = "lowercase"))]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum ReasoningEffort {

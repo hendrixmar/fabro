@@ -1,0 +1,21 @@
+---
+title: "Docker images for Daytona snapshots"
+date: "2026-08-27"
+---
+
+Daytona environments now accept `image.docker`. Fabro creates or reuses a
+Daytona snapshot from that image, so an existing image no longer needs a
+wrapper Dockerfile. `image.dockerfile` remains available for custom builds.
+
+Set one image source per Daytona environment:
+
+```toml
+[environments.cloud]
+provider = "daytona"
+
+[environments.cloud.image]
+docker = "python:3.11-slim"
+```
+
+Fabro rejects a Daytona environment that sets both `image.docker` and
+`image.dockerfile`.

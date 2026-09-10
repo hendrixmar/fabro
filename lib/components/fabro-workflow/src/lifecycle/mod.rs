@@ -1,5 +1,4 @@
 pub(crate) mod artifact;
-pub(crate) mod auto_status;
 pub(crate) mod circuit_breaker;
 pub(crate) mod event;
 pub(crate) mod fidelity;
@@ -26,7 +25,6 @@ use fabro_sandbox::Sandbox;
 use fabro_types::RunId;
 
 use self::artifact::ArtifactLifecycle;
-use self::auto_status::AutoStatusLifecycle;
 use self::circuit_breaker::CircuitBreakerLifecycle;
 use self::event::EventLifecycle;
 use self::fidelity::FidelityLifecycle;
@@ -34,10 +32,10 @@ use self::git::{GitCheckpointResult, GitLifecycle};
 use self::hook::HookLifecycle;
 use crate::artifact_upload::ArtifactSink;
 use crate::context;
-use crate::error::{FailureSignature, FailureSignatureExt};
+use crate::error::FailureSignature;
 use crate::event::Emitter;
 use crate::graph::{WorkflowGraph, WorkflowNode};
-use crate::outcome::{BilledModelUsage, Outcome, OutcomeExt};
+use crate::outcome::{BilledModelUsage, Outcome};
 use crate::run_control::RunControlState;
 use crate::run_metadata::{RunMetadataRuntime, RunMetadataWriterHandle};
 use crate::run_options::RunOptions;
@@ -56,7 +54,6 @@ pub(crate) struct WorkflowLifecycle {
     event:                 EventLifecycle,
     hook:                  HookLifecycle,
     fidelity:              FidelityLifecycle,
-    auto_status:           AutoStatusLifecycle,
     circuit_breaker:       Arc<CircuitBreakerLifecycle>,
     git:                   GitLifecycle,
     artifact:              ArtifactLifecycle,
@@ -187,7 +184,6 @@ impl WorkflowLifecycle {
             event,
             hook,
             fidelity,
-            auto_status: AutoStatusLifecycle,
             circuit_breaker,
             git,
             artifact,
@@ -361,7 +357,6 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         result: &mut WfNodeResult,
         state: &WfRunState,
     ) -> CoreResult<()> {
-        self.auto_status.after_node(node, result, state).await?;
         self.circuit_breaker.after_node(node, result, state).await?;
         self.artifact.after_node(node, result, state).await?;
         self.event.after_node(node, result, state).await?;
@@ -375,47 +370,13 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         result: &WfNodeResult,
         state: &WfRunState,
     ) -> CoreResult<()> {
-        let outcome = &result.outcome;
         let retry_count = state.node_retries.get(node.id()).copied().unwrap_or(0);
-        let failure_class = outcome.classified_failure_category();
-        let failure_signature = failure_class
-            .map(|category| {
-                let signature_hint = outcome
-                    .failure
-                    .as_ref()
-                    .and_then(|f| f.signature.as_deref());
-                FailureSignature::new(
-                    node.id(),
-                    category,
-                    signature_hint,
-                    outcome.failure_reason(),
-                )
-                .to_string()
-            })
-            .unwrap_or_default();
-
-        state.context.set(
-            context::keys::retry_count_key(node.id()),
-            serde_json::json!(retry_count),
+        context::apply_recorded_outcome_context(
+            &state.context,
+            node.id(),
+            &result.outcome,
+            retry_count,
         );
-        state.context.set(
-            context::keys::OUTCOME,
-            serde_json::json!(outcome.status.to_string()),
-        );
-        state.context.set(
-            context::keys::FAILURE_CLASS,
-            serde_json::json!(failure_class.map_or(String::new(), |fc| fc.to_string())),
-        );
-        state.context.set(
-            context::keys::FAILURE_SIGNATURE,
-            serde_json::json!(failure_signature),
-        );
-        if let Some(ref preferred_label) = outcome.preferred_label {
-            state.context.set(
-                context::keys::PREFERRED_LABEL,
-                serde_json::json!(preferred_label),
-            );
-        }
         Ok(())
     }
 

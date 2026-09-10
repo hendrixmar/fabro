@@ -43,8 +43,7 @@ pub async fn resume(run_dir: &Path, services: StartServices) -> Result<Started, 
         &services.run_id,
         &Event::RunSubmitted { definition_blob },
     )
-    .await
-    .map_err(|err| Error::engine(err.to_string()))?;
+    .await?;
 
     Box::pin(execute_persisted_run(run_dir, Some(resume_state), services)).await
 }

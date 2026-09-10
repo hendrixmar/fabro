@@ -1,0 +1,7 @@
+digraph InvalidNodeOnFailure {
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    work [prompt="Do the work" on_failure="stop"]
+
+    start -> work -> exit
+}

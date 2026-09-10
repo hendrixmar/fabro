@@ -2059,7 +2059,8 @@ fn build_github_app_manifest(
             "issues": "write",
             "emails": "read",
             "vulnerability_alerts": "write",
-            "organization_projects": "write"
+            "organization_projects": "write",
+            "packages": "read"
         },
         "default_events": []
     })
@@ -2372,6 +2373,21 @@ mod tests {
         assert!(
             manifest["default_permissions"].get("workflows").is_none(),
             "GitHub App must not be able to write workflow files"
+        );
+    }
+
+    #[test]
+    fn github_app_manifest_includes_packages_read_permission() {
+        let manifest = build_github_app_manifest(
+            "Fabro Test",
+            "https://fabro.example/setup",
+            "https://fabro.example/auth/callback/github",
+            "https://fabro.example/setup",
+        );
+
+        assert_eq!(
+            manifest["default_permissions"]["packages"],
+            serde_json::json!("read"),
         );
     }
 

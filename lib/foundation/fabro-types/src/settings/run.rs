@@ -6,7 +6,7 @@
 //! notifications, interviews, agent knobs, hooks, SCM targeting, pull-request
 //! behavior, and artifact collection.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
@@ -22,6 +22,7 @@ use super::size::Size;
 
 /// A structurally resolved `[run]` view for consumers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunNamespace {
     pub goal:          Option<RunGoal>,
     pub working_dir:   Option<String>,
@@ -603,9 +604,19 @@ pub struct RunIntegrationsSettings {
 /// presence-vs-clear distinction is only meaningful at the layer-merge
 /// stage; the resolved form collapses both `None` and `Some({})` into an
 /// empty map.
+///
+/// `additional_repositories` lists repositories, beyond the implicit run
+/// origin, that the minted `GITHUB_TOKEN` must cover. Configuration
+/// resolution guarantees a non-empty set comes with a non-empty permission
+/// map that includes `contents`; runs persisted before the field existed
+/// deserialize to an empty set via the serde default.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunIntegrationsGithubSettings {
-    pub permissions: HashMap<String, InterpString>,
+    pub permissions:             HashMap<String, InterpString>,
+    /// Omitted when empty so settings serialized by this release stay
+    /// byte-identical to earlier releases for single-repository runs.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub additional_repositories: BTreeSet<crate::GitHubRepositorySlug>,
 }
 
 impl RunIntegrationsGithubSettings {
@@ -616,16 +627,67 @@ impl RunIntegrationsGithubSettings {
         !self.permissions.is_empty()
     }
 
+    /// Whether the run declares additional repositories beyond the origin.
+    pub fn has_additional_repositories(&self) -> bool {
+        !self.additional_repositories.is_empty()
+    }
+
+    /// Whether a resolved `contents` permission level lets the token reach
+    /// repository contents — the level a declared `additional_repositories`
+    /// set requires. The one definition shared by config-time validation and
+    /// the runtime re-check after interpolation, so the accepted levels
+    /// cannot drift between the two layers.
+    #[must_use]
+    pub fn contents_permission_allows_repository_access(value: &str) -> bool {
+        value == "read" || value == "write"
+    }
+
     /// Resolve every `permissions` value. `{{ vars.* }}` is substituted
     /// server-side at run creation, so values are literal by this point; a
     /// still-unresolved token fails closed rather than reaching the GitHub API
     /// as literal text.
-    pub fn resolve_permissions(&self) -> Result<HashMap<String, String>, ResolveError> {
+    fn resolve_permissions(&self) -> Result<HashMap<String, String>, ResolveError> {
         let mut ctx = ResolveCtx::new();
         self.permissions
             .iter()
             .map(|(name, value)| Ok((name.clone(), value.resolve_with(&mut ctx)?)))
             .collect()
+    }
+
+    /// Resolve the whole runtime integration request: interpolated
+    /// permissions plus the declared additional repositories, produced
+    /// together so consumers cannot pick up one without the other.
+    pub fn resolve_integration(&self) -> Result<ResolvedGithubIntegration, ResolveError> {
+        Ok(ResolvedGithubIntegration {
+            permissions:             self.resolve_permissions()?,
+            additional_repositories: self.additional_repositories.clone(),
+        })
+    }
+}
+
+/// The resolved runtime GitHub integration request for one run: interpolated
+/// permission values plus the declared additional repositories.
+///
+/// This is the single value carried from run materialization into workflow
+/// startup, replacing parallel permission/repository collections that could
+/// drift apart.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedGithubIntegration {
+    pub permissions:             HashMap<String, String>,
+    pub additional_repositories: BTreeSet<crate::GitHubRepositorySlug>,
+}
+
+impl ResolvedGithubIntegration {
+    /// Mirrors [`RunIntegrationsGithubSettings::is_token_requested`] for the
+    /// resolved form.
+    #[must_use]
+    pub fn is_token_requested(&self) -> bool {
+        !self.permissions.is_empty()
+    }
+
+    #[must_use]
+    pub fn has_additional_repositories(&self) -> bool {
+        !self.additional_repositories.is_empty()
     }
 }
 
@@ -635,10 +697,11 @@ mod run_integrations_github_tests {
 
     fn settings(permissions: &[(&str, &str)]) -> RunIntegrationsGithubSettings {
         RunIntegrationsGithubSettings {
-            permissions: permissions
+            permissions:             permissions
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), InterpString::parse(v)))
                 .collect(),
+            additional_repositories: std::collections::BTreeSet::new(),
         }
     }
 
@@ -669,6 +732,53 @@ mod run_integrations_github_tests {
     #[test]
     fn resolve_permissions_is_empty_for_empty_settings() {
         assert!(settings(&[]).resolve_permissions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn settings_without_additional_repositories_field_deserialize_to_empty_set() {
+        // Persisted run.created events from releases before
+        // `additional_repositories` existed omit the field entirely.
+        let parsed: RunIntegrationsGithubSettings = serde_json::from_value(serde_json::json!({
+            "permissions": { "contents": "read" }
+        }))
+        .expect("legacy settings should deserialize");
+
+        assert!(parsed.additional_repositories.is_empty());
+        assert!(!parsed.has_additional_repositories());
+    }
+
+    #[test]
+    fn resolve_integration_carries_permissions_and_repositories_together() {
+        let mut s = settings(&[("contents", "read")]);
+        s.additional_repositories
+            .insert("fabro-sh/keystone".parse().unwrap());
+
+        let resolved = s.resolve_integration().unwrap();
+
+        assert!(resolved.is_token_requested());
+        assert!(resolved.has_additional_repositories());
+        assert_eq!(
+            resolved.permissions.get("contents"),
+            Some(&"read".to_string())
+        );
+        assert_eq!(
+            resolved
+                .additional_repositories
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["fabro-sh/keystone"]
+        );
+    }
+
+    #[test]
+    fn resolve_integration_fails_on_an_unresolved_permission_token() {
+        let mut s = settings(&[("contents", "{{ env.GH_PERM_LEVEL }}")]);
+        s.additional_repositories
+            .insert("fabro-sh/keystone".parse().unwrap());
+
+        let err = s.resolve_integration().unwrap_err();
+        assert_eq!(err.namespace, Namespace::Env);
     }
 }
 
@@ -961,12 +1071,30 @@ impl Default for RunCheckpointSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunCloneSettings {
     pub enabled: bool,
+    #[serde(default = "default_clone_depth")]
+    pub depth:   i32,
+}
+
+impl RunCloneSettings {
+    pub const DEFAULT_DEPTH: i32 = 100;
+
+    /// Git history depth to fetch, or `None` to fetch full history.
+    pub fn depth_limit(&self) -> Option<i32> {
+        (self.depth > 0).then_some(self.depth)
+    }
 }
 
 impl Default for RunCloneSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            depth:   Self::DEFAULT_DEPTH,
+        }
     }
+}
+
+fn default_clone_depth() -> i32 {
+    RunCloneSettings::DEFAULT_DEPTH
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

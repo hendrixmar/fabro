@@ -3,6 +3,7 @@ import type { BoardColumn, Run } from "@qltysh/fabro-api-client";
 
 import {
   buildBoardColumns,
+  buildFilterOptions,
   loadStoredRunsWorkspaceSearchParams,
   placeArchivedColumnLast,
   persistRunsWorkspacePreferences,
@@ -11,6 +12,7 @@ import {
   shouldRefreshBoardForEvent,
 } from "./runs";
 import { summarizeBatchLifecycleAction } from "../components/runs-list/batch-lifecycle";
+import { mapRunListItem } from "../data/runs";
 import { TEST_PRINCIPAL } from "../lib/test-fixtures";
 
 function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
@@ -214,6 +216,38 @@ describe("runs route board mapping", () => {
       message: "Couldn't delete 2 runs. Try again.",
       tone:    "error",
     });
+  });
+});
+
+describe("runs route filter options", () => {
+  function runWith(id: string, repoName: string, workflowName: string): Run {
+    const run = boardRun(id, "running");
+    return {
+      ...run,
+      repository: { ...run.repository, name: repoName },
+      workflow:   { ...run.workflow, name: workflowName },
+    };
+  }
+
+  test("derives sorted unique options from run items", () => {
+    const items = [
+      runWith("a", "qlty/beta", "release"),
+      runWith("b", "qlty/alpha", "hello"),
+      runWith("c", "qlty/beta", "release"),
+    ].map(mapRunListItem);
+
+    expect(buildFilterOptions(items, (item) => item.repo, "all")).toEqual(["alpha", "beta"]);
+    expect(buildFilterOptions(items, (item) => item.workflow, "all")).toEqual([
+      "hello",
+      "release",
+    ]);
+  });
+
+  test("keeps the active selection when no loaded run matches it", () => {
+    const items = [runWith("a", "qlty/beta", "release")].map(mapRunListItem);
+
+    expect(buildFilterOptions(items, (item) => item.repo, "gamma")).toEqual(["beta", "gamma"]);
+    expect(buildFilterOptions([], (item) => item.workflow, "release")).toEqual(["release"]);
   });
 });
 

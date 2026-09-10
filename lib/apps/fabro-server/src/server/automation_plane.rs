@@ -1181,11 +1181,11 @@ mod tests {
     use std::sync::Mutex;
 
     use fabro_automation::{
-        AutomationDraft, AutomationId, AutomationStore, AutomationTarget, AutomationTrigger,
-        AutomationTriggerId, PlaneTrigger,
+        AutomationDraft, AutomationId, AutomationStore, AutomationTrigger, AutomationTriggerId,
+        PlaneTrigger,
     };
     use fabro_db::Database;
-    use fabro_types::{ExternalAgentHarness, SuccessReason};
+    use fabro_types::{ExternalAgentHarness, GitRunTarget, RunTarget, SuccessReason};
 
     use super::*;
 
@@ -1400,15 +1400,19 @@ mod tests {
         let automations = AutomationStore::new(database.clone_pool());
         let created = automations
             .create(AutomationDraft {
-                id:          AutomationId::new("tierra").unwrap(),
-                name:        "Tierra".to_string(),
-                description: None,
-                target:      AutomationTarget {
-                    repository:   "owner/repo".to_string(),
-                    ref_selector: "main".to_string(),
-                    workflow:     "ticket".to_string(),
-                },
-                triggers:    vec![AutomationTrigger::Plane(sample_trigger())],
+                id:              AutomationId::new("tierra").unwrap(),
+                name:            "Tierra".to_string(),
+                description:     None,
+                environment_id:  None,
+                target:          RunTarget::Git(GitRunTarget {
+                    repo:   "owner/repo".to_string(),
+                    branch: "main".to_string(),
+                    tag:    None,
+                    sha:    None,
+                }),
+                workflow:        "ticket".to_string(),
+                workflow_source: None,
+                triggers:        vec![AutomationTrigger::Plane(sample_trigger())],
             })
             .await
             .unwrap();

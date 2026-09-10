@@ -1061,11 +1061,9 @@ impl RunProjection {
 
 #[cfg(test)]
 mod title_tests {
-    use std::collections::HashMap;
-
     use chrono::Utc;
 
-    use crate::{AttrValue, Graph, RunId, RunProjection, RunSpec, WorkflowSettings, test_support};
+    use crate::{AttrValue, Graph, RunProjection, RunSpec, test_support};
 
     fn projection_with_goal(goal: Option<&str>) -> RunProjection {
         let mut graph = Graph::new("test");
@@ -1076,19 +1074,8 @@ mod title_tests {
         }
 
         let spec = RunSpec {
-            run_id: RunId::new(),
-            settings: WorkflowSettings::default(),
             graph,
-            graph_source: None,
-            workflow_slug: None,
-            automation: None,
-            source_directory: None,
-            labels: HashMap::new(),
-            provenance: test_support::test_run_provenance(),
-            manifest_blob: None,
-            definition_blob: None,
-            git: None,
-            fork_source_ref: None,
+            ..test_support::test_run_spec()
         };
         RunProjection::new(String::new(), spec, Utc::now())
     }
@@ -1129,7 +1116,6 @@ mod title_tests {
 
 #[cfg(test)]
 mod iter_stages_tests {
-    use std::collections::HashMap;
     use std::num::NonZeroU32;
 
     use chrono::Utc;
@@ -1137,10 +1123,7 @@ mod iter_stages_tests {
     use serde_json::json;
 
     use super::RunProjection;
-    use crate::{
-        AgentControlState, BilledTokenCounts, Graph, RunId, RunSpec, StageProjection,
-        WorkflowSettings, test_support,
-    };
+    use crate::{AgentControlState, BilledTokenCounts, StageProjection, test_support};
 
     fn seq(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).unwrap()
@@ -1149,21 +1132,7 @@ mod iter_stages_tests {
     fn projection() -> RunProjection {
         RunProjection::new(
             "Test run".to_string(),
-            RunSpec {
-                run_id:           RunId::new(),
-                settings:         WorkflowSettings::default(),
-                graph:            Graph::new("test"),
-                graph_source:     None,
-                workflow_slug:    None,
-                automation:       None,
-                source_directory: None,
-                labels:           HashMap::default(),
-                provenance:       test_support::test_run_provenance(),
-                manifest_blob:    None,
-                definition_blob:  None,
-                git:              None,
-                fork_source_ref:  None,
-            },
+            test_support::test_run_spec(),
             Utc::now(),
         )
     }
@@ -1336,14 +1305,12 @@ mod iter_stages_tests {
 
 #[cfg(test)]
 mod live_timing_tests {
-    use std::collections::HashMap;
-
     use chrono::{DateTime, TimeZone, Utc};
 
     use super::{RunProjection, StageToolBatchProjection};
     use crate::{
-        Graph, ModelRef, RunId, RunSpec, StageHandler, StageInferenceProjection, StageProjection,
-        StageState, StageTiming, StartRecord, WorkflowSettings, first_event_seq, test_support,
+        ModelRef, StageHandler, StageInferenceProjection, StageProjection, StageState, StageTiming,
+        StartRecord, first_event_seq, test_support,
     };
 
     fn at(seconds: i64) -> DateTime<Utc> {
@@ -1351,25 +1318,7 @@ mod live_timing_tests {
     }
 
     fn projection() -> RunProjection {
-        RunProjection::new(
-            "Test run".to_string(),
-            RunSpec {
-                run_id:           RunId::new(),
-                settings:         WorkflowSettings::default(),
-                graph:            Graph::new("test"),
-                graph_source:     None,
-                workflow_slug:    None,
-                automation:       None,
-                source_directory: None,
-                labels:           HashMap::default(),
-                provenance:       test_support::test_run_provenance(),
-                manifest_blob:    None,
-                definition_blob:  None,
-                git:              None,
-                fork_source_ref:  None,
-            },
-            at(0),
-        )
+        RunProjection::new("Test run".to_string(), test_support::test_run_spec(), at(0))
     }
 
     /// In-flight stage that started at `at(0)`.

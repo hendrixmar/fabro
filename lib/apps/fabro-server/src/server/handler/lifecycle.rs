@@ -41,7 +41,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 async fn run_response(state: &AppState, id: RunId, status: StatusCode) -> Response {
-    match state.stores.runs.get_cached_summary(&id, Utc::now()).await {
+    match state.stores.run_summaries.get(&id, Utc::now()).await {
         Ok(Some(summary)) => {
             (status, Json(state.decorate_run_summary(summary).await)).into_response()
         }
@@ -445,7 +445,7 @@ async fn cancel_run(
     if let Some(response) = reject_if_archived(state.as_ref(), &id).await {
         return response;
     }
-    let durable_summary = match state.stores.runs.runs().find(&id).await {
+    let durable_summary = match state.stores.run_summaries.get(&id, Utc::now()).await {
         Ok(summary) => summary,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -809,12 +809,12 @@ async fn batch_archive_runs(
     State(state): State<Arc<AppState>>,
     Json(request): Json<BatchRunLifecycleRequest>,
 ) -> Response {
-    batch_run_archive_action(
+    Box::pin(batch_run_archive_action(
         state,
         Principal::User(user),
         request,
         ArchiveAction::Archive,
-    )
+    ))
     .await
 }
 
@@ -823,12 +823,12 @@ async fn batch_unarchive_runs(
     State(state): State<Arc<AppState>>,
     Json(request): Json<BatchRunLifecycleRequest>,
 ) -> Response {
-    batch_run_archive_action(
+    Box::pin(batch_run_archive_action(
         state,
         Principal::User(user),
         request,
         ArchiveAction::Unarchive,
-    )
+    ))
     .await
 }
 
@@ -1187,7 +1187,7 @@ async fn batch_run_archive_item(
         }
     };
 
-    match state.stores.runs.get_cached_summary(&id, Utc::now()).await {
+    match state.stores.run_summaries.get(&id, Utc::now()).await {
         Ok(Some(summary)) => BatchRunLifecycleResult {
             run_id: id.to_string(),
             ok: true,

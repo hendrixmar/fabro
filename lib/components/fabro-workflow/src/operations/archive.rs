@@ -144,7 +144,7 @@ mod tests {
     use super::*;
 
     fn memory_store() -> Arc<Database> {
-        Arc::new(Database::new(
+        Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -215,23 +215,26 @@ mod tests {
 
     async fn seed_created(run_store: &fabro_store::RunDatabase, run_id: &RunId) {
         event::append_event(run_store, run_id, &Event::RunCreated {
-            run_id:           *run_id,
-            title:            None,
-            settings:         serde_json::to_value(fabro_types::WorkflowSettings::default())
+            run_id:              *run_id,
+            title:               None,
+            settings:            serde_json::to_value(fabro_types::WorkflowSettings::default())
                 .unwrap(),
-            graph:            serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
-            workflow_source:  None,
-            labels:           std::collections::BTreeMap::default(),
-            source_directory: None,
-            workflow_slug:    None,
-            automation:       None,
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            git:              None,
-            fork_source_ref:  None,
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            graph:               serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
+            workflow_source:     None,
+            labels:              std::collections::BTreeMap::default(),
+            source_directory:    None,
+            workflow_slug:       None,
+            workflow_version_id: None,
+            target:              None,
+            automation:          None,
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            spec_blob:           None,
+            git:                 None,
+            fork_source_ref:     None,
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .unwrap();

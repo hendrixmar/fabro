@@ -122,10 +122,11 @@ fn config_help() {
 
     Options:
           --json                       Output as JSON [env: FABRO_JSON=]
-          --storage-dir <STORAGE_DIR>  Local storage directory (default: ~/.fabro/storage) [env: FABRO_STORAGE_DIR=]
+          --name <NAME>                Name of the mcpServers entry; use distinct names to register multiple Fabro servers [default: fabro]
           --debug                      Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
-          --server <SERVER>            Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
+          --storage-dir <STORAGE_DIR>  Local storage directory (default: ~/.fabro/storage) [env: FABRO_STORAGE_DIR=]
           --no-upgrade-check           Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
+          --server <SERVER>            Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
           --quiet                      Suppress non-essential output [env: FABRO_QUIET=]
           --verbose                    Enable verbose output [env: FABRO_VERBOSE=]
       -h, --help                       Print help
@@ -151,10 +152,11 @@ fn init_help() {
 
     Options:
           --json                       Output as JSON [env: FABRO_JSON=]
-          --storage-dir <STORAGE_DIR>  Local storage directory (default: ~/.fabro/storage) [env: FABRO_STORAGE_DIR=]
+          --name <NAME>                Name of the mcpServers entry; use distinct names to register multiple Fabro servers [default: fabro]
           --debug                      Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
-          --server <SERVER>            Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
+          --storage-dir <STORAGE_DIR>  Local storage directory (default: ~/.fabro/storage) [env: FABRO_STORAGE_DIR=]
           --no-upgrade-check           Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
+          --server <SERVER>            Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
           --quiet                      Suppress non-essential output [env: FABRO_QUIET=]
           --verbose                    Enable verbose output [env: FABRO_VERBOSE=]
       -h, --help                       Print help
@@ -219,6 +221,55 @@ fn config_preserves_connection_flags() {
     }
     ----- stderr -----
     "#);
+}
+
+#[test]
+fn config_uses_custom_entry_name() {
+    let context = test_context!();
+    let mut cmd = context.command();
+    cmd.args([
+        "mcp",
+        "config",
+        "--name",
+        "fabro-production",
+        "--server",
+        "https://fabro.example.test",
+    ]);
+    fabro_snapshot!(context.filters(), cmd, @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    {
+      "mcpServers": {
+        "fabro-production": {
+          "command": "fabro",
+          "args": [
+            "mcp",
+            "start",
+            "--server",
+            "https://fabro.example.test"
+          ]
+        }
+      }
+    }
+    ----- stderr -----
+    "#);
+}
+
+#[test]
+fn config_rejects_empty_entry_name() {
+    let context = test_context!();
+    let mut cmd = context.command();
+    cmd.args(["mcp", "config", "--name", ""]);
+    fabro_snapshot!(context.filters(), cmd, @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+    ----- stderr -----
+    error: a value is required for '--name <NAME>' but none was supplied
+
+    For more information, try '--help'.
+    ");
 }
 
 #[test]
@@ -413,6 +464,91 @@ fn init_preserves_existing_servers() {
         }
       },
       "theme": "dark"
+    }
+    "#);
+}
+
+#[test]
+fn init_merges_multiple_named_fabro_entries() {
+    let context = test_context!();
+    context
+        .command()
+        .args(["mcp", "init", "cursor"])
+        .assert()
+        .success();
+    context
+        .command()
+        .args([
+            "mcp",
+            "init",
+            "cursor",
+            "--name",
+            "fabro-production",
+            "--server",
+            "https://production.example.test",
+        ])
+        .assert()
+        .success();
+    context
+        .command()
+        .args([
+            "mcp",
+            "init",
+            "cursor",
+            "--name",
+            "fabro-testing",
+            "--server",
+            "https://testing.example.test",
+        ])
+        .assert()
+        .success();
+    // Reusing a name updates only that entry.
+    context
+        .command()
+        .args([
+            "mcp",
+            "init",
+            "cursor",
+            "--name",
+            "fabro-production",
+            "--server",
+            "https://production.example.test:8443",
+        ])
+        .assert()
+        .success();
+
+    let config_path = context.home_dir.join(".cursor").join("mcp.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    fabro_json_snapshot!(context, config, @r#"
+    {
+      "mcpServers": {
+        "fabro": {
+          "command": "fabro",
+          "args": [
+            "mcp",
+            "start"
+          ]
+        },
+        "fabro-production": {
+          "command": "fabro",
+          "args": [
+            "mcp",
+            "start",
+            "--server",
+            "https://production.example.test:8443"
+          ]
+        },
+        "fabro-testing": {
+          "command": "fabro",
+          "args": [
+            "mcp",
+            "start",
+            "--server",
+            "https://testing.example.test"
+          ]
+        }
+      }
     }
     "#);
 }

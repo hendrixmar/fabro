@@ -8,7 +8,7 @@ use serde::Serialize;
 use super::{ApiError, AppState, IntoResponse, Json, Response, StatusCode, demo};
 
 mod artifacts;
-mod automations;
+pub(in crate::server) mod automations;
 mod billing;
 mod completions;
 mod environments;
@@ -20,7 +20,6 @@ mod llm_sse;
 mod mcp_servers;
 mod models;
 mod pair;
-mod playground;
 pub(in crate::server) mod pull_requests;
 pub(in crate::server) mod runs;
 mod sandbox;
@@ -188,7 +187,6 @@ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
         .merge(graph::manifest_routes())
         .merge(models::routes())
         .merge(completions::routes())
-        .merge(playground::routes())
 }
 
 pub(super) fn real_routes() -> Router<Arc<AppState>> {
@@ -233,5 +231,4 @@ pub(super) fn real_routes() -> Router<Arc<AppState>> {
         .merge(sessions::routes())
         .merge(system::routes())
         .merge(completions::routes())
-        .merge(playground::routes())
 }

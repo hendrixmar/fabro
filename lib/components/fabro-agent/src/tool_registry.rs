@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{ToolAccessPolicy, ToolExposureMode};
 use crate::native_tool::{NativeTool, ToolVocabulary};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{OutputCaptureStats, Sandbox};
 use crate::session::ToolEnvProvider;
 use crate::tool_permissions;
 use crate::types::AgentEvent;
@@ -20,6 +20,10 @@ use crate::types::AgentEvent;
 /// the session is using.
 pub trait AgentEventEmitter: Send + Sync {
     fn emit(&self, event: AgentEvent);
+
+    /// Record byte counts for the model-facing output produced by this tool.
+    /// Emitters without a tool-execution owner may ignore this side channel.
+    fn record_tool_output_stats(&self, _stats: OutputCaptureStats) {}
 }
 
 pub struct ToolContext {
@@ -51,6 +55,13 @@ impl ToolContext {
     pub fn emit_agent_event(&self, event: AgentEvent) {
         if let Some(emitter) = self.agent_event_emitter.as_ref() {
             emitter.emit(event);
+        }
+    }
+
+    /// Record model-facing output byte counts for the owning tool call.
+    pub fn record_tool_output_stats(&self, stats: OutputCaptureStats) {
+        if let Some(emitter) = self.agent_event_emitter.as_ref() {
+            emitter.record_tool_output_stats(stats);
         }
     }
 }

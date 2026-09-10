@@ -2037,17 +2037,20 @@ reasoning = false
         client
     }
 
-    /// Live-dispatch counterpart of the adapter_registry route-equivalence
-    /// table: for every built-in model, `resolve_provider` lands on the same
-    /// provider the resolved route names.
+    /// For every built-in model selector, live dispatch and catalog selection
+    /// choose the same provider from the same ready-provider set.
     #[tokio::test]
     async fn dispatch_agrees_with_resolve_route_for_every_builtin_model() {
         let catalog = catalog_with("");
         let client = client_with_all_catalog_providers(&catalog).await;
+        let ready_providers = catalog.all_provider_ids();
 
         for model in catalog.list(None) {
-            let route = adapter_registry::resolve_route(&catalog, model)
-                .expect("built-in model should resolve to a route");
+            let selected = catalog
+                .select(model.id.as_str(), None, &ready_providers)
+                .expect("built-in model should be selectable");
+            let route = adapter_registry::resolve_route(&catalog, selected)
+                .expect("selected built-in model should resolve to a route");
             let mut request = test_request();
             request.model = model.id.to_string();
 

@@ -2,7 +2,9 @@ use std::fmt::Write as _;
 
 use anyhow::{Context as _, Result};
 
-use crate::args::{McpAgent, McpCommand, McpNamespace, ServerConnectionArgs};
+use crate::args::{
+    McpAgent, McpCommand, McpConfigArgs, McpInitArgs, McpNamespace, ServerConnectionArgs,
+};
 use crate::command_context::CommandContext;
 use crate::server_client;
 
@@ -12,12 +14,12 @@ pub(crate) async fn dispatch(ns: McpNamespace, base_ctx: &CommandContext) -> Res
             fabro_mcp_server::start(server_settings(base_ctx, &args.connection)?).await
         }
         McpCommand::Config(args) => {
-            let json = fabro_mcp_server::config_json(&config_settings(&args.connection))?;
+            let json = fabro_mcp_server::config_json(&config_settings(&args))?;
             let _ = write!(base_ctx.printer().stdout_important(), "{json}");
             Ok(())
         }
         McpCommand::Init(args) => {
-            fabro_mcp_server::init_agent(&init_settings(args.agent, &args.connection)?)?;
+            fabro_mcp_server::init_agent(&init_settings(&args)?)?;
             Ok(())
         }
     }
@@ -56,21 +58,19 @@ fn server_settings(
     })
 }
 
-fn init_settings(
-    agent: McpAgent,
-    connection: &ServerConnectionArgs,
-) -> Result<fabro_mcp_server::McpInitSettings> {
+fn init_settings(args: &McpInitArgs) -> Result<fabro_mcp_server::McpInitSettings> {
     Ok(fabro_mcp_server::McpInitSettings {
-        agent:    McpAgentForServer(agent).into(),
-        config:   config_settings(connection),
+        agent:    McpAgentForServer(args.agent).into(),
+        config:   config_settings(&args.config),
         home_dir: home_dir()?,
     })
 }
 
-fn config_settings(connection: &ServerConnectionArgs) -> fabro_mcp_server::McpConfigSettings {
+fn config_settings(args: &McpConfigArgs) -> fabro_mcp_server::McpConfigSettings {
     fabro_mcp_server::McpConfigSettings {
-        server:      connection.target.server.clone(),
-        storage_dir: connection.storage_dir.clone_path(),
+        name:        args.name.clone(),
+        server:      args.connection.target.server.clone(),
+        storage_dir: args.connection.storage_dir.clone_path(),
     }
 }
 

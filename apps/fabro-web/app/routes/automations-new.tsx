@@ -2,16 +2,19 @@ import { useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 import { useSWRConfig } from "swr";
 import { ChevronRightIcon } from "@heroicons/react/20/solid";
+import type { Environment } from "@qltysh/fabro-api-client";
 
 import { ApiError, apiData, automationsApi } from "../lib/api-client";
 import { queryKeys } from "../lib/query-keys";
-import { useRun, useRunSettings } from "../lib/queries";
+import { useEnvironments, useRun, useRunSettings, useRunState } from "../lib/queries";
 import {
   AutomationFormFields,
   EMPTY_AUTOMATION_FORM,
   automationFormValuesFromRun,
   isFormValid,
+  targetFromFormValues,
   triggersFromFormValues,
+  workflowSourceFromFormValues,
   type AutomationFormValues,
 } from "../components/automation-form";
 import {
@@ -31,13 +34,21 @@ export default function AutomationsNew() {
   const [searchParams] = useSearchParams();
   const fromRunId = searchParams.get("from_run")?.trim() || undefined;
   const runQuery = useRun(fromRunId);
+  const runStateQuery = useRunState(fromRunId);
   const settingsQuery = useRunSettings(fromRunId);
+  const environmentsQuery = useEnvironments();
+  const environments = environmentsQuery.data?.data;
+  const environmentsPending = environmentsQuery.isLoading && !environmentsQuery.data;
+  const environmentsError = Boolean(environmentsQuery.error);
 
   if (!fromRunId) {
     return (
       <AutomationCreateForm
         key="blank"
         initialValues={EMPTY_AUTOMATION_FORM}
+        environments={environments}
+        environmentsLoading={environmentsPending}
+        environmentsError={environmentsError}
       />
     );
   }
@@ -45,8 +56,9 @@ export default function AutomationsNew() {
   // Wait for both queries to settle before mounting the form, so the user's
   // edits aren't blown away when settings arrive after the run.
   const runPending = runQuery.isLoading && !runQuery.data;
+  const runStatePending = runStateQuery.isLoading && !runStateQuery.data;
   const settingsPending = settingsQuery.isLoading && !settingsQuery.data;
-  if (runPending || settingsPending) {
+  if (runPending || runStatePending || settingsPending || environmentsPending) {
     return (
       <div className="space-y-6">
         <PageHeader />
@@ -62,6 +74,8 @@ export default function AutomationsNew() {
       <AutomationCreateForm
         key={`missing:${fromRunId}`}
         initialValues={EMPTY_AUTOMATION_FORM}
+        environments={environments}
+        environmentsError={environmentsError}
         sourceError="The source run could not be loaded. You can still fill it out manually."
       />
     );
@@ -69,22 +83,32 @@ export default function AutomationsNew() {
 
   const initialValues = automationFormValuesFromRun(
     runQuery.data,
+    runStateQuery.data ?? null,
     settingsQuery.data ?? null,
+    environments,
   );
 
   return (
     <AutomationCreateForm
       key={`from-run:${fromRunId}`}
       initialValues={initialValues}
+      environments={environments}
+      environmentsError={environmentsError}
     />
   );
 }
 
 function AutomationCreateForm({
   initialValues,
+  environments = [],
+  environmentsLoading = false,
+  environmentsError = false,
   sourceError = null,
 }: {
   initialValues: AutomationFormValues;
+  environments?: Environment[];
+  environmentsLoading?: boolean;
+  environmentsError?: boolean;
   sourceError?: string | null;
 }) {
   const navigate = useNavigate();
@@ -94,7 +118,10 @@ function AutomationCreateForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const canSubmit = isFormValid(values) && !submitting;
+  const canSubmit = isFormValid(values)
+    && !environmentsLoading
+    && !environmentsError
+    && !submitting;
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -108,11 +135,10 @@ function AutomationCreateForm({
           id:          values.id.trim(),
           name:        trimmedName,
           description: values.description.trim() || null,
-          target:      {
-            repository: values.repository.trim(),
-            ref:        values.ref.trim(),
-            workflow:   values.workflow.trim(),
-          },
+          environment_id: values.environmentId.trim(),
+          target:      targetFromFormValues(values),
+          workflow:    values.workflow.trim(),
+          workflow_source: workflowSourceFromFormValues(values),
           triggers: triggersFromFormValues(values),
         }),
       );
@@ -133,7 +159,13 @@ function AutomationCreateForm({
     <form onSubmit={onSubmit} className="space-y-6">
       <PageHeader />
 
-      <AutomationFormFields values={values} onChange={setValues} />
+      <AutomationFormFields
+        values={values}
+        onChange={setValues}
+        environments={environments}
+        environmentsLoading={environmentsLoading}
+        environmentsError={environmentsError}
+      />
 
       {sourceError ? <ErrorMessage message={sourceError} /> : null}
       {error ? <ErrorMessage message={error} /> : null}

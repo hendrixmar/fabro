@@ -24,14 +24,6 @@ import {
   type KeyValueEntry,
 } from "./key-value-editor";
 
-// Providers a managed environment can be created with. `local` is a reserved,
-// in-memory environment, never a managed-environment provider, so it is never
-// offered. The provider is fixed at creation time and cannot be changed.
-export const CREATABLE_PROVIDERS = [
-  EnvironmentProvider.DOCKER,
-  EnvironmentProvider.DAYTONA,
-] as const;
-
 // Parse the `provider` query param used by the create flow into a creatable
 // provider, defaulting to Docker for anything unexpected.
 export function parseCreatableProvider(value: string | null): EnvironmentProvider {

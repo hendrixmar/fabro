@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use daytona_sdk::DaytonaError;
 use fabro_static::EnvVars;
 use fabro_types::{SandboxInfo, SandboxProviderKind};
 
@@ -89,7 +88,7 @@ impl SandboxProvider for DaytonaSandboxProvider {
         let client = self.client().await?;
         let sandbox = match client.get(id).await {
             Ok(sandbox) => sandbox,
-            Err(err) if daytona_not_found(&err) => return Ok(None),
+            Err(err) if daytona::daytona_not_found(&err) => return Ok(None),
             Err(err) => {
                 return Err(crate::Error::context(
                     format!("Failed to get Daytona sandbox '{id}'"),
@@ -130,6 +129,8 @@ impl SandboxProvider for DaytonaSandboxProvider {
             run_id,
             clone_origin_url,
             clone_branch,
+            None,
+            None,
             Some(api_key),
         )
         .await?;
@@ -144,7 +145,7 @@ impl SandboxProvider for DaytonaSandboxProvider {
         let client = self.client().await?;
         let sandbox = match client.get(id).await {
             Ok(sandbox) => sandbox,
-            Err(err) if daytona_not_found(&err) => return Ok(()),
+            Err(err) if daytona::daytona_not_found(&err) => return Ok(()),
             Err(err) => {
                 return Err(crate::Error::context(
                     format!("Failed to get Daytona sandbox '{id}' before delete"),
@@ -165,8 +166,4 @@ impl SandboxProvider for DaytonaSandboxProvider {
 
 fn managed_from_sdk_sandbox(sandbox: &daytona_sdk::Sandbox) -> bool {
     managed_labels::is_managed(&sandbox.labels)
-}
-
-fn daytona_not_found(err: &DaytonaError) -> bool {
-    matches!(err, DaytonaError::NotFound { .. }) || err.status_code() == Some(404)
 }

@@ -17,7 +17,7 @@ use crate::args::{
     ServerConnectionArgs, ServerTargetArgs, printer_from_verbosity, require_no_json_override,
 };
 use crate::server_client::Client;
-use crate::user_config::LoadedSettings;
+use crate::user_config::{LoadedSettings, RunSettingsKeyPresence};
 use crate::{server_client, user_config};
 
 #[derive(Clone, Debug)]
@@ -33,24 +33,19 @@ pub(crate) enum ServerMode {
 }
 
 pub(crate) struct CommandContext {
-    printer:            Printer,
+    printer: Printer,
     process_local_json: bool,
-    cwd:                PathBuf,
-    base_config_path:   PathBuf,
-    cli_layer:          CliLayer,
-    storage_dir:        PathBuf,
-    run_settings:       std::result::Result<RunNamespace, SharedError>,
-    user_settings:      UserSettings,
-    server_mode:        ServerMode,
-    server:             OnceCell<Arc<Client>>,
-    llm_source:         OnceCell<Arc<dyn CredentialSource>>,
-    catalog:            OnceLock<Arc<Catalog>>,
-}
-
-struct ResolvedCommandSettings {
-    storage_dir:   PathBuf,
-    run_settings:  std::result::Result<RunNamespace, SharedError>,
+    cwd: PathBuf,
+    base_config_path: PathBuf,
+    cli_layer: CliLayer,
+    storage_dir: PathBuf,
+    run_settings: std::result::Result<RunNamespace, SharedError>,
     user_settings: UserSettings,
+    run_settings_key_presence: RunSettingsKeyPresence,
+    server_mode: ServerMode,
+    server: OnceCell<Arc<Client>>,
+    llm_source: OnceCell<Arc<dyn CredentialSource>>,
+    catalog: OnceLock<Arc<Catalog>>,
 }
 
 impl CommandContext {
@@ -69,6 +64,7 @@ impl CommandContext {
             storage_dir: resolved_settings.storage_dir,
             run_settings: resolved_settings.run_settings,
             user_settings: resolved_settings.user_settings,
+            run_settings_key_presence: resolved_settings.run_settings_key_presence,
             server_mode: ServerMode::None,
             server: OnceCell::new(),
             llm_source: OnceCell::new(),
@@ -117,6 +113,10 @@ impl CommandContext {
 
     pub(crate) fn user_settings(&self) -> &UserSettings {
         &self.user_settings
+    }
+
+    pub(crate) fn run_settings_key_presence(&self) -> &RunSettingsKeyPresence {
+        &self.run_settings_key_presence
     }
 
     pub(crate) fn base_config_path(&self) -> &Path {
@@ -219,6 +219,7 @@ impl CommandContext {
             storage_dir: resolved_settings.storage_dir,
             run_settings: resolved_settings.run_settings,
             user_settings: resolved_settings.user_settings,
+            run_settings_key_presence: resolved_settings.run_settings_key_presence,
             server_mode,
             server: OnceCell::new(),
             llm_source: OnceCell::new(),
@@ -227,13 +228,10 @@ impl CommandContext {
     }
 }
 
-fn load_merged_settings(
-    cli_layer: &CliLayer,
-    server_mode: &ServerMode,
-) -> Result<ResolvedCommandSettings> {
-    let loaded_settings = match server_mode {
+fn load_merged_settings(cli_layer: &CliLayer, server_mode: &ServerMode) -> Result<LoadedSettings> {
+    match server_mode {
         ServerMode::None | ServerMode::ByTarget { .. } => {
-            user_config::load_resolved_settings(None, None, Some(cli_layer))?
+            user_config::load_resolved_settings(None, None, Some(cli_layer))
         }
         ServerMode::ByStorageDir {
             storage_dir_override,
@@ -242,16 +240,7 @@ fn load_merged_settings(
             None,
             storage_dir_override.as_deref(),
             Some(cli_layer),
-        )?,
-    };
-    Ok(resolve_command_settings(loaded_settings))
-}
-
-fn resolve_command_settings(loaded_settings: LoadedSettings) -> ResolvedCommandSettings {
-    ResolvedCommandSettings {
-        storage_dir:   loaded_settings.storage_dir,
-        run_settings:  loaded_settings.run_settings,
-        user_settings: loaded_settings.user_settings,
+        ),
     }
 }
 
@@ -265,7 +254,7 @@ mod tests {
     use fabro_util::printer::Printer;
     use tokio::sync::OnceCell;
 
-    use super::{CommandContext, ServerMode, resolve_command_settings};
+    use super::{CommandContext, ServerMode};
     use crate::user_config;
 
     fn cli_layer_with_json_and_verbose() -> CliLayer {
@@ -280,10 +269,9 @@ mod tests {
 
     fn synthetic_context(process_local_json: bool, printer: Printer) -> CommandContext {
         let cli_layer = cli_layer_with_json_and_verbose();
-        let resolved_settings = resolve_command_settings(
+        let resolved_settings =
             user_config::load_resolved_settings_from_toml("_version = 1\n", None, Some(&cli_layer))
-                .expect("settings should resolve"),
-        );
+                .expect("settings should resolve");
         CommandContext {
             printer,
             process_local_json,
@@ -293,6 +281,7 @@ mod tests {
             storage_dir: resolved_settings.storage_dir,
             run_settings: resolved_settings.run_settings,
             user_settings: resolved_settings.user_settings,
+            run_settings_key_presence: resolved_settings.run_settings_key_presence,
             server_mode: ServerMode::None,
             server: OnceCell::new(),
             llm_source: OnceCell::new(),
@@ -316,32 +305,28 @@ mod tests {
     #[test]
     fn storage_dir_override_only_changes_storage_root_in_merged_settings() {
         let cli_layer = cli_layer_with_json_and_verbose();
-        let base_settings = resolve_command_settings(
-            user_config::load_resolved_settings_from_toml(
-                r#"
+        let base_settings = user_config::load_resolved_settings_from_toml(
+            r#"
 _version = 1
 
 [server.storage]
 root = "/srv/fabro/default"
 "#,
-                None,
-                Some(&cli_layer),
-            )
-            .expect("base settings should resolve"),
-        );
-        let connection_settings = resolve_command_settings(
-            user_config::load_resolved_settings_from_toml(
-                r#"
+            None,
+            Some(&cli_layer),
+        )
+        .expect("base settings should resolve");
+        let connection_settings = user_config::load_resolved_settings_from_toml(
+            r#"
 _version = 1
 
 [server.storage]
 root = "/srv/fabro/default"
 "#,
-                Some(std::path::Path::new("/srv/fabro/override")),
-                Some(&cli_layer),
-            )
-            .expect("connection settings should resolve"),
-        );
+            Some(std::path::Path::new("/srv/fabro/override")),
+            Some(&cli_layer),
+        )
+        .expect("connection settings should resolve");
 
         assert_eq!(
             base_settings.user_settings,
@@ -385,27 +370,24 @@ root = "/srv/fabro"
             "fixture intentionally omits [server.auth] so server_settings should fail to resolve"
         );
 
-        let resolved = resolve_command_settings(loaded);
-        assert_eq!(resolved.storage_dir, PathBuf::from("/srv/fabro"));
-        assert!(resolved.run_settings.is_ok());
+        assert_eq!(loaded.storage_dir, PathBuf::from("/srv/fabro"));
+        assert!(loaded.run_settings.is_ok());
     }
 
     #[test]
     fn run_settings_include_run_agent_mcps() {
-        let resolved = resolve_command_settings(
-            user_config::load_resolved_settings_from_toml(
-                r#"
+        let resolved = user_config::load_resolved_settings_from_toml(
+            r#"
 _version = 1
 
 [run.agent.mcps.demo]
 type = "stdio"
 command = ["demo-mcp"]
 "#,
-                None,
-                Some(&CliLayer::default()),
-            )
-            .expect("settings should resolve"),
-        );
+            None,
+            Some(&CliLayer::default()),
+        )
+        .expect("settings should resolve");
 
         let run_settings = resolved.run_settings.expect("run settings should resolve");
         assert!(run_settings.agent.mcps.contains_key("demo"));

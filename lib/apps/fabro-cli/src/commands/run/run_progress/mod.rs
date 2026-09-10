@@ -1029,10 +1029,13 @@ mod tests {
         emit(
             &mut ui,
             agent_event("plan", AgentEvent::ToolCallCompleted {
-                tool_name:    "read_file".into(),
-                tool_call_id: "tc1".into(),
-                output:       serde_json::json!({"ok": true}),
-                is_error:     false,
+                tool_name:             "read_file".into(),
+                tool_call_id:          "tc1".into(),
+                output:                serde_json::json!({"ok": true}),
+                is_error:              false,
+                output_bytes_observed: 11,
+                output_bytes_retained: 11,
+                output_bytes_omitted:  0,
             }),
         );
         emit(&mut ui, stage_completed("plan", "Plan"));
@@ -1570,10 +1573,13 @@ mod tests {
         let tool_completed = serde_json::to_string(&to_run_event_at(
             &fixtures::RUN_1,
             &agent_event("code", AgentEvent::ToolCallCompleted {
-                tool_name:    "read_file".into(),
-                tool_call_id: "tc1".into(),
-                output:       serde_json::json!({"ok": true}),
-                is_error:     false,
+                tool_name:             "read_file".into(),
+                tool_call_id:          "tc1".into(),
+                output:                serde_json::json!({"ok": true}),
+                is_error:              false,
+                output_bytes_observed: 11,
+                output_bytes_retained: 11,
+                output_bytes_omitted:  0,
             }),
             completed_ts,
             None,

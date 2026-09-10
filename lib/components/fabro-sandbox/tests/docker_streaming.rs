@@ -40,6 +40,8 @@ async fn streaming_timeout_terminates_docker_exec_before_returning() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .expect("docker sandbox should construct");
     sandbox
@@ -112,6 +114,8 @@ async fn streaming_command_receives_exact_stdin_and_eof() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .expect("docker sandbox should construct");
     sandbox
@@ -172,6 +176,8 @@ async fn cloned_docker_sandbox_uses_repos_checkout_and_workspace_symlink() {
         None,
         None,
         Some("https://github.com/brynary/rack-test".to_string()),
+        None,
+        None,
         None,
     )
     .expect("docker sandbox should construct");
@@ -235,6 +241,8 @@ async fn docker_runs_clean_bash_through_both_command_paths() {
             skip_clone: true,
             ..DockerSandboxOptions::default()
         },
+        None,
+        None,
         None,
         None,
         None,
@@ -332,6 +340,8 @@ async fn docker_glob_matches_patterns_containing_a_path_separator() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .expect("docker sandbox should construct");
     sandbox
@@ -389,4 +399,80 @@ async fn docker_glob_matches_patterns_containing_a_path_separator() {
             .any(|path| path.ends_with("skills/nested/deeper/SKILL.md")),
         "`**/SKILL.md` should match files nested several levels deep, got: {recursive:?}"
     );
+}
+
+// The Fabro runtime directory is where prompt blobs materialize, so it must
+// exist after initialization, sit outside the repository checkout, and stay
+// owner-private along with the files written beneath it (issue #798).
+#[tokio::test]
+#[ignore = "requires real Docker container lifecycle; run explicitly when changing Docker runtime directory setup"]
+async fn docker_runtime_directory_is_private_and_outside_workspace() {
+    let image = "buildpack-deps:noble";
+    let Ok(docker) = Docker::connect_with_local_defaults() else {
+        return;
+    };
+    if docker.inspect_image(image).await.is_err() {
+        return;
+    }
+
+    let sandbox = DockerSandbox::new(
+        DockerSandboxOptions {
+            image: image.to_string(),
+            auto_pull: false,
+            skip_clone: true,
+            ..DockerSandboxOptions::default()
+        },
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("docker sandbox should construct");
+    sandbox
+        .initialize()
+        .await
+        .expect("docker sandbox should initialize");
+
+    let runtime_directory = sandbox
+        .runtime_directory()
+        .expect("docker sandbox should expose a runtime directory")
+        .to_string();
+    assert!(
+        !runtime_directory.starts_with(sandbox.working_directory()),
+        "runtime directory {runtime_directory} must sit outside the workspace"
+    );
+
+    let blob_path = format!("{runtime_directory}/blobs/test-blob.json");
+    sandbox
+        .write_file(&blob_path, "{}")
+        .await
+        .expect("runtime blob write should succeed");
+
+    let modes = sandbox
+        .exec_command(
+            &format!("stat -c '%a' {runtime_directory} {blob_path}"),
+            10_000,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("stat should run");
+    let readback = sandbox.read_file_text(&blob_path).await;
+
+    sandbox
+        .cleanup()
+        .await
+        .expect("docker cleanup should succeed");
+
+    assert!(modes.is_success(), "stat failed: {}", modes.stderr);
+    let modes: Vec<&str> = modes.stdout.split_whitespace().collect();
+    assert_eq!(
+        modes,
+        ["700", "600"],
+        "runtime directory and blob file should be owner-private"
+    );
+    assert_eq!(readback.expect("runtime blob should be readable"), "{}");
 }

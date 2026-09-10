@@ -63,7 +63,9 @@ pub(super) fn decode_response(
 
     let wire_usage = api_resp.usage.as_ref();
     let usage = wire_usage.map_or_else(TokenCounts::default, ApiUsage::token_counts);
-    let cost_usd = wire_usage.and_then(|u| u.cost);
+    let cost_usd = wire_usage
+        .and_then(|usage| usage.cost)
+        .or_else(|| api_resp.cost.as_ref().and_then(|cost| cost.usd));
     let cost_source = translate::authoritative_cost_source(cost_usd);
 
     Ok(Response {

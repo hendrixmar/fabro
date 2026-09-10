@@ -59,13 +59,18 @@ Fabro performs this selection once when creating a run and persists the chosen p
 | `gemini-3.1-flash-lite` | gemini | `gemini-flash-lite`, `gemini-3.1-flash-lite-preview` | 1M | $0.25 / $1.50 | 200 tok/s |
 | `kimi-k2.5` | moonshot | | 262K | $0.60 / $3.00 | 50 tok/s |
 | `kimi-k3` | moonshot | `kimi` | 1M | $3.00 / $15.00 | n/a |
+| `kimi-k3-fast` | venice | `kimi-fast` | 1M | $4.50 / $22.50 | n/a |
 | `deepseek-v4-flash` | deepseek | `deepseek`, `deepseek-v4`, `deepseek-flash` | 1,048,576 | $0.14 / $0.28 | n/a |
 | `deepseek-v4-pro` | deepseek | | 1,048,576 | $0.435 / $0.87 | n/a |
+| `grok-4.6` | venice | `grok`, `grok46`, `grok-46` | 500K | $2.27 / $6.80 | n/a |
 | `laguna-s-2.1` | poolside | `laguna`, `laguna-s` | 1M | $0.10 / $0.20 | n/a |
 | `laguna-xs-2.1` | poolside | `laguna-xs` | 262K | $0.10 / $0.20 | n/a |
 | `glm-5.2` | zai | `glm`, `glm5`, `glm52`, `glm5.2` | 1M | $1.40 / $4.40 | n/a |
+| `glm-5.3` | venice | `glm`, `glm5`, `glm53`, `glm5.3`, `glm-5-3` | 1M | $1.75 / $5.50 | n/a |
 | `minimax-m2.5` | minimax | `minimax` | 197K | $0.30 / $1.20 | 45 tok/s |
 | `mercury-2` | inception | `mercury` | 131K | $0.25 / $0.75 | 1000 tok/s |
+| `qwen3.8-max` | venice | `qwen`, `qwen-max`, `qwen3.8`, `qwen-3.8`, `qwen38`, `qwen-3.8-max`, `qwen38-max` | 1M | $2.50 / $7.50 | n/a |
+| `qwen3.8-27b` | venice | `qwen-27b`, `qwen-3.8-27b`, `qwen38-27b` | 262K | $0.45 / $3.20 | n/a |
 
 Each provider requires its own API key. Server-backed workflows read provider credentials from the server vault (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, or `POOLSIDE_API_KEY` set with `fabro secret set` or `fabro provider login`). Standalone SDK/CLI flows can opt into env-backed credential sources explicitly. See the [Quick Start](/getting-started/quick-start) for setup.
 
@@ -161,13 +166,17 @@ Workflow runs also add `x-session-id: <run-id>` to every LLM request so compatib
 
 Provider `agent_profile` defaults from `adapter` and controls profile-specific behavior such as which tools the agent registers, project-memory filenames, CLI/ACP command selection, and native session routing. Valid values are `anthropic`, `openai`, `gemini`, `kimi`, and `gpt56`; model-level values override provider-level values.
 
-Two profiles are selected per model rather than per provider, because they follow the model wherever it is served: `kimi` for Kimi models, and `gpt56` for the GPT-5.6 models (Sol, Terra, Luna). The `gpt56` profile uses Codex's narrow core surface — `shell_command`, `apply_patch`, and `update_plan`, plus optional Brave-backed `web_search` — instead of fabro's dedicated file-read, discovery, and `web_fetch` tools. On OpenAI-compatible routes that cannot carry the freeform `apply_patch` grammar, it substitutes the JSON-schema `edit_file` tool. Session features may add their own question, skill, or subagent tools separately.
+Two profiles are selected per model rather than per provider, because they follow the model wherever it is served: `kimi` for Kimi models, and `gpt56` for the GPT-5.6 models (Sol, Terra, Luna). The `gpt56` profile uses Codex's narrow core surface — `shell_command`, `apply_patch`, and `update_plan`, plus optional credential-backed `web_search` — instead of fabro's dedicated file-read, discovery, and `web_fetch` tools. On OpenAI-compatible routes that cannot carry the freeform `apply_patch` grammar, it substitutes the JSON-schema `edit_file` tool. Session features may add their own question, skill, or subagent tools separately.
 
 Provider `billing_policy` defaults from `adapter` and controls usage-cost estimation. Use `openai`, `anthropic`, `gemini`, or `none`. Model rows may override it for models whose billing family differs from their provider's — for example, Claude models served through OpenRouter set `billing_policy = "anthropic"` so cache reads and writes price correctly.
 
 <Note>
 Provider fields in configuration, APIs, and model routing are provider ID strings. Built-in names like `anthropic`, `openai`, and `gemini` still work, but custom IDs like `proxy` work anywhere a provider ID is accepted.
 </Note>
+
+### Venice
+
+Fabro ships a built-in [Venice](/integrations/venice) provider with a curated catalog of Venice-hosted Kimi, Grok, GLM, DeepSeek, and Qwen models. Store its API key with `fabro provider login --provider venice`. Pin `provider = "venice"` when a shared model slug must use Venice instead of a higher-priority direct provider.
 
 ### Poolside
 
@@ -232,6 +241,7 @@ When no model or provider is specified, Fabro chooses the default offering on th
 | `moonshot` | `kimi-k3` |
 | `poolside` | `laguna-s-2.1` |
 | `zai` | `glm-5.2` |
+| `venice` | `deepseek-v4-flash` |
 | `minimax` | `minimax-m2.5` |
 | `inception` | `mercury-2` |
 

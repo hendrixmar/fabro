@@ -12,8 +12,8 @@ fn help() {
     Usage: fabro [OPTIONS] [COMMAND]
 
     Commands:
-      run         Launch a workflow run
-      create      Create a workflow run (allocate run dir, persist spec)
+      run         Register a local workflow version, create a run, and start it
+      create      Register a local workflow version and create a submitted run
       start       Start a created workflow run on the server
       attach      Attach to a running or finished workflow run
       events      View the event log of a workflow run
@@ -96,7 +96,7 @@ fn no_args_prints_curated_landing() {
 
       fabro validate       Validate a workflow
       fabro preflight      Validate run configuration without executing
-      fabro run            Launch a workflow run
+      fabro run            Register and run a local workflow
 
     Inspect runs
 

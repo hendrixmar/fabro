@@ -13,8 +13,8 @@ use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::{
-    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, StdioProcessControl, optional_timeout,
-    validate_bash_probe, write_process_stdin,
+    self, BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, OutputCaptureBuffer,
+    StdioProcessControl, optional_timeout, validate_bash_probe, write_process_stdin,
 };
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
@@ -525,6 +525,7 @@ impl Sandbox for LocalSandbox {
             cancel_token,
             stdin,
             output_callback,
+            stream_output_bytes_cap,
         } = request;
         let start = Instant::now();
 
@@ -573,10 +574,22 @@ impl Sandbox for LocalSandbox {
         let stdout_callback = output_callback.clone();
         let stderr_callback = output_callback;
         let stdout_task = tokio::spawn(async move {
-            drain_command_pipe(stdout_pipe, CommandOutputStream::Stdout, stdout_callback).await
+            drain_command_pipe(
+                stdout_pipe,
+                CommandOutputStream::Stdout,
+                stdout_callback,
+                stream_output_bytes_cap,
+            )
+            .await
         });
         let stderr_task = tokio::spawn(async move {
-            drain_command_pipe(stderr_pipe, CommandOutputStream::Stderr, stderr_callback).await
+            drain_command_pipe(
+                stderr_pipe,
+                CommandOutputStream::Stderr,
+                stderr_callback,
+                stream_output_bytes_cap,
+            )
+            .await
         });
 
         let (termination, exit_code) = tokio::select! {
@@ -613,15 +626,17 @@ impl Sandbox for LocalSandbox {
                 }
             }
         }
-        let stdout_bytes = stdout_task
+        let stdout_capture = stdout_task
             .await
             .map_err(|e| crate::Error::context("stdout stream task failed", e))??;
-        let stderr_bytes = stderr_task
+        let stderr_capture = stderr_task
             .await
             .map_err(|e| crate::Error::context("stderr stream task failed", e))??;
+        let (stdout_bytes, stdout_capture) = stdout_capture.into_parts();
+        let (stderr_bytes, stderr_capture) = stderr_capture.into_parts();
 
         Ok(ExecStreamingResult {
-            result:            ExecResult {
+            result: ExecResult {
                 stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
                 exit_code,
@@ -629,7 +644,9 @@ impl Sandbox for LocalSandbox {
                 duration_ms,
             },
             streams_separated: true,
-            live_streaming:    true,
+            live_streaming: true,
+            stdout_capture,
+            stderr_capture,
         })
     }
 
@@ -878,20 +895,31 @@ impl Sandbox for LocalSandbox {
         Ok(())
     }
 
-    async fn git_push_ref(&self, refspec: &str) -> crate::Result<()> {
+    async fn git_push_ref(
+        &self,
+        refspec: &str,
+        plan: &crate::RetryPlan,
+    ) -> Result<crate::PushReport, crate::PushError> {
         let has_origin = match self
             .exec_command("git remote get-url origin", 10_000, None, None, None)
             .await
         {
             Ok(result) if result.is_success() => true,
             Ok(_) => false,
-            Err(err) => return Err(crate::Error::context("git remote get-url origin", err)),
+            Err(err) => {
+                return Err(crate::PushError {
+                    report: crate::PushReport::default(),
+                    error:  crate::Error::context("git remote get-url origin", err),
+                });
+            }
         };
         if !has_origin {
-            return Ok(());
+            return Ok(crate::PushReport::default());
         }
 
-        crate::git_push_via_exec(self, refspec).await
+        // Local pushes use whatever credentials the host repository already
+        // carries; there is no managed credential state to lease.
+        sandbox::git_push_via_exec(self, None, refspec, plan).await
     }
 
     async fn cleanup(&self) -> crate::Result<()> {
@@ -991,11 +1019,12 @@ async fn drain_command_pipe<R>(
     mut reader: Option<R>,
     stream: CommandOutputStream,
     output_callback: Option<CommandOutputCallback>,
-) -> crate::Result<Vec<u8>>
+    stream_output_bytes_cap: Option<usize>,
+) -> crate::Result<OutputCaptureBuffer>
 where
     R: AsyncRead + Unpin,
 {
-    let mut output = Vec::new();
+    let mut output = OutputCaptureBuffer::new(stream_output_bytes_cap);
     let Some(reader) = reader.as_mut() else {
         return Ok(output);
     };
@@ -1009,7 +1038,7 @@ where
         if read == 0 {
             return Ok(output);
         }
-        output.extend_from_slice(&buf[..read]);
+        output.push(&buf[..read]);
         if let Some(output_callback) = output_callback.as_ref() {
             output_callback(stream, buf[..read].to_vec()).await?;
         }
@@ -1160,7 +1189,7 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context as TaskContext, Poll};
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadBuf};
@@ -1394,6 +1423,39 @@ mod tests {
             result.result.stderr
         );
         assert_eq!(result.result.stdout.trim(), "two");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_command_streaming_drains_full_output_after_capture_cap() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+        let callback_bytes = Arc::new(Mutex::new(Vec::new()));
+        let callback_bytes_for_stream = Arc::clone(&callback_bytes);
+
+        let result = sandbox
+            .exec_command_streaming(ExecStreamingRequest {
+                timeout_ms: Some(5000),
+                output_callback: Some(Arc::new(move |stream, bytes| {
+                    let callback_bytes = Arc::clone(&callback_bytes_for_stream);
+                    Box::pin(async move {
+                        if stream == CommandOutputStream::Stdout {
+                            callback_bytes.lock().unwrap().extend(bytes);
+                        }
+                        Ok(())
+                    })
+                })),
+                stream_output_bytes_cap: Some(8),
+                ..ExecStreamingRequest::new("printf 'abcdefghijklmnopqrst'")
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.result.stdout, "abcdqrst");
+        assert_eq!(result.stdout_capture.observed_bytes, 20);
+        assert_eq!(result.stdout_capture.retained_bytes, 8);
+        assert_eq!(result.stdout_capture.omitted_bytes, 12);
+        assert_eq!(&*callback_bytes.lock().unwrap(), b"abcdefghijklmnopqrst");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

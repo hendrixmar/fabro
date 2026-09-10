@@ -30,14 +30,15 @@ pub fn validate(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::pipeline::parse::parse;
     use crate::pipeline::transform;
     use crate::pipeline::types::TransformOptions;
 
-    fn run_pipeline(dot: &str) -> Validated {
-        let parsed = parse(dot).unwrap();
-        let transformed = transform::transform(parsed, &TransformOptions {
+    fn transform_options() -> TransformOptions {
+        TransformOptions {
             current_dir:       None,
             file_resolver:     None,
             template_context:  fabro_template::TemplateContext::new(),
@@ -45,8 +46,12 @@ mod tests {
             render_mode:       crate::operations::RenderMode::Strict,
             custom_transforms: vec![],
             model_resolution:  None,
-        })
-        .unwrap();
+        }
+    }
+
+    fn run_pipeline(dot: &str) -> Validated {
+        let parsed = parse(dot).unwrap();
+        let transformed = transform::transform(parsed, &transform_options()).unwrap();
         validate(transformed, None, &[])
     }
 
@@ -105,5 +110,62 @@ mod tests {
         assert!(!diags.is_empty());
         // Then raise
         assert!(validated.raise_on_errors().is_err());
+    }
+
+    #[test]
+    fn validates_fully_rendered_model_stylesheet_syntax() {
+        let dot = r#"digraph Test {
+            graph [model_stylesheet="* { {{ inputs.declaration }} }"]
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            start -> exit
+        }"#;
+        let transformed = transform::transform(parse(dot).unwrap(), &TransformOptions {
+            template_context: fabro_template::TemplateContext::new().with_inputs(HashMap::from([
+                (
+                    "declaration".to_string(),
+                    toml::Value::String("garbage garbage".to_string()),
+                ),
+            ])),
+            source_name: Some("workflow.fabro".to_string()),
+            render_mode: crate::operations::RenderMode::Structural,
+            ..transform_options()
+        })
+        .unwrap();
+        let validated = validate(transformed, None, &[]);
+
+        assert!(
+            validated
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.rule == "stylesheet_syntax"),
+            "{:?}",
+            validated.diagnostics()
+        );
+    }
+
+    #[test]
+    fn unresolved_model_stylesheet_skips_stylesheet_rules() {
+        let dot = r#"digraph Test {
+            graph [model_stylesheet="* { model: {{ vars.MODEL }}; }"]
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            start -> exit
+        }"#;
+        let transformed = transform::transform(parse(dot).unwrap(), &TransformOptions {
+            source_name: Some("workflow.fabro".to_string()),
+            render_mode: crate::operations::RenderMode::Structural,
+            ..transform_options()
+        })
+        .unwrap();
+        let validated = validate(transformed, None, &[]);
+
+        assert!(validated.diagnostics().iter().any(|diagnostic| {
+            diagnostic.rule == "template_undefined_variable"
+                && diagnostic.message.contains("vars.MODEL")
+        }));
+        assert!(validated.diagnostics().iter().all(|diagnostic| {
+            diagnostic.rule != "stylesheet_syntax" && diagnostic.rule != "stylesheet_model_known"
+        }));
     }
 }

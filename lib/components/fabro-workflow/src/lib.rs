@@ -293,7 +293,7 @@ pub mod error;
 pub mod event;
 pub mod file_resolver;
 pub mod git;
-pub mod github_token_source;
+pub(crate) mod git_bridge;
 pub(crate) mod graph;
 pub mod handler;
 mod hook_context;

@@ -211,6 +211,17 @@ async fn delete_environment(
 ) -> Result<Response, ApiError> {
     let id = parse_path_id(id)?;
     let expected = parse_required_if_match(&headers, "environment", &id)?;
+    if state
+        .automation_store()
+        .references_environment(id.as_str())
+        .await?
+    {
+        return Err(ApiError::with_code(
+            StatusCode::CONFLICT,
+            format!("environment is used by an automation: {id}"),
+            "environment_in_use",
+        ));
+    }
     state.environment_store().delete(&id, &expected).await?;
     state.refresh_manifest_run_settings_from_environment_catalog();
     Ok(StatusCode::NO_CONTENT.into_response())

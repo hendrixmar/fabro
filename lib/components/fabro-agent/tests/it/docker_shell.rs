@@ -28,6 +28,8 @@ async fn shell_reports_real_docker_process_outcome() {
         None,
         None,
         None,
+        None,
+        None,
     ) else {
         return;
     };
@@ -49,11 +51,11 @@ async fn shell_reports_real_docker_process_outcome() {
             session_id:          Some("test-session".to_string()),
             root_session_id:     Some("test-session".to_string()),
             tool_call_id:        Some("call_1".to_string()),
-            agent_event_emitter: Some(Arc::new(SessionBoundEmitter {
-                emitter:      emitter.clone(),
-                session_id:   "test-session".to_string(),
-                tool_call_id: Some("call_1".to_string()),
-            })),
+            agent_event_emitter: Some(Arc::new(SessionBoundEmitter::new(
+                emitter.clone(),
+                "test-session".to_string(),
+                Some("call_1".to_string()),
+            ))),
         },
     )
     .await;

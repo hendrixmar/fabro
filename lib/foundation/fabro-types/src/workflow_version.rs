@@ -6,7 +6,7 @@ use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-use crate::{WorkflowPath, WorkflowVersionId};
+use crate::{BlobHash, WorkflowPath, WorkflowVersionId};
 
 pub const MAX_WORKFLOW_VERSION_FILES: usize = 512;
 pub const MAX_WORKFLOW_VERSION_DEPENDENCIES: usize = 512;
@@ -84,6 +84,22 @@ impl WorkflowVersion {
     #[must_use]
     pub fn workflow_dependencies(&self) -> &BTreeMap<WorkflowPath, WorkflowVersionId> {
         &self.workflow_dependencies
+    }
+
+    /// Path of the optional `workflow.toml` that configures this version. It
+    /// always sits beside the entrypoint graph.
+    #[must_use]
+    pub fn config_path(&self) -> WorkflowPath {
+        self.entrypoint
+            .resolve_reference("workflow.toml")
+            .expect("the static workflow config path must resolve beside a valid entrypoint")
+    }
+
+    /// Content-addressed identity: the hash of the canonical wire form.
+    pub fn id(&self) -> Result<WorkflowVersionId, WorkflowVersionShapeError> {
+        Ok(WorkflowVersionId::from(BlobHash::new(
+            &self.canonical_bytes()?,
+        )))
     }
 
     /// Serialize to the canonical wire form.

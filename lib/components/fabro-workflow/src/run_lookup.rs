@@ -234,7 +234,8 @@ fn scan_orphan_runs(base: &Path) -> Result<Vec<RunInfo>> {
 
 pub async fn scan_runs_combined(store: &Database, base: &Path) -> Result<Vec<RunInfo>> {
     let store_runs = store
-        .list_runs(&fabro_store::ListRunsQuery::default(), Utc::now())
+        .run_summary_store()
+        .list_all(Utc::now())
         .await
         .unwrap_or_default();
     scan_runs_with_summaries(&store_runs, base)
@@ -445,13 +446,11 @@ fn run_id_matches(run_id: RunId, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use fabro_graphviz::graph::Graph;
     use fabro_store::Database;
-    use fabro_types::{RunStatus, WorkflowSettings, fixtures, test_support};
+    use fabro_types::{RunStatus, fixtures, test_support};
     use object_store::memory::InMemory;
 
     use super::scan_runs_combined;
@@ -460,7 +459,7 @@ mod tests {
     use crate::records::RunSpec;
 
     fn memory_store() -> Arc<Database> {
-        Arc::new(Database::new(
+        Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -470,24 +469,15 @@ mod tests {
 
     fn sample_run_spec() -> RunSpec {
         RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         WorkflowSettings::default(),
-            graph:            Graph::new("test"),
-            graph_source:     None,
-            workflow_slug:    Some("test".to_string()),
-            automation:       None,
+            workflow_slug: Some("test".to_string()),
             source_directory: Some("/tmp/project".to_string()),
-            git:              Some(fabro_types::GitContext {
+            git: Some(fabro_types::GitContext {
                 origin_url: String::new(),
                 branch:     "main".to_string(),
                 sha:        None,
                 dirty:      fabro_types::DirtyStatus::Clean,
             }),
-            labels:           HashMap::new(),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            fork_source_ref:  None,
+            ..test_support::test_run_spec()
         }
     }
 
@@ -501,22 +491,25 @@ mod tests {
         let run_spec = sample_run_spec();
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
         append_event(&run_store, &fixtures::RUN_1, &Event::RunCreated {
-            run_id:           fixtures::RUN_1,
-            title:            None,
-            settings:         serde_json::to_value(&run_spec.settings).unwrap(),
-            graph:            serde_json::to_value(&run_spec.graph).unwrap(),
-            workflow_source:  None,
-            labels:           run_spec.labels.clone().into_iter().collect(),
-            source_directory: run_spec.source_directory.clone(),
-            workflow_slug:    run_spec.workflow_slug.clone(),
-            automation:       None,
-            provenance:       run_spec.provenance.clone(),
-            manifest_blob:    None,
-            git:              run_spec.git.clone(),
-            fork_source_ref:  run_spec.fork_source_ref.clone(),
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            run_id:              fixtures::RUN_1,
+            title:               None,
+            settings:            serde_json::to_value(&run_spec.settings).unwrap(),
+            graph:               serde_json::to_value(&run_spec.graph).unwrap(),
+            workflow_source:     None,
+            labels:              run_spec.labels.clone().into_iter().collect(),
+            source_directory:    run_spec.source_directory.clone(),
+            workflow_slug:       run_spec.workflow_slug.clone(),
+            workflow_version_id: None,
+            target:              None,
+            automation:          None,
+            provenance:          run_spec.provenance.clone(),
+            manifest_blob:       None,
+            spec_blob:           None,
+            git:                 run_spec.git.clone(),
+            fork_source_ref:     run_spec.fork_source_ref.clone(),
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .unwrap();

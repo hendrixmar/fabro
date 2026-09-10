@@ -209,7 +209,7 @@ mod tests {
         let redacted = redact_json_value(input);
 
         assert_eq!(redacted["name"], "fabro-01KQR3V9D4VPFFWMNTVH09J48G");
-        assert_eq!(redacted["content"], "REDACTED");
+        assert_eq!(redacted["content"], "token=REDACTED");
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
 
         let redacted = redact_json_value(input);
 
-        assert_eq!(redacted["content"], "REDACTED");
+        assert_eq!(redacted["content"], "key=REDACTED");
         assert_eq!(redacted["session_id"], HIGH_ENTROPY_SECRET);
     }
 

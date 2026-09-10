@@ -22,3 +22,9 @@ New API:
 ## ACP observability
 
 ACP `ToolCall` / `ToolCallUpdate` notifications now emit the same durable `agent.tool.started` / `agent.tool.completed` events as the native agent. `skill://` inputs and explicit skill tools emit `agent.skill.activated` once per skill per stage visit.
+
+## More
+
+<Accordion title="Fixes">
+- Fireworks HTTP `412` account suspension responses now activate configured model fallbacks instead of being treated as invalid requests
+</Accordion>

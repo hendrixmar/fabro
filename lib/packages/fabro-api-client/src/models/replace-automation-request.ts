@@ -15,10 +15,13 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { AutomationTarget } from './automation-target';
+import type { AutomationGitWorkflowSource } from './automation-git-workflow-source';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { AutomationTrigger } from './automation-trigger';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { RunTarget } from './run-target';
 
 /**
  * Request body for replacing an automation.
@@ -26,6 +29,15 @@ import type { AutomationTrigger } from './automation-trigger';
 export interface ReplaceAutomationRequest {
     'name': string;
     'description'?: string | null;
-    'target': AutomationTarget;
+    /**
+     * Server-managed Docker or Daytona environment selected when the automation fires.
+     */
+    'environment_id': string;
+    'target': RunTarget;
+    /**
+     * Workflow slug or path resolved in the run-target checkout when `workflow_source` is omitted, or in the explicit workflow-source checkout when present.
+     */
+    'workflow': string;
+    'workflow_source'?: AutomationGitWorkflowSource;
     'triggers': Array<AutomationTrigger>;
 }

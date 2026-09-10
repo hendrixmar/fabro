@@ -1,0 +1,23 @@
+---
+title: "Immutable workflow versions"
+date: "2026-08-13"
+---
+
+## Store validated workflow packages by content
+
+The API can now validate and store an immutable workflow package with its entrypoint, files, and exact child-workflow dependencies. Repeating the same canonical package returns the same SHA-256 workflow version ID.
+
+```http
+POST /api/v1/workflow-versions
+```
+
+## More
+
+<Accordion title="API">
+- Invalid workflow-version content and missing or non-canonical dependencies return `422` errors
+- Workflow version IDs are accepted case-insensitively and returned in canonical lowercase form
+</Accordion>
+
+<Accordion title="Fixes">
+- Workflow-version validation now detects file path collisions that were previously hidden by sort order
+</Accordion>

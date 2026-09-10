@@ -354,6 +354,9 @@ mod tests {
                     tool_call_id: "call_1".to_string(),
                     output: json!("contents"),
                     is_error: false,
+                    output_bytes_observed: None,
+                    output_bytes_retained: None,
+                    output_bytes_omitted: None,
                 }),
             ),
         ];

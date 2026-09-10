@@ -83,11 +83,14 @@ mod tests {
             stage:             "code".to_string(),
             visit:             1,
             event:             AgentEvent::ToolProcessCompleted {
-                exit_code:         Some(7),
-                termination:       ::fabro_types::CommandTermination::Exited,
-                duration_ms:       12,
-                streams_separated: true,
-                exec_output_tail:  Some(fabro_types::ExecOutputTail {
+                exit_code:             Some(7),
+                termination:           ::fabro_types::CommandTermination::Exited,
+                duration_ms:           12,
+                streams_separated:     true,
+                output_bytes_observed: 100,
+                output_bytes_retained: 100,
+                output_bytes_omitted:  0,
+                exec_output_tail:      Some(fabro_types::ExecOutputTail {
                     stdout:           Some(format!("stdout {secret}")),
                     stderr:           Some("plain stderr".to_string()),
                     stdout_truncated: false,

@@ -97,12 +97,14 @@
               "integrations/litellm",
               "integrations/bedrock",
               "integrations/deepseek",
+              "integrations/venice",
               "integrations/poolside",
               "integrations/openrouter",
               "integrations/modal",
               "integrations/fireworks",
               "integrations/slack",
-              "integrations/brave-search"
+              "integrations/brave-search",
+              "integrations/venice-search"
             ]
           },
           {
@@ -186,6 +188,13 @@
             ]
           },
           {
+            "group": "Workflow Versions",
+            "icon": "code-branch",
+            "pages": [
+              "POST /api/v1/workflow-versions"
+            ]
+          },
+          {
             "group": "Runs",
             "icon": "play",
             "pages": [
@@ -200,6 +209,8 @@
               "POST /api/v1/runs/{id}/cancel",
               "POST /api/v1/runs/{id}/pause",
               "POST /api/v1/runs/{id}/unpause",
+              "POST /api/v1/runs/{id}/pull_request",
+              "GET /api/v1/runs/{id}/pull_request/creation",
               "GET /api/v1/runs/{id}/graph",
               "GET /api/v1/runs/{id}/events"
             ]
@@ -218,6 +229,7 @@
             "icon": "file-export",
             "pages": [
               "GET /api/v1/runs/{id}/artifacts",
+              "GET /api/v1/runs/{id}/artifacts/download",
               "GET /api/v1/runs/{id}/billing",
               {
                 "group": "Run Internals",
@@ -294,9 +306,45 @@
         "icon": "clock-rotate-left",
         "groups": [
           {
+            "group": "September 2026",
+            "icon": "clock-rotate-left",
+            "pages": [
+              "changelog/2026-09-03"
+            ]
+          },
+          {
+            "group": "August 2026",
+            "icon": "clock-rotate-left",
+            "pages": [
+              "changelog/2026-08-27",
+              "changelog/2026-08-26",
+              "changelog/2026-08-25",
+              "changelog/2026-08-23",
+              "changelog/2026-08-21",
+              "changelog/2026-08-20",
+              "changelog/2026-08-18",
+              "changelog/2026-08-17",
+              "changelog/2026-08-16",
+              "changelog/2026-08-14",
+              "changelog/2026-08-13",
+              "changelog/2026-08-12",
+              "changelog/2026-08-06",
+              "changelog/2026-08-05",
+              "changelog/2026-08-04",
+              "changelog/2026-08-03",
+              "changelog/2026-08-01"
+            ]
+          },
+          {
             "group": "July 2026",
             "icon": "clock-rotate-left",
             "pages": [
+              "changelog/2026-07-31",
+              "changelog/2026-07-30",
+              "changelog/2026-07-29",
+              "changelog/2026-07-28",
+              "changelog/2026-07-27",
+              "changelog/2026-07-26",
               "changelog/2026-07-25",
               "changelog/2026-07-24",
               "changelog/2026-07-23",

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DiffSummary, InterviewQuestionRecord, Principal, PullRequestLink, RepositoryRef,
+    DiffSummary, GitRunTarget, InterviewQuestionRecord, Principal, PullRequestLink, RepositoryRef,
     RunControlAction, RunId, RunSandbox, RunStatus, RunTiming,
 };
 
@@ -113,13 +113,44 @@ impl WorkflowRef {
     }
 }
 
+/// Requested workflow-source coordinate and the immutable commit selected for
+/// one automation run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedAutomationGitWorkflowSource {
+    pub repo:         String,
+    pub branch:       String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag:          Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha:          Option<String>,
+    pub resolved_sha: String,
+}
+
+impl ResolvedAutomationGitWorkflowSource {
+    #[must_use]
+    pub fn from_requested(source: GitRunTarget, resolved_sha: String) -> Self {
+        Self {
+            repo: source.repo,
+            branch: source.branch,
+            tag: source.tag,
+            sha: source.sha,
+            resolved_sha,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutomationRef {
-    pub id:         String,
+    pub id:              String,
     #[serde(default)]
-    pub name:       Option<String>,
+    pub name:            Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_id: Option<String>,
+    pub trigger_id:      Option<String>,
+    /// Boxed because this metadata is uncommon and run specs cross many async
+    /// server boundaries where their inline size matters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_source: Option<Box<ResolvedAutomationGitWorkflowSource>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

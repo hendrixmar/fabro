@@ -7,6 +7,7 @@ use fabro_agent::{Sandbox, ToolSecrets};
 use fabro_auth::{
     CredentialSource, ExtraHeadersCredentialSource, VaultCredentialSource, auth_issue_message,
 };
+use fabro_github::token_source::InstallationTokenSource;
 use fabro_graphviz::graph;
 use fabro_hooks::{HookContext, HookDecision, HookEvent, HookExecutionContext, HookRunner};
 use fabro_model::Catalog;
@@ -23,7 +24,7 @@ use super::types::{InitOptions, Initialized, LlmSpec, Persisted, SandboxEnvSpec}
 use crate::error::Error;
 use crate::event::{Event, RunNoticeCode, RunNoticeLevel};
 use crate::git::GitAuthor;
-use crate::github_token_source::{AppIatMinter, GitHubTokenSource};
+use crate::git_bridge;
 use crate::handler::llm::{AgentAcpBackend, AgentApiBackend, BackendRouter, routing};
 use crate::handler::{HandlerRegistry, default_registry};
 #[cfg(test)]
@@ -37,7 +38,14 @@ use crate::services::{
 use crate::stage_execution::{StageExecutionSeed, StageExecutionTracker};
 use crate::steering_hub::SteeringHub;
 
-type BuiltSandboxEnv = (HashMap<String, String>, Option<Arc<GitHubTokenSource>>);
+struct BuiltSandboxEnv {
+    env:           HashMap<String, String>,
+    github_token:  Option<Arc<InstallationTokenSource>>,
+    /// The validated effective repository set behind `github_token`.
+    /// Present only in App mode or when additional repositories are
+    /// declared; drives the eager access validation at initialization.
+    github_access: Option<fabro_github::GitHubRepositoryAccess>,
+}
 
 async fn run_hooks(
     hook_runner: Option<&HookRunner>,
@@ -88,49 +96,113 @@ fn build_sandbox_env(
     spec: &SandboxEnvSpec,
     github_app: Option<&fabro_github::GitHubCredentials>,
 ) -> Result<BuiltSandboxEnv, Error> {
-    let env = spec.toml_env.clone();
+    let mut env = spec.toml_env.clone();
 
-    let Some(permissions) = spec.github_permissions.as_ref().filter(|p| !p.is_empty()) else {
-        return Ok((env, None));
+    let no_token = |env| BuiltSandboxEnv {
+        env,
+        github_token: None,
+        github_access: None,
     };
+    let Some(integration) = spec
+        .github_integration
+        .as_ref()
+        .filter(|integration| integration.is_token_requested())
+    else {
+        return Ok(no_token(env));
+    };
+    let declares_additional = integration.has_additional_repositories();
     let Some(creds) = github_app else {
-        return Ok((env, None));
+        if declares_additional {
+            // Legacy permissions-only configuration stays best-effort, but a
+            // declared additional set is an explicit access requirement.
+            return Err(Error::Precondition(
+                "run.integrations.github.additional_repositories requires GitHub credentials, \
+                 but none are configured"
+                    .to_string(),
+            ));
+        }
+        return Ok(no_token(env));
     };
 
-    let source = match creds {
-        fabro_github::GitHubCredentials::Pat(token) => {
-            Some(Arc::new(GitHubTokenSource::pat(token.clone())))
-        }
-        fabro_github::GitHubCredentials::Installation(token) => {
-            Some(Arc::new(GitHubTokenSource::static_iat(token.clone())))
-        }
-        fabro_github::GitHubCredentials::App(app) => {
-            let Some(origin_url) = spec.origin_url.as_deref() else {
-                return Ok((env, None));
-            };
-            let https_url = fabro_github::ssh_url_to_https(origin_url);
-            let (owner, repo) = fabro_github::parse_github_owner_repo(&https_url)
-                .map_err(|err| Error::engine_with_anyhow("Failed to parse GitHub origin", err))?;
-            let permissions = serde_json::to_value(permissions).map_err(|err| {
-                Error::engine_with_source("Failed to serialize GitHub permissions", err)
-            })?;
-            let http = fabro_http::http_client()
-                .map_err(|err| Error::engine_with_source("Failed to build HTTP client", err))?;
-            let install_url = app.installation_url(&owner);
-            let minter = AppIatMinter::new(
-                app.clone(),
-                http,
-                owner,
-                repo,
-                fabro_github::github_api_base_url(),
-                install_url,
-                permissions,
-            );
-            Some(Arc::new(GitHubTokenSource::mintable(Arc::new(minter))))
-        }
+    // Validate the effective repository set whenever it matters: App mode
+    // scopes the mint to it, and any declared additional set must hold its
+    // invariants regardless of credential kind. Legacy PAT/static
+    // permissions-only runs skip it to preserve their origin-agnostic
+    // behavior.
+    let github_access =
+        if declares_additional || matches!(creds, fabro_github::GitHubCredentials::App(_)) {
+            fabro_github::GitHubRepositoryAccess::new(
+                spec.origin_url.as_deref(),
+                &integration.additional_repositories,
+                integration.permissions.clone(),
+            )
+            .map_err(|err| {
+                Error::engine_with_anyhow("Failed to validate GitHub repository access", err)
+            })?
+        } else {
+            None
+        };
+
+    let github_token = match github_access.as_ref() {
+        Some(access) => Some(InstallationTokenSource::for_access(creds, access).map_err(
+            |err| Error::engine_with_anyhow("Failed to build GitHub token source", err),
+        )?),
+        None => match creds {
+            fabro_github::GitHubCredentials::Pat(token) => {
+                Some(InstallationTokenSource::pat(token.clone()))
+            }
+            fabro_github::GitHubCredentials::Installation(token) => {
+                Some(InstallationTokenSource::installation(token.clone()))
+            }
+            // No origin URL and nothing declared: keep the legacy App-mode
+            // best-effort skip.
+            fabro_github::GitHubCredentials::App(_) => None,
+        },
     };
 
-    Ok((env, source))
+    if declares_additional {
+        let access = github_access
+            .as_ref()
+            .expect("access is always constructed when additional repositories are declared");
+        git_bridge::merge_git_bridge_env(&mut env, &access.targets())?;
+    }
+
+    Ok(BuiltSandboxEnv {
+        env,
+        github_token,
+        github_access,
+    })
+}
+
+/// When additional repositories are declared, resolve their token before the
+/// first workflow stage. App-backed sources first check that every target is
+/// on one installation. Static credentials resolve locally; the first Git
+/// operation remains their access check. Legacy permissions-only runs skip
+/// eager resolution.
+async fn resolve_declared_repository_token(built: &BuiltSandboxEnv) -> Result<(), Error> {
+    let Some(_) = built
+        .github_access
+        .as_ref()
+        .filter(|access| access.has_additional_repositories())
+    else {
+        return Ok(());
+    };
+    // `build_sandbox_env` guarantees a token source whenever additional
+    // repositories are declared; fail closed if that ever breaks.
+    let Some(source) = built.github_token.as_ref() else {
+        return Err(Error::Precondition(
+            "run.integrations.github.additional_repositories requires GitHub credentials, but \
+             none are configured"
+                .to_string(),
+        ));
+    };
+    source.resolve().await.map_err(|err| {
+        Error::engine_with_anyhow(
+            "Failed to resolve the GitHub token for the declared repository set",
+            err,
+        )
+    })?;
+    Ok(())
 }
 
 async fn build_registry(
@@ -241,13 +313,10 @@ async fn build_registry(
 }
 
 async fn tool_secrets_from_configured_sources(vault: &Arc<AsyncRwLock<Vault>>) -> ToolSecrets {
-    let brave_search_api_key = vault
-        .read()
-        .await
-        .get(EnvVars::BRAVE_SEARCH_API_KEY)
-        .map(str::to_string);
+    let vault = vault.read().await;
     ToolSecrets {
-        brave_search_api_key,
+        brave_search_api_key: vault.get(EnvVars::BRAVE_SEARCH_API_KEY).map(str::to_string),
+        venice_api_key:       vault.get(EnvVars::VENICE_API_KEY).map(str::to_string),
     }
 }
 
@@ -449,17 +518,23 @@ pub async fn initialize(
         });
     }
 
-    let (base_env, github_token) = build_sandbox_env(
+    let built_env = build_sandbox_env(
         &options.sandbox_env,
         options.run_options.github_app.as_ref(),
     )?;
+    resolve_declared_repository_token(&built_env).await?;
+    let BuiltSandboxEnv {
+        env: base_env,
+        github_token,
+        github_access: _,
+    } = built_env;
     let tool_env_provider = Arc::new(WorkflowToolEnvProvider {
         base_env:     base_env.clone(),
         github_token: github_token.clone(),
     });
     let github_token_refresh_managed = github_token
         .as_deref()
-        .is_some_and(GitHubTokenSource::is_refreshable);
+        .is_some_and(InstallationTokenSource::mints_installation_tokens);
     let (registry, effective_dry_run) = if let Some(registry) = options.registry_override.clone() {
         // A caller-supplied registry owns execution behavior for its handlers.
         (registry, options.dry_run)
@@ -601,20 +676,21 @@ pub async fn initialize(
         });
     }
 
-    let metadata_writer = match build_metadata_writer(&options.run_options) {
-        Ok(writer) => writer,
-        Err(err) => {
-            let message = format!("failed to initialize checkpoint metadata writer: {err}");
-            if metadata_runtime.mark_metadata_degraded() {
-                options.emitter.notice(
-                    RunNoticeLevel::Warn,
-                    RunNoticeCode::CheckpointMetadataWriteFailed,
-                    message,
-                );
+    let metadata_writer =
+        match build_metadata_writer(&options.run_options, sandbox.push_token_source()) {
+            Ok(writer) => writer,
+            Err(err) => {
+                let message = format!("failed to initialize checkpoint metadata writer: {err}");
+                if metadata_runtime.mark_metadata_degraded(false) {
+                    options.emitter.notice(
+                        RunNoticeLevel::Warn,
+                        RunNoticeCode::CheckpointMetadataWriteFailed,
+                        message,
+                    );
+                }
+                None
             }
-            None
-        }
-    };
+        };
 
     let run_services = RunServices::new(
         options.run_store.clone(),
@@ -673,7 +749,7 @@ mod tests {
     use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
     use fabro_interview::AutoApproveInterviewer;
     use fabro_sandbox::SandboxSpec;
-    use fabro_store::Database;
+    use fabro_store::{Database, RunDatabase};
     use fabro_types::settings::run::RunModelControls;
     use fabro_types::{
         EventBody, ForkSourceRef, RunEvent, RunId, WorkflowSettings, fixtures, test_support,
@@ -710,12 +786,44 @@ mod tests {
     }
 
     fn memory_store() -> Arc<Database> {
-        Arc::new(Database::new(
+        Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
             None,
         ))
+    }
+
+    async fn seed_run_created(
+        run_store: &RunDatabase,
+        settings: serde_json::Value,
+        graph: serde_json::Value,
+        source_directory: Option<String>,
+        fork_source_ref: Option<ForkSourceRef>,
+    ) {
+        crate::event::append_event(run_store, &test_run_id(), &Event::RunCreated {
+            run_id: test_run_id(),
+            title: None,
+            settings,
+            graph,
+            workflow_source: None,
+            labels: BTreeMap::new(),
+            source_directory,
+            workflow_slug: Some("test".to_string()),
+            workflow_version_id: None,
+            target: None,
+            automation: None,
+            provenance: test_support::test_run_provenance(),
+            manifest_blob: None,
+            spec_blob: None,
+            git: None,
+            fork_source_ref,
+            retried_from: None,
+            parent_id: None,
+            web_url: None,
+        })
+        .await
+        .unwrap();
     }
 
     fn simple_graph() -> (Graph, String) {
@@ -823,7 +931,7 @@ mod tests {
             hooks: fabro_hooks::HookSettings { hooks: vec![] },
             sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::new(),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             vault: auth_test_support::empty_vault(),
@@ -859,6 +967,8 @@ mod tests {
                 graph,
                 graph_source: None,
                 workflow_slug: Some("test".to_string()),
+                workflow_version_id: None,
+                target: None,
                 automation: None,
                 source_directory: Some(std::env::current_dir().unwrap().display().to_string()),
                 git: Some(fabro_types::GitContext {
@@ -871,6 +981,7 @@ mod tests {
                 provenance: test_support::test_run_provenance(),
                 manifest_blob: None,
                 definition_blob: None,
+                spec_blob: None,
                 fork_source_ref,
             },
         )
@@ -951,7 +1062,7 @@ mod tests {
         let initialized = initialize(persisted, InitOptions {
             sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::from([("TEST_KEY".to_string(), "value".to_string())]),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             ..test_init_options(
@@ -1042,26 +1153,14 @@ mod tests {
         let mut run_options = test_settings(&run_dir);
         run_options.settings = settings;
         run_options.fork_source_ref = fork_source_ref;
-        crate::event::append_event(&run_store, &test_run_id(), &Event::RunCreated {
-            run_id:           test_run_id(),
-            title:            None,
-            settings:         serde_json::to_value(&run_options.settings).unwrap(),
-            graph:            serde_json::to_value(&graph).unwrap(),
-            workflow_source:  None,
-            labels:           BTreeMap::new(),
-            source_directory: Some(workspace.display().to_string()),
-            workflow_slug:    Some("test".to_string()),
-            automation:       None,
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            git:              None,
-            fork_source_ref:  run_options.fork_source_ref.clone(),
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
-        })
-        .await
-        .unwrap();
+        seed_run_created(
+            &run_store,
+            serde_json::to_value(&run_options.settings).unwrap(),
+            serde_json::to_value(&graph).unwrap(),
+            Some(workspace.display().to_string()),
+            run_options.fork_source_ref.clone(),
+        )
+        .await;
 
         initialize(persisted, InitOptions {
             resume: Some(ResumeState::for_test(
@@ -1272,7 +1371,7 @@ mod tests {
             hooks: fabro_hooks::HookSettings { hooks: vec![] },
             sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::new(),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             vault,
@@ -1327,10 +1426,18 @@ mod tests {
         let run_dir = temp.path().join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
         let (graph, source) = simple_graph();
-        let persisted = test_persisted(graph, source, &run_dir);
+        let persisted = test_persisted(graph.clone(), source, &run_dir);
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
         let store = memory_store();
         let run_store = store.create_run(&test_run_id()).await.unwrap();
+        seed_run_created(
+            &run_store,
+            serde_json::to_value(WorkflowSettings::default()).unwrap(),
+            serde_json::to_value(graph).unwrap(),
+            None,
+            None,
+        )
+        .await;
         let store_logger = StoreProgressLogger::new(run_store.clone());
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         emitter.on_event({
@@ -1367,7 +1474,7 @@ mod tests {
             hooks:             fabro_hooks::HookSettings { hooks: vec![] },
             sandbox_env:       SandboxEnvSpec {
                 toml_env:           HashMap::new(),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             vault:             auth_test_support::empty_vault(),
@@ -1381,7 +1488,7 @@ mod tests {
         })
         .await
         .unwrap();
-        store_logger.flush().await;
+        store_logger.flush().await.unwrap();
 
         assert_eq!(initialized.run_options.run_dir, run_dir);
         assert!(
@@ -1509,7 +1616,7 @@ mod tests {
             hooks: fabro_hooks::HookSettings { hooks: vec![] },
             sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::new(),
-                github_permissions: None,
+                github_integration: None,
                 origin_url:         None,
             },
             vault: auth_test_support::empty_vault(),
@@ -1524,5 +1631,170 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    mod github_integration_env {
+        //! Focused tests for `build_sandbox_env` /
+        //! `resolve_declared_repository_token` around declared additional
+        //! repositories. Installation-resolution failure naming is covered
+        //! by `fabro_github::access` tests; these prove the initialization
+        //! wiring: hard errors for declared sets, best-effort behavior for
+        //! legacy permissions-only configuration.
+
+        use fabro_github::test_support::{InstallationTokenMinter, installation_token_source};
+        use fabro_github::{GitHubAppCredentials, GitHubCredentials, InstallationToken};
+        use fabro_types::settings::run::ResolvedGithubIntegration;
+
+        use super::*;
+
+        fn integration(additional: &[&str]) -> ResolvedGithubIntegration {
+            ResolvedGithubIntegration {
+                permissions:             HashMap::from([(
+                    "contents".to_string(),
+                    "read".to_string(),
+                )]),
+                additional_repositories: additional
+                    .iter()
+                    .map(|value| value.parse().expect("test slug should parse"))
+                    .collect(),
+            }
+        }
+
+        fn spec(
+            origin: Option<&str>,
+            github_integration: Option<ResolvedGithubIntegration>,
+        ) -> SandboxEnvSpec {
+            SandboxEnvSpec {
+                toml_env: HashMap::new(),
+                github_integration,
+                origin_url: origin.map(str::to_string),
+            }
+        }
+
+        #[test]
+        fn declared_additional_repositories_require_credentials() {
+            let spec = spec(
+                Some("https://github.com/fabro-sh/fabro"),
+                Some(integration(&["fabro-sh/keystone"])),
+            );
+            let Err(err) = build_sandbox_env(&spec, None) else {
+                panic!("declared additional repositories without credentials must fail");
+            };
+            assert!(
+                err.to_string().contains("requires GitHub credentials"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn declared_additional_repositories_require_an_origin() {
+            let spec = spec(None, Some(integration(&["fabro-sh/keystone"])));
+            let creds = GitHubCredentials::Pat("ghp_x".to_string());
+            let Err(err) = build_sandbox_env(&spec, Some(&creds)) else {
+                panic!("declared additional repositories without an origin must fail");
+            };
+            assert!(
+                err.to_string().contains("GitHub repository access"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn declared_repositories_inject_bridge_entries_and_keep_the_pat_source() {
+            let spec = spec(
+                Some("https://github.com/fabro-sh/fabro"),
+                Some(integration(&["fabro-sh/keystone"])),
+            );
+            let creds = GitHubCredentials::Pat("ghp_x".to_string());
+            let built = build_sandbox_env(&spec, Some(&creds)).unwrap();
+
+            assert!(built.github_token.is_some());
+            let access = built.github_access.expect("access should be constructed");
+            assert!(access.has_additional_repositories());
+            // Helper entry plus two SSH rewrites for each of the two
+            // effective repositories (origin + declared additional).
+            assert_eq!(
+                built.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+                Some("5")
+            );
+            assert_eq!(
+                built.env.get("GIT_CONFIG_KEY_0").map(String::as_str),
+                Some("credential.https://github.com.helper")
+            );
+            assert_eq!(
+                built.env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+                Some("0")
+            );
+        }
+
+        #[test]
+        fn legacy_permissions_only_configuration_stays_best_effort() {
+            // No credentials: no error, no token source, no bridge entries.
+            let no_creds = spec(
+                Some("https://github.com/fabro-sh/fabro"),
+                Some(integration(&[])),
+            );
+            let built = build_sandbox_env(&no_creds, None).unwrap();
+            assert!(built.github_token.is_none());
+            assert!(!built.env.contains_key("GIT_CONFIG_COUNT"));
+
+            // App credentials without an origin: legacy best-effort skip.
+            let creds = GitHubCredentials::App(GitHubAppCredentials {
+                app_id:          "1".to_string(),
+                private_key_pem: "unused".to_string(),
+                slug:            None,
+            });
+            let no_origin = spec(None, Some(integration(&[])));
+            let built = build_sandbox_env(&no_origin, Some(&creds)).unwrap();
+            assert!(built.github_token.is_none());
+            assert!(built.github_access.is_none());
+        }
+
+        struct FailingMinter;
+
+        #[async_trait::async_trait]
+        impl InstallationTokenMinter for FailingMinter {
+            async fn mint(&self) -> anyhow::Result<InstallationToken> {
+                Err(anyhow::anyhow!("scripted mint failure"))
+            }
+        }
+
+        #[tokio::test]
+        async fn eager_validation_fails_when_the_declared_token_cannot_resolve() {
+            let access = fabro_github::GitHubRepositoryAccess::new(
+                Some("https://github.com/fabro-sh/fabro"),
+                &["fabro-sh/keystone".parse().unwrap()].into_iter().collect(),
+                HashMap::from([("contents".to_string(), "read".to_string())]),
+            )
+            .unwrap();
+            let built = BuiltSandboxEnv {
+                env:           HashMap::new(),
+                github_token:  Some(installation_token_source(
+                    "fabro-sh/fabro (+1 additional)",
+                    Arc::new(FailingMinter),
+                )),
+                github_access: access,
+            };
+
+            let err = resolve_declared_repository_token(&built).await.unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("declared repository set"), "{message}");
+        }
+
+        #[tokio::test]
+        async fn eager_validation_skips_legacy_permissions_only_runs() {
+            let built = BuiltSandboxEnv {
+                env:           HashMap::new(),
+                github_token:  Some(installation_token_source(
+                    "fabro-sh/fabro",
+                    Arc::new(FailingMinter),
+                )),
+                github_access: None,
+            };
+
+            resolve_declared_repository_token(&built)
+                .await
+                .expect("legacy permissions-only runs must not resolve eagerly");
+        }
     }
 }

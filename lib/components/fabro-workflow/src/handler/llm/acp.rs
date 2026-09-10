@@ -13,6 +13,7 @@ use fabro_acp::{
 use fabro_agent::{
     AgentEvent, RefreshOutcome, Sandbox, StaticEnvProvider, SteeringItem, ToolEnvProvider,
 };
+use fabro_github::token_source::REFRESH_MARGIN;
 use fabro_graphviz::graph::Node;
 use fabro_mcp::config::McpServerSettings;
 use fabro_mcp::sandbox::ManagedMcpServers;
@@ -41,8 +42,13 @@ use crate::outcome::{BilledModelUsage, reported_model_usage};
 use crate::steering_hub::{ActiveControlHandle, SteeringHub};
 
 /// Default refresh-ahead interval — comfortably under the ~60-min GitHub App
-/// installation-token TTL.
+/// installation-token TTL. Used as the loop cadence when a tick reports no
+/// managed credentials; ticks that see a real token reschedule from its
+/// expiry instead.
 const REFRESH_INTERVAL_DEFAULT: Duration = Duration::from_mins(45);
+/// Floor for expiry-driven rescheduling, so a token already inside the cache
+/// margin cannot pin the loop in a hot cycle.
+const REFRESH_RESCHEDULE_FLOOR: Duration = Duration::from_secs(30);
 /// Upper bound on a single push-credential refresh (token mint + `git remote
 /// set-url` exec). The turn-entry refresh runs before the ACP process spawns
 /// and the ACP node uses `NodeTimeoutPolicy::HandlerManaged`, so without this
@@ -122,19 +128,39 @@ fn push_cred_refresh_interval() -> Option<Duration> {
     )
 }
 
-/// Background loop that re-mints the sandbox's push credentials every
-/// `interval` for the duration of one ACP turn, so a single turn that outlives
-/// the installation-token TTL still pushes with a fresh token. Bounded by
-/// `cancel` (the drop-guard cancels it at turn end). A failed or timed-out tick
-/// retries after a shorter delay so a transient error does not leave a
-/// longer-than-interval window with an expired token.
+/// Delay until the next refresh-ahead tick after a successful refresh.
+///
+/// With a cached token source, a fixed interval is unsafe: a tick landing
+/// just outside the cache margin returns a reused token, and a fixed
+/// 45-minute sleep would leave the embedded token expired until the next
+/// tick. Schedule from the token's own `expires_at` instead: wake when the
+/// cache margin opens, so that tick re-mints. `None` disables the loop —
+/// static credentials cannot be re-minted by waiting.
+fn next_refresh_delay(outcome: &RefreshOutcome) -> Option<Duration> {
+    let token = outcome.token()?;
+    let expires_at = token.expires_at()?;
+    let margin = chrono::Duration::from_std(REFRESH_MARGIN).unwrap_or(chrono::Duration::MAX);
+    let until_margin = ((expires_at - margin) - chrono::Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    Some(until_margin.max(REFRESH_RESCHEDULE_FLOOR))
+}
+
+/// Background loop that keeps the sandbox's push credentials fresh for the
+/// duration of one ACP turn, so a single turn that outlives the
+/// installation-token TTL still pushes with a fresh token. Bounded by
+/// `cancel` (the drop-guard cancels it at turn end). Each successful tick
+/// reschedules from the embedded token's expiry ([`next_refresh_delay`]); a
+/// failed or timed-out tick retries after a shorter delay so a transient
+/// error does not leave a longer-than-interval window with an expired token.
 async fn refresh_ahead_loop(
     sandbox: Arc<dyn Sandbox>,
     cancel: CancellationToken,
     interval: Duration,
+    initial_delay: Duration,
 ) {
     let retry_delay = interval.min(Duration::from_mins(1));
-    let mut delay = interval;
+    let mut delay = initial_delay;
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
@@ -142,19 +168,34 @@ async fn refresh_ahead_loop(
                 match timeout(REFRESH_MINT_TIMEOUT, sandbox.refresh_push_credentials())
                     .await
                 {
-                    Ok(Ok(RefreshOutcome::Refreshed)) => {
-                        tracing::info!(
-                            interval_secs = interval.as_secs(),
-                            "refresh-ahead re-minted push credentials mid-turn"
-                        );
-                        delay = interval;
-                    }
-                    Ok(Ok(RefreshOutcome::Skipped)) => {
-                        tracing::debug!(
-                            interval_secs = interval.as_secs(),
-                            "refresh-ahead tick: no managed push credentials to refresh"
-                        );
-                        delay = interval;
+                    Ok(Ok(outcome)) => {
+                        match outcome {
+                            RefreshOutcome::Embedded(token) => {
+                                tracing::info!(
+                                    generation = token.generation,
+                                    "refresh-ahead re-embedded push credentials mid-turn"
+                                );
+                            }
+                            RefreshOutcome::Unchanged(token) => {
+                                tracing::debug!(
+                                    generation = token.generation,
+                                    "refresh-ahead tick: embedded push credentials still fresh"
+                                );
+                            }
+                            RefreshOutcome::None => {
+                                tracing::debug!(
+                                    "refresh-ahead tick: no managed push credentials to refresh"
+                                );
+                            }
+                        }
+                        if let Some(next) = next_refresh_delay(&outcome) {
+                            delay = next;
+                        } else {
+                            tracing::debug!(
+                                "refresh-ahead loop stopped: static credentials cannot be re-minted"
+                            );
+                            break;
+                        }
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -406,64 +447,57 @@ impl AgentAcpBackend {
             }) as Arc<dyn Fn(String, Option<Principal>) + Send + Sync>
         });
 
-        // Keep the sandbox's push credentials fresh for the duration of this ACP
-        // turn so the agent's own `git push` uses a live token instead of the one
-        // baked into the clone at run start.
-        //
-        // Part 2 (turn-entry): re-mint + rewrite the origin URL before the ACP
-        // process spawns, covering a push early in the turn. Non-fatal and
-        // timeout-bounded — a stalled mint must neither fail nor hang node entry.
-        // Part 3 (loop): a background task re-mints every ~45 min so a single turn
-        // that itself outlives the ~60-min installation-token TTL still pushes
-        // with a fresh token; a normal sub-interval turn never ticks (the
-        // drop-guard aborts the task at turn end before the first tick).
-        //
-        // FABRO_PUSH_CRED_REFRESH_AHEAD=0 (or false/off/no/empty, case-
-        // insensitive) disables the WHOLE feature — turn-entry re-mint AND loop —
-        // so an operator who manages `origin` themselves can opt out of all
-        // fabro-side origin rewriting. FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS
-        // overrides the loop interval; 0 disables just the loop.
-        //
-        // Known limitations tracked as follow-ups (not addressed here): (a)
-        // resumed/parked runs reconnect the sandbox with no GitHub App creds, so
-        // refresh no-ops until those creds are threaded through the reconnect
-        // path; (b) the turn-entry re-mint has no freshness check, so it mints
-        // once per node entry even when the current token is still fresh; (c) the
-        // background `git remote set-url` can contend with the agent's own git on
-        // `.git/config.lock`; (d) parallel ACP branches each run their own loop;
-        // (e) this refresh lives in the ACP handler only, though the stale-origin
-        // problem is stage-type-agnostic (native/command stages that push are not
-        // covered); (f) refresh failures are logged via tracing but not surfaced
-        // as a RunNotice event on the run stream.
+        // Refresh before launch for early pushes. Schedule later refreshes from
+        // token expiry so the loop cannot sleep past the cache margin.
         let refresh_enabled = push_cred_refresh_enabled();
-        if refresh_enabled {
+        let refresh_interval = refresh_enabled.then(push_cred_refresh_interval).flatten();
+        let refresh_schedule = if refresh_enabled {
             match timeout(REFRESH_MINT_TIMEOUT, sandbox.refresh_push_credentials()).await {
-                Ok(Ok(RefreshOutcome::Refreshed)) => {
-                    tracing::debug!("refreshed sandbox push credentials at ACP turn entry");
+                Ok(Ok(outcome)) => {
+                    match outcome {
+                        RefreshOutcome::Embedded(token) => {
+                            tracing::debug!(
+                                generation = token.generation,
+                                "refreshed sandbox push credentials at ACP turn entry"
+                            );
+                        }
+                        RefreshOutcome::Unchanged(token) => {
+                            tracing::debug!(
+                                generation = token.generation,
+                                "sandbox push credentials already fresh at ACP turn entry"
+                            );
+                        }
+                        RefreshOutcome::None => {}
+                    }
+                    refresh_interval.zip(next_refresh_delay(&outcome))
                 }
-                Ok(Ok(RefreshOutcome::Skipped)) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(
                         error = %fabro_sandbox::display_for_log(&e),
                         "node-entry push-credential refresh failed (non-fatal)"
                     );
+                    refresh_interval
+                        .map(|interval| (interval, interval.min(Duration::from_mins(1))))
                 }
                 Err(_elapsed) => {
                     tracing::warn!(
                         timeout_secs = REFRESH_MINT_TIMEOUT.as_secs(),
                         "node-entry push-credential refresh timed out (non-fatal)"
                     );
+                    refresh_interval
+                        .map(|interval| (interval, interval.min(Duration::from_mins(1))))
                 }
             }
-        }
-        let _refresh_ahead_guard: Option<AbortOnDrop> = refresh_enabled
-            .then(push_cred_refresh_interval)
-            .flatten()
-            .map(|interval| {
+        } else {
+            None
+        };
+        let _refresh_ahead_guard: Option<AbortOnDrop> =
+            refresh_schedule.map(|(interval, initial_delay)| {
                 AbortOnDrop(tokio::spawn(refresh_ahead_loop(
                     Arc::clone(sandbox),
                     cancel_token.child_token(),
                     interval,
+                    initial_delay,
                 )))
             });
 
@@ -604,8 +638,9 @@ impl AgentAcpBackend {
             emitter.notice(
                 RunNoticeLevel::Info,
                 RunNoticeCode::GithubTokenRefreshLimited,
-                "ACP agent stages receive workflow env at process launch; stages running beyond \
-                 token expiry may need to be retried.",
+                "ACP agent stages receive workflow env at process launch; GITHUB_TOKEN access to \
+                 every declared repository expires together, so stages running beyond token \
+                 expiry may need to be retried.",
             );
         }
         provider
@@ -1146,7 +1181,10 @@ mod tests {
         AcpError, AcpProcessExit, AcpProcessSpec, AcpReportedCost, AcpRunUsage, AcpSessionActivity,
         AcpToolKind,
     };
-    use fabro_agent::{LocalSandbox, RefreshOutcome, Sandbox, shell_quote};
+    use fabro_agent::{
+        LocalSandbox, RefreshOutcome, RemoteCredentialAction, Sandbox, TokenProvenance,
+        TokenSnapshot, shell_quote,
+    };
     use fabro_graphviz::graph::{AttrValue, Node};
     use fabro_sandbox::test_support::MockSandbox;
     use fabro_types::{
@@ -1156,8 +1194,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AgentAcpBackend, acp_error_to_workflow, billed_acp_usage, parse_refresh_enabled,
-        parse_refresh_interval, session_activity_callback,
+        AgentAcpBackend, REFRESH_RESCHEDULE_FLOOR, acp_error_to_workflow, billed_acp_usage,
+        next_refresh_delay, parse_refresh_enabled, parse_refresh_interval, refresh_ahead_loop,
+        session_activity_callback,
     };
     use crate::context::Context;
     use crate::event::{Emitter, StageScope};
@@ -1410,15 +1449,310 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_reports_skipped_without_managed_credentials() {
-        // MockSandbox uses the trait default (no GitHub App creds), so refresh is
-        // a no-op that must report Skipped — the signal the refresh-ahead loop
-        // relies on to log at debug rather than falsely claim a re-mint.
+    async fn refresh_reports_no_action_without_managed_credentials() {
+        // MockSandbox uses the trait default (no GitHub App creds), so refresh
+        // is a no-op that must report no remote action and no token — the
+        // signal the refresh-ahead loop relies on to log at debug rather than
+        // falsely claim a re-embed.
         let sandbox = MockSandbox::linux();
         assert_eq!(
             sandbox.refresh_push_credentials().await.unwrap(),
-            RefreshOutcome::Skipped
+            RefreshOutcome::none()
         );
+    }
+
+    fn minted_outcome(
+        action: RemoteCredentialAction,
+        generation: u64,
+        minted_ago: chrono::Duration,
+        expires_in: chrono::Duration,
+        reused: bool,
+    ) -> RefreshOutcome {
+        let now = chrono::Utc::now();
+        let minted_at = now - minted_ago;
+        let expires_at = now + expires_in;
+        let provenance = if reused {
+            TokenProvenance::Reused {
+                minted_at,
+                expires_at,
+            }
+        } else {
+            TokenProvenance::Minted {
+                minted_at,
+                expires_at,
+            }
+        };
+        let token = TokenSnapshot {
+            generation,
+            provenance,
+        };
+        match action {
+            RemoteCredentialAction::Embedded => RefreshOutcome::embedded(token),
+            RemoteCredentialAction::Unchanged => RefreshOutcome::unchanged(token),
+            RemoteCredentialAction::None => RefreshOutcome::none(),
+        }
+    }
+
+    fn static_outcome() -> RefreshOutcome {
+        RefreshOutcome::unchanged(TokenSnapshot {
+            generation: 0,
+            provenance: TokenProvenance::Static,
+        })
+    }
+
+    #[test]
+    fn next_refresh_delay_schedules_from_token_expiry_minus_margin() {
+        let outcome = minted_outcome(
+            RemoteCredentialAction::Embedded,
+            1,
+            chrono::Duration::zero(),
+            chrono::Duration::minutes(60),
+            false,
+        );
+        let delay = next_refresh_delay(&outcome).unwrap();
+        // Expiry minus the 10-minute refresh margin: ~50 minutes out.
+        assert!(delay > Duration::from_mins(49), "{delay:?}");
+        assert!(delay <= Duration::from_mins(50), "{delay:?}");
+    }
+
+    #[test]
+    fn next_refresh_delay_floors_when_the_margin_is_already_open() {
+        let outcome = minted_outcome(
+            RemoteCredentialAction::Unchanged,
+            1,
+            chrono::Duration::minutes(55),
+            chrono::Duration::minutes(5),
+            true,
+        );
+        assert_eq!(next_refresh_delay(&outcome), Some(REFRESH_RESCHEDULE_FLOOR));
+    }
+
+    #[test]
+    fn next_refresh_delay_disables_the_loop_for_static_credentials() {
+        assert_eq!(next_refresh_delay(&static_outcome()), None);
+    }
+
+    #[test]
+    fn next_refresh_delay_disables_the_loop_without_managed_credentials() {
+        assert_eq!(next_refresh_delay(&RefreshOutcome::none()), None);
+    }
+
+    /// Sandbox stub whose refresh outcomes are scripted, recording when each
+    /// refresh tick lands on the (paused) tokio clock.
+    struct ScriptedRefreshSandbox {
+        script: Mutex<std::collections::VecDeque<RefreshOutcome>>,
+        ticks:  Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl ScriptedRefreshSandbox {
+        fn new(script: Vec<RefreshOutcome>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script.into()),
+                ticks:  Mutex::new(Vec::new()),
+            })
+        }
+
+        fn ticks(&self) -> Vec<tokio::time::Instant> {
+            self.ticks.lock().expect("ticks lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sandbox for ScriptedRefreshSandbox {
+        async fn refresh_push_credentials(&self) -> fabro_sandbox::Result<RefreshOutcome> {
+            self.ticks
+                .lock()
+                .expect("ticks lock")
+                .push(tokio::time::Instant::now());
+            Ok(self
+                .script
+                .lock()
+                .expect("script lock")
+                .pop_front()
+                .expect("refresh script exhausted"))
+        }
+
+        async fn read_file_bytes(&self, _path: &str) -> fabro_sandbox::Result<Vec<u8>> {
+            unimplemented!("refresh loop only calls refresh_push_credentials")
+        }
+
+        async fn write_file(&self, _path: &str, _content: &str) -> fabro_sandbox::Result<()> {
+            unimplemented!()
+        }
+
+        async fn delete_file(&self, _path: &str) -> fabro_sandbox::Result<()> {
+            unimplemented!()
+        }
+
+        async fn file_exists(&self, _path: &str) -> fabro_sandbox::Result<bool> {
+            unimplemented!()
+        }
+
+        async fn list_directory(
+            &self,
+            _path: &str,
+            _depth: Option<usize>,
+        ) -> fabro_sandbox::Result<Vec<fabro_sandbox::DirEntry>> {
+            unimplemented!()
+        }
+
+        async fn exec_command(
+            &self,
+            _command: &str,
+            _timeout_ms: u64,
+            _working_dir: Option<&str>,
+            _env_vars: Option<&HashMap<String, String>>,
+            _cancel_token: Option<CancellationToken>,
+        ) -> fabro_sandbox::Result<fabro_sandbox::ExecResult> {
+            unimplemented!()
+        }
+
+        async fn grep(
+            &self,
+            _pattern: &str,
+            _path: &str,
+            _options: &fabro_sandbox::GrepOptions,
+        ) -> fabro_sandbox::Result<Vec<String>> {
+            unimplemented!()
+        }
+
+        async fn download_file_to_local(
+            &self,
+            _remote_path: &str,
+            _local_path: &std::path::Path,
+        ) -> fabro_sandbox::Result<()> {
+            unimplemented!()
+        }
+
+        async fn upload_file_from_local(
+            &self,
+            _local_path: &std::path::Path,
+            _remote_path: &str,
+        ) -> fabro_sandbox::Result<()> {
+            unimplemented!()
+        }
+
+        async fn initialize(&self) -> fabro_sandbox::Result<()> {
+            Ok(())
+        }
+
+        async fn cleanup(&self) -> fabro_sandbox::Result<()> {
+            Ok(())
+        }
+
+        fn working_directory(&self) -> &str {
+            "/workspace"
+        }
+
+        fn platform(&self) -> &str {
+            "linux"
+        }
+
+        fn os_version(&self) -> String {
+            "linux".to_string()
+        }
+    }
+
+    /// Long-turn timeline: the clone/turn-entry mint happened at minute 0 with
+    /// a 60-minute TTL. The loop's first tick at minute 45 sees the cached
+    /// token reused with ~15 minutes left and must NOT sleep another fixed 45
+    /// minutes (that would cross expiry at minute 60) — it reschedules for the
+    /// margin opening (~5 minutes out). That margin-crossing tick re-mints and
+    /// reschedules from the fresh token's expiry (~50 minutes out).
+    #[tokio::test(start_paused = true)]
+    async fn refresh_ahead_reschedules_from_token_expiry_across_a_long_turn() {
+        let interval = Duration::from_mins(45);
+        let sandbox = ScriptedRefreshSandbox::new(vec![
+            // Minute 45: cache still fresh (expires minute 60, margin opens
+            // minute 50).
+            minted_outcome(
+                RemoteCredentialAction::Unchanged,
+                1,
+                chrono::Duration::minutes(45),
+                chrono::Duration::minutes(15),
+                true,
+            ),
+            // Minute ~50: margin open → the source minted generation 2.
+            minted_outcome(
+                RemoteCredentialAction::Embedded,
+                2,
+                chrono::Duration::zero(),
+                chrono::Duration::minutes(60),
+                false,
+            ),
+            // Minute ~100: generation 2 still fresh.
+            minted_outcome(
+                RemoteCredentialAction::Unchanged,
+                2,
+                chrono::Duration::minutes(50),
+                chrono::Duration::minutes(10),
+                true,
+            ),
+        ]);
+        let cancel = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let loop_task = tokio::spawn(refresh_ahead_loop(
+            Arc::clone(&sandbox) as Arc<dyn Sandbox>,
+            cancel.clone(),
+            interval,
+            interval,
+        ));
+
+        while sandbox.ticks().len() < 3 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        cancel.cancel();
+        loop_task.await.expect("refresh loop should exit cleanly");
+
+        let ticks = sandbox.ticks();
+        assert_eq!(ticks[0] - start, interval, "first tick uses the interval");
+        // Reused token expiring in 15 minutes → next tick when the 10-minute
+        // margin opens, ~5 minutes later (never another fixed 45 minutes).
+        let second_gap = ticks[1] - ticks[0];
+        assert!(second_gap <= Duration::from_mins(5), "{second_gap:?}");
+        assert!(second_gap > Duration::from_mins(4), "{second_gap:?}");
+        // Fresh 60-minute token → next tick ~50 minutes out.
+        let third_gap = ticks[2] - ticks[1];
+        assert!(third_gap <= Duration::from_mins(50), "{third_gap:?}");
+        assert!(third_gap > Duration::from_mins(49), "{third_gap:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_ahead_honors_the_expiry_based_initial_delay() {
+        let interval = Duration::from_mins(45);
+        let entry_outcome = minted_outcome(
+            RemoteCredentialAction::Unchanged,
+            1,
+            chrono::Duration::minutes(45),
+            chrono::Duration::minutes(15),
+            true,
+        );
+        let initial_delay = next_refresh_delay(&entry_outcome).unwrap();
+        let sandbox = ScriptedRefreshSandbox::new(vec![minted_outcome(
+            RemoteCredentialAction::Embedded,
+            2,
+            chrono::Duration::zero(),
+            chrono::Duration::minutes(60),
+            false,
+        )]);
+        let cancel = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let loop_task = tokio::spawn(refresh_ahead_loop(
+            Arc::clone(&sandbox) as Arc<dyn Sandbox>,
+            cancel.clone(),
+            interval,
+            initial_delay,
+        ));
+
+        while sandbox.ticks().is_empty() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        cancel.cancel();
+        loop_task.await.expect("refresh loop should exit cleanly");
+
+        let first_tick = sandbox.ticks()[0] - start;
+        assert!(first_tick <= Duration::from_mins(5), "{first_tick:?}");
+        assert!(first_tick > Duration::from_mins(4), "{first_tick:?}");
     }
 
     #[tokio::test]

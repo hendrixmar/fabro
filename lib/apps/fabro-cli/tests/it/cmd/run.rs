@@ -10,7 +10,8 @@ use httpmock::MockServer;
 use serde_json::Value;
 
 use super::support::{
-    created_run_id, output_stderr, remote_run_summary_json, run_state, wait_for_event_names,
+    created_run_id, mock_environment, mock_workflow_version_registrations, output_stderr,
+    remote_run_summary_json, run_state, wait_for_event_names,
 };
 use crate::support::{LightweightCli, run_output_filters, run_projection_json, unique_run_id};
 
@@ -118,12 +119,12 @@ fn help() {
     success: true
     exit_code: 0
     ----- stdout -----
-    Launch a workflow run
+    Register a local workflow version, create a run, and start it
 
     Usage: fabro run [OPTIONS] <WORKFLOW>
 
     Arguments:
-      <WORKFLOW>  Path to a .fabro workflow file or .toml task config
+      <WORKFLOW>  Local workflow name, checkout path, .fabro file, or workflow TOML
 
     Options:
           --json                       Output as JSON [env: FABRO_JSON=]
@@ -135,7 +136,7 @@ fn help() {
           --auto-approve               Auto-approve all human gates
           --quiet                      Suppress non-essential output [env: FABRO_QUIET=]
           --goal <GOAL>                Override the workflow goal (available as {{ goal }} in prompts)
-          --goal-file <GOAL_FILE>      Read the workflow goal from a file
+          --goal-file <GOAL_FILE>      Read a per-run goal value from a local file
           --model <MODEL>              Override default LLM model
           --provider <PROVIDER>        Override default LLM provider
       -v, --verbose                    Enable verbose output
@@ -154,6 +155,8 @@ fn detach_uses_explicit_server_target_and_prints_remote_run_id() {
     let context = test_context!();
     let server = MockServer::start();
     let run_id = unique_run_id();
+    let environment_mock = mock_environment(&server, "default", "docker");
+    let version_mock = mock_workflow_version_registrations(&server);
     let create_mock = server.mock(|when, then| {
         when.method("POST").path("/api/v1/runs");
         then.status(201)
@@ -188,6 +191,8 @@ fn detach_uses_explicit_server_target_and_prints_remote_run_id() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    environment_mock.assert();
+    version_mock.assert();
     create_mock.assert();
     start_mock.assert();
     assert_eq!(output_stderr(&output), "");
@@ -198,12 +203,14 @@ fn detach_uses_explicit_server_target_and_prints_remote_run_id() {
 }
 
 #[test]
-fn run_parent_resolves_parent_and_sends_parent_id_in_manifest() {
+fn run_parent_resolves_parent_and_sends_parent_id_in_intent() {
     let context = test_context!();
     let server = MockServer::start();
     let run_id = unique_run_id();
     let parent_id = unique_run_id();
     let resolve_mock = super::support::mock_resolved_run(&server, "nightly-parent", &parent_id);
+    let environment_mock = mock_environment(&server, "default", "docker");
+    let version_mock = mock_workflow_version_registrations(&server);
     let create_mock = server.mock(|when, then| {
         when.method("POST")
             .path("/api/v1/runs")
@@ -243,6 +250,8 @@ fn run_parent_resolves_parent_and_sends_parent_id_in_manifest() {
         String::from_utf8_lossy(&output.stderr)
     );
     resolve_mock.assert();
+    environment_mock.assert();
+    version_mock.assert();
     create_mock.assert();
     start_mock.assert();
     assert_eq!(
@@ -256,6 +265,8 @@ fn detach_uses_configured_server_target_without_server_flag() {
     let context = test_context!();
     let server = MockServer::start();
     let run_id = unique_run_id();
+    let environment_mock = mock_environment(&server, "default", "docker");
+    let version_mock = mock_workflow_version_registrations(&server);
     let create_mock = server.mock(|when, then| {
         when.method("POST").path("/api/v1/runs");
         then.status(201)
@@ -289,6 +300,8 @@ fn detach_uses_configured_server_target_without_server_flag() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    environment_mock.assert();
+    version_mock.assert();
     create_mock.assert();
     start_mock.assert();
     assert_eq!(
@@ -301,6 +314,8 @@ fn detach_uses_configured_server_target_without_server_flag() {
 fn run_create_failure_shows_action_context_and_response_body() {
     let context = test_context!();
     let server = MockServer::start();
+    let environment_mock = mock_environment(&server, "default", "docker");
+    let version_mock = mock_workflow_version_registrations(&server);
     let create_mock = server.mock(|when, then| {
         when.method("POST").path("/api/v1/runs");
         then.status(422)
@@ -328,6 +343,8 @@ fn run_create_failure_shows_action_context_and_response_body() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    environment_mock.assert();
+    version_mock.assert();
     create_mock.assert();
 
     let stderr = output_stderr(&output);
@@ -479,6 +496,8 @@ fn detach_cli_server_target_overrides_configured_server_target() {
     });
     let cli_server = MockServer::start();
     let run_id = unique_run_id();
+    let environment_mock = mock_environment(&cli_server, "default", "docker");
+    let version_mock = mock_workflow_version_registrations(&cli_server);
     let cli_create = cli_server.mock(|when, then| {
         when.method("POST").path("/api/v1/runs");
         then.status(201)
@@ -514,6 +533,8 @@ fn detach_cli_server_target_overrides_configured_server_target() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    environment_mock.assert();
+    version_mock.assert();
     cli_create.assert();
     cli_start.assert();
     config_create.assert_calls(0);
@@ -529,6 +550,8 @@ fn remote_foreground_run_consumes_paginated_events_and_prints_server_backed_summ
     let context = test_context!();
     let server = MockServer::start();
     let run_id = unique_run_id();
+    let environment_mock = mock_environment(&server, "default", "docker");
+    let version_mock = mock_workflow_version_registrations(&server);
     let preflight = server.mock(|when, then| {
         when.method("POST").path("/api/v1/preflight");
         then.status(500)
@@ -626,6 +649,8 @@ fn remote_foreground_run_consumes_paginated_events_and_prints_server_backed_summ
         String::from_utf8_lossy(&output.stderr)
     );
     preflight.assert_calls(0);
+    environment_mock.assert();
+    version_mock.assert();
     first_page.assert();
     second_page.assert();
 
@@ -644,14 +669,16 @@ fn remote_foreground_run_consumes_paginated_events_and_prints_server_backed_summ
 }
 
 #[test]
-fn run_rejects_unbound_template_inputs_before_creating_remote_run() {
+fn run_surfaces_server_rejection_for_unbound_template_inputs() {
     let context = test_context!();
     let server = MockServer::start();
+    let environment_mock = mock_environment(&server, "default", "docker");
+    let version_mock = mock_workflow_version_registrations(&server);
     let create = server.mock(|when, then| {
         when.method("POST").path("/api/v1/runs");
-        then.status(500)
-            .header("Content-Type", "application/json")
-            .body(serde_json::json!({ "error": "run should not be created" }).to_string());
+        then.status(422)
+            .header("Content-Type", "text/plain")
+            .body("server-authoritative unbound-input rejection");
     });
 
     let workflow = context.install_fixture("templated_unbound.fabro");
@@ -671,32 +698,29 @@ fn run_rejects_unbound_template_inputs_before_creating_remote_run() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    create.assert_calls(0);
+    environment_mock.assert();
+    version_mock.assert();
+    create.assert();
 
     let stderr = output_stderr(&output);
+    assert!(stderr.contains("could not create run"), "{stderr}");
     assert!(
-        stderr.contains("inputs.app_dir"),
-        "stderr should name the unbound variable: {stderr}"
-    );
-    assert!(
-        stderr.contains("templated_unbound.fabro"),
-        "stderr should name the workflow source: {stderr}"
-    );
-    assert!(
-        !stderr.contains("<string>"),
-        "stderr should not expose MiniJinja's generic source name: {stderr}"
+        stderr.contains("server-authoritative unbound-input rejection"),
+        "{stderr}"
     );
 }
 
 #[test]
-fn foreground_run_rejects_invalid_workflow_before_creating_remote_run() {
+fn foreground_run_surfaces_server_rejection_for_invalid_workflow() {
     let context = test_context!();
     let server = MockServer::start();
+    let environment_mock = mock_environment(&server, "default", "docker");
+    let version_mock = mock_workflow_version_registrations(&server);
     let create = server.mock(|when, then| {
         when.method("POST").path("/api/v1/runs");
-        then.status(500)
-            .header("Content-Type", "application/json")
-            .body(serde_json::json!({ "error": "run should not be created" }).to_string());
+        then.status(422)
+            .header("Content-Type", "text/plain")
+            .body("server-authoritative invalid-workflow rejection");
     });
 
     let workflow = context.install_fixture("invalid.fabro");
@@ -716,15 +740,16 @@ fn foreground_run_rejects_invalid_workflow_before_creating_remote_run() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    create.assert_calls(0);
+    environment_mock.assert();
+    version_mock.assert();
+    create.assert();
 
     let stderr = output_stderr(&output);
-    assert!(stderr.contains("Workflow: Invalid"), "{stderr}");
+    assert!(stderr.contains("could not create run"), "{stderr}");
     assert!(
-        stderr.contains("Pipeline must have exactly one start node"),
+        stderr.contains("server-authoritative invalid-workflow rejection"),
         "{stderr}"
     );
-    assert!(stderr.contains("Validation failed"), "{stderr}");
 }
 
 #[test]
@@ -743,7 +768,7 @@ fn local_foreground_run_prints_artifact_paths_from_server_artifact_list() {
 "#,
     );
     context.write_temp(
-        "artifact-summary/run.toml",
+        "artifact-summary/workflow.toml",
         r#"_version = 1
 
 [workflow]
@@ -770,7 +795,7 @@ include = ["assets/**"]
             "local",
             "--provider",
             "openai",
-            "run.toml",
+            "workflow.toml",
         ])
         .output()
         .expect("command should execute");
@@ -802,10 +827,6 @@ fn dry_run_simple() {
     exit_code: 0
     ----- stdout -----
     ----- stderr -----
-    Workflow: Simple (4 nodes, 3 edges)
-    Graph: [GRAPH_PATH]
-    Goal: Run tests and report results
-
         Run: [ULID]
         Web UI: http://localhost:3000/runs/[ULID]
         Sandbox: local (ready in [TIME])
@@ -827,8 +848,8 @@ fn dry_run_simple() {
 #[test]
 fn dry_run_with_goal_file_reads_contents_into_goal() {
     // Regression test for the `--goal-file` flag that was previously
-    // being silently ignored in the v2 path. The file content must end
-    // up in the effective goal displayed in the workflow summary.
+    // being silently ignored in the v2 path. The file content must reach
+    // the server-authoritative run specification.
     let context = test_context!();
 
     let goal_dir = tempfile::tempdir().unwrap();
@@ -847,10 +868,10 @@ fn dry_run_with_goal_file_reads_contents_into_goal() {
         "run should succeed:\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Ship the rate-limiting feature end to end."),
-        "goal file content should appear in workflow summary, got:\n{stderr}"
+    assert_eq!(
+        run_state(&context.single_run_dir()).spec.graph.goal(),
+        "Ship the rate-limiting feature end to end.\n",
+        "goal file content should reach the admitted run"
     );
 }
 
@@ -1101,6 +1122,8 @@ fn detach_creates_run_dir_with_detach_log() {
             "--detach",
             "--dry-run",
             "--auto-approve",
+            "--environment",
+            "local",
             workflow.to_str().unwrap(),
         ])
         .assert()

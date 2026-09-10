@@ -8,6 +8,7 @@ use fabro_agent::{Sandbox, ToolEnvProvider};
 use fabro_auth::CredentialSource;
 #[cfg(test)]
 use fabro_auth::ResolvedCredentials;
+use fabro_github::token_source::InstallationTokenSource;
 use fabro_hooks::{HookContext, HookDecision, HookExecutionContext, HookRunner};
 use fabro_interview::Interviewer;
 use fabro_model::{Catalog, ProviderId};
@@ -15,7 +16,6 @@ use fabro_types::{ManifestPath, RunId};
 use tokio_util::sync::CancellationToken;
 
 use crate::event::Emitter;
-use crate::github_token_source::GitHubTokenSource;
 use crate::handler::HandlerRegistry;
 use crate::interview_runtime::RunInterviewBlocker;
 use crate::run_metadata::{RunMetadataRuntime, RunMetadataWriterHandle};
@@ -238,7 +238,7 @@ pub struct EngineServices {
     /// Environment variables from `[sandbox.env]` config.
     pub base_env:        HashMap<String, String>,
     /// GitHub token source used to inject `GITHUB_TOKEN` at the point of use.
-    pub github_token:    Option<Arc<GitHubTokenSource>>,
+    pub github_token:    Option<Arc<InstallationTokenSource>>,
     /// Typed values from `[run.inputs]`, available to prompt templates.
     pub inputs:          HashMap<String, toml::Value>,
     /// When true, handlers should skip real execution and return simulated
@@ -262,7 +262,6 @@ impl EngineServices {
         reason = "Test scaffolding must build a slate-backed run store from sync code."
     )]
     pub fn test_default() -> Self {
-        use fabro_store::Database;
         use object_store::memory::InMemory;
 
         use crate::handler::start;
@@ -286,7 +285,7 @@ impl EngineServices {
             }
         }
 
-        let store = Arc::new(Database::new(
+        let store = Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -342,7 +341,7 @@ impl EngineServices {
 
 pub struct WorkflowToolEnvProvider {
     pub base_env:     HashMap<String, String>,
-    pub github_token: Option<Arc<GitHubTokenSource>>,
+    pub github_token: Option<Arc<InstallationTokenSource>>,
 }
 
 #[async_trait::async_trait]
@@ -354,11 +353,15 @@ impl ToolEnvProvider for WorkflowToolEnvProvider {
 
 async fn resolve_workflow_env(
     base_env: &HashMap<String, String>,
-    github_token: Option<&Arc<GitHubTokenSource>>,
+    github_token: Option<&Arc<InstallationTokenSource>>,
 ) -> anyhow::Result<HashMap<String, String>> {
     let mut env = base_env.clone();
     if let Some(source) = github_token {
-        env.insert("GITHUB_TOKEN".to_string(), source.current_token().await?);
+        let resolved = source.resolve().await?;
+        env.insert(
+            "GITHUB_TOKEN".to_string(),
+            resolved.token.expose().to_owned(),
+        );
     }
     Ok(env)
 }
@@ -371,9 +374,10 @@ mod tests {
     use anyhow::anyhow;
     use fabro_agent::ToolEnvProvider as _;
     use fabro_github::InstallationToken;
+    use fabro_github::test_support::{InstallationTokenMinter, installation_token_source};
+    use fabro_github::token_source::InstallationTokenSource;
 
     use super::{EngineServices, WorkflowToolEnvProvider};
-    use crate::github_token_source::{GitHubTokenSource, IatMinter};
 
     #[tokio::test]
     async fn test_default_uses_stub_credential_source() {
@@ -406,7 +410,7 @@ mod tests {
     async fn workflow_tool_env_provider_merges_current_github_token() {
         let provider = WorkflowToolEnvProvider {
             base_env:     HashMap::from([("FOO".to_string(), "bar".to_string())]),
-            github_token: Some(Arc::new(GitHubTokenSource::pat("ghp_pat".to_string()))),
+            github_token: Some(InstallationTokenSource::pat("ghp_pat".to_string())),
         };
 
         let env = provider.resolve().await.unwrap();
@@ -418,7 +422,7 @@ mod tests {
     struct FailingMinter;
 
     #[async_trait::async_trait]
-    impl IatMinter for FailingMinter {
+    impl InstallationTokenMinter for FailingMinter {
         async fn mint(&self) -> anyhow::Result<InstallationToken> {
             Err(anyhow!("GITHUB_TOKEN refresh failed"))
         }
@@ -428,9 +432,10 @@ mod tests {
     async fn workflow_tool_env_provider_propagates_token_refresh_errors() {
         let provider = WorkflowToolEnvProvider {
             base_env:     HashMap::new(),
-            github_token: Some(Arc::new(GitHubTokenSource::mintable(Arc::new(
-                FailingMinter,
-            )))),
+            github_token: Some(installation_token_source(
+                "owner/repo",
+                Arc::new(FailingMinter),
+            )),
         };
 
         let err = format!("{:#}", provider.resolve().await.unwrap_err());

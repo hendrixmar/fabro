@@ -175,7 +175,7 @@ fn acp_artifacts_are_listed_when_touched_file_mtime_precedes_attempt_start() {
         ),
     );
     context.write_temp(
-        "run.toml",
+        "workflow.toml",
         r#"_version = 1
 
 [workflow]
@@ -196,7 +196,7 @@ include = ["verification-artifacts/**"]
     context
         .run_cmd()
         .args(["--auto-approve", "--environment", "local"])
-        .arg(context.temp_dir.join("run.toml"))
+        .arg(context.temp_dir.join("workflow.toml"))
         .assert()
         .success();
 

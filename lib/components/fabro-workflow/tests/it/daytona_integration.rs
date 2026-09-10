@@ -26,10 +26,10 @@ use fabro_agent::Sandbox;
 use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 use fabro_sandbox::daytona::{DaytonaConfig, DaytonaSandbox};
 use fabro_static::EnvVars;
-use fabro_store::{ArtifactKey, ArtifactStore, Database};
-use fabro_types::{RunId, StageId, WorkflowSettings};
+use fabro_store::{ArtifactKey, ArtifactStore};
+use fabro_types::{RunId, StageId, WorkflowSettings, parse_blob_ref};
 use fabro_util::shell;
-use fabro_workflow::artifact::sync_artifacts_to_env;
+use fabro_workflow::artifact;
 use fabro_workflow::context::Context;
 use fabro_workflow::error::Error;
 use fabro_workflow::event::Emitter;
@@ -39,6 +39,7 @@ use fabro_workflow::handler::{Handler, HandlerRegistry};
 use fabro_workflow::outcome::{Outcome, StageOutcome};
 use fabro_workflow::records::Checkpoint;
 use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
+use fabro_workflow::runtime_store::RunStoreHandle;
 use fabro_workflow::test_support::{WorkflowRunner, test_store_dir};
 use object_store::local::LocalFileSystem;
 use tokio_util::sync::CancellationToken;
@@ -67,12 +68,13 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
     } else {
         test_store_dir(&run_dir)
     };
-    let object_store = Arc::new(LocalFileSystem::new_with_prefix(store_dir)?);
-    let store = Arc::new(Database::new(
+    let object_store = Arc::new(LocalFileSystem::new_with_prefix(&store_dir)?);
+    let store = Arc::new(fabro_store::test_support::test_database_at(
         object_store,
         "",
         std::time::Duration::from_millis(1),
         None,
+        &store_dir,
     ));
     let state = if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::spawn(
@@ -80,27 +82,23 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                let run_id =
-                    if uses_shared_store {
-                        run_dir
-                            .file_name()
-                            .ok_or("run dir should have file name")?
-                            .to_string_lossy()
-                            .rsplit('-')
-                            .next()
-                            .ok_or("run dir should contain run id suffix")?
-                            .parse()?
-                    } else {
-                        runtime
-                            .block_on(store.list_runs(
-                                &fabro_store::ListRunsQuery::default(),
-                                chrono::Utc::now(),
-                            ))?
-                            .into_iter()
-                            .next()
-                            .ok_or("test store should contain one run")?
-                            .id
-                    };
+                let run_id = if uses_shared_store {
+                    run_dir
+                        .file_name()
+                        .ok_or("run dir should have file name")?
+                        .to_string_lossy()
+                        .rsplit('-')
+                        .next()
+                        .ok_or("run dir should contain run id suffix")?
+                        .parse()?
+                } else {
+                    runtime
+                        .block_on(store.run_summary_store().list_all(chrono::Utc::now()))?
+                        .into_iter()
+                        .next()
+                        .ok_or("test store should contain one run")?
+                        .id
+                };
                 let run = runtime.block_on(store.open_run_reader(&run_id))?;
                 let state = runtime.block_on(async {
                     for attempt in 0..20 {
@@ -133,9 +131,7 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
                 .parse()?
         } else {
             runtime
-                .block_on(
-                    store.list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now()),
-                )?
+                .block_on(store.run_summary_store().list_all(chrono::Utc::now()))?
                 .into_iter()
                 .next()
                 .ok_or("test store should contain one run")?
@@ -159,6 +155,32 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
         .ok_or_else(|| "checkpoint should exist in run store".into())
 }
 
+async fn resolve_checkpoint_text(
+    run_dir: &Path,
+    run_id: &RunId,
+    value: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(current) = value.as_str() else {
+        return Ok(value.to_string());
+    };
+    if parse_blob_ref(current).is_none() {
+        return Ok(current.to_string());
+    }
+
+    let store_dir = test_store_dir(run_dir);
+    let object_store = Arc::new(LocalFileSystem::new_with_prefix(&store_dir)?);
+    let store = fabro_store::test_support::test_database_at(
+        object_store,
+        "",
+        std::time::Duration::from_millis(1),
+        None,
+        &store_dir,
+    );
+    let run = store.open_run_reader(run_id).await?;
+    let run_store = RunStoreHandle::from(run);
+    Ok(artifact::resolve_text_or_blob_ref_str(current, &run_store).await?)
+}
+
 async fn create_env() -> DaytonaSandbox {
     let creds = load_github_app_credentials();
     create_env_with_github_app(Some(creds)).await
@@ -175,9 +197,18 @@ fn test_artifact_store(run_dir: &Path) -> ArtifactStore {
 async fn create_env_with_github_app(
     github_app: Option<fabro_github::GitHubCredentials>,
 ) -> DaytonaSandbox {
-    DaytonaSandbox::new(DaytonaConfig::default(), github_app, None, None, None, None)
-        .await
-        .expect("Failed to create Daytona client — is DAYTONA_API_KEY set?")
+    DaytonaSandbox::new(
+        DaytonaConfig::default(),
+        github_app,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("Failed to create Daytona client — is DAYTONA_API_KEY set?")
 }
 
 fn load_github_app_credentials() -> fabro_github::GitHubCredentials {
@@ -369,18 +400,21 @@ async fn daytona_snapshot_sandbox() {
     let config = DaytonaConfig {
         auto_stop_interval: Some(60),
         snapshot: Some(DaytonaSnapshotConfig {
-            cpu:        Some(2),
-            memory:     Some(4),
-            disk:       Some(10),
-            dockerfile: Some(fabro_sandbox::daytona::DockerfileSource::Inline(
-                "FROM ubuntu:22.04\nRUN apt-get update && apt-get install -y ripgrep".to_string(),
-            )),
+            cpu:    Some(2),
+            memory: Some(4),
+            disk:   Some(10),
+            source: fabro_sandbox::daytona::DaytonaSnapshotSource::Dockerfile(
+                fabro_sandbox::daytona::DockerfileSource::Inline(
+                    "FROM ubuntu:22.04\nRUN apt-get update && apt-get install -y ripgrep"
+                        .to_string(),
+                ),
+            ),
         }),
         ..DaytonaConfig::default()
     };
 
     let creds = load_github_app_credentials();
-    let env = DaytonaSandbox::new(config, Some(creds), None, None, None, None)
+    let env = DaytonaSandbox::new(config, Some(creds), None, None, None, None, None, None)
         .await
         .expect("Failed to create Daytona client — is DAYTONA_API_KEY set?");
     env.initialize().await.unwrap();
@@ -419,7 +453,9 @@ async fn daytona_artifact_sync_uploads_and_rewrites_pointer() {
 
     // Sync — the local file doesn't exist in the Daytona sandbox, so it should
     // upload
-    sync_artifacts_to_env(&mut updates, &env).await.unwrap();
+    artifact::sync_artifacts_to_env(&mut updates, &env)
+        .await
+        .unwrap();
 
     // Pointer should be rewritten to the Daytona working directory
     let new_pointer = updates["response.plan"].as_str().unwrap();
@@ -544,14 +580,17 @@ async fn daytona_pipeline_artifact_offload_and_sync() {
         .get("response.big_output")
         .expect("context should have response.big_output");
     let pointer_str = pointer_value.as_str().expect("pointer should be a string");
-    let expected_blob_hash = fabro_types::BlobHash::new(
-        &serde_json::to_vec(&serde_json::json!("x".repeat(150 * 1024)))
-            .expect("large value should serialize"),
-    );
-    assert_eq!(
-        pointer_str,
-        fabro_types::format_blob_ref(&expected_blob_hash),
+    assert!(
+        parse_blob_ref(pointer_str).is_some(),
         "checkpoint should persist a blob ref"
+    );
+    let resolved = resolve_checkpoint_text(dir.path(), &run_options.run_id, pointer_value)
+        .await
+        .expect("offloaded value should resolve through the run store");
+    assert_eq!(
+        resolved,
+        "x".repeat(150 * 1024),
+        "offloaded value should round-trip through the run store"
     );
 
     env.cleanup().await.unwrap();
@@ -1153,7 +1192,7 @@ async fn daytona_clone_public_repo_gets_credentials() {
 
     // Directly test resolve_clone_credentials against a repo in an org where the
     // app is installed
-    let (username, password) = fabro_github::resolve_clone_credentials(
+    let credentials = fabro_github::resolve_clone_credentials(
         &fabro_github::GitHubContext::new(&creds, &fabro_github::github_api_base_url()),
         "fabro-sh",
         "fabro",
@@ -1162,12 +1201,12 @@ async fn daytona_clone_public_repo_gets_credentials() {
     .unwrap();
 
     assert_eq!(
-        username.as_deref(),
-        Some("x-access-token"),
+        credentials.username(),
+        "x-access-token",
         "installed org repo should get credentials for pushing"
     );
     assert!(
-        password.is_some(),
+        !credentials.password().is_empty(),
         "installed org repo should get a token for pushing"
     );
 }
@@ -1580,7 +1619,7 @@ async fn daytona_computer_use_browser_screenshot() {
         skip_clone: true,
         ..DaytonaConfig::default()
     };
-    let env = DaytonaSandbox::new(config, None, None, None, None, None)
+    let env = DaytonaSandbox::new(config, None, None, None, None, None, None, None)
         .await
         .expect("DAYTONA_API_KEY must be set");
     env.initialize().await.unwrap();
@@ -1728,7 +1767,7 @@ async fn daytona_playwright_mcp_sandbox_transport() {
         skip_clone: true,
         ..DaytonaConfig::default()
     };
-    let sandbox = DaytonaSandbox::new(config, None, None, None, None, None)
+    let sandbox = DaytonaSandbox::new(config, None, None, None, None, None, None, None)
         .await
         .expect("DAYTONA_API_KEY must be set");
     sandbox.initialize().await.unwrap();

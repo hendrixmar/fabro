@@ -61,12 +61,6 @@ pub(crate) async fn run_init(
 # https://docs.fabro.computer/getting-started/quick-start
 
 _version = 1
-
-# Auto-create pull requests on successful workflow runs.
-[run.pull_request]
-enabled = true
-draft = true
-# auto_merge = true
 ",
     )
     .with_context(|| format!("failed to write {}", project_toml.display()))?;
@@ -122,7 +116,18 @@ draft = true
     let toml_path = workflow_dir.join("workflow.toml");
     std::fs::write(
         &toml_path,
-        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
+        "\
+_version = 1
+
+[workflow]
+graph = \"workflow.fabro\"
+
+# Auto-create pull requests on successful workflow runs.
+[run.pull_request]
+enabled = true
+draft = true
+# auto_merge = true
+",
     )
     .with_context(|| format!("failed to write {}", toml_path.display()))?;
     created.push(".fabro/workflows/hello/workflow.toml".to_string());

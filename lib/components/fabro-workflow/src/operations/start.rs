@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::HashSet;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,23 +16,30 @@ use fabro_sandbox::from_environment::{
 };
 use fabro_sandbox::{DockerSandboxOptions, SandboxSpec};
 use fabro_static::EnvVars;
+#[cfg(test)]
+use fabro_types::GitRunTarget;
 use fabro_types::settings::run::{
     ApprovalMode, McpServerSettings as ResolvedMcpServerSettings, PullRequestSettings,
-    ResolvedMcpEntry, RunMode, RunNamespace as ResolvedRunSettings,
+    ResolvedGithubIntegration, ResolvedMcpEntry, RunMode, RunNamespace as ResolvedRunSettings,
     RunPrepareSettings as ResolvedRunPrepareSettings,
 };
-use fabro_types::{ManifestPath, RunId, RunRunnableSource, SandboxProviderKind};
+use fabro_types::{
+    ManifestPath, RunId, RunRunnableSource, RunSpec, RunTarget, SandboxProviderKind,
+    TargetValidationError,
+};
+use fabro_util::error::collect_chain;
 use fabro_vault::Vault;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock as AsyncRwLock;
-use tokio::time;
+use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::artifact_upload::ArtifactSink;
 use crate::context::Context;
 use crate::error::{self, Error};
 use crate::event::{
-    Emitter, Event, EventBody, RunEventLogger, RunEventSink, RunNoticeLevel, append_event_to_sink,
+    Emitter, Event, EventBody, RunEventLogger, RunEventPersistenceError, RunEventSink,
+    RunNoticeLevel, append_event_to_sink,
 };
 use crate::handler::HandlerRegistry;
 use crate::model_fallback::{ModelFallbackNotice, ResolvedModelFallbacks, resolve_model_fallbacks};
@@ -104,9 +112,10 @@ pub struct StartServices {
     pub artifact_sink:      Option<ArtifactSink>,
     pub run_control:        Option<Arc<RunControlState>>,
     pub github_app:         Option<fabro_github::GitHubCredentials>,
-    /// Server-resolved GitHub integration permissions to inject into the
-    /// sandbox env. Empty when github integration has no permissions.
-    pub github_permissions: HashMap<String, String>,
+    /// The resolved GitHub integration request (interpolated permissions
+    /// plus declared additional repositories) to inject into the sandbox
+    /// env. Empty when the github integration requests no token.
+    pub github_integration: ResolvedGithubIntegration,
     pub vault:              Arc<AsyncRwLock<Vault>>,
     pub catalog:            Arc<Catalog>,
     pub on_node:            crate::OnNodeCallback,
@@ -157,8 +166,7 @@ pub async fn start(run_dir: &Path, services: StartServices) -> Result<Started, E
                 actor:  None,
             },
         )
-        .await
-        .map_err(|err| Error::engine(err.to_string()))?;
+        .await?;
         append_event_to_sink(
             &services.event_sink,
             &services.run_id,
@@ -167,8 +175,7 @@ pub async fn start(run_dir: &Path, services: StartServices) -> Result<Started, E
                 actor:  None,
             },
         )
-        .await
-        .map_err(|err| Error::engine(err.to_string()))?;
+        .await?;
     }
 
     Box::pin(execute_persisted_run(run_dir, None, services)).await
@@ -198,7 +205,7 @@ pub(super) async fn execute_persisted_run(
         return Err(error);
     }
     if let Err(err) = append_event_to_sink(&event_sink, &run_id, &Event::RunStarting).await {
-        let error = Error::engine(err.to_string());
+        let error = Error::from(err);
         let _ = persist_detached_failure(
             run_id,
             &run_store,
@@ -318,7 +325,13 @@ async fn emit_workflow_run_failed(
         conclusion.billing,
     );
     if let Err(err) = append_event_to_sink(event_sink, &run_id, &failure_event).await {
-        tracing::warn!(error = %err, "Failed to append run.failed event");
+        let rendered_error = collect_chain(&err).join(": ");
+        tracing::error!(
+            run_id = %run_id,
+            event = "run.failed",
+            error = %rendered_error,
+            "Failed to append run.failed event",
+        );
     }
 }
 
@@ -347,6 +360,40 @@ async fn persist_terminal_engine_failure(
     .await;
 }
 
+fn stop_for_run_event_persistence_failure(
+    cancel_token: &CancellationToken,
+    error: RunEventPersistenceError,
+) -> Error {
+    cancel_token.cancel();
+    error.into()
+}
+
+/// Race a pipeline step against the first latched run-event persistence
+/// failure. When the failure wins, the step future is dropped mid-flight and
+/// the run token is cancelled.
+async fn race_persistence<T>(
+    logger: &RunEventLogger,
+    cancel_token: &CancellationToken,
+    step: impl Future<Output = T>,
+) -> Result<T, Error> {
+    tokio::select! {
+        result = step => Ok(result),
+        failure = logger.wait_for_failure() => {
+            Err(stop_for_run_event_persistence_failure(cancel_token, failure))
+        }
+    }
+}
+
+async fn flush_or_stop(
+    logger: &RunEventLogger,
+    cancel_token: &CancellationToken,
+) -> Result<(), Error> {
+    logger
+        .flush()
+        .await
+        .map_err(|failure| stop_for_run_event_persistence_failure(cancel_token, failure))
+}
+
 impl RunSession {
     async fn new(persisted: &Persisted, services: StartServices) -> Result<Self, Error> {
         let record = persisted.run_spec();
@@ -356,7 +403,14 @@ impl RunSession {
             .state()
             .await
             .map_err(|err| Error::engine(err.to_string()))?;
-        let git = git_checkpoint_options_from_start(settings, &record.run_id, state.start);
+        let dry_run_clone_target = settings.run.execution.mode == RunMode::DryRun
+            && matches!(
+                record.target.as_ref(),
+                Some(RunTarget::Git(_) | RunTarget::None {})
+            );
+        let git = (!dry_run_clone_target)
+            .then(|| git_checkpoint_options_from_start(settings, &record.run_id, state.start))
+            .flatten();
         let definition_blob = state.spec.definition_blob;
         let accepted_definition = match definition_blob {
             Some(blob_hash) => {
@@ -371,8 +425,29 @@ impl RunSession {
             accepted_definition.map(|definition| Arc::new(definition.workflow_bundle()));
 
         let resolved = &settings.run;
-        let sandbox_provider =
-            resolve_sandbox_provider(resolved).effective_for(resolved.execution.mode);
+        let configured_sandbox_provider = resolve_sandbox_provider(resolved);
+        let sandbox_provider = configured_sandbox_provider.effective_for(resolved.execution.mode);
+        let clone_source = if dry_run_clone_target {
+            CloneSourceForRun {
+                origin_url: None,
+                branch:     None,
+                tag:        None,
+                commit_sha: None,
+                skip_clone: true,
+            }
+        } else {
+            clone_source_for_run(record)?
+        };
+        // Clone avoidance and repository identity are independent for Local
+        // folder targets: their files are already present, but GitHub tokens
+        // and pull-request publication still need the persisted origin. Only
+        // an explicit empty target or a clone-target dry-run uses a repository-
+        // free scratch workspace.
+        let repository_free_workspace =
+            dry_run_clone_target || matches!(record.target.as_ref(), Some(RunTarget::None {}));
+        let runtime_origin_url = (!repository_free_workspace)
+            .then(|| record.repo_origin_url().map(str::to_string))
+            .flatten();
         let catalog = Arc::clone(&services.catalog);
         let configured =
             configured_providers_for_start(&services.vault, Arc::clone(&catalog)).await;
@@ -410,37 +485,77 @@ impl RunSession {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let sandbox = match sandbox_provider {
-            SandboxProviderKind::Local => {
-                let working_directory = local_working_directory_from_environment(
-                    &resolved.environment,
-                    record.source_directory.as_deref().map(Path::new),
-                )
-                .map_err(|err| {
-                    Error::engine_with_source(
-                        "Failed to resolve local environment working directory",
-                        err,
-                    )
-                })?;
-                SandboxSpec::Local { working_directory }
+        if configured_sandbox_provider != SandboxProviderKind::Local
+            && matches!(record.target, Some(RunTarget::Folder { .. }))
+        {
+            return Err(Error::engine(
+                "persisted folder run targets require the Local sandbox provider",
+            ));
+        }
+        if configured_sandbox_provider == SandboxProviderKind::Local {
+            if let Some(target @ (RunTarget::Git(_) | RunTarget::None {})) = record.target.as_ref()
+            {
+                return Err(Error::engine(format!(
+                    "persisted {} run targets require a clone-based sandbox provider",
+                    target.kind_name()
+                )));
             }
-            SandboxProviderKind::Docker => SandboxSpec::Docker {
-                config:           resolve_docker_config(resolved, secret_lookup)?,
-                github_app:       services.github_app.clone(),
-                run_id:           Some(record.run_id),
-                clone_origin_url: record.repo_origin_url().map(str::to_string),
-                clone_branch:     record.base_branch().map(str::to_string),
+        }
+        let sandbox = match sandbox_provider {
+            SandboxProviderKind::Local if dry_run_clone_target => SandboxSpec::Local {
+                working_directory: dry_run_workspace_for_target(persisted).await?,
             },
+            SandboxProviderKind::Local => match record.target.as_ref() {
+                Some(target @ (RunTarget::Git(_) | RunTarget::None {})) => {
+                    return Err(Error::engine(format!(
+                        "persisted {} run targets require a clone-based sandbox provider",
+                        target.kind_name()
+                    )));
+                }
+                Some(RunTarget::Folder { path }) => SandboxSpec::Local {
+                    working_directory: folder_working_directory_from_record(record, path).await?,
+                },
+                None => {
+                    let working_directory = local_working_directory_from_environment(
+                        &resolved.environment,
+                        record.source_directory.as_deref().map(Path::new),
+                    )
+                    .map_err(|err| {
+                        Error::engine_with_source(
+                            "Failed to resolve local environment working directory",
+                            err,
+                        )
+                    })?;
+                    SandboxSpec::Local { working_directory }
+                }
+            },
+            SandboxProviderKind::Docker => {
+                let mut config = resolve_docker_config(resolved, secret_lookup)?;
+                config.skip_clone |= clone_source.skip_clone;
+                SandboxSpec::Docker {
+                    config,
+                    github_app: services.github_app.clone(),
+                    run_id: Some(record.run_id),
+                    clone_origin_url: clone_source.origin_url,
+                    clone_branch: clone_source.branch,
+                    clone_tag: clone_source.tag,
+                    clone_commit_sha: clone_source.commit_sha,
+                }
+            }
             SandboxProviderKind::Daytona => {
                 let api_key = vault_guard
                     .get(EnvVars::DAYTONA_API_KEY)
                     .map(str::to_string);
+                let mut config = resolve_daytona_config(resolved);
+                config.skip_clone |= clone_source.skip_clone;
                 SandboxSpec::Daytona {
-                    config: Box::new(resolve_daytona_config(resolved)),
+                    config: Box::new(config),
                     github_app: services.github_app.clone(),
                     run_id: Some(record.run_id),
-                    clone_origin_url: record.repo_origin_url().map(str::to_string),
-                    clone_branch: record.base_branch().map(str::to_string),
+                    clone_origin_url: clone_source.origin_url,
+                    clone_branch: clone_source.branch,
+                    clone_tag: clone_source.tag,
+                    clone_commit_sha: clone_source.commit_sha,
                     api_key,
                 }
             }
@@ -450,12 +565,14 @@ impl RunSession {
             .environment
             .resolve_env(secret_lookup)
             .map_err(|err| Error::engine_with_source("failed to resolve run environment", err))?;
-        let github_permissions: Option<HashMap<String, String>> =
-            (!services.github_permissions.is_empty()).then(|| services.github_permissions.clone());
+        let github_integration = services
+            .github_integration
+            .is_token_requested()
+            .then(|| services.github_integration.clone());
         let sandbox_env = SandboxEnvSpec {
             toml_env,
-            github_permissions,
-            origin_url: record.repo_origin_url().map(str::to_string),
+            github_integration,
+            origin_url: runtime_origin_url.clone(),
         };
 
         let interviewer: Arc<dyn Interviewer> = if resolved.execution.approval == ApprovalMode::Auto
@@ -505,7 +622,7 @@ impl RunSession {
             stop_on_terminal: resolved.environment.lifecycle.stop_on_terminal,
             pr_config,
             pr_github_app: services.github_app,
-            pr_origin_url: record.repo_origin_url().map(str::to_string),
+            pr_origin_url: runtime_origin_url,
             pr_model: llm.model,
             workflow_path,
             workflow_bundle,
@@ -514,6 +631,116 @@ impl RunSession {
             fabro_run_tools: services.fabro_run_tools,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloneSourceForRun {
+    origin_url: Option<String>,
+    branch:     Option<String>,
+    tag:        Option<String>,
+    commit_sha: Option<String>,
+    /// The target asked for an empty workspace, so the provider must not
+    /// clone even when it would otherwise inherit an origin.
+    skip_clone: bool,
+}
+
+async fn folder_working_directory_from_record(
+    record: &RunSpec,
+    target_path: &str,
+) -> Result<PathBuf, Error> {
+    let source_directory = record.source_directory.as_deref().ok_or_else(|| {
+        Error::engine("persisted folder run target is missing its source-directory projection")
+    })?;
+    if source_directory != target_path {
+        return Err(Error::engine(
+            "persisted folder run target disagrees with its source-directory projection",
+        ));
+    }
+
+    // The persisted path was canonical at admission, so it is absolute and
+    // symlink-free. Re-canonicalizing detects any redirection since then.
+    let canonical = fs::canonicalize(target_path).await.map_err(|source| {
+        Error::engine_with_source(
+            "persisted folder run target path could not be canonicalized",
+            source,
+        )
+    })?;
+    if canonical.to_str() != Some(target_path) {
+        return Err(Error::engine(
+            "persisted folder run target path is no longer canonical",
+        ));
+    }
+
+    let metadata = fs::metadata(&canonical).await.map_err(|source| {
+        Error::engine_with_source(
+            "persisted folder run target path could not be inspected",
+            source,
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(Error::engine(
+            "persisted folder run target path is not a directory",
+        ));
+    }
+
+    Ok(canonical)
+}
+
+async fn dry_run_workspace_for_target(persisted: &Persisted) -> Result<PathBuf, Error> {
+    let workspace = persisted.run_dir().join("dry-run-workspace");
+    fs::create_dir_all(&workspace).await.map_err(|source| {
+        Error::engine_with_source("failed to create dry-run target workspace", source)
+    })?;
+    fs::canonicalize(&workspace).await.map_err(|source| {
+        Error::engine_with_source("failed to canonicalize dry-run target workspace", source)
+    })
+}
+
+fn clone_source_for_run(record: &RunSpec) -> Result<CloneSourceForRun, Error> {
+    let Some(target) = &record.target else {
+        return Ok(CloneSourceForRun {
+            origin_url: record.repo_origin_url().map(str::to_string),
+            branch:     record.base_branch().map(str::to_string),
+            tag:        None,
+            commit_sha: None,
+            skip_clone: false,
+        });
+    };
+
+    // The Git-target grammar is owned by `RunTarget::validate` in fabro-types;
+    // admission accepts targets through the same rules, and this start path
+    // re-derives the clone source from the persisted target alone. The
+    // persisted `git` projection is display metadata, never a clone input, so
+    // writers cannot break starts by letting the pair drift.
+    let validated = target.clone().validate().map_err(|error| {
+        Error::engine(match error {
+            TargetValidationError::Repository => {
+                "persisted Git run target has an invalid repository slug"
+            }
+            TargetValidationError::Branch => "persisted Git run target has an invalid branch",
+            TargetValidationError::Tag => "persisted Git run target has an invalid tag",
+            TargetValidationError::Sha => "persisted Git run target has an invalid SHA",
+        })
+    })?;
+    // A target with no Git projection (`none` or `folder`) supplies no clone
+    // source. Folder targets only reach the Local provider, where `skip_clone`
+    // is unused.
+    Ok(match (validated.target, validated.git) {
+        (RunTarget::Git(target), Some(git)) => CloneSourceForRun {
+            origin_url: Some(git.origin_url),
+            branch:     Some(target.branch),
+            tag:        target.tag,
+            commit_sha: git.sha,
+            skip_clone: false,
+        },
+        _ => CloneSourceForRun {
+            origin_url: None,
+            branch:     None,
+            tag:        None,
+            commit_sha: None,
+            skip_clone: true,
+        },
+    })
 }
 
 async fn configured_providers_for_start(
@@ -589,7 +816,7 @@ fn resolve_sandbox_provider(settings: &ResolvedRunSettings) -> SandboxProviderKi
 }
 
 fn resolve_daytona_config(settings: &ResolvedRunSettings) -> DaytonaConfig {
-    daytona_config_from_environment(&settings.environment, !settings.clone.enabled)
+    daytona_config_from_environment(&settings.environment, &settings.clone)
 }
 
 fn resolve_docker_config(
@@ -598,7 +825,7 @@ fn resolve_docker_config(
 ) -> Result<DockerSandboxOptions, Error> {
     docker_config_from_environment_with_secrets(
         &settings.environment,
-        !settings.clone.enabled,
+        &settings.clone,
         secrets_lookup,
     )
     .map_err(|err| Error::engine_with_source("failed to resolve Docker environment config", err))
@@ -689,6 +916,7 @@ impl RunSession {
         resume: Option<ResumeState>,
     ) -> Result<Started, Error> {
         let on_node = self.on_node.clone();
+        let run_cancel_token = self.cancel_token.clone();
 
         let record = persisted.run_spec();
         let run_options = RunOptions {
@@ -777,7 +1005,19 @@ impl RunSession {
             seed_context: self.seed_context,
             fabro_run_tools: self.fabro_run_tools,
         };
-        let mut initialized = Box::pin(pipeline::initialize(persisted, init_options)).await?;
+        let mut initialized = match race_persistence(
+            &store_progress_logger,
+            &run_cancel_token,
+            Box::pin(pipeline::initialize(persisted, init_options)),
+        )
+        .await?
+        {
+            Ok(initialized) => initialized,
+            Err(err) => {
+                flush_or_stop(&store_progress_logger, &run_cancel_token).await?;
+                return Err(err);
+            }
+        };
         initialized.on_node = on_node;
 
         let sandbox_for_cleanup = Arc::clone(&initialized.engine.run.sandbox);
@@ -801,8 +1041,15 @@ impl RunSession {
             steering_hub_for_drain.drain_pending_at_run_end();
         });
 
-        let executed = pipeline::execute(initialized).await;
-        store_progress_logger.flush().await;
+        flush_or_stop(&store_progress_logger, &run_cancel_token).await?;
+
+        let executed = race_persistence(
+            &store_progress_logger,
+            &run_cancel_token,
+            Box::pin(pipeline::execute(initialized)),
+        )
+        .await?;
+        flush_or_stop(&store_progress_logger, &run_cancel_token).await?;
         let final_context = Some(executed.final_context.clone());
 
         let finalize_opts = FinalizeOptions {
@@ -822,16 +1069,21 @@ impl RunSession {
             model:      self.pr_model,
         };
 
-        let concluding = async {
-            let concluded = Box::pin(pipeline::conclude(executed, &finalize_opts)).await?;
-            let published = Box::pin(pipeline::publish(concluded, &publish_opts)).await;
-            Box::pin(pipeline::finalize(published, &finalize_opts)).await
-        };
-        let finalized = match concluding.await {
+        let concluding = race_persistence(
+            &store_progress_logger,
+            &run_cancel_token,
+            Box::pin(async {
+                let concluded = Box::pin(pipeline::conclude(executed, &finalize_opts)).await?;
+                let published = Box::pin(pipeline::publish(concluded, &publish_opts)).await;
+                Box::pin(pipeline::finalize(published, &finalize_opts)).await
+            }),
+        )
+        .await?;
+        let finalized = match concluding {
             Ok(finalized) => finalized,
             Err(err) => {
                 self.steering_hub.drain_pending_at_run_end();
-                store_progress_logger.flush().await;
+                flush_or_stop(&store_progress_logger, &run_cancel_token).await?;
                 return Err(err);
             }
         };
@@ -840,7 +1092,7 @@ impl RunSession {
         // scopeguard above re-runs as a no-op (drain is idempotent on an
         // already-empty buffer) on the way out of scope.
         self.steering_hub.drain_pending_at_run_end();
-        store_progress_logger.flush().await;
+        flush_or_stop(&store_progress_logger, &run_cancel_token).await?;
 
         scopeguard::ScopeGuard::into_inner(cleanup_guard);
 
@@ -1000,13 +1252,20 @@ impl Drop for DetachedRunCompletionGuard {
                     0,
                 )
                 .await;
-                let _ = append_event_to_sink(&event_sink, &run_id, &Event::RunNotice {
+                if let Err(err) = append_event_to_sink(&event_sink, &run_id, &Event::RunNotice {
                     level:            RunNoticeLevel::Error,
                     code:             code.to_string(),
                     message:          message.to_string(),
                     exec_output_tail: None,
                 })
-                .await;
+                .await
+                {
+                    let rendered_error = collect_chain(&err).join(": ");
+                    tracing::warn!(
+                        error = %rendered_error,
+                        "Failed to append detached completion notice",
+                    );
+                }
             });
         }
     }
@@ -1030,7 +1289,11 @@ async fn persist_detached_failure(
         exec_output_tail: None,
     };
     if let Err(err) = append_event_to_sink(event_sink, &run_id, &event).await {
-        tracing::warn!(error = %err, "Failed to append detached failure notice");
+        let rendered_error = collect_chain(&err).join(": ");
+        tracing::warn!(
+            error = %rendered_error,
+            "Failed to append detached failure notice",
+        );
     }
 
     Ok(())
@@ -1049,14 +1312,16 @@ mod tests {
         EnvironmentImageLayer, EnvironmentNetworkLayer, EnvironmentResourcesLayer, RunCloneLayer,
         RunEnvironmentLayer, RunExecutionLayer, RunLayer, StickyMap, WorkflowSettingsBuilder,
     };
+    use fabro_sandbox::test_support::MockSandbox;
     use fabro_store::Database;
     use fabro_types::settings::InterpString;
     use fabro_types::settings::run::{
-        McpTransport as ResolvedMcpTransport, PreparedStep, PreparedStepRun, RunMode,
-        RunPrepareSettings,
+        EnvironmentProvider, McpTransport as ResolvedMcpTransport, PreparedStep, PreparedStepRun,
+        RunMode, RunPrepareSettings,
     };
     use fabro_types::{
-        BilledModelUsage, ManifestPath, StageTiming, WorkflowSettings, fixtures, test_support,
+        BilledModelUsage, GitContext, ManifestPath, RunTarget, StageTiming, WorkflowSettings,
+        fixtures, test_support,
     };
     use fabro_vault::SecretType;
     use object_store::memory::InMemory;
@@ -1089,7 +1354,18 @@ mod tests {
         work -> exit
     }"#;
 
+    const BLOCKING_DOT: &str = r#"digraph Test {
+        graph [goal="Wait forever"]
+        start [shape=Mdiamond]
+        block [type="blocking"]
+        exit  [shape=Msquare]
+        start -> block
+        block -> exit
+    }"#;
+
     struct TimedOutcomeHandler;
+
+    struct BlockingHandler;
 
     fn timed_success_outcome() -> Outcome {
         let mut outcome = Outcome::success();
@@ -1122,8 +1398,22 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Handler for BlockingHandler {
+        async fn execute(
+            &self,
+            _node: &fabro_graphviz::graph::Node,
+            _context: &Context,
+            _graph: &fabro_graphviz::graph::Graph,
+            _run_dir: &Path,
+            _services: &EngineServices,
+        ) -> Result<Outcome, Error> {
+            std::future::pending().await
+        }
+    }
+
     fn memory_store() -> Arc<Database> {
-        Arc::new(Database::new(
+        Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -1283,6 +1573,7 @@ reasoning = false
         let settings = settings_from_run_layer(RunLayer {
             clone: Some(RunCloneLayer {
                 enabled: Some(false),
+                depth:   Some(1),
             }),
             ..RunLayer::default()
         });
@@ -1293,6 +1584,45 @@ reasoning = false
                 .skip_clone
         );
         assert!(resolve_daytona_config(&settings.run).skip_clone);
+        assert_eq!(resolve_daytona_config(&settings.run).clone_depth, Some(1));
+        assert_eq!(
+            resolve_docker_config(&settings.run, |_| None)
+                .unwrap()
+                .clone_depth,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn zero_clone_depth_requests_full_history_from_clone_providers() {
+        let settings = settings_from_run_layer(RunLayer {
+            clone: Some(RunCloneLayer {
+                enabled: None,
+                depth:   Some(0),
+            }),
+            ..RunLayer::default()
+        });
+
+        assert_eq!(resolve_daytona_config(&settings.run).clone_depth, None);
+        assert_eq!(
+            resolve_docker_config(&settings.run, |_| None)
+                .unwrap()
+                .clone_depth,
+            None
+        );
+    }
+
+    #[test]
+    fn clone_providers_default_to_depth_100() {
+        let settings = settings_from_run_layer(RunLayer::default());
+
+        assert_eq!(resolve_daytona_config(&settings.run).clone_depth, Some(100));
+        assert_eq!(
+            resolve_docker_config(&settings.run, |_| None)
+                .unwrap()
+                .clone_depth,
+            Some(100)
+        );
     }
 
     #[test]
@@ -1573,6 +1903,484 @@ reasoning = false
         assert!(err.causes()[0].contains("DEPLOY_TOKEN"));
     }
 
+    #[tokio::test]
+    async fn run_session_new_none_target_forces_empty_docker_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+        let mut settings = settings_from_run_layer(RunLayer {
+            clone: Some(RunCloneLayer {
+                enabled: Some(true),
+                depth:   None,
+            }),
+            ..RunLayer::default()
+        });
+        settings.run.environment.provider = EnvironmentProvider::Docker;
+        settings.run.environment.image.docker = Some("buildpack-deps:noble".to_string());
+        let (persisted, store) = persisted_workflow_with_settings_and_target(
+            MINIMAL_DOT,
+            &storage_root,
+            settings,
+            Some(RunTarget::None {}),
+        )
+        .await;
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let registry = Arc::new(test_registry());
+
+        let session = RunSession::new(
+            &persisted,
+            test_start_services(&store, &storage_root, emitter, registry).await,
+        )
+        .await
+        .unwrap();
+
+        let RunSession {
+            sandbox,
+            sandbox_env,
+            pr_origin_url,
+            ..
+        } = session;
+        let runtime = sandbox
+            .to_run_sandbox_instance(&MockSandbox::linux(), fixtures::RUN_1)
+            .runtime;
+        assert_eq!(runtime.repo_cloned, Some(false));
+        assert_eq!(runtime.clone_origin_url, None);
+        assert_eq!(runtime.clone_branch, None);
+        assert_eq!(runtime.primary_repo_path, None);
+        assert_eq!(runtime.primary_repo_link, None);
+        let SandboxSpec::Docker {
+            config,
+            clone_origin_url,
+            clone_branch,
+            clone_commit_sha,
+            ..
+        } = sandbox
+        else {
+            panic!("none target should retain the selected Docker provider");
+        };
+        assert!(config.skip_clone);
+        assert_eq!(clone_origin_url, None);
+        assert_eq!(clone_branch, None);
+        assert_eq!(clone_commit_sha, None);
+        assert_eq!(sandbox_env.origin_url, None);
+        assert_eq!(pr_origin_url, None);
+    }
+
+    #[tokio::test]
+    async fn run_session_new_none_target_forces_empty_daytona_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+        let mut settings = settings_from_run_layer(RunLayer {
+            clone: Some(RunCloneLayer {
+                enabled: Some(true),
+                depth:   None,
+            }),
+            ..RunLayer::default()
+        });
+        settings.run.environment.provider = EnvironmentProvider::Daytona;
+        settings.run.environment.image.docker = None;
+        let (persisted, store) = persisted_workflow_with_settings_and_target(
+            MINIMAL_DOT,
+            &storage_root,
+            settings,
+            Some(RunTarget::None {}),
+        )
+        .await;
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let registry = Arc::new(test_registry());
+        let vault = Arc::new(AsyncRwLock::new(start_vault(&[(
+            EnvVars::DAYTONA_API_KEY,
+            "test-daytona-key",
+            SecretType::Token,
+        )])));
+
+        let session = RunSession::new(&persisted, StartServices {
+            vault,
+            ..test_start_services(&store, &storage_root, emitter, registry).await
+        })
+        .await
+        .unwrap();
+
+        let RunSession {
+            sandbox,
+            sandbox_env,
+            pr_origin_url,
+            ..
+        } = session;
+        let runtime = sandbox
+            .to_run_sandbox_instance(&MockSandbox::linux(), fixtures::RUN_1)
+            .runtime;
+        assert_eq!(runtime.repo_cloned, Some(false));
+        assert_eq!(runtime.clone_origin_url, None);
+        assert_eq!(runtime.clone_branch, None);
+        assert_eq!(runtime.primary_repo_path, None);
+        assert_eq!(runtime.primary_repo_link, None);
+        let SandboxSpec::Daytona {
+            config,
+            clone_origin_url,
+            clone_branch,
+            clone_commit_sha,
+            ..
+        } = sandbox
+        else {
+            panic!("none target should retain the selected Daytona provider");
+        };
+        assert!(config.skip_clone);
+        assert_eq!(clone_origin_url, None);
+        assert_eq!(clone_branch, None);
+        assert_eq!(clone_commit_sha, None);
+        assert_eq!(sandbox_env.origin_url, None);
+        assert_eq!(pr_origin_url, None);
+    }
+
+    #[tokio::test]
+    async fn run_session_new_rejects_persisted_none_target_with_local_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+        let mut settings = settings_from_run_layer(RunLayer::default());
+        settings.run.environment.provider = EnvironmentProvider::Local;
+        let (persisted, store) = persisted_workflow_with_settings_and_target(
+            MINIMAL_DOT,
+            &storage_root,
+            settings,
+            Some(RunTarget::None {}),
+        )
+        .await;
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let registry = Arc::new(test_registry());
+
+        let Err(error) = RunSession::new(
+            &persisted,
+            test_start_services(&store, &storage_root, emitter, registry).await,
+        )
+        .await
+        else {
+            panic!("persisted none target with Local should fail before sandbox creation");
+        };
+
+        assert!(error.to_string().contains("none run targets require"));
+    }
+
+    #[tokio::test]
+    async fn run_session_new_dry_run_clone_targets_use_isolated_local_workspace() {
+        for target in [
+            RunTarget::None {},
+            RunTarget::Git(GitRunTarget {
+                repo:   "fabro-sh/fabro".to_string(),
+                branch: "main".to_string(),
+                tag:    None,
+                sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            }),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (storage_root, run_dir) = storage_root_and_run_dir(&temp);
+            let mut settings = settings_from_run_layer(RunLayer {
+                execution: Some(RunExecutionLayer {
+                    mode: Some(RunMode::DryRun),
+                    ..RunExecutionLayer::default()
+                }),
+                ..RunLayer::default()
+            });
+            settings.run.environment.provider = EnvironmentProvider::Docker;
+            settings.run.environment.image.docker = Some("buildpack-deps:noble".to_string());
+            let (persisted, store) = persisted_workflow_with_settings_and_target(
+                MINIMAL_DOT,
+                &storage_root,
+                settings,
+                Some(target.clone()),
+            )
+            .await;
+            assert_eq!(persisted.run_spec().target, Some(target.clone()));
+            let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+            let registry = Arc::new(test_registry());
+
+            let session = RunSession::new(
+                &persisted,
+                test_start_services(&store, &storage_root, emitter, registry).await,
+            )
+            .await
+            .unwrap();
+
+            let SandboxSpec::Local { working_directory } = session.sandbox else {
+                panic!("clone target dry-run should execute in a Local scratch sandbox");
+            };
+            assert_eq!(
+                working_directory,
+                run_dir.join("dry-run-workspace").canonicalize().unwrap()
+            );
+            assert_eq!(session.sandbox_env.origin_url, None);
+            assert_eq!(session.pr_origin_url, None);
+            assert!(session.git.is_none());
+            assert_eq!(persisted.run_spec().target, Some(target));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_session_new_dry_run_rejects_configured_target_mismatches() {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+        let mut local_settings = settings_from_run_layer(RunLayer {
+            execution: Some(RunExecutionLayer {
+                mode: Some(RunMode::DryRun),
+                ..RunExecutionLayer::default()
+            }),
+            ..RunLayer::default()
+        });
+        local_settings.run.environment.provider = EnvironmentProvider::Local;
+        let (persisted, store) = persisted_workflow_with_settings_and_target(
+            MINIMAL_DOT,
+            &storage_root,
+            local_settings,
+            Some(RunTarget::None {}),
+        )
+        .await;
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let registry = Arc::new(test_registry());
+        let Err(error) = RunSession::new(
+            &persisted,
+            test_start_services(&store, &storage_root, emitter, registry).await,
+        )
+        .await
+        else {
+            panic!("Local configured provider must reject none even in dry-run");
+        };
+        assert!(error.to_string().contains("none run targets require"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+        let (_, canonical_text) = canonical_folder(&temp);
+        let mut docker_settings = settings_from_run_layer(RunLayer {
+            execution: Some(RunExecutionLayer {
+                mode: Some(RunMode::DryRun),
+                ..RunExecutionLayer::default()
+            }),
+            ..RunLayer::default()
+        });
+        docker_settings.run.environment.provider = EnvironmentProvider::Docker;
+        let (persisted, store) =
+            persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, docker_settings).await;
+        let persisted = persisted_with_target_projection(
+            persisted,
+            RunTarget::Folder {
+                path: canonical_text.clone(),
+            },
+            Some(canonical_text),
+        );
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let registry = Arc::new(test_registry());
+        let Err(error) = RunSession::new(
+            &persisted,
+            test_start_services(&store, &storage_root, emitter, registry).await,
+        )
+        .await
+        else {
+            panic!("Docker configured provider must reject folder even in dry-run");
+        };
+        assert!(error.to_string().contains("folder run targets require"));
+    }
+
+    #[tokio::test]
+    async fn run_session_new_folder_target_uses_canonical_path_and_preserves_git_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+        let (canonical_folder, canonical_text) = canonical_folder(&temp);
+        let environment_cwd = temp.path().join("environment-cwd");
+        std::fs::create_dir_all(&environment_cwd).unwrap();
+        let mut settings = settings_from_run_layer(RunLayer::default());
+        settings.run.environment.provider = EnvironmentProvider::Local;
+        settings.run.environment.cwd = Some(environment_cwd.to_string_lossy().into_owned());
+        let (persisted, store) =
+            persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
+        let persisted = persisted_with_target_projection(
+            persisted,
+            RunTarget::Folder {
+                path: canonical_text.clone(),
+            },
+            Some(canonical_text),
+        );
+        let origin_url = "https://github.com/acme/widgets";
+        let persisted = persisted_with_git_projection(persisted, GitContext {
+            origin_url: origin_url.to_string(),
+            branch:     "feature".to_string(),
+            sha:        Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            dirty:      fabro_types::DirtyStatus::Clean,
+        });
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let registry = Arc::new(test_registry());
+
+        let session = RunSession::new(
+            &persisted,
+            test_start_services(&store, &storage_root, emitter, registry).await,
+        )
+        .await
+        .unwrap();
+
+        let SandboxSpec::Local { working_directory } = session.sandbox else {
+            panic!("folder target should retain the selected Local provider");
+        };
+        assert_eq!(working_directory, canonical_folder);
+        assert_ne!(working_directory, environment_cwd);
+        assert_eq!(session.sandbox_env.origin_url.as_deref(), Some(origin_url));
+        assert_eq!(session.pr_origin_url.as_deref(), Some(origin_url));
+    }
+
+    #[tokio::test]
+    async fn run_session_new_folder_target_rejects_clone_based_providers() {
+        for provider in [EnvironmentProvider::Docker, EnvironmentProvider::Daytona] {
+            let temp = tempfile::tempdir().unwrap();
+            let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+            let (_, canonical_text) = canonical_folder(&temp);
+            let mut settings = settings_from_run_layer(RunLayer::default());
+            settings.run.environment.provider = provider;
+            settings.run.environment.image.docker = match provider {
+                EnvironmentProvider::Docker => Some("buildpack-deps:noble".to_string()),
+                EnvironmentProvider::Daytona | EnvironmentProvider::Local => None,
+            };
+            let (persisted, store) =
+                persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
+            let persisted = persisted_with_target_projection(
+                persisted,
+                RunTarget::Folder {
+                    path: canonical_text.clone(),
+                },
+                Some(canonical_text),
+            );
+            let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+            let registry = Arc::new(test_registry());
+
+            let Err(error) = RunSession::new(
+                &persisted,
+                test_start_services(&store, &storage_root, emitter, registry).await,
+            )
+            .await
+            else {
+                panic!("folder target with a clone-based provider should fail closed");
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("folder run targets require the Local sandbox provider")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_session_new_legacy_local_run_still_prefers_environment_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+        let environment_cwd = temp.path().join("environment-cwd");
+        std::fs::create_dir_all(&environment_cwd).unwrap();
+        let mut settings = settings_from_run_layer(RunLayer::default());
+        settings.run.environment.provider = EnvironmentProvider::Local;
+        settings.run.environment.cwd = Some(environment_cwd.to_string_lossy().into_owned());
+        let (persisted, store) =
+            persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let registry = Arc::new(test_registry());
+
+        let session = RunSession::new(
+            &persisted,
+            test_start_services(&store, &storage_root, emitter, registry).await,
+        )
+        .await
+        .unwrap();
+
+        let SandboxSpec::Local { working_directory } = session.sandbox else {
+            panic!("legacy Local run should retain the selected Local provider");
+        };
+        assert_eq!(working_directory, environment_cwd);
+    }
+
+    #[tokio::test]
+    async fn folder_target_start_rejects_projection_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, canonical_text) = canonical_folder(&temp);
+        let mut record = test_folder_run_spec(&canonical_text);
+
+        record.source_directory = None;
+        let missing_error = folder_working_directory_from_record(&record, &canonical_text)
+            .await
+            .expect_err("missing source-directory projection should fail");
+        assert!(missing_error.to_string().contains("missing"));
+
+        record.source_directory = Some(temp.path().to_string_lossy().into_owned());
+        let drift_error = folder_working_directory_from_record(&record, &canonical_text)
+            .await
+            .expect_err("mismatched source-directory projection should fail");
+        assert!(drift_error.to_string().contains("disagrees"));
+    }
+
+    #[tokio::test]
+    async fn folder_target_start_rejects_relative_and_noncanonical_paths() {
+        let relative = "relative/folder";
+        let relative_record = test_folder_run_spec(relative);
+        let relative_error = folder_working_directory_from_record(&relative_record, relative)
+            .await
+            .expect_err("relative persisted target should fail");
+        assert!(
+            relative_error
+                .to_string()
+                .contains("persisted folder run target path")
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let (canonical_folder, _) = canonical_folder(&temp);
+        let noncanonical = canonical_folder
+            .join("..")
+            .join(canonical_folder.file_name().unwrap());
+        let noncanonical_text = noncanonical.to_str().unwrap();
+        let noncanonical_record = test_folder_run_spec(noncanonical_text);
+
+        let error = folder_working_directory_from_record(&noncanonical_record, noncanonical_text)
+            .await
+            .expect_err("noncanonical persisted target should fail");
+        assert!(error.to_string().contains("no longer canonical"));
+    }
+
+    #[tokio::test]
+    async fn folder_target_start_rejects_disappeared_or_retyped_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let (canonical_folder, canonical_text) = canonical_folder(&temp);
+        let record = test_folder_run_spec(&canonical_text);
+
+        std::fs::remove_dir(&canonical_folder).unwrap();
+        let missing_error = folder_working_directory_from_record(&record, &canonical_text)
+            .await
+            .expect_err("disappeared folder target should fail");
+        assert!(
+            missing_error
+                .to_string()
+                .contains("could not be canonicalized")
+        );
+        assert!(!missing_error.causes().is_empty());
+
+        fs::write(&canonical_folder, "not a directory")
+            .await
+            .unwrap();
+        let file_error = folder_working_directory_from_record(&record, &canonical_text)
+            .await
+            .expect_err("folder target replaced by a file should fail");
+        assert!(file_error.to_string().contains("is not a directory"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn folder_target_start_rejects_redirected_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (canonical_folder, canonical_text) = canonical_folder(&temp);
+        let redirected = temp.path().join("redirected-target");
+        let record = test_folder_run_spec(&canonical_text);
+        std::fs::rename(&canonical_folder, &redirected).unwrap();
+        symlink(&redirected, &canonical_folder).unwrap();
+
+        let error = folder_working_directory_from_record(&record, &canonical_text)
+            .await
+            .expect_err("redirected folder target should fail");
+        assert!(error.to_string().contains("no longer canonical"));
+    }
+
     #[test]
     fn runtime_docker_config_maps_environment_hints() {
         let settings = settings_from_run_layer(RunLayer {
@@ -1646,6 +2454,15 @@ reasoning = false
         storage_root: &Path,
         settings: WorkflowSettings,
     ) -> (Persisted, Arc<Database>) {
+        persisted_workflow_with_settings_and_target(dot, storage_root, settings, None).await
+    }
+
+    async fn persisted_workflow_with_settings_and_target(
+        dot: &str,
+        storage_root: &Path,
+        settings: WorkflowSettings,
+        target: Option<RunTarget>,
+    ) -> (Persisted, Arc<Database>) {
         let store = memory_store();
         let created = crate::operations::create(
             &store,
@@ -1663,6 +2480,7 @@ reasoning = false
                 workflow_slug: Some("test".to_string()),
                 workflow_path: None,
                 workflow_bundle: None,
+                target,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_1),
                 title: None,
@@ -1680,6 +2498,42 @@ reasoning = false
         .await
         .unwrap();
         (created.persisted, store)
+    }
+
+    fn persisted_with_target_projection(
+        persisted: Persisted,
+        target: RunTarget,
+        source_directory: Option<String>,
+    ) -> Persisted {
+        let (graph, source, diagnostics, run_dir, mut run_spec) = persisted.into_parts();
+        run_spec.target = Some(target);
+        run_spec.source_directory = source_directory;
+        Persisted::new(graph, source, diagnostics, run_dir, run_spec)
+    }
+
+    fn persisted_with_git_projection(persisted: Persisted, git: GitContext) -> Persisted {
+        let (graph, source, diagnostics, run_dir, mut run_spec) = persisted.into_parts();
+        run_spec.git = Some(git);
+        Persisted::new(graph, source, diagnostics, run_dir, run_spec)
+    }
+
+    /// Create `folder-target` under `temp` and return its canonical path and
+    /// the UTF-8 text a persisted folder target would carry.
+    fn canonical_folder(temp: &tempfile::TempDir) -> (PathBuf, String) {
+        let folder = temp.path().join("folder-target");
+        std::fs::create_dir_all(&folder).unwrap();
+        let canonical_folder = folder.canonicalize().unwrap();
+        let canonical_text = canonical_folder.to_str().unwrap().to_string();
+        (canonical_folder, canonical_text)
+    }
+
+    fn test_folder_run_spec(path: &str) -> RunSpec {
+        let mut record = test_support::test_run_spec();
+        record.target = Some(RunTarget::Folder {
+            path: path.to_string(),
+        });
+        record.source_directory = Some(path.to_string());
+        record
     }
 
     async fn persisted_workflow(dot: &str, storage_root: &Path) -> (Persisted, Arc<Database>) {
@@ -1723,7 +2577,7 @@ reasoning = false
             artifact_sink: None,
             run_control: None,
             github_app: None,
-            github_permissions: HashMap::new(),
+            github_integration: ResolvedGithubIntegration::default(),
             vault: Arc::new(AsyncRwLock::new(start_vault(&[]))),
             catalog: test_catalog(),
             on_node: None,
@@ -2086,6 +2940,74 @@ reasoning = false
     }
 
     #[tokio::test]
+    async fn event_persistence_failure_stops_execution_and_fails_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, run_dir) = storage_root_and_run_dir(&temp);
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let mut registry = test_registry();
+        registry.register("blocking", Box::new(BlockingHandler));
+        let (_persisted, store) = persisted_workflow(BLOCKING_DOT, &storage_root).await;
+        let run_store = store.open_run(&fixtures::RUN_1).await.unwrap();
+        let canonical_sink = RunEventSink::store(run_store.clone());
+        let mut services = test_start_services(&store, &run_dir, emitter, Arc::new(registry)).await;
+        let cancel_token = services.cancel_token.clone();
+        services.event_sink = RunEventSink::callback(move |event| {
+            let canonical_sink = canonical_sink.clone();
+            async move {
+                if matches!(&event.body, EventBody::StageStarted(_))
+                    && event.node_id.as_deref() == Some("block")
+                {
+                    return Err(anyhow::anyhow!(
+                        "request failed with status 413 Payload Too Large"
+                    )
+                    .context("worker lost canonical run store during append run event"));
+                }
+                canonical_sink.write_run_event(&event).await
+            }
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), start(&run_dir, services))
+            .await
+            .expect("event persistence failure should stop the blocking stage");
+        let Err(error) = result else {
+            panic!("event persistence failure should fail the run");
+        };
+
+        assert!(cancel_token.is_cancelled());
+        let rendered = error.display_with_causes();
+        assert!(
+            rendered.contains("run event persistence failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("stage.started"), "{rendered}");
+        assert!(rendered.contains("413 Payload Too Large"), "{rendered}");
+
+        let projection = run_store.state().await.unwrap();
+        assert!(matches!(projection.status, RunStatus::Failed { .. }));
+        let events = run_store.list_events().await.unwrap();
+        let run_failed = events
+            .iter()
+            .find_map(|event| match &event.event.body {
+                EventBody::RunFailed(properties) => Some(properties),
+                _ => None,
+            })
+            .expect("persistence failure should emit run.failed");
+        assert!(
+            run_failed
+                .failure
+                .detail
+                .causes
+                .iter()
+                .any(|cause| cause.contains("413 Payload Too Large"))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(&event.event.body, EventBody::RunCompleted(_)))
+        );
+    }
+
+    #[tokio::test]
     async fn start_can_run_bundle_backed_child_workflow_without_workflow_bundle_json() {
         let temp = tempfile::tempdir().unwrap();
         let (storage_root, run_dir) = storage_root_and_run_dir(&temp);
@@ -2151,6 +3073,7 @@ reasoning = false
                 workflow_slug: Some("bundle-child".to_string()),
                 workflow_path: Some(ManifestPath::from_wire("workflow.fabro").unwrap()),
                 workflow_bundle: Some(workflow_bundle),
+                target: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_1),
                 title: None,
@@ -2396,5 +3319,140 @@ reasoning = false
             "expected Precondition error, got: {result:?}",
             result = result.as_ref().map(|_| "Ok"),
         );
+    }
+
+    #[test]
+    fn clone_commit_legacy_run_never_activates_an_observed_git_sha() {
+        let mut spec = test_support::test_run_spec();
+        spec.git = Some(fabro_types::GitContext {
+            origin_url: "https://github.com/fabro-sh/fabro".to_string(),
+            branch:     "main".to_string(),
+            sha:        Some("abcdef0123456789abcdef0123456789abcdef01".to_string()),
+            dirty:      fabro_types::DirtyStatus::Clean,
+        });
+
+        let source = clone_source_for_run(&spec).unwrap();
+
+        assert_eq!(source.commit_sha, None);
+        assert_eq!(source.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn none_target_forces_an_empty_clone_source_and_workspace() {
+        let mut spec = test_support::test_run_spec();
+        spec.target = Some(RunTarget::None {});
+        spec.git = Some(fabro_types::GitContext {
+            origin_url: "https://github.com/fabro-sh/fabro".to_string(),
+            branch:     "main".to_string(),
+            sha:        Some("abcdef0123456789abcdef0123456789abcdef01".to_string()),
+            dirty:      fabro_types::DirtyStatus::Clean,
+        });
+
+        let source = clone_source_for_run(&spec).unwrap();
+
+        assert_eq!(source.origin_url, None);
+        assert_eq!(source.branch, None);
+        assert_eq!(source.commit_sha, None);
+        assert!(source.skip_clone);
+    }
+
+    #[test]
+    fn clone_commit_persisted_git_target_activates_exact_branch_and_sha() {
+        let mut spec = test_support::test_run_spec();
+        let submitted_sha = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+        let normalized_sha = "abcdef0123456789abcdef0123456789abcdef01";
+        spec.target = Some(RunTarget::Git(GitRunTarget {
+            repo:   "fabro-sh/fabro".to_string(),
+            branch: "feature/run-intent".to_string(),
+            tag:    Some("v1.2.3".to_string()),
+            sha:    Some(submitted_sha.to_string()),
+        }));
+        spec.git = Some(fabro_types::GitContext {
+            origin_url: "https://github.com/fabro-sh/fabro".to_string(),
+            branch:     "feature/run-intent".to_string(),
+            sha:        Some(submitted_sha.to_string()),
+            dirty:      fabro_types::DirtyStatus::Clean,
+        });
+
+        let source = clone_source_for_run(&spec).unwrap();
+
+        assert_eq!(
+            source.origin_url.as_deref(),
+            Some("https://github.com/fabro-sh/fabro")
+        );
+        assert_eq!(source.branch.as_deref(), Some("feature/run-intent"));
+        assert_eq!(source.tag.as_deref(), Some("v1.2.3"));
+        assert_eq!(source.commit_sha.as_deref(), Some(normalized_sha));
+    }
+
+    #[test]
+    fn clone_commit_persisted_git_target_without_sha_keeps_branch_unpinned() {
+        let mut spec = test_support::test_run_spec();
+        spec.target = Some(RunTarget::Git(GitRunTarget {
+            repo:   "fabro-sh/fabro".to_string(),
+            branch: "feature/run-intent".to_string(),
+            tag:    None,
+            sha:    None,
+        }));
+        spec.git = Some(fabro_types::GitContext {
+            origin_url: "https://github.com/fabro-sh/fabro".to_string(),
+            branch:     "feature/run-intent".to_string(),
+            sha:        None,
+            dirty:      fabro_types::DirtyStatus::Clean,
+        });
+
+        let source = clone_source_for_run(&spec).unwrap();
+
+        assert_eq!(source.branch.as_deref(), Some("feature/run-intent"));
+        assert_eq!(source.commit_sha, None);
+    }
+
+    #[test]
+    fn clone_source_preserves_unpinned_tag_separately_from_working_branch() {
+        let mut spec = test_support::test_run_spec();
+        spec.target = Some(RunTarget::Git(GitRunTarget {
+            repo:   "fabro-sh/fabro".to_string(),
+            branch: "release-work".to_string(),
+            tag:    Some("v1.2.3".to_string()),
+            sha:    None,
+        }));
+
+        let source = clone_source_for_run(&spec).unwrap();
+
+        assert_eq!(source.branch.as_deref(), Some("release-work"));
+        assert_eq!(source.tag.as_deref(), Some("v1.2.3"));
+        assert_eq!(source.commit_sha, None);
+    }
+
+    #[test]
+    fn clone_commit_persisted_git_target_is_authoritative_over_projection() {
+        let mut spec = test_support::test_run_spec();
+        spec.target = Some(RunTarget::Git(GitRunTarget {
+            repo:   "fabro-sh/fabro".to_string(),
+            branch: "main".to_string(),
+            tag:    None,
+            sha:    None,
+        }));
+        // A drifted (or absent) projection never feeds the clone source: the
+        // validated target alone does.
+        spec.git = Some(fabro_types::GitContext {
+            origin_url: "https://github.com/fabro-sh/other".to_string(),
+            branch:     "other".to_string(),
+            sha:        Some("abcdef0123456789abcdef0123456789abcdef01".to_string()),
+            dirty:      fabro_types::DirtyStatus::Clean,
+        });
+
+        let source = clone_source_for_run(&spec).unwrap();
+
+        assert_eq!(
+            source.origin_url.as_deref(),
+            Some("https://github.com/fabro-sh/fabro")
+        );
+        assert_eq!(source.branch.as_deref(), Some("main"));
+        assert_eq!(source.commit_sha, None);
+
+        spec.git = None;
+        let source = clone_source_for_run(&spec).unwrap();
+        assert_eq!(source.branch.as_deref(), Some("main"));
     }
 }

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
+use fabro_types::run_event::MAX_RUN_EVENT_BODY_BYTES;
 use fabro_types::{
     RunEventDetailContent, RunEventDetailContentKind, RunEventDetailEnvelope,
     RunEventDetailResponse,
@@ -20,7 +22,9 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/attach", get(attach_events))
         .route(
             "/runs/{id}/events",
-            get(list_run_events).post(append_run_event),
+            get(list_run_events)
+                .post(append_run_event)
+                .layer(DefaultBodyLimit::max(MAX_RUN_EVENT_BODY_BYTES)),
         )
         .route("/runs/{id}/events/{seq}", get(get_run_event_detail))
         .route(
@@ -214,9 +218,9 @@ async fn append_run_event(
     if event.run_id != id {
         return ApiError::bad_request("Event run_id does not match path run ID.").into_response();
     }
-    if let Some(denied) = denied_lifecycle_event_name(&event.body) {
+    if let Some(denied) = denied_dedicated_operation_event_name(&event.body) {
         return ApiError::bad_request(format!(
-            "{denied} is a lifecycle event; clients must call the corresponding operation endpoint instead of injecting it via append_run_event"
+            "{denied} must be performed through its dedicated operation endpoint instead of injecting it via append_run_event"
         ))
         .into_response();
     }
@@ -572,7 +576,7 @@ async fn attach_run_events(
 /// (e.g. "archive only from terminal") that a direct event append would
 /// bypass. Other run-lifecycle events flow through this endpoint legitimately:
 /// the worker subprocess emits state transitions during execution.
-fn denied_lifecycle_event_name(body: &EventBody) -> Option<&str> {
+fn denied_dedicated_operation_event_name(body: &EventBody) -> Option<&str> {
     match body {
         EventBody::RunArchived(_)
         | EventBody::RunUnarchived(_)
@@ -581,7 +585,8 @@ fn denied_lifecycle_event_name(body: &EventBody) -> Option<&str> {
         | EventBody::RunPauseRequested(_)
         | EventBody::RunUnpauseRequested(_)
         | EventBody::PullRequestLinked(_)
-        | EventBody::PullRequestUnlinked(_) => Some(body.event_name()),
+        | EventBody::PullRequestUnlinked(_)
+        | EventBody::RunSessionCreated(_) => Some(body.event_name()),
         _ => None,
     }
 }
@@ -616,22 +621,25 @@ mod stage_events_tests {
 
     async fn append_run_created(run_store: &fabro_store::RunDatabase, run_id: &RunId) {
         workflow_event::append_event(run_store, run_id, &workflow_event::Event::RunCreated {
-            run_id:           *run_id,
-            title:            None,
-            settings:         serde_json::to_value(WorkflowSettings::default()).unwrap(),
-            graph:            serde_json::to_value(Graph::new("test")).unwrap(),
-            workflow_source:  None,
-            labels:           std::collections::BTreeMap::new(),
-            source_directory: None,
-            workflow_slug:    None,
-            automation:       None,
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            git:              None,
-            fork_source_ref:  None,
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            run_id:              *run_id,
+            title:               None,
+            settings:            serde_json::to_value(WorkflowSettings::default()).unwrap(),
+            graph:               serde_json::to_value(Graph::new("test")).unwrap(),
+            workflow_source:     None,
+            labels:              std::collections::BTreeMap::new(),
+            source_directory:    None,
+            workflow_slug:       None,
+            workflow_version_id: None,
+            target:              None,
+            automation:          None,
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            spec_blob:           None,
+            git:                 None,
+            fork_source_ref:     None,
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .expect("run.created should append");

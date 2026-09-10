@@ -9,7 +9,46 @@ use fabro_types::settings::run::MergeStrategy;
 use serde::Deserialize;
 use tokio::process::Command;
 
+use crate::token_source::SecretString;
+
+pub mod access;
+pub mod token_source;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+#[cfg(test)]
+pub(crate) mod tests_mock;
+
+pub use access::GitHubRepositoryAccess;
+
 pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+
+/// Git config key that routes github.com HTTPS credentials through
+/// [`GITHUB_CREDENTIAL_HELPER`].
+pub const GITHUB_CREDENTIAL_HELPER_KEY: &str = "credential.https://github.com.helper";
+
+/// Secret-free git credential helper: reads `$GITHUB_TOKEN` from the
+/// invoking git process's environment at invocation time, so the token never
+/// lands in git configuration, argv, or rendered errors. Non-`get`
+/// operations (`store`, `erase`) are ignored. The one definition shared by
+/// the runtime git bridge, server preflight probes, and the live contract
+/// test, so the probes always exercise exactly what the bridge configures.
+pub const GITHUB_CREDENTIAL_HELPER: &str = r#"!f() { if [ "$1" = get ]; then echo username=x-access-token; echo "password=$GITHUB_TOKEN"; fi; }; f"#;
+
+/// Configure a `git` invocation to authenticate to github.com through
+/// [`GITHUB_CREDENTIAL_HELPER`] with `token`, isolated from user/system git
+/// configuration and terminal prompts. The token is passed only through the
+/// child process environment.
+pub fn apply_probe_git_env(command: &mut Command, token: &str) {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env(EnvVars::GITHUB_TOKEN, token)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", GITHUB_CREDENTIAL_HELPER_KEY)
+        .env("GIT_CONFIG_VALUE_0", GITHUB_CREDENTIAL_HELPER);
+}
 
 /// Returns the GitHub API base URL, allowing override via `GITHUB_BASE_URL` env
 /// var.
@@ -147,6 +186,29 @@ impl GitHubAppCredentials {
         permissions: serde_json::Value,
         install_url: Option<&str>,
     ) -> anyhow::Result<InstallationToken> {
+        self.mint_installation_token_for_repositories(
+            client,
+            owner,
+            &[repo.to_string()],
+            base_url,
+            permissions,
+            install_url,
+        )
+        .await
+    }
+
+    /// Mint one installation token scoped to every repository in
+    /// `repository_names` (names within `owner`'s installation, primary
+    /// first) with the shared `permissions`.
+    pub async fn mint_installation_token_for_repositories(
+        &self,
+        client: &impl HttpClient,
+        owner: &str,
+        repository_names: &[String],
+        base_url: &str,
+        permissions: serde_json::Value,
+        install_url: Option<&str>,
+    ) -> anyhow::Result<InstallationToken> {
         let jwt = sign_app_jwt(&self.app_id, &self.private_key_pem)?;
         let default_install_url = self.installation_url(owner);
         let install_url = install_url.or(default_install_url.as_deref());
@@ -154,7 +216,7 @@ impl GitHubAppCredentials {
             client,
             &jwt,
             owner,
-            repo,
+            repository_names,
             base_url,
             permissions,
             install_url,
@@ -470,87 +532,145 @@ pub async fn create_installation_access_token_with_permissions_and_install_url(
     permissions: serde_json::Value,
     install_url: Option<&str>,
 ) -> anyhow::Result<String> {
-    mint_installation_token_with_jwt(client, jwt, owner, repo, base_url, permissions, install_url)
-        .await
-        .map(|token| token.token)
+    mint_installation_token_with_jwt(
+        client,
+        jwt,
+        owner,
+        &[repo.to_string()],
+        base_url,
+        permissions,
+        install_url,
+    )
+    .await
+    .map(|token| token.token)
+}
+
+/// Outcome of one GitHub App installation lookup
+/// (`GET /repos/{owner}/{repo}/installation`).
+///
+/// Status interpretation stays with callers because their user guidance
+/// differs: the mint path speaks about the owner's App installation, the
+/// multi-repository resolution names the specific repository.
+pub(crate) enum InstallationLookup {
+    Found(u64),
+    /// 404: the App cannot see the repository (or is not installed at all).
+    NotFound,
+    /// Any other non-200 status.
+    Failed(u16),
+}
+
+/// Look up the App installation covering `owner/repo` and parse its id.
+/// Transport and parse failures carry no caller-specific context; callers
+/// attach their own.
+pub(crate) async fn lookup_installation(
+    client: &impl HttpClient,
+    jwt: &str,
+    base_url: &str,
+    owner: &str,
+    repo: &str,
+) -> anyhow::Result<InstallationLookup> {
+    #[derive(Deserialize)]
+    struct Installation {
+        id: u64,
+    }
+
+    let endpoint = format!("{base_url}/repos/{owner}/{repo}/installation");
+    let auth = format!("Bearer {jwt}");
+    let resp = client
+        .request(HttpMethod::Get, &endpoint, &github_headers(&auth), None)
+        .await?;
+    match resp.status {
+        200 => {
+            let installation: Installation = resp
+                .json()
+                .context("Failed to parse installation response")?;
+            Ok(InstallationLookup::Found(installation.id))
+        }
+        404 => Ok(InstallationLookup::NotFound),
+        status => Ok(InstallationLookup::Failed(status)),
+    }
 }
 
 async fn mint_installation_token_with_jwt(
     client: &impl HttpClient,
     jwt: &str,
     owner: &str,
-    repo: &str,
+    repos: &[String],
     base_url: &str,
     permissions: serde_json::Value,
     install_url: Option<&str>,
 ) -> anyhow::Result<InstallationToken> {
-    #[derive(Deserialize)]
-    struct Installation {
-        id: u64,
-    }
+    let Some(primary_repo) = repos.first() else {
+        bail!("installation token mint requires at least one repository");
+    };
 
+    // Step 1: Find the installation via the primary repository. Multi-
+    // repository callers resolve every repository's installation up front
+    // (`GitHubRepositoryAccess::resolve_shared_installation`), so the
+    // primary stands for the whole set here.
+    let installation_id = match lookup_installation(client, jwt, base_url, owner, primary_repo)
+        .await
+        .context("Failed to look up GitHub App installation")?
+    {
+        InstallationLookup::Found(id) => id,
+        InstallationLookup::NotFound => {
+            let install_url = install_url.map_or_else(
+                || format!("https://github.com/organizations/{owner}/settings/installations"),
+                str::to_string,
+            );
+            bail!(
+                "GitHub App is not installed for {owner}, or its installation does not \
+                 include {owner}/{primary_repo}. Check repository access at {install_url}"
+            );
+        }
+        InstallationLookup::Failed(403) => {
+            bail!(
+                "GitHub App installation is suspended. \
+                 Re-enable it in your organization's GitHub App settings."
+            );
+        }
+        InstallationLookup::Failed(401) => {
+            bail!(
+                "GitHub App authentication failed. \
+                 Check that app_id and GITHUB_APP_PRIVATE_KEY are correct."
+            );
+        }
+        InstallationLookup::Failed(status) => {
+            bail!("Unexpected status {status} looking up GitHub App installation");
+        }
+    };
+
+    mint_installation_token_for_id_with_jwt(
+        client,
+        jwt,
+        installation_id,
+        repos,
+        base_url,
+        permissions,
+    )
+    .await
+}
+
+/// Create a repository-scoped token for an installation already resolved by
+/// the caller.
+pub(crate) async fn mint_installation_token_for_id_with_jwt(
+    client: &impl HttpClient,
+    jwt: &str,
+    installation_id: u64,
+    repos: &[String],
+    base_url: &str,
+    permissions: serde_json::Value,
+) -> anyhow::Result<InstallationToken> {
     #[derive(Deserialize)]
     struct AccessToken {
         token:      String,
         expires_at: DateTime<Utc>,
     }
 
-    // Step 1: Find the installation for this repo
-    let installation_endpoint = format!("{base_url}/repos/{owner}/{repo}/installation");
     let auth = format!("Bearer {jwt}");
-    let resp = client
-        .request(
-            HttpMethod::Get,
-            &installation_endpoint,
-            &github_headers(&auth),
-            None,
-        )
-        .await
-        .context("Failed to look up GitHub App installation")?;
-
-    match resp.status {
-        200 => {}
-        404 => {
-            let install_url = install_url.map_or_else(
-                || format!("https://github.com/organizations/{owner}/settings/installations"),
-                str::to_string,
-            );
-            bail!(
-                "GitHub App is not installed for {owner}. \
-                 Install it at {install_url}"
-            );
-        }
-        403 => {
-            bail!(
-                "GitHub App installation is suspended. \
-                 Re-enable it in your organization's GitHub App settings."
-            );
-        }
-        401 => {
-            bail!(
-                "GitHub App authentication failed. \
-                 Check that app_id and GITHUB_APP_PRIVATE_KEY are correct."
-            );
-        }
-        _ => {
-            bail!(
-                "Unexpected status {} looking up GitHub App installation",
-                resp.status
-            );
-        }
-    }
-
-    let installation: Installation = resp
-        .json()
-        .context("Failed to parse installation response")?;
-
-    // Step 2: Create a scoped access token
-    let token_url = format!(
-        "{base_url}/app/installations/{}/access_tokens",
-        installation.id
-    );
+    let token_url = format!("{base_url}/app/installations/{installation_id}/access_tokens");
     let body = serde_json::json!({
-        "repositories": [repo],
+        "repositories": repos,
         "permissions": permissions,
     });
 
@@ -568,8 +688,9 @@ async fn mint_installation_token_with_jwt(
         201 => {}
         422 => {
             bail!(
-                "GitHub App does not have access to repository {repo}. \
-                 Update the installation's repository permissions to include it."
+                "GitHub App does not have access to every requested repository ({}). \
+                 Update the installation's repository permissions to include them.",
+                repos.join(", ")
             );
         }
         401 => {
@@ -1060,25 +1181,24 @@ pub async fn check_app_installed(
     repo: &str,
     base_url: &str,
 ) -> anyhow::Result<bool> {
-    let url = format!("{base_url}/repos/{owner}/{repo}/installation");
-    let auth = format!("Bearer {jwt}");
-    let resp = client
-        .request(HttpMethod::Get, &url, &github_headers(&auth), None)
+    let lookup = lookup_installation(client, jwt, base_url, owner, repo)
         .await
         .context("Failed to check GitHub App installation")?;
 
-    match resp.status {
-        200 => Ok(true),
-        404 => Ok(false),
-        401 => bail!(
+    match lookup {
+        InstallationLookup::Found(_) => Ok(true),
+        InstallationLookup::NotFound => Ok(false),
+        InstallationLookup::Failed(401) => bail!(
             "GitHub App authentication failed. \
              Check that app_id and GITHUB_APP_PRIVATE_KEY are correct."
         ),
-        403 => bail!(
+        InstallationLookup::Failed(403) => bail!(
             "GitHub App installation is suspended. \
              Re-enable it in your organization's GitHub App settings."
         ),
-        status => bail!("Unexpected status {status} checking GitHub App installation"),
+        InstallationLookup::Failed(status) => {
+            bail!("Unexpected status {status} checking GitHub App installation")
+        }
     }
 }
 
@@ -1148,42 +1268,119 @@ pub async fn update_app_webhook_config(
     Ok(())
 }
 
-/// Resolve git clone credentials for a GitHub repository.
+/// Required credentials for an authenticated GitHub HTTPS clone.
 ///
-/// Returns `(username, password)` for authenticated cloning and pushing.
-/// Always generates a token regardless of repo visibility, since the token
-/// is needed for pushing from the sandbox.
+/// The password is redacted from `Debug` output and should only be exposed at
+/// the point where it is passed to Git.
+#[derive(Clone, Debug)]
+pub struct GitCloneCredentials {
+    username: String,
+    password: SecretString,
+}
+
+impl GitCloneCredentials {
+    fn from_token(token: String) -> anyhow::Result<Self> {
+        if token.is_empty() {
+            bail!("GitHub clone credential token is empty");
+        }
+        Ok(Self {
+            username: "x-access-token".to_string(),
+            password: SecretString::new(token),
+        })
+    }
+
+    /// The username passed to Git's HTTPS basic authentication.
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// The secret passed to Git's HTTPS basic authentication.
+    ///
+    /// Callers must not log or persist the returned value.
+    #[must_use]
+    pub fn password(&self) -> &str {
+        self.password.expose()
+    }
+}
+
+/// Resolve Git clone credentials for a GitHub repository.
+///
+/// Always generates credentials regardless of repository visibility because
+/// the token is needed for pushing from the sandbox.
+///
+/// # Errors
+///
+/// Returns an error when an installation token is expired, a GitHub App token
+/// cannot be minted, the HTTP client cannot be created, or the resolved token
+/// is empty.
 pub async fn resolve_clone_credentials(
     ctx: &GitHubContext<'_>,
     owner: &str,
     repo: &str,
-) -> anyhow::Result<(Option<String>, Option<String>)> {
+) -> anyhow::Result<GitCloneCredentials> {
     let token = match ctx.creds {
         GitHubCredentials::Pat(token) => token.clone(),
         GitHubCredentials::Installation(token) => token.valid_token()?.to_string(),
         GitHubCredentials::App(_) => {
             let client = ctx.http_client()?;
-            mint_git_contents_write_token(&client, ctx, owner, repo).await?
+            mint_git_token(
+                &client,
+                ctx,
+                owner,
+                repo,
+                serde_json::json!({ "contents": "write" }),
+            )
+            .await?
         }
     };
-    Ok((Some("x-access-token".to_string()), Some(token)))
+    GitCloneCredentials::from_token(token)
 }
 
-/// Mint an installation token scoped to repository contents writes.
-async fn mint_git_contents_write_token(
+/// Resolve credentials for fetching repository contents without granting a
+/// GitHub App token permission to push.
+///
+/// Static PATs and pre-minted installation tokens retain their configured
+/// permissions. App credentials mint a repository-scoped token with
+/// `contents: read`.
+///
+/// # Errors
+///
+/// Returns an error when an installation token is expired, a GitHub App token
+/// cannot be minted, the HTTP client cannot be created, or the resolved token
+/// is empty.
+pub async fn resolve_read_only_clone_credentials(
+    ctx: &GitHubContext<'_>,
+    owner: &str,
+    repo: &str,
+) -> anyhow::Result<GitCloneCredentials> {
+    let token = match ctx.creds {
+        GitHubCredentials::Pat(token) => token.clone(),
+        GitHubCredentials::Installation(token) => token.valid_token()?.to_string(),
+        GitHubCredentials::App(_) => {
+            let client = ctx.http_client()?;
+            mint_git_token(
+                &client,
+                ctx,
+                owner,
+                repo,
+                serde_json::json!({ "contents": "read" }),
+            )
+            .await?
+        }
+    };
+    GitCloneCredentials::from_token(token)
+}
+
+async fn mint_git_token(
     client: &impl HttpClient,
     ctx: &GitHubContext<'_>,
     owner: &str,
     repo: &str,
+    permissions: serde_json::Value,
 ) -> anyhow::Result<String> {
     ctx.creds
-        .resolve_bearer_token(
-            client,
-            owner,
-            repo,
-            ctx.base_url,
-            serde_json::json!({ "contents": "write" }),
-        )
+        .resolve_bearer_token(client, owner, repo, ctx.base_url, permissions)
         .await
 }
 
@@ -1212,11 +1409,8 @@ pub async fn resolve_authenticated_url(
     url: &str,
 ) -> anyhow::Result<DisplaySafeUrl> {
     let (owner, repo) = parse_github_owner_repo(url)?;
-    let (_username, password) = resolve_clone_credentials(ctx, &owner, &repo).await?;
-    match password {
-        Some(token) => embed_token_in_url(url, &token),
-        None => DisplaySafeUrl::parse(url).context("Failed to parse GitHub HTTPS URL"),
-    }
+    let credentials = resolve_clone_credentials(ctx, &owner, &repo).await?;
+    embed_token_in_url(url, credentials.password())
 }
 
 /// Fetch detailed information about a pull request.
@@ -1710,7 +1904,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn test_rsa_key() -> &'static str {
-        include_str!("testdata/rsa_private.pem")
+        tests_mock::test_rsa_key()
     }
 
     #[test]
@@ -1764,89 +1958,7 @@ mod tests {
     // MockHttpClient
     // -----------------------------------------------------------------------
 
-    struct MockRoute {
-        method:           HttpMethod,
-        path:             String,
-        status:           u16,
-        response_body:    String,
-        assert_header:    Option<(String, MockHeaderCheck)>,
-        assert_body_json: Option<serde_json::Value>,
-    }
-
-    enum MockHeaderCheck {
-        Equals(String),
-    }
-
-    struct MockHttpClient {
-        routes: Vec<MockRoute>,
-    }
-
-    impl MockHttpClient {
-        fn new() -> Self {
-            Self { routes: vec![] }
-        }
-
-        fn on(mut self, method: HttpMethod, path: &str, status: u16, body: &str) -> Self {
-            self.routes.push(MockRoute {
-                method,
-                path: path.to_string(),
-                status,
-                response_body: body.to_string(),
-                assert_header: None,
-                assert_body_json: None,
-            });
-            self
-        }
-
-        fn with_req_header(mut self, name: &str, value: &str) -> Self {
-            self.routes.last_mut().unwrap().assert_header =
-                Some((name.to_string(), MockHeaderCheck::Equals(value.to_string())));
-            self
-        }
-
-        fn with_req_body(mut self, json_str: &str) -> Self {
-            self.routes.last_mut().unwrap().assert_body_json =
-                Some(serde_json::from_str(json_str).unwrap());
-            self
-        }
-    }
-
-    impl HttpClient for MockHttpClient {
-        async fn request(
-            &self,
-            method: HttpMethod,
-            url: &str,
-            headers: &[(&str, &str)],
-            body: Option<&serde_json::Value>,
-        ) -> anyhow::Result<HttpResponse> {
-            for route in &self.routes {
-                if method == route.method && url.ends_with(&route.path) {
-                    if let Some((name, MockHeaderCheck::Equals(expected))) = &route.assert_header {
-                        let (_, v) = headers
-                            .iter()
-                            .find(|(k, _)| *k == name.as_str())
-                            .unwrap_or_else(|| {
-                                panic!("Expected header '{name}' not found in request to {url}")
-                            });
-                        assert_eq!(*v, expected.as_str(), "Header '{name}' mismatch for {url}");
-                    }
-                    if let Some(expected_body) = &route.assert_body_json {
-                        let actual = body.expect("Expected request body");
-                        assert_eq!(actual, expected_body, "Request body mismatch for {url}");
-                    }
-                    return Ok(HttpResponse::new(route.status, route.response_body.clone()));
-                }
-            }
-            panic!(
-                "No mock route for {:?} {url}\nRegistered routes: {:?}",
-                method,
-                self.routes
-                    .iter()
-                    .map(|r| format!("{:?} {}", r.method, r.path))
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
+    use crate::tests_mock::{self, MockHttpClient};
 
     // -----------------------------------------------------------------------
     // create_installation_access_token — success
@@ -1894,6 +2006,62 @@ mod tests {
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .unwrap()
         );
+    }
+
+    /// The multi-repository mint sends one request listing every projected
+    /// repository name exactly once, primary first, with the shared
+    /// permissions; the installation lookup uses the primary repository.
+    #[tokio::test]
+    async fn multi_repository_mint_lists_every_repository_name_once() {
+        let access = GitHubRepositoryAccess::new(
+            Some("git@github.com:owner/repo.git"),
+            &[
+                "owner/keystone".parse().unwrap(),
+                "owner/arc".parse().unwrap(),
+            ]
+            .into_iter()
+            .collect(),
+            std::collections::HashMap::from([("contents".to_string(), "read".to_string())]),
+        )
+        .unwrap()
+        .expect("origin should produce an access value");
+
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/repos/owner/repo/installation",
+                200,
+                r#"{"id": 123}"#,
+            )
+            .on(
+                HttpMethod::Post,
+                "/app/installations/123/access_tokens",
+                201,
+                r#"{"token": "ghs_multi", "expires_at": "2026-01-01T12:00:00Z"}"#,
+            )
+            .with_req_body(
+                r#"{"permissions":{"contents":"read"},"repositories":["repo","arc","keystone"]}"#,
+            );
+
+        let creds = GitHubAppCredentials {
+            app_id:          "test".to_string(),
+            private_key_pem: test_rsa_key().to_string(),
+            slug:            None,
+        };
+
+        let token = creds
+            .mint_installation_token_for_repositories(
+                &mock,
+                access.owner(),
+                &access.repository_names(),
+                "",
+                access.permissions_json().unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(token.token, "ghs_multi");
     }
 
     #[tokio::test]
@@ -2446,13 +2614,22 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(
-            credentials,
-            (
-                Some("x-access-token".to_string()),
-                Some("ghu_test".to_string())
-            )
-        );
+        assert_eq!(credentials.username(), "x-access-token");
+        assert_eq!(credentials.password(), "ghu_test");
+        assert!(!format!("{credentials:?}").contains("ghu_test"));
+    }
+
+    #[tokio::test]
+    async fn resolve_read_only_clone_credentials_returns_static_token_unchanged() {
+        let creds = GitHubCredentials::Pat("ghu_test".to_string());
+
+        let credentials =
+            resolve_read_only_clone_credentials(&GitHubContext::new(&creds, ""), "owner", "repo")
+                .await
+                .unwrap();
+
+        assert_eq!(credentials.username(), "x-access-token");
+        assert_eq!(credentials.password(), "ghu_test");
     }
 
     #[tokio::test]
@@ -2477,9 +2654,50 @@ mod tests {
             slug:            None,
         });
         let context = GitHubContext::new(&credentials, "");
-        let token = mint_git_contents_write_token(&mock, &context, "owner", "repo")
-            .await
-            .unwrap();
+        let token = mint_git_token(
+            &mock,
+            &context,
+            "owner",
+            "repo",
+            serde_json::json!({ "contents": "write" }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(token, "ghs_xxx");
+    }
+
+    #[tokio::test]
+    async fn read_only_clone_token_requests_only_contents_read() {
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/repos/owner/repo/installation",
+                200,
+                r#"{"id": 123}"#,
+            )
+            .on(
+                HttpMethod::Post,
+                "/app/installations/123/access_tokens",
+                201,
+                r#"{"token": "ghs_xxx", "expires_at": "2099-01-01T00:00:00Z"}"#,
+            )
+            .with_req_body(r#"{"permissions":{"contents":"read"},"repositories":["repo"]}"#);
+        let credentials = GitHubCredentials::App(GitHubAppCredentials {
+            app_id:          "test".to_string(),
+            private_key_pem: test_rsa_key().to_string(),
+            slug:            None,
+        });
+        let context = GitHubContext::new(&credentials, "");
+        let token = mint_git_token(
+            &mock,
+            &context,
+            "owner",
+            "repo",
+            serde_json::json!({ "contents": "read" }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(token, "ghs_xxx");
     }

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use croner::errors::CronError;
+use fabro_types::{GitCoordinateValidationError, TargetValidationError};
 use toml::de::Error as TomlDeError;
 use toml::ser::Error as TomlSerError;
 
@@ -14,10 +15,20 @@ pub enum AutomationValidationError {
     InvalidAutomationTriggerId { value: String },
     #[error("automation name must not be empty")]
     EmptyName,
-    #[error("repository slug {value:?} must be a GitHub owner/repo slug")]
-    InvalidRepositorySlug { value: String },
-    #[error("git ref selector {value:?} is not safe")]
-    InvalidGitRefSelector { value: String },
+    #[error("automation environment is required")]
+    MissingEnvironment,
+    #[error("automation target kind {kind:?} is not supported; only Git targets are accepted")]
+    UnsupportedTarget { kind: String },
+    #[error("automation Git target is invalid")]
+    InvalidTarget {
+        #[source]
+        source: TargetValidationError,
+    },
+    #[error("automation workflow source is invalid")]
+    InvalidWorkflowSource {
+        #[source]
+        source: GitCoordinateValidationError,
+    },
     #[error("workflow selector {value:?} is not safe")]
     InvalidWorkflowSelector { value: String },
     #[error("duplicate automation trigger id {id:?}")]
@@ -94,6 +105,8 @@ pub enum AutomationStoreError {
     },
     #[error("stored automation {id} has an invalid trigger row")]
     StoredTriggerShape { id: AutomationId },
+    #[error("stored automation {id} has a partial workflow source coordinate")]
+    StoredWorkflowSourceShape { id: AutomationId },
     #[error("stored automation {id} has an invalid revision")]
     InvalidRevision {
         id:     AutomationId,
@@ -137,6 +150,14 @@ pub enum AutomationStoreError {
         #[source]
         source:      std::io::Error,
     },
+    #[error(
+        "legacy automation target at {path:?} cannot be migrated; edit target.ref to a branch, supported heads/tags selector, HEAD, or 40-hex SHA and restart"
+    )]
+    LegacyTarget {
+        path:   PathBuf,
+        #[source]
+        source: TargetValidationError,
+    },
 }
 
 impl AutomationStoreError {
@@ -172,6 +193,7 @@ impl AutomationStoreError {
             Self::StoredValidation { .. } => "stored_validation",
             Self::StoredId { .. } => "stored_id",
             Self::StoredTriggerShape { .. } => "stored_trigger_shape",
+            Self::StoredWorkflowSourceShape { .. } => "stored_workflow_source_shape",
             Self::InvalidRevision { .. } => "invalid_revision",
             Self::Db { .. } => "db",
             Self::InvalidFilename { .. } => "invalid_filename",
@@ -179,6 +201,7 @@ impl AutomationStoreError {
             Self::Serialize { .. } => "serialize",
             Self::Io { .. } => "io",
             Self::LegacyBackup { .. } => "legacy_backup",
+            Self::LegacyTarget { .. } => "legacy_target",
         }
     }
 }

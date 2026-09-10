@@ -1,0 +1,55 @@
+---
+source: lib/components/fabro-llm/tests/it/wire/openai_compatible.rs
+expression: rendered
+---
+{
+  "id": "chatcmpl_venice_test",
+  "model": "test-model",
+  "provider": "openai-compatible",
+  "message": {
+    "role": "assistant",
+    "content": [
+      {
+        "kind": "text",
+        "data": "ok"
+      }
+    ]
+  },
+  "finish_reason": "stop",
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 2,
+    "reasoning_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0
+  },
+  "raw": {
+    "id": "chatcmpl_venice_test",
+    "object": "chat.completion",
+    "created": 1700000000,
+    "model": "test-model",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "ok"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "cost": {
+      "usd": 0.00042,
+      "diem": 0.0
+    },
+    "usage": {
+      "prompt_tokens": 12,
+      "completion_tokens": 2,
+      "total_tokens": 14
+    }
+  },
+  "warnings": [],
+  "rate_limit": null,
+  "cost_usd": 0.00042,
+  "cost_source": "authoritative"
+}

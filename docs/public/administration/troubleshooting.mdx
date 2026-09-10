@@ -17,7 +17,7 @@ It checks:
 
 - Local user config and storage directory health
 - Server-reported LLM provider connectivity, with configured providers probed concurrently
-- GitHub App, sandbox, and Brave Search credentials, plus Docker daemon reachability when the Docker sandbox provider is enabled
+- GitHub App, sandbox, and web search credentials (Brave or Venice), plus Docker daemon reachability when the Docker sandbox provider is enabled
 - Server authentication and crypto configuration
 
 LLM provider probe failures are reported as errors. Use `--verbose` to see the underlying provider error chain when a key, network route, or model endpoint fails.

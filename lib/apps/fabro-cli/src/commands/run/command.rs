@@ -15,7 +15,7 @@ pub(crate) async fn execute(mut args: RunArgs, base_ctx: &CommandContext) -> Res
 
     let quiet = args.detach;
     let prevent_idle_sleep = ctx.user_settings().cli.exec.prevent_idle_sleep;
-    let created_run = Box::pin(super::create::create_run(&ctx, &args, styles, quiet)).await?;
+    let created_run = Box::pin(super::create::create_run(&ctx, &args, styles)).await?;
 
     if !quiet {
         fabro_util::printerr!(

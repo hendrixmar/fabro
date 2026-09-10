@@ -4,8 +4,11 @@ use fabro_types::graph::Graph;
 use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext, RunSpec};
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
-use fabro_types::test_support::test_run_provenance;
-use fabro_types::{AutomationRef, WorkflowSettings, fixtures};
+use fabro_types::test_support::{test_run_provenance, test_workflow_version_id};
+use fabro_types::{
+    AutomationRef, GitRunTarget, ResolvedAutomationGitWorkflowSource, RunTarget, WorkflowSettings,
+    fixtures,
+};
 
 fn templated_settings() -> WorkflowSettings {
     let mut settings = WorkflowSettings::default();
@@ -16,28 +19,43 @@ fn templated_settings() -> WorkflowSettings {
 #[test]
 fn run_spec_round_trips_templated_settings() {
     let record = RunSpec {
-        run_id:           fixtures::RUN_1,
-        settings:         templated_settings(),
-        graph:            Graph::new("ship"),
-        graph_source:     None,
-        workflow_slug:    Some("demo".to_string()),
-        automation:       Some(AutomationRef {
-            id:         "nightly".to_string(),
-            name:       Some("Nightly".to_string()),
-            trigger_id: Some("schedule_1".to_string()),
+        run_id:              fixtures::RUN_1,
+        settings:            templated_settings(),
+        graph:               Graph::new("ship"),
+        graph_source:        None,
+        workflow_slug:       Some("demo".to_string()),
+        workflow_version_id: Some(test_workflow_version_id()),
+        target:              Some(RunTarget::Git(GitRunTarget {
+            repo:   "fabro-sh/fabro".to_string(),
+            branch: "main".to_string(),
+            tag:    None,
+            sha:    Some("abc123".to_string()),
+        })),
+        automation:          Some(AutomationRef {
+            id:              "nightly".to_string(),
+            name:            Some("Nightly".to_string()),
+            trigger_id:      Some("schedule_1".to_string()),
+            workflow_source: Some(Box::new(ResolvedAutomationGitWorkflowSource {
+                repo:         "fabro-sh/workflows".to_string(),
+                branch:       "main".to_string(),
+                tag:          None,
+                sha:          None,
+                resolved_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            })),
         }),
-        source_directory: Some("/Users/client/project".to_string()),
-        labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
-        provenance:       test_run_provenance(),
-        manifest_blob:    None,
-        definition_blob:  None,
-        git:              Some(GitContext {
+        source_directory:    Some("/Users/client/project".to_string()),
+        labels:              HashMap::from([("team".to_string(), "platform".to_string())]),
+        provenance:          test_run_provenance(),
+        manifest_blob:       None,
+        definition_blob:     None,
+        spec_blob:           None,
+        git:                 Some(GitContext {
             origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
             branch:     "main".to_string(),
             sha:        Some("abc123".to_string()),
             dirty:      DirtyStatus::Clean,
         }),
-        fork_source_ref:  Some(ForkSourceRef {
+        fork_source_ref:     Some(ForkSourceRef {
             source_run_id:  fixtures::RUN_2,
             checkpoint_sha: "def456".to_string(),
         }),
@@ -58,6 +76,16 @@ fn run_spec_round_trips_templated_settings() {
     assert_eq!(json["fork_source_ref"]["checkpoint_sha"], "def456");
     assert_eq!(json["automation"]["id"], "nightly");
     assert_eq!(json["automation"]["trigger_id"], "schedule_1");
+    assert_eq!(json["automation"]["workflow_source"]["branch"], "main");
+    assert_eq!(
+        json["automation"]["workflow_source"]["resolved_sha"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(
+        json["workflow_version_id"],
+        test_workflow_version_id().to_string()
+    );
+    assert_eq!(json["target"]["kind"], "git");
     let round_trip: RunSpec =
         serde_json::from_value(json.clone()).expect("record should deserialize");
 
@@ -84,4 +112,9 @@ fn run_spec_defaults_automation_for_legacy_specs() {
     let record: RunSpec = serde_json::from_value(json).expect("legacy spec should deserialize");
 
     assert_eq!(record.automation, None);
+    assert_eq!(record.workflow_version_id, None);
+    assert_eq!(record.target, None);
+
+    let round_trip = serde_json::to_value(&record).expect("record should serialize");
+    assert!(round_trip.get("workflow_version_id").is_none());
 }

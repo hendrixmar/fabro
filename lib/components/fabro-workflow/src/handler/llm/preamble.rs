@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use fabro_graphviz::graph::{Graph, Node, is_llm_handler_type};
 
-use crate::artifact::{artifact_path, format_artifact_reference};
+use crate::artifact::{self, PromptLargeValue};
 use crate::context::{Context, WorkflowContext, keys};
 use crate::outcome::{Outcome, OutcomeExt};
 
@@ -96,23 +96,49 @@ fn is_blank_value(val: Option<&serde_json::Value>) -> bool {
     val.and_then(|v| v.as_str()).is_some_and(str::is_empty)
 }
 
-fn is_context_key_excluded(key: &str) -> bool {
-    key.starts_with(keys::INTERNAL_PREFIX)
-        || key.starts_with(keys::CURRENT_PREFIX)
-        || key.starts_with(keys::GRAPH_PREFIX)
-        || key.starts_with(keys::THREAD_PREFIX)
-        || key.starts_with(keys::RESPONSE_PREFIX)
-        || key == keys::OUTCOME
-        || key == keys::LAST_STAGE
-        || key == keys::LAST_RESPONSE
-        || key == keys::PREFERRED_LABEL
-}
-
 fn format_value(val: &serde_json::Value) -> String {
+    if let Some(large) = artifact::prompt_large_value(val) {
+        return format!(
+            "{}; Preview: {}",
+            large.location_summary(),
+            format_preview(large.preview, "")
+        );
+    }
     match val.as_str() {
         Some(s) => s.to_string(),
         None => val.to_string(),
     }
+}
+
+fn format_preview(preview: &str, continuation_indent: &str) -> String {
+    let separator = format!("\n{continuation_indent}");
+    let mut rendered = preview.lines().collect::<Vec<_>>().join(&separator);
+    rendered.push('…');
+    rendered
+}
+
+fn append_large_value(
+    parts: &mut Vec<String>,
+    label: &str,
+    preview_indent: &str,
+    large: PromptLargeValue<'_>,
+) {
+    parts.push(format!("{label} ({})", large.location_summary()));
+    parts.push(format!(
+        "{preview_indent}Preview: {}",
+        format_preview(large.preview, preview_indent)
+    ));
+}
+
+fn format_large_value_table_cell(large: PromptLargeValue<'_>) -> String {
+    let summary = large.location_summary().replace('|', "\\|");
+    let preview = large
+        .preview
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('|', "\\|");
+    format!("{summary}; Preview: {preview}…")
 }
 
 fn tail_lines(text: &str, max_lines: usize, indent: &str) -> String {
@@ -165,14 +191,18 @@ fn render_compact_stage_details(
                 lines.push(format!("  - Script: `{cmd}`"));
             }
             if let Some(output_val) = outcome.context_updates.get(keys::COMMAND_OUTPUT) {
-                let output = format_value(output_val);
-                if output.trim().is_empty() {
-                    lines.push("  - Output: (empty)".to_string());
+                if let Some(large) = artifact::prompt_large_value(output_val) {
+                    append_large_value(&mut lines, "  - Output", "    ", large);
                 } else {
-                    lines.push("  - Output:".to_string());
-                    lines.push("    ```".to_string());
-                    lines.push(tail_lines(output.trim(), COMPACT_OUTPUT_MAX_LINES, "    "));
-                    lines.push("    ```".to_string());
+                    let output = format_value(output_val);
+                    if output.trim().is_empty() {
+                        lines.push("  - Output: (empty)".to_string());
+                    } else {
+                        lines.push("  - Output:".to_string());
+                        lines.push("    ```".to_string());
+                        lines.push(tail_lines(output.trim(), COMPACT_OUTPUT_MAX_LINES, "    "));
+                        lines.push("    ```".to_string());
+                    }
                 }
             }
             lines
@@ -212,8 +242,13 @@ fn render_summary_high_stage_section(
                 lines.push(format!("- Script: `{cmd}`"));
             }
             if let Some(output_val) = outcome.context_updates.get(keys::COMMAND_OUTPUT) {
-                if let Some(path) = artifact_path(output_val) {
-                    lines.push(format!("- Output: {}", format_artifact_reference(path)));
+                if let Some(large) = artifact::prompt_large_value(output_val) {
+                    append_large_value(&mut lines, "- Output", "  ", large);
+                } else if let Some(path) = artifact::artifact_path(output_val) {
+                    lines.push(format!(
+                        "- Output: {}",
+                        artifact::format_artifact_reference(path)
+                    ));
                 } else {
                     let output = format_value(output_val);
                     if output.trim().is_empty() {
@@ -243,8 +278,13 @@ fn render_summary_high_stage_section(
             }
             // Include full response from context_updates (or artifact pointer)
             if let Some(resp_val) = outcome.context_updates.get(&keys::response_key(node_id)) {
-                if let Some(path) = artifact_path(resp_val) {
-                    lines.push(format!("- Response: {}", format_artifact_reference(path)));
+                if let Some(large) = artifact::prompt_large_value(resp_val) {
+                    append_large_value(&mut lines, "- Response", "  ", large);
+                } else if let Some(path) = artifact::artifact_path(resp_val) {
+                    lines.push(format!(
+                        "- Response: {}",
+                        artifact::format_artifact_reference(path)
+                    ));
                 } else {
                     let resp = format_value(resp_val);
                     if !resp.is_empty() {
@@ -280,7 +320,7 @@ fn append_filtered_context(
     let mut context_keys: Vec<&String> = snapshot
         .keys()
         .filter(|k| {
-            !is_context_key_excluded(k)
+            !keys::is_preamble_hidden_key(k)
                 && !rendered_keys.contains(*k)
                 && !is_blank_value(snapshot.get(*k))
         })
@@ -290,7 +330,11 @@ fn append_filtered_context(
         parts.push(String::from("\n## Context"));
         for key in context_keys {
             if let Some(val) = snapshot.get(key) {
-                parts.push(format!("- {key}: {}", format_value(val)));
+                if let Some(large) = artifact::prompt_large_value(val) {
+                    append_large_value(parts, &format!("- {key}"), "  ", large);
+                } else {
+                    parts.push(format!("- {key}: {}", format_value(val)));
+                }
             }
         }
     }
@@ -306,7 +350,7 @@ fn append_filtered_context_table(
     let mut context_keys: Vec<&String> = snapshot
         .keys()
         .filter(|k| {
-            !is_context_key_excluded(k)
+            !keys::is_preamble_hidden_key(k)
                 && !rendered_keys.contains(*k)
                 && !is_blank_value(snapshot.get(*k))
         })
@@ -318,7 +362,9 @@ fn append_filtered_context_table(
         parts.push("|-----|-------|".to_string());
         for key in context_keys {
             if let Some(val) = snapshot.get(key) {
-                parts.push(format!("| {key} | {} |", format_value(val)));
+                let rendered = artifact::prompt_large_value(val)
+                    .map_or_else(|| format_value(val), format_large_value_table_cell);
+                parts.push(format!("| {key} | {rendered} |"));
             }
         }
     }
@@ -566,6 +612,17 @@ mod tests {
         .unwrap()
     }
 
+    fn large_prompt_value(bytes: u64, path: &str, preview: &str) -> serde_json::Value {
+        serde_json::json!({
+            "fabroLargeValue": {
+                "bytes": bytes,
+                "path": path,
+                "hint": "too large to inline; read this file for the full value",
+                "preview": preview,
+            }
+        })
+    }
+
     // --- truncate mode ---
 
     #[test]
@@ -706,6 +763,74 @@ mod tests {
             "should include user.name context key"
         );
         assert!(preamble.contains("alice"), "should include context value");
+    }
+
+    #[test]
+    fn compact_preamble_renders_large_values_without_marker_chrome() {
+        let mut graph = Graph::new("test");
+        graph.attrs.insert(
+            "goal".to_string(),
+            AttrValue::String("Review security findings".to_string()),
+        );
+        let mut scan = Node::new("scan");
+        scan.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("parallelogram".to_string()),
+        );
+        scan.attrs.insert(
+            "script".to_string(),
+            AttrValue::String("scan --json".to_string()),
+        );
+        graph.nodes.insert("scan".to_string(), scan);
+
+        let context = Context::new();
+        context.set(
+            "security_findings",
+            large_prompt_value(
+                1_843_279,
+                "/tmp/fabro/runtime/blobs/findings.json",
+                "{\"findings\":[\n{\"severity\":\"high\"}",
+            ),
+        );
+        let completed_nodes = vec!["scan".to_string()];
+        let mut outcome = Outcome::success();
+        outcome.context_updates.insert(
+            keys::COMMAND_OUTPUT.to_string(),
+            large_prompt_value(
+                12 * 1024,
+                "/tmp/fabro/runtime/blobs/output.json",
+                "first result\nsecond result",
+            ),
+        );
+        let node_outcomes = HashMap::from([("scan".to_string(), outcome)]);
+
+        let preamble = build_preamble(
+            keys::Fidelity::Compact,
+            &context,
+            &graph,
+            &completed_nodes,
+            &node_outcomes,
+        );
+
+        assert_eq!(
+            preamble,
+            concat!(
+                "Goal: Review security findings\n",
+                "\n## Completed stages\n",
+                "- **scan**: succeeded\n",
+                "  - Script: `scan --json`\n",
+                "  - Output (12.0 KB; full value: `/tmp/fabro/runtime/blobs/output.json`)\n",
+                "    Preview: first result\n",
+                "    second result…\n",
+                "\n## Context\n",
+                "- security_findings (1.8 MB; full value: ",
+                "`/tmp/fabro/runtime/blobs/findings.json`)\n",
+                "  Preview: {\"findings\":[\n",
+                "  {\"severity\":\"high\"}…\n",
+            )
+        );
+        assert!(!preamble.contains("fabroLargeValue"));
+        assert!(!preamble.contains("too large to inline"));
     }
 
     #[test]
@@ -1571,6 +1696,35 @@ mod tests {
     }
 
     #[test]
+    fn summary_high_table_compacts_large_value_preview() {
+        let graph = Graph::new("test");
+        let context = Context::new();
+        context.set(
+            "security_findings",
+            large_prompt_value(
+                1_843_279,
+                "/tmp/fabro/runtime/blobs/findings.json",
+                "{\"findings\": [\n{\"message\": \"a | b\"}]}",
+            ),
+        );
+
+        let preamble = build_preamble(
+            keys::Fidelity::SummaryHigh,
+            &context,
+            &graph,
+            &[],
+            &HashMap::new(),
+        );
+
+        assert!(preamble.contains(concat!(
+            "| security_findings | 1.8 MB; full value: ",
+            "`/tmp/fabro/runtime/blobs/findings.json`; Preview: ",
+            "{\"findings\": [ {\"message\": \"a \\| b\"}]}… |",
+        )));
+        assert!(!preamble.contains("fabroLargeValue"));
+    }
+
+    #[test]
     fn summary_high_pipeline_progress_count() {
         let mut graph = Graph::new("test");
         // Create 4 nodes total (including start/exit)
@@ -1603,29 +1757,29 @@ mod tests {
         );
     }
 
-    // --- is_context_key_excluded ---
+    // --- is_preamble_hidden_key ---
 
     #[test]
-    fn is_context_key_excluded_checks() {
-        assert!(is_context_key_excluded(keys::INTERNAL_FIDELITY));
-        assert!(is_context_key_excluded(&keys::retry_count_key("plan")));
-        assert!(is_context_key_excluded(keys::CURRENT_NODE));
-        assert!(is_context_key_excluded(keys::CURRENT_PREAMBLE));
-        assert!(is_context_key_excluded(&keys::graph_attr_key(
+    fn is_preamble_hidden_key_checks() {
+        assert!(keys::is_preamble_hidden_key(keys::INTERNAL_FIDELITY));
+        assert!(keys::is_preamble_hidden_key(&keys::retry_count_key("plan")));
+        assert!(keys::is_preamble_hidden_key(keys::CURRENT_NODE));
+        assert!(keys::is_preamble_hidden_key(keys::CURRENT_PREAMBLE));
+        assert!(keys::is_preamble_hidden_key(&keys::graph_attr_key(
             "default_fidelity"
         )));
-        assert!(is_context_key_excluded(keys::GRAPH_GOAL));
-        assert!(is_context_key_excluded(&keys::thread_current_node_key(
-            "main"
-        )));
-        assert!(is_context_key_excluded(&keys::response_key("plan")));
-        assert!(is_context_key_excluded(keys::OUTCOME));
-        assert!(is_context_key_excluded(keys::LAST_STAGE));
-        assert!(is_context_key_excluded(keys::LAST_RESPONSE));
-        assert!(is_context_key_excluded(keys::PREFERRED_LABEL));
-        assert!(!is_context_key_excluded("user.name"));
-        assert!(!is_context_key_excluded("custom.key"));
-        assert!(!is_context_key_excluded(keys::COMMAND_OUTPUT));
+        assert!(keys::is_preamble_hidden_key(keys::GRAPH_GOAL));
+        assert!(keys::is_preamble_hidden_key(
+            &keys::thread_current_node_key("main")
+        ));
+        assert!(keys::is_preamble_hidden_key(&keys::response_key("plan")));
+        assert!(keys::is_preamble_hidden_key(keys::OUTCOME));
+        assert!(keys::is_preamble_hidden_key(keys::LAST_STAGE));
+        assert!(keys::is_preamble_hidden_key(keys::LAST_RESPONSE));
+        assert!(keys::is_preamble_hidden_key(keys::PREFERRED_LABEL));
+        assert!(!keys::is_preamble_hidden_key("user.name"));
+        assert!(!keys::is_preamble_hidden_key("custom.key"));
+        assert!(!keys::is_preamble_hidden_key(keys::COMMAND_OUTPUT));
     }
 
     // --- meta node filtering ---

@@ -221,7 +221,7 @@ impl Estimator {
         let mut tokens =
             estimate_text_tokens(&result.tool_call_id) + estimate_json_tokens(&result.content);
         if let Some(image_data) = &result.image_data {
-            tokens += estimate_embedded_bytes(image_data.len());
+            tokens += estimate_byte_tokens(image_data.len());
             self.warn(
                 MEDIA_ESTIMATE_WARNING,
                 "Media content couldn't be precisely tokenized; total is approximate.",
@@ -243,7 +243,7 @@ impl Estimator {
             + image
                 .data
                 .as_ref()
-                .map_or(2000, |data| estimate_embedded_bytes(data.len()).max(2000))
+                .map_or(2000, |data| estimate_byte_tokens(data.len()).max(2000))
     }
 
     fn estimate_audio(&mut self, audio: &AudioData) -> usize {
@@ -252,7 +252,7 @@ impl Estimator {
             + audio
                 .data
                 .as_ref()
-                .map_or(2000, |data| estimate_embedded_bytes(data.len()))
+                .map_or(2000, |data| estimate_byte_tokens(data.len()))
     }
 
     fn estimate_document(&mut self, document: &DocumentData) -> usize {
@@ -265,7 +265,7 @@ impl Estimator {
             + document
                 .data
                 .as_ref()
-                .map_or(2000, |data| estimate_embedded_bytes(data.len()))
+                .map_or(2000, |data| estimate_byte_tokens(data.len()))
     }
 
     fn estimate_media_common(&mut self, url: Option<&str>, media_type: Option<&str>) -> usize {
@@ -292,7 +292,9 @@ fn estimate_tool(tool: &ToolDefinition) -> usize {
         + estimate_json_tokens(&tool.parameters)
 }
 
-fn estimate_embedded_bytes(byte_len: usize) -> usize {
+/// Approximate the token cost of a raw byte payload (4 bytes per token).
+#[must_use]
+pub fn estimate_byte_tokens(byte_len: usize) -> usize {
     byte_len.div_ceil(4)
 }
 

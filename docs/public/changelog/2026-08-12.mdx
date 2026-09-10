@@ -1,0 +1,10 @@
+---
+title: "Safer workflow root paths"
+date: "2026-08-12"
+---
+
+## More
+
+<Accordion title="Fixes">
+- Workflow bundling once again normalizes relative root paths before reading them, rejects `~`-prefixed roots, and prevents `..` segments from resolving through a symlink to a different file
+</Accordion>

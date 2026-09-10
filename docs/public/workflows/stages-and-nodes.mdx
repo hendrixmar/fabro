@@ -198,6 +198,8 @@ keeps the results in input order. The source lookup is flat:
 `context.candidates` checks that exact key and then `candidates`; it does not
 traverse nested objects.
 
+Each item can contribute up to 64 KiB of serialized JSON to its branch prompt. Fabro stores larger items as content-addressed blobs and replaces the inline item with its size, a readable file path, and a 300-character preview. The preview remains inside the untrusted-data fence, and the branch agent can read the file for the full item.
+
 The template target must be an agent or prompt node, and nested `for_each` is
 rejected. An empty source array succeeds with `parallel.results=[]` and skips
 straight to `aggregate`. Missing, invalid, non-array, or over-long sources fail

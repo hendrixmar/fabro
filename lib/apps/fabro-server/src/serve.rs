@@ -40,7 +40,7 @@ use crate::server::{
     spawn_scheduler,
 };
 use crate::server_secrets::{ServerSecrets, process_env_snapshot};
-use crate::startup::{migrate_startup_vault, resolve_startup, validate_startup_configuration};
+use crate::startup::{resolve_startup, validate_startup_configuration};
 use crate::{migrations, static_files};
 
 pub const DEFAULT_TCP_PORT: u16 = 32276;
@@ -667,7 +667,6 @@ where
     let resolved_server_settings = resolved_app_settings.server_settings.server.clone();
     validate_startup_configuration(&resolved_server_settings)?;
     let env_entries = process_env_snapshot();
-    migrate_startup_vault(&vault_path);
     let bind_request = resolve_bind_request_from_server_settings(
         &resolved_app_settings.server_settings,
         args.bind.as_deref(),
@@ -681,30 +680,6 @@ where
         .await
         .with_context(|| format!("importing legacy secrets file {}", vault_path.display()))?;
     let secret_store = fabro_vault::SecretStore::new(database.clone_pool());
-    let optional_report = migrations::migrate_optional_server_env_secrets_to_store(
-        &secret_store,
-        &server_env_path,
-        &env_entries,
-    )
-    .await
-    .context("migrate optional server env secrets into SQLite")?;
-    for warning in &optional_report.warnings {
-        warn!(
-            warning = %warning,
-            removal_deadline = migrations::OPTIONAL_SERVER_ENV_SECRETS_REMOVAL_DEADLINE,
-            "Optional server env secrets migration warning"
-        );
-    }
-    if optional_report.changed() {
-        warn!(
-            migrated_secrets = optional_report.migrated_secrets,
-            removed_env_entries = optional_report.removed_env_entries,
-            preserved_env_entries = optional_report.preserved_env_entries,
-            backup_path = ?optional_report.backup_path,
-            removal_deadline = migrations::OPTIONAL_SERVER_ENV_SECRETS_REMOVAL_DEADLINE,
-            "Migrated optional server env secrets into SQLite"
-        );
-    }
     let startup_vault = secret_store
         .snapshot()
         .await
@@ -774,14 +749,36 @@ where
     } else {
         None
     };
-    let store = Arc::new(fabro_store::Database::new(
+    let blob_activation = migrations::activate_blob_storage(
+        &database,
+        &sqlite_path,
         object_store,
         slatedb_prefix,
         flush_interval,
         cache_path,
-    ));
-    let auth_code_store = store.auth_codes().await?;
-    let auth_token_store = store.refresh_tokens().await?;
+    )
+    .await
+    .context("activating SQLite blob storage")?;
+    migrations::activate_run_history(
+        &database,
+        &sqlite_path,
+        &blob_activation.store,
+        &blob_activation.run_history_identity,
+    )
+    .await
+    .context("activating SQLite run history")?;
+    let store = blob_activation.store;
+    // Refresh tokens now live in SQLite. Nothing reads the old records and no
+    // reaper collects them any more, so clear them out once rather than
+    // leaving them in the object store forever. Pending authorization codes
+    // also moved to SQLite, but their old records are left in place: at most a
+    // handful exist at cutover, every binary rejects them within 60 seconds of
+    // issue, and nothing reads their keyspace again.
+    match store.retire_refresh_token_keyspace().await {
+        Ok(0) => {}
+        Ok(removed) => info!(removed, "Removed retired SlateDB refresh token records"),
+        Err(err) => warn!(error = %err, "Failed to remove retired SlateDB refresh token records"),
+    }
     let (artifact_object_store, artifact_prefix) = build_artifact_object_store_with_server_secrets(
         &resolved_server_settings,
         &server_secrets,
@@ -812,12 +809,6 @@ where
         #[cfg(any(test, feature = "test-support"))]
         automation_materializer_override: None,
     })?;
-    state
-        .stores
-        .runs
-        .warm_projection_cache()
-        .await
-        .context("warming run projection cache and reconciling run summaries")?;
     let reconciled = reconcile_incomplete_runs_on_startup(&state).await?;
     if reconciled > 0 {
         info!(
@@ -849,8 +840,8 @@ where
     .await?;
 
     spawn_auth_store_reapers(
-        Arc::clone(&auth_code_store),
-        Arc::clone(&auth_token_store),
+        Arc::clone(&state.stores.auth_codes),
+        Arc::clone(&state.stores.auth_sessions),
         shutdown.clone(),
     );
 
@@ -1120,11 +1111,11 @@ async fn shutdown_signal() {
 
 fn spawn_auth_store_reapers(
     auth_codes: Arc<fabro_store::AuthCodeStore>,
-    auth_tokens: Arc<fabro_store::RefreshTokenStore>,
+    auth_sessions: Arc<fabro_store::AuthSessionStore>,
     shutdown: CancellationToken,
 ) {
     spawn_auth_code_reaper(auth_codes, shutdown.clone());
-    spawn_refresh_token_reaper(auth_tokens, shutdown);
+    spawn_refresh_token_reaper(auth_sessions, shutdown);
 }
 
 fn spawn_auth_code_reaper(
@@ -1149,7 +1140,7 @@ fn spawn_auth_code_reaper(
 }
 
 fn spawn_refresh_token_reaper(
-    auth_tokens: Arc<fabro_store::RefreshTokenStore>,
+    auth_sessions: Arc<fabro_store::AuthSessionStore>,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -1161,7 +1152,7 @@ fn spawn_refresh_token_reaper(
                 () = shutdown.cancelled() => break,
                 _ = interval.tick() => {
                     let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
-                    if let Err(err) = auth_tokens.gc_expired(cutoff).await {
+                    if let Err(err) = auth_sessions.gc_expired(cutoff).await {
                         warn!(error = %err, "Failed to garbage collect expired refresh tokens");
                     }
                 }

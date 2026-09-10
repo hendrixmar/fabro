@@ -152,7 +152,8 @@ fn inspect_resolves_selector_via_server_endpoint() {
                 "commit_timeout_ms": 30000
               },
               "clone": {
-                "enabled": true
+                "enabled": true,
+                "depth": 100
               },
               "run_branch": {
                 "enabled": true,
@@ -385,7 +386,7 @@ fn inspect_completed_run_shows_run_start_conclusion_checkpoint() {
         "conclusion": {
           "status": "succeeded",
           "timing": "[TIMING]",
-          "stage_count": null
+          "stage_count": 3
         },
         "checkpoint": {
           "current_node": "report",
@@ -457,7 +458,7 @@ fn inspect_completed_run_reads_store_without_disk_metadata_files() {
         "conclusion": {
           "status": "succeeded",
           "timing": "[TIMING]",
-          "stage_count": null
+          "stage_count": 3
         },
         "checkpoint": {
           "current_node": "report",
@@ -517,7 +518,7 @@ fn inspect_git_backed_run_exposes_checkpoint_and_sandbox_state() {
           "status": "succeeded",
           "timing": "[TIMING]",
           "final_git_commit_sha": "[SHA]",
-          "stage_count": null
+          "stage_count": 3
         },
         "checkpoint": {
           "current_node": "step_two",

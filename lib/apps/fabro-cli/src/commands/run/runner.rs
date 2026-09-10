@@ -161,13 +161,13 @@ pub(crate) async fn execute(
         artifact_sink,
         run_control: Some(run_control),
         github_app,
-        github_permissions: run_spec
+        github_integration: run_spec
             .settings
             .run
             .integrations
             .github
-            .resolve_permissions()
-            .context("failed to resolve github permissions")?,
+            .resolve_integration()
+            .context("failed to resolve github integration")?,
         vault,
         catalog,
         on_node: None,
@@ -1762,7 +1762,10 @@ mod tests {
                 .parse::<EnvironmentProvider>()
                 .expect("test provider should parse");
             run.integrations = RunIntegrationsSettings {
-                github: RunIntegrationsGithubSettings { permissions },
+                github: RunIntegrationsGithubSettings {
+                    permissions,
+                    ..RunIntegrationsGithubSettings::default()
+                },
             };
             run
         }

@@ -57,7 +57,7 @@ pub(crate) async fn generate_title_or_current(input: GenerateTitleInput<'_>) -> 
     let result = match generate::generate_object(params, title_response_schema()).await {
         Ok(result) => result,
         Err(err) => {
-            tracing::debug!(error = %err, "Run title generation failed");
+            tracing::warn!(run_id = %input.prompt.run_id, error = %err, "Run title generation failed");
             return current_title;
         }
     };

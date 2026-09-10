@@ -1,0 +1,27 @@
+---
+title: "Empty run workspaces and more reliable Daytona activation"
+date: "2026-08-23"
+---
+
+Version-backed run intents can now use `{ "kind": "none" }` when a workflow
+should start without a repository. The target creates an empty Docker or
+Daytona workspace and suppresses cloning even when the resolved workflow
+settings enable it.
+
+Local environments reject the `none` target. Server-managed Local scratch
+workspaces remain a separate future capability.
+
+Run intents can also use
+`{ "kind": "folder", "path": "/absolute/server/path" }` with a Local
+environment to execute in an existing server directory. Fabro resolves the
+submitted path to an existing canonical directory, persists that path, and
+uses it instead of the environment's `cwd`. Folder targets are intended for
+trusted single-tenant deployments and are rejected by Docker and Daytona.
+They execute in place without Fabro Git checkpoints, so retries retain the
+folder target while fork and rewind remain unavailable.
+
+## More
+
+<Accordion title="Fixes">
+- Daytona snapshot activation now allows the provider more time to finish before Fabro reports a timeout
+</Accordion>

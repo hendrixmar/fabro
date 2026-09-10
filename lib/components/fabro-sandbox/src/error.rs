@@ -18,6 +18,13 @@ pub enum Error {
         source:  Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    #[error("{message}")]
+    AnyhowContext {
+        message: String,
+        #[source]
+        source:  anyhow::Error,
+    },
+
     #[cfg(feature = "docker")]
     #[error("Failed to connect to Docker daemon")]
     DockerConnect {
@@ -65,6 +72,13 @@ impl Error {
         Self::Context {
             message: message.into(),
             source:  Box::new(source),
+        }
+    }
+
+    pub fn context_anyhow(message: impl Into<String>, source: anyhow::Error) -> Self {
+        Self::AnyhowContext {
+            message: message.into(),
+            source,
         }
     }
 

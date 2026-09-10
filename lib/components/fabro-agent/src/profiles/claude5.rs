@@ -18,6 +18,7 @@ use crate::todo_tools::{
     make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
 };
 use crate::tool_registry::ToolRegistry;
+use crate::web_search::SearchBackend;
 
 const CORE_PROMPT: &str = include_str!("prompts/claude5.md.j2");
 
@@ -43,8 +44,8 @@ impl Claude5Profile {
         registry.register(claude5_tools::make_edit_tool());
         registry.register(claude5_tools::make_bash_tool(options));
         registry.register(claude5_tools::make_web_fetch_tool(summarizer));
-        if let Some(api_key) = &options.secrets.brave_search_api_key {
-            registry.register(claude5_tools::make_web_search_tool(api_key.clone()));
+        if let Some(backend) = SearchBackend::from_secrets(&options.secrets) {
+            registry.register(claude5_tools::make_web_search_tool(backend));
         }
 
         registry.register(claude5_tools::strict_object_tool(make_task_create_tool(

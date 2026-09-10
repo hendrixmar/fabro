@@ -140,6 +140,18 @@ export function buildBoardColumns(
   });
 }
 
+export function buildFilterOptions(
+  items: RunItem[],
+  pick: (item: RunItem) => string,
+  selected: string,
+): string[] {
+  const values = new Set(items.map(pick));
+  // Keep the active selection visible even when no loaded run matches it,
+  // e.g. a stored repo filter while paginating the list view.
+  if (selected !== "all") values.add(selected);
+  return Array.from(values).sort();
+}
+
 export function placeArchivedColumnLast(columns: Column[], includeArchived: boolean): Column[] {
   if (!includeArchived) return columns;
   const archived = columns.find((column) => column.id === "archived");
@@ -771,18 +783,18 @@ export default function Runs() {
   );
   const hasGitHubAuth = authConfig.data?.methods.includes("github") === true;
   const serverUrl = systemInfo.data?.server_url;
-  const allRepos = Array.from(
-    new Set(
-      initialColumns.flatMap((col: Column) => col.items.map((item: RunItem) => String(item.repo))),
-    ),
+  // Filter options come from the loaded runs: all runs in columns view, the
+  // current page in list view (until a facets endpoint provides the full set).
+  const filterSourceItems: RunItem[] =
+    view === "list"
+      ? (listRunsPage.data?.data ?? []).map(mapRunListItem)
+      : initialColumns.flatMap((col: Column) => col.items);
+  const allRepos = buildFilterOptions(filterSourceItems, (item) => item.repo, repoFilter);
+  const allWorkflows = buildFilterOptions(
+    filterSourceItems,
+    (item) => item.workflow,
+    workflowFilter,
   );
-  allRepos.sort();
-  const allWorkflows = Array.from(
-    new Set(
-      initialColumns.flatMap((col: Column) => col.items.map((item: RunItem) => String(item.workflow))),
-    ),
-  );
-  allWorkflows.sort();
   const [columnsState, setColumnsState] = useState(() => ({
     base:    initialColumns,
     columns: initialColumns,

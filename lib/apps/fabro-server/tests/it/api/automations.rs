@@ -2,31 +2,32 @@ use std::path::{Path, PathBuf};
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use fabro_automation::AutomationGitWorkflowSource;
 use fabro_config::Storage;
 use fabro_server::server::build_router;
 use fabro_server::test_support::{
     TestAppStateBuilder, TestAutomationRunMaterializer, build_test_router, test_auth_mode,
 };
 use fabro_static::EnvVars;
+use fabro_types::GitRunTarget;
 use serde_json::{Value, json};
 use sqlx::Row as _;
 use tower::ServiceExt;
 
-use crate::helpers::{
-    MINIMAL_DOT, api, checked_response, minimal_manifest_json, response_json, response_status,
-    run_json,
-};
+use crate::helpers::{api, checked_response, response_json, response_status, run_json};
 
 fn automation_body(id: &str, name: &str) -> Value {
     json!({
         "id": id,
         "name": name,
         "description": "Runs on a schedule.",
+        "environment_id": "default",
         "target": {
-            "repository": "fabro-sh/fabro",
-            "ref": "main",
-            "workflow": "release"
+            "kind": "git",
+            "repo": "fabro-sh/fabro",
+            "branch": "main"
         },
+        "workflow": "release",
         "triggers": [
             {
                 "type": "api",
@@ -47,11 +48,13 @@ fn replacement_body(name: &str) -> Value {
     json!({
         "name": name,
         "description": null,
+        "environment_id": "default",
         "target": {
-            "repository": "fabro-sh/fabro",
-            "ref": "main",
-            "workflow": "release"
+            "kind": "git",
+            "repo": "fabro-sh/fabro",
+            "branch": "main"
         },
+        "workflow": "release",
         "triggers": [
             {
                 "type": "api",
@@ -75,23 +78,26 @@ fn automation_app() -> (axum::Router, tempfile::TempDir, PathBuf) {
 }
 
 fn automation_app_with_fake_materializer() -> (axum::Router, tempfile::TempDir, PathBuf) {
+    automation_app_with_materializer(TestAutomationRunMaterializer::succeed(GitRunTarget {
+        repo:   "fabro-sh/fabro".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+    }))
+}
+
+fn automation_app_with_materializer(
+    materializer: TestAutomationRunMaterializer,
+) -> (axum::Router, tempfile::TempDir, PathBuf) {
     let temp_dir = tempfile::tempdir().expect("automation test tempdir should be created");
     let active_config_path = temp_dir.path().join("settings.toml");
     let vault_path = temp_dir.path().join("secrets.json");
     let sqlite_path = Storage::new(temp_dir.path()).sqlite_path();
-    let materialized_manifest: fabro_api::types::RunManifest =
-        serde_json::from_value(minimal_manifest_json(MINIMAL_DOT))
-            .expect("minimal run manifest fixture should deserialize");
-    let submitted_manifest_bytes =
-        serde_json::to_vec(&materialized_manifest).expect("minimal run manifest should serialize");
     let state = TestAppStateBuilder::new()
         .active_config_path(active_config_path)
         .vault_path(vault_path)
         .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
-        .automation_materializer(TestAutomationRunMaterializer::succeed(
-            materialized_manifest,
-            submitted_manifest_bytes,
-        ))
+        .automation_materializer(materializer)
         .build();
     (build_test_router(state), temp_dir, sqlite_path)
 }
@@ -266,6 +272,7 @@ async fn create_automation_persists_sql_aggregate() {
 
     assert_eq!(body["id"], "nightly");
     assert_eq!(body["name"], "Nightly");
+    assert_eq!(body["environment_id"], "default");
     assert_eq!(
         persisted_automation(&sqlite_path, "nightly").await,
         Some(json!({
@@ -277,6 +284,57 @@ async fn create_automation_persists_sql_aggregate() {
             }]
         }))
     );
+}
+
+#[tokio::test]
+async fn create_automation_requires_an_environment() {
+    let (app, _temp_dir, _sqlite_path) = automation_app();
+    let mut body = automation_body("nightly", "Nightly");
+    body.as_object_mut()
+        .expect("automation body should be an object")
+        .remove("environment_id");
+
+    let response = app
+        .oneshot(json_request(Method::POST, "/automations", &body))
+        .await
+        .expect("create automation without environment should respond");
+    let error = response_json(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "POST /api/v1/automations without environment",
+    )
+    .await;
+
+    assert_eq!(
+        error["errors"][0]["code"],
+        "automation_environment_required"
+    );
+}
+
+#[tokio::test]
+async fn create_automation_rejects_missing_and_local_environments() {
+    let (app, _temp_dir, _sqlite_path) = automation_app();
+
+    for (environment_id, expected_code) in [
+        ("missing", "automation_environment_not_found"),
+        ("local", "automation_environment_incompatible"),
+    ] {
+        let mut body = automation_body(environment_id, "Nightly");
+        body["environment_id"] = json!(environment_id);
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, "/automations", &body))
+            .await
+            .expect("invalid automation environment should respond");
+        let error = response_json(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("POST /api/v1/automations with {environment_id} environment"),
+        )
+        .await;
+
+        assert_eq!(error["errors"][0]["code"], expected_code);
+    }
 }
 
 #[tokio::test]
@@ -909,6 +967,155 @@ async fn successful_api_triggered_automation_run_persists_automation_metadata() 
     let retrieved = run_json(&app, run_id).await;
     assert_eq!(retrieved["id"], run_id);
     assert_eq!(retrieved["automation"], created["automation"]);
+}
+
+#[tokio::test]
+async fn api_triggered_automation_uses_its_selected_environment() {
+    let (app, _temp_dir, _sqlite_path) = automation_app_with_fake_materializer();
+    let environment = json!({
+        "id": "smoke",
+        "provider": "docker",
+        "cwd": null,
+        "image": { "docker": "buildpack-deps:noble", "dockerfile": null },
+        "resources": { "cpu": 2, "memory": "4GB", "disk": null },
+        "network": { "mode": "allow_all", "allow": [] },
+        "lifecycle": { "preserve": false, "stop_on_terminal": true, "auto_stop": null },
+        "labels": {},
+        "env": {}
+    });
+    let response = app
+        .clone()
+        .oneshot(json_request(Method::POST, "/environments", &environment))
+        .await
+        .expect("create smoke environment should respond");
+    response_status(
+        response,
+        StatusCode::CREATED,
+        "POST /api/v1/environments smoke",
+    )
+    .await;
+    let mut body = automation_body("nightly", "Nightly");
+    body["environment_id"] = json!("smoke");
+    create_automation_with_body(&app, &body).await;
+
+    let created = create_automation_run(&app, "nightly", StatusCode::CREATED).await;
+    let run_id = created["id"]
+        .as_str()
+        .expect("created automation run should include id");
+    let response = app
+        .oneshot(empty_request(
+            Method::GET,
+            &format!("/runs/{run_id}/settings"),
+        ))
+        .await
+        .expect("automation run settings should respond");
+    let settings = response_json(response, StatusCode::OK, "GET /api/v1/runs/{id}/settings").await;
+
+    assert_eq!(settings["run"]["environment"]["id"], "smoke");
+}
+
+#[tokio::test]
+async fn incomplete_legacy_automation_fails_before_materialization() {
+    let materializer = TestAutomationRunMaterializer::fail_invalid_target();
+    let (app, _temp_dir, sqlite_path) = automation_app_with_materializer(materializer);
+    create_automation(&app, "nightly", "Nightly").await;
+    let database = fabro_db::Database::connect(sqlite_path)
+        .await
+        .expect("automation test database should open");
+    sqlx::query("UPDATE automations SET environment_id = NULL WHERE id = 'nightly'")
+        .execute(database.pool())
+        .await
+        .expect("test automation environment should clear");
+
+    let error = create_automation_run(&app, "nightly", StatusCode::CONFLICT).await;
+
+    assert_eq!(
+        error["errors"][0]["code"],
+        "automation_environment_required"
+    );
+}
+
+#[tokio::test]
+async fn api_triggered_run_passes_saved_workflow_source_to_materialization() {
+    let materializer = TestAutomationRunMaterializer::succeed(GitRunTarget {
+        repo:   "fabro-sh/fabro".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+    });
+    let (app, _temp_dir, _automation_dir) = automation_app_with_materializer(materializer.clone());
+    let mut body = automation_body("nightly", "Nightly");
+    body["workflow_source"] = json!({
+        "repo": "fabro-sh/workflows",
+        "branch": "main",
+        "tag": "release-v1"
+    });
+    create_automation_with_body(&app, &body).await;
+
+    let created = create_automation_run(&app, "nightly", StatusCode::CREATED).await;
+
+    let captured = materializer.captured_workflow_sources();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0],
+        Some(AutomationGitWorkflowSource {
+            repo:   "fabro-sh/workflows".to_string(),
+            branch: "main".to_string(),
+            tag:    Some("release-v1".to_string()),
+            sha:    None,
+        })
+    );
+    assert_eq!(
+        created["automation"]["workflow_source"],
+        json!({
+            "repo": "fabro-sh/workflows",
+            "branch": "main",
+            "tag": "release-v1",
+            "resolved_sha": "ffffffffffffffffffffffffffffffffffffffff"
+        })
+    );
+}
+
+#[tokio::test]
+async fn api_triggered_automation_with_missing_version_does_not_create_or_start_a_run() {
+    let materializer = TestAutomationRunMaterializer::return_unstored_version(GitRunTarget {
+        repo:   "fabro-sh/fabro".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+    });
+    let (app, _temp_dir, _automation_dir) = automation_app_with_materializer(materializer);
+    create_automation(&app, "nightly", "Nightly").await;
+
+    let error = create_automation_run(&app, "nightly", StatusCode::NOT_FOUND).await;
+
+    assert_eq!(error["errors"][0]["code"], "workflow_version_not_found");
+    let runs = list_automation_runs(&app, "/automations/nightly/runs").await;
+    assert_eq!(runs["meta"]["total"], 0);
+    assert_eq!(runs["data"], json!([]));
+}
+
+#[tokio::test]
+async fn api_workflow_source_failure_does_not_create_or_start_a_run() {
+    let materializer = TestAutomationRunMaterializer::fail_invalid_workflow_source();
+    let (app, _temp_dir, _automation_dir) = automation_app_with_materializer(materializer);
+    let mut body = automation_body("nightly", "Nightly");
+    body["workflow_source"] = json!({
+        "repo": "fabro-sh/workflows",
+        "branch": "main"
+    });
+    create_automation_with_body(&app, &body).await;
+
+    let error = create_automation_run(&app, "nightly", StatusCode::UNPROCESSABLE_ENTITY).await;
+
+    assert!(
+        error["errors"][0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("workflow source"))
+    );
+    let runs = list_automation_runs(&app, "/automations/nightly/runs").await;
+    assert_eq!(runs["meta"]["total"], 0);
+    assert_eq!(runs["data"], json!([]));
 }
 
 #[tokio::test]

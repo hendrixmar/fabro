@@ -13,7 +13,9 @@ use tokio::task;
 use crate::config::NativeToolOptions;
 use crate::sandbox::{ExecStreamingResult, GrepOptions};
 use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
+use crate::truncation::{MAX_RETAINED_TOOL_OUTPUT_BYTES, retain_tool_output};
 use crate::types::AgentEvent;
+use crate::web_search::{SearchBackend, make_web_search_tool};
 
 const MAX_WEB_FETCH_BYTES: usize = 100 * 1024;
 const MAX_READ_MANY_FILES_CONCURRENCY: usize = 8;
@@ -49,14 +51,14 @@ fn html_to_markdown(text: &str) -> String {
     converter.convert(text).unwrap_or_else(|_| text.to_string())
 }
 
-/// Name of the Brave-backed web search tool. Profiles look this up in their own
-/// registry to decide whether to advertise web search in the system prompt, so
-/// availability and prompt guidance cannot drift apart.
+/// Name of the credential-backed web search tool. Profiles look this up in
+/// their own registry to decide whether to advertise web search in the system
+/// prompt, so availability and prompt guidance cannot drift apart.
 pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
 /// Registers the core tools shared by all provider profiles: `read_file`,
 /// `write_file`, `shell`, `grep`, `glob`, and `web_fetch`. `web_search` is
-/// included when a Brave Search API key is configured.
+/// included when a Brave or Venice Search API key is configured.
 ///
 /// The shell tool captures its default and max timeouts from `options`.
 pub fn register_core_tools(
@@ -82,13 +84,13 @@ pub(crate) fn register_discovery_and_web_tools(
     registry.register(make_web_fetch_tool(summarizer));
 }
 
-/// Register `web_search` when a Brave Search key is configured.
+/// Register `web_search` when a search provider credential is configured.
 ///
 /// Separate from [`register_discovery_and_web_tools`] for profiles that offer
 /// search without fabro's discovery tools.
 pub(crate) fn register_web_search_tool(registry: &mut ToolRegistry, options: &NativeToolOptions) {
-    if let Some(api_key) = &options.secrets.brave_search_api_key {
-        registry.register(make_web_search_tool_with_api_key(api_key.clone()));
+    if let Some(backend) = SearchBackend::from_secrets(&options.secrets) {
+        registry.register(make_web_search_tool(backend));
     }
 }
 
@@ -226,7 +228,7 @@ pub fn make_edit_file_tool() -> RegisteredTool {
                 };
 
                 ctx.env
-                    .write_file(file_path, &new_content)
+                    .write_existing_file(file_path, &new_content)
                     .await
                     .map_err(|e| e.display_with_causes())?;
                 Ok(format!("Successfully edited {file_path}"))
@@ -302,6 +304,7 @@ pub(crate) async fn execute_shell_command(
             working_dir: cwd,
             env_vars: tool_env.as_ref(),
             cancel_token: Some(ctx.cancel.clone()),
+            stream_output_bytes_cap: Some(MAX_RETAINED_TOOL_OUTPUT_BYTES),
             ..crate::ExecStreamingRequest::new(command)
         })
         .await
@@ -317,11 +320,27 @@ pub(crate) async fn run_shell_command(
     cwd: Option<&str>,
 ) -> Result<String, String> {
     let streaming = execute_shell_command(ctx, command, timeout_ms, cwd).await?;
-    let text = render_shell_result(&streaming);
+    let text = retain_shell_output(ctx, &streaming, render_shell_result(&streaming));
     let is_success = streaming.result.is_success();
     emit_shell_process_completed(ctx, streaming).await;
 
     if is_success { Ok(text) } else { Err(text) }
+}
+
+/// Bound rendered shell output to the retention budget and record the capture
+/// stats for the executing tool call.
+pub(crate) fn retain_shell_output(
+    ctx: &ToolContext,
+    streaming: &ExecStreamingResult,
+    output: String,
+) -> String {
+    let retained = retain_tool_output(
+        output,
+        MAX_RETAINED_TOOL_OUTPUT_BYTES,
+        streaming.output_capture().omitted_bytes,
+    );
+    ctx.record_tool_output_stats(retained.stats);
+    retained.output
 }
 
 /// Emit the subordinate process outcome after model-facing output has been
@@ -339,6 +358,7 @@ pub(crate) async fn emit_shell_process_completed(
     let termination = streaming.result.termination;
     let duration_ms = streaming.result.duration_ms;
     let streams_separated = streaming.streams_separated;
+    let output_stats = streaming.output_capture();
     let result = streaming.result;
     let exec_output_tail =
         match task::spawn_blocking(move || result.default_redacted_output_tail()).await {
@@ -357,6 +377,9 @@ pub(crate) async fn emit_shell_process_completed(
         duration_ms,
         streams_separated,
         exec_output_tail,
+        output_bytes_observed: output_stats.observed_bytes,
+        output_bytes_retained: output_stats.retained_bytes,
+        output_bytes_omitted: output_stats.omitted_bytes,
     });
 }
 
@@ -610,102 +633,6 @@ pub(crate) fn make_list_dir_tool() -> RegisteredTool {
     }
 }
 
-fn format_brave_results(body: &serde_json::Value) -> String {
-    let results = body
-        .get("web")
-        .and_then(|w| w.get("results"))
-        .and_then(serde_json::Value::as_array);
-
-    let Some(results) = results else {
-        return "No results found.".to_string();
-    };
-
-    let mut output = String::new();
-    for (i, result) in results.iter().enumerate() {
-        let title = result
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("(no title)");
-        let url = result
-            .get("url")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("(no url)");
-        let description = result
-            .get("description")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let _ = write!(
-            output,
-            "{}. {}\n   {}\n   {}\n\n",
-            i + 1,
-            title,
-            url,
-            description
-        );
-    }
-    output
-}
-
-pub(crate) fn make_web_search_tool_with_api_key(api_key: String) -> RegisteredTool {
-    use std::sync::OnceLock;
-    static CLIENT: OnceLock<fabro_http::HttpClient> = OnceLock::new();
-
-    RegisteredTool {
-        definition: ToolDefinition {
-            name:        WEB_SEARCH_TOOL_NAME.into(),
-            description: "Search the web using Brave Search when current external information is needed. Returns result titles, URLs, and descriptions; use web_fetch for a specific URL.".into(),
-            parameters:  serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "integer", "description": "Maximum number of results (default 5, max 20)"}
-                },
-                "required": ["query"]
-            }),
-        },
-        executor:   Arc::new(move |args, _ctx| {
-            let api_key = api_key.clone();
-            Box::pin(async move {
-                let query = required_str(&args, "query")?;
-                let client = CLIENT
-                    .get_or_init(|| {
-                        fabro_http::http_client().expect("Brave Search HTTP client should build")
-                    })
-                    .clone();
-                let count = args
-                    .get("max_results")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(5)
-                    .min(20);
-
-                let resp = client
-                    .get("https://api.search.brave.com/res/v1/web/search")
-                    .header("X-Subscription-Token", &api_key)
-                    .header("Accept", "application/json")
-                    .query(&[("q", query), ("count", &count.to_string())])
-                    .send()
-                    .await
-                    .map_err(|e| format!("HTTP request failed: {e}"))?;
-
-                if !resp.status().is_success() {
-                    return Err(format!(
-                        "Brave Search API returned status {}",
-                        resp.status()
-                    ));
-                }
-
-                let body: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| format!("Failed to parse response: {e}"))?;
-
-                Ok(format_brave_results(&body))
-            })
-        }),
-        source:     ToolSource::Native,
-    }
-}
-
 #[must_use]
 pub(crate) fn make_web_fetch_tool(summarizer: Option<WebFetchSummarizer>) -> RegisteredTool {
     RegisteredTool {
@@ -827,6 +754,7 @@ mod tests {
     use crate::tool_registry::ToolContext;
     use crate::truncation;
     use crate::types::SessionEvent;
+    use crate::web_search::make_web_search_tool_with_api_key;
 
     #[test]
     fn core_tool_descriptions_include_actionable_guidance() {
@@ -1002,6 +930,7 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), "Successfully wrote to /out.txt");
+        assert_eq!(env.existing_file_write_count(), 0);
         let written = env.written_files.lock().unwrap();
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].0, "/out.txt");
@@ -1036,6 +965,7 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), "Successfully edited /f.txt");
+        assert_eq!(env.existing_file_write_count(), 1);
         let written = env.written_files.lock().unwrap();
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].1, "goodbye world");
@@ -1185,11 +1115,11 @@ mod tests {
             session_id: Some("test-session".to_string()),
             root_session_id: Some("test-session".to_string()),
             tool_call_id: Some("call_1".to_string()),
-            agent_event_emitter: Some(Arc::new(SessionBoundEmitter {
-                emitter:      emitter.clone(),
-                session_id:   "test-session".to_string(),
-                tool_call_id: Some("call_1".to_string()),
-            })),
+            agent_event_emitter: Some(Arc::new(SessionBoundEmitter::new(
+                emitter.clone(),
+                "test-session".to_string(),
+                Some("call_1".to_string()),
+            ))),
             ..shell_context(env)
         }
     }
@@ -1405,11 +1335,16 @@ mod tests {
                 duration_ms,
                 streams_separated,
                 exec_output_tail,
+                output_bytes_observed,
+                output_bytes_retained,
+                output_bytes_omitted,
             } => {
                 assert_eq!(exit_code, Some(7));
                 assert_eq!(termination, CommandTermination::Exited);
                 assert_eq!(duration_ms, 12);
                 assert!(streams_separated);
+                assert_eq!(output_bytes_observed, output_bytes_retained);
+                assert_eq!(output_bytes_omitted, 0);
                 let tail = exec_output_tail.expect("output tail");
                 assert_eq!(tail.stdout.as_deref(), Some("out"));
                 let stderr = tail.stderr.expect("stderr tail");
@@ -1483,7 +1418,8 @@ mod tests {
             truncation::truncate_tool_output(&output, "shell", &SessionOptions::default());
 
         assert!(truncated.len() < output.len());
-        assert!(truncated.starts_with("Termination: exited\nExit code: 2\n"));
+        assert!(truncated.starts_with("Warning: truncated output"));
+        assert!(truncated.contains("Termination: exited\nExit code: 2\n"));
         assert!(
             truncated.contains("stderr:\nthe build failed"),
             "stderr tail did not survive truncation"
@@ -1816,6 +1752,7 @@ mod tests {
         let options = NativeToolOptions {
             secrets: ToolSecrets {
                 brave_search_api_key: Some("fake-key".to_string()),
+                ..ToolSecrets::default()
             },
             ..NativeToolOptions::default()
         };
@@ -1842,29 +1779,6 @@ mod tests {
             err.contains("query"),
             "configured key should allow validation to reach query parsing, got: {err}"
         );
-    }
-
-    #[test]
-    fn format_brave_results_formats_results() {
-        let body = serde_json::json!({
-            "web": {
-                "results": [
-                    {"title": "Rust Lang", "url": "https://rust-lang.org", "description": "A systems language"},
-                    {"title": "Rust Book", "url": "https://doc.rust-lang.org/book", "description": "The Rust book"}
-                ]
-            }
-        });
-        let output = format_brave_results(&body);
-        assert!(output.contains("1. Rust Lang"));
-        assert!(output.contains("https://rust-lang.org"));
-        assert!(output.contains("A systems language"));
-        assert!(output.contains("2. Rust Book"));
-    }
-
-    #[test]
-    fn format_brave_results_no_results() {
-        let body = serde_json::json!({"web": {}});
-        assert_eq!(format_brave_results(&body), "No results found.");
     }
 
     #[tokio::test]

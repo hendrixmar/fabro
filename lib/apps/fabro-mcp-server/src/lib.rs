@@ -13,9 +13,9 @@ pub use config::{config_json, init_agent};
 use fabro_client::Client;
 pub use server::start;
 
-/// The name this MCP server reports over the wire and registers under in agent
-/// config files.
-pub(crate) const SERVER_NAME: &str = "fabro";
+/// The name this MCP server reports over the wire. It is also the default
+/// `mcpServers` key that `fabro mcp config` and `fabro mcp init` register.
+pub const SERVER_NAME: &str = "fabro";
 
 pub type FabroClientFuture = Pin<Box<dyn Future<Output = Result<Client>> + Send>>;
 
@@ -39,8 +39,10 @@ impl std::fmt::Debug for FabroMcpServerSettings {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct McpConfigSettings {
+    /// The `mcpServers` key the generated client entry is registered under.
+    pub name:        String,
     pub server:      Option<String>,
     pub storage_dir: Option<PathBuf>,
 }

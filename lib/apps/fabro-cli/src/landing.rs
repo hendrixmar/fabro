@@ -46,7 +46,7 @@ pub(crate) fn print() {
         &[
             ("validate", "Validate a workflow"),
             ("preflight", "Validate run configuration without executing"),
-            ("run", "Launch a workflow run"),
+            ("run", "Register and run a local workflow"),
         ],
         cmd_width,
     );

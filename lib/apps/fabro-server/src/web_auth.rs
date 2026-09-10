@@ -897,24 +897,15 @@ async fn list_auth_sessions(
         }
     }
 
-    let auth_tokens = match state.store_ref().refresh_tokens().await {
-        Ok(store) => store,
-        Err(err) => {
-            error!(error = %err, "Failed to open refresh token store while listing auth sessions");
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to list auth sessions.",
-            )
-            .into_response();
-        }
-    };
-    let cli_sessions = match auth_tokens
+    let cli_sessions = match state
+        .stores
+        .auth_sessions
         .active_cli_sessions(&authenticated.principal.identity, now)
         .await
     {
-        Ok(tokens) => tokens,
+        Ok(sessions) => sessions,
         Err(err) => {
-            error!(error = %err, "Failed to scan refresh tokens while listing auth sessions");
+            error!(error = %err, "Failed to load auth sessions");
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to list auth sessions.",
@@ -923,17 +914,17 @@ async fn list_auth_sessions(
         }
     };
 
-    sessions.extend(cli_sessions.into_iter().map(|token| AuthSession {
-        id:           format!("cli:{}", token.chain_id),
+    sessions.extend(cli_sessions.into_iter().map(|active| AuthSession {
+        id:           format!("cli:{}", active.session.id),
         kind:         "cli",
         current:      false,
         provider:     "github".to_string(),
-        login:        token.login,
+        login:        active.session.login,
         label:        "Fabro CLI".to_string(),
-        user_agent:   Some(token.user_agent),
-        created_at:   token.issued_at,
-        last_seen_at: token.last_used_at,
-        expires_at:   token.expires_at,
+        user_agent:   Some(active.session.user_agent),
+        created_at:   active.session.created_at,
+        last_seen_at: active.session.last_used_at,
+        expires_at:   active.expires_at,
         revocable:    true,
     }));
     sessions.sort_by(|left, right| {
@@ -961,31 +952,26 @@ async fn delete_auth_session(
             .into_response();
     }
 
-    let Some(raw_chain_id) = id.strip_prefix("cli:") else {
+    let Some(raw_session_id) = id.strip_prefix("cli:") else {
         return ApiError::not_found("Auth session not found.").into_response();
     };
-    let Ok(chain_id) = uuid::Uuid::parse_str(raw_chain_id) else {
+    let Ok(session_id) = uuid::Uuid::parse_str(raw_session_id) else {
         return ApiError::bad_request("Malformed CLI auth session id.").into_response();
     };
 
-    let auth_tokens = match state.store_ref().refresh_tokens().await {
-        Ok(store) => store,
-        Err(err) => {
-            error!(error = %err, "Failed to open refresh token store while deleting auth session");
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to revoke auth session.",
-            )
-            .into_response();
-        }
-    };
-    let deleted = match auth_tokens
-        .delete_active_chain_for_identity(&authenticated.principal.identity, chain_id, Utc::now())
+    let deleted = match state
+        .stores
+        .auth_sessions
+        .delete_active_session_for_identity(
+            &authenticated.principal.identity,
+            session_id,
+            Utc::now(),
+        )
         .await
     {
         Ok(deleted) => deleted,
         Err(err) => {
-            error!(error = %err, "Failed to scan refresh tokens while deleting auth session");
+            error!(error = %err, "Failed to revoke auth session");
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to revoke auth session.",

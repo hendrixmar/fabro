@@ -158,6 +158,7 @@ pub async fn git_checkpoint(
     clippy::too_many_arguments,
     reason = "Checkpointing needs explicit run metadata, checkpoint settings, and author inputs."
 )]
+#[tracing::instrument(name = "git_op", skip_all, fields(op = "checkpoint-commit"))]
 pub(crate) async fn checked_git_checkpoint(
     runtime: &SandboxGitRuntime,
     sandbox: &dyn Sandbox,

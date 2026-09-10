@@ -18,6 +18,9 @@ pub struct DaytonaSettings {
     pub labels:             Option<HashMap<String, String>>,
     pub snapshot:           Option<DaytonaSnapshotSettings>,
     pub network:            Option<DaytonaNetwork>,
+    /// Git history depth for the repository clone; `None` clones full
+    /// history.
+    pub clone_depth:        Option<i32>,
     #[serde(default)]
     pub skip_clone:         bool,
 }
@@ -114,10 +117,19 @@ pub enum DockerfileSource {
     Path { path: String },
 }
 
+/// Where a custom Daytona snapshot is built from.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum DaytonaSnapshotSource {
+    /// A pullable image reference such as `ubuntu:24.04`.
+    Image(String),
+    /// A Dockerfile that Daytona builds into the snapshot.
+    Dockerfile(DockerfileSource),
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct DaytonaSnapshotSettings {
-    pub cpu:        Option<i32>,
-    pub memory:     Option<i32>,
-    pub disk:       Option<i32>,
-    pub dockerfile: Option<DockerfileSource>,
+    pub cpu:    Option<i32>,
+    pub memory: Option<i32>,
+    pub disk:   Option<i32>,
+    pub source: DaytonaSnapshotSource,
 }

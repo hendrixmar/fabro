@@ -2873,10 +2873,13 @@ reasoning = false
 
         track_file_event(
             &AgentEvent::ToolCallCompleted {
-                tool_call_id: "tc1".to_string(),
-                tool_name:    "write_file".to_string(),
-                is_error:     false,
-                output:       serde_json::Value::String("ok".to_string()),
+                tool_call_id:          "tc1".to_string(),
+                tool_name:             "write_file".to_string(),
+                is_error:              false,
+                output:                serde_json::Value::String("ok".to_string()),
+                output_bytes_observed: 2,
+                output_bytes_retained: 2,
+                output_bytes_omitted:  0,
             },
             &mut state,
         );
@@ -2906,10 +2909,13 @@ reasoning = false
 
         track_file_event(
             &AgentEvent::ToolCallCompleted {
-                tool_call_id: "tc-sub".to_string(),
-                tool_name:    "edit_file".to_string(),
-                is_error:     false,
-                output:       serde_json::Value::String("ok".to_string()),
+                tool_call_id:          "tc-sub".to_string(),
+                tool_name:             "edit_file".to_string(),
+                is_error:              false,
+                output:                serde_json::Value::String("ok".to_string()),
+                output_bytes_observed: 2,
+                output_bytes_retained: 2,
+                output_bytes_omitted:  0,
             },
             &mut state,
         );
@@ -2933,10 +2939,13 @@ reasoning = false
         );
         track_file_event(
             &AgentEvent::ToolCallCompleted {
-                tool_call_id: "tc-kimi".to_string(),
-                tool_name:    "Write".to_string(),
-                is_error:     false,
-                output:       serde_json::Value::String("ok".to_string()),
+                tool_call_id:          "tc-kimi".to_string(),
+                tool_name:             "Write".to_string(),
+                is_error:              false,
+                output:                serde_json::Value::String("ok".to_string()),
+                output_bytes_observed: 2,
+                output_bytes_retained: 2,
+                output_bytes_omitted:  0,
             },
             &mut state,
         );
@@ -2966,10 +2975,13 @@ reasoning = false
 
         track_file_event(
             &AgentEvent::ToolCallCompleted {
-                tool_call_id: "tc-err".to_string(),
-                tool_name:    "edit_file".to_string(),
-                is_error:     true,
-                output:       serde_json::Value::String("failed".to_string()),
+                tool_call_id:          "tc-err".to_string(),
+                tool_name:             "edit_file".to_string(),
+                is_error:              true,
+                output:                serde_json::Value::String("failed".to_string()),
+                output_bytes_observed: 6,
+                output_bytes_retained: 6,
+                output_bytes_omitted:  0,
             },
             &mut state,
         );
@@ -3952,6 +3964,7 @@ enabled = true
             // An invalid header value makes a correctly configured executor
             // fail locally before any request can leave the test process.
             brave_search_api_key: Some("\n".to_string()),
+            ..ToolSecrets::default()
         });
         let node = Node::new("search");
         let context = Context::new();

@@ -34,24 +34,27 @@ Files that omit `_version` are treated as version `1`. The legacy top-level `ver
 | Scope | Examples |
 |---|---|
 | CLI-only | `[cli.target]`, `[cli.auth]`, `[cli.exec]`, `[cli.output]`, `[cli.updates]`, `[cli.logging]` |
-| Shared run defaults | `[run.model]`, `[run.environment]`, `[environments.<slug>]`, `[run.checkpoint]`, `[run.inputs]`, `[run.prepare]`, `[run.pull_request]`, `[run.integrations.github.permissions]`, `[run.hooks]`, `[run.agent.mcps]` |
+| Server-side run policy | `[run.model]`, `[run.environment]`, `[environments.<slug>]`, `[run.checkpoint]`, `[run.inputs]`, `[run.prepare]`, `[run.pull_request]`, `[run.integrations.github]`, `[run.hooks]`, `[run.agent.mcps]` |
 | Shared LLM catalog | `[llm.providers.<id>]`, provider-scoped `[llm.providers.<id>.models.<slug>]` offerings, limits, features, controls, and costs |
 | Server-only | `[server.listen]`, `[server.api]`, `[server.web]`, `[server.auth]`, `[server.storage]`, `[server.artifacts]`, `[server.slatedb]`, `[server.scheduler]`, `[server.logging]`, `[server.integrations]` |
 
 `[cli.*]` and `[server.*]` stanzas are owner-specific: they are only consumed from `~/.fabro/settings.toml` (plus process-local flags and env overrides). The same stanzas in `.fabro/project.toml` or `workflow.toml` remain schema-valid but runtime-inert.
 
+`fabro run` and `fabro create` do not copy the CLI machine's `[run]` or
+`[environments]` tables into an intent request. They warn with only the file
+path and affected key names when those tables are present. Put workflow-owned
+behavior in `workflow.toml` and configure placement in environments managed by
+the target server. The server may still use its own active `settings.toml`
+independently.
+
 See [Server Configuration](/administration/server-configuration) for the server-owned sections.
 
 ## Precedence
 
-Shared layered domains (`[project]`, `[workflow]`, `[run]`) use this override order:
-
-1. **CLI flags** — always win
-2. **Environment overrides** — Fabro-defined override channels
-3. **`workflow.toml`** — per-workflow overrides
-4. **`.fabro/project.toml`** — project defaults
-5. **`~/.fabro/settings.toml`** — machine defaults
-6. **Built-in defaults**
+For CLI-created workflow runs, sparse CLI flags override immutable
+`workflow.toml` behavior. The CLI does not layer local project or machine run
+defaults into the request. A target server resolves its own server-side policy
+and environment catalog during admission.
 
 Owner-specific domains (`[cli.*]`, `[server.*]`) use a narrower trust boundary — only CLI flags, env overrides, `~/.fabro/settings.toml`, and built-in defaults apply.
 
@@ -116,38 +119,16 @@ output_cost_per_mtok = 8.00
 input_cost_per_mtok = 3.00
 output_cost_per_mtok = 16.00
 
-[run.model]
-name = "claude-sonnet-4-5"
-
-[run.git.author]
-name = "fabro-bot"
-email = "fabro-bot@company.com"
-
-[run.pull_request]
-enabled = true
-
-[run.integrations.github.permissions]
-contents = "write"
-pull_requests = "write"
-
-[run.agent.mcps.filesystem]
-type = "stdio"
-command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
-startup_timeout = "15s"
-tool_timeout = "90s"
-
-[run.agent.mcps.filesystem.env]
-NODE_ENV = "production"
-
-[run.agent.mcps.sentry]
-type = "http"
-url = "https://mcp.sentry.dev/mcp"
-
-[run.agent.mcps.sentry.headers]
-Authorization = "Bearer sk-xxx"
 ```
 
 All fields are optional. Include only the sections and keys you want to override. A single file can still include both CLI and server sections when you run both processes on one machine, but explicit remote targets do not read remote server state from the local machine.
+
+<Note>
+The `[run]` schemas below remain valid for a server's own active configuration,
+but they are not CLI-side defaults for `fabro run` or `fabro create`. Put
+automatic pull-request settings and other workflow-owned behavior in
+`workflow.toml`; there is no compatibility request field or CLI global default.
+</Note>
 
 {/* generated:options */}
 ## `[cli.target]`

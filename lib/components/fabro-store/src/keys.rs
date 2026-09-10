@@ -1,7 +1,8 @@
 use std::fmt::{self, Write};
+#[cfg(test)]
 use std::ops::Range;
 
-use fabro_types::{RunId, SessionId};
+use fabro_types::RunId;
 
 pub(crate) const MAX_EVENT_SEQ: u32 = 999_999;
 
@@ -28,6 +29,7 @@ impl SlateKey {
 
     /// Exclusive end bound of this key's prefix keyspace: every key under
     /// `self.into_prefix()` sorts below it and no other key sorts between.
+    #[cfg(test)]
     fn into_prefix_end(mut self) -> Self {
         self.0.push('\u{1}');
         self
@@ -51,15 +53,36 @@ impl AsRef<[u8]> for SlateKey {
 
 // --- Construction ---
 
-pub(crate) fn run_data_prefix(run_id: &RunId) -> SlateKey {
-    SlateKey::new("runs").with(run_id).into_prefix()
-}
-
 pub(crate) fn run_events_prefix(run_id: &RunId) -> SlateKey {
     SlateKey::new("runs")
         .with(run_id)
         .with("events")
         .into_prefix()
+}
+
+/// Prefix of the retired `runs/_index/by-start/<run_id>` catalog markers that
+/// the legacy layout kept beside each run's events.
+pub(crate) fn run_catalog_prefix() -> SlateKey {
+    run_catalog_root().into_prefix()
+}
+
+#[cfg(test)]
+pub(crate) fn run_catalog_key(run_id: &RunId) -> SlateKey {
+    run_catalog_root().with(run_id)
+}
+
+/// Extracts the run id from a full catalog marker key, or `None` when the key
+/// is not exactly `runs/_index/by-start/<run_id>`.
+pub(crate) fn parse_run_catalog_key(raw: &str) -> Option<RunId> {
+    let segments = SlateKey::segments(raw).collect::<Vec<_>>();
+    let ["runs", "_index", "by-start", run_id] = segments.as_slice() else {
+        return None;
+    };
+    run_id.parse().ok()
+}
+
+fn run_catalog_root() -> SlateKey {
+    SlateKey::new("runs").with("_index").with("by-start")
 }
 
 // Sequence keys zero-pad `seq` to six digits so lexicographic key order
@@ -73,6 +96,7 @@ pub(crate) fn run_event_key(run_id: &RunId, seq: u32, epoch_ms: i64) -> SlateKey
         .with(format!("{seq:06}-{epoch_ms}"))
 }
 
+#[cfg(test)]
 pub(crate) fn run_event_seq_prefix(run_id: &RunId, seq: u32) -> SlateKey {
     SlateKey::new("runs")
         .with(run_id)
@@ -83,6 +107,7 @@ pub(crate) fn run_event_seq_prefix(run_id: &RunId, seq: u32) -> SlateKey {
 /// Scan range covering the run's event keys from `start_seq` to the end of
 /// the run's event namespace, so seek-based listing never touches keys of
 /// other runs or namespaces.
+#[cfg(test)]
 pub(crate) fn run_events_range(run_id: &RunId, start_seq: u32) -> Range<SlateKey> {
     let end = SlateKey::new("runs")
         .with(run_id)
@@ -95,12 +120,14 @@ pub(crate) fn sessions_by_id_prefix() -> SlateKey {
     SlateKey::new("sessions").with("by-id").into_prefix()
 }
 
-pub(crate) fn session_by_id_key(session_id: &SessionId) -> SlateKey {
+#[cfg(test)]
+pub(crate) fn session_by_id_key(session_id: &fabro_types::SessionId) -> SlateKey {
     SlateKey::new("sessions").with("by-id").with(session_id)
 }
 
 // --- Parsing ---
 
+#[cfg(test)]
 pub(crate) fn parse_event_seq(key: &str) -> Option<u32> {
     let mut segments = SlateKey::segments(key);
     let _ = segments.next()?; // "runs"

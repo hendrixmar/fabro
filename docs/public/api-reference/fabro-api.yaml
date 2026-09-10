@@ -596,6 +596,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagnosticsReport"
+        "504":
+          description: Diagnostics operation timed out
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/openapi.json:
     get:
@@ -1163,13 +1172,26 @@ paths:
       operationId: createRun
       tags: [Runs]
       summary: Create Run
-      description: Creates a new workflow run in `submitted` status from a self-contained manifest.
+      description: >-
+        Creates a new workflow run in `submitted` status from either a
+        self-contained legacy manifest or an immutable workflow-version intent.
+        Creation does not start or schedule the run.
+
+
+        Failures return the standard error body. The intent lane responds
+        `404` (`workflow_version_not_found`, `environment_not_found`), `422`
+        (`run_intent_invalid`, `target_invalid`,
+        `target_environment_unsupported`,
+        `pull_request_environment_unsupported`, `workflow_version_unusable`,
+        `run_compile_invalid`), `503` (`integration_unavailable`), or `500`
+        (`workflow_version_store_error`, `credential_store_error`,
+        `variable_store_error`, `run_persistence_failed`).
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RunManifest"
+              $ref: "#/components/schemas/CreateRunRequest"
       responses:
         "201":
           description: Run created
@@ -1177,8 +1199,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Run"
+        # Non-2xx statuses beyond 400 are deliberately documented in the
+        # endpoint description instead of declared here: progenitor-generated
+        # clients drop the HTTP status when a declared error response's body
+        # is not valid JSON (e.g. a gateway's plain-text error), which breaks
+        # the CLI's error display contract
+        # (run_create_failure_shows_action_context_and_response_body).
         "400":
-          description: Invalid Graphviz source
+          description: Invalid JSON or legacy manifest
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -5743,6 +5771,7 @@ paths:
           description: The canonical model ID or an alias.
         - $ref: "#/components/parameters/ModelTestProviderParam"
         - $ref: "#/components/parameters/ModelTestModeParam"
+        - $ref: "#/components/parameters/ModelTestReasoningEffortParam"
       responses:
         "200":
           description: Test result
@@ -5751,7 +5780,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ModelTestResult"
         "400":
-          description: Invalid test mode
+          description: Invalid test mode or reasoning effort
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -5879,44 +5908,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompletionResponse"
-        "400":
-          description: Invalid request
-          headers:
-            x-request-id:
-              $ref: "#/components/headers/XRequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-
-  # ── Playground ────────────────────────────────────────────────────────
-
-  /api/v1/playground/chat:
-    post:
-      operationId: createPlaygroundChat
-      tags: [Playground]
-      summary: Chat with the playground assistant
-      description: |
-        Drives a single turn of the playground chat that builds a workflow
-        graph incrementally. The server is stateless: each request includes
-        the full current draft, and the response streams text deltas plus a
-        single `write_workflow_file` tool call carrying the full new contents
-        of `workflow.fabro` for the client to parse, diff against its local
-        draft, and animate into the canvas.
-
-        Responses are always SSE. Frames use `event: stream_event` with a
-        JSON-serialized StreamEvent payload — see /api/v1/completions for the
-        StreamEvent shape. The tool call arrives on a `tool_call_end` event
-        with the tool name and parsed JSON arguments.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreatePlaygroundChatRequest"
-      responses:
-        "200":
-          description: SSE stream of text deltas and tool calls.
         "400":
           description: Invalid request
           headers:
@@ -6284,6 +6275,15 @@ components:
       schema:
         $ref: "#/components/schemas/ProviderId"
       example: openrouter
+
+    ModelTestReasoningEffortParam:
+      name: reasoning_effort
+      in: query
+      required: false
+      description: Optional native reasoning-effort level for the model test.
+      schema:
+        $ref: "#/components/schemas/ReasoningEffort"
+      example: high
 
   headers:
     XRequestId:
@@ -6769,6 +6769,84 @@ components:
 
     # ── Automations ──────────────────────────────────────────────────────
 
+    AutomationGitWorkflowSource:
+      description: >-
+        Explicit GitHub coordinate from which an automation acquires workflow
+        bytes. The branch is the fallback selector and audit context. An
+        optional tag overrides the branch, and an optional exact SHA overrides
+        both without requiring branch ancestry. This source is independent of
+        the run target and does not provide its working branch.
+      type: object
+      additionalProperties: false
+      required:
+        - repo
+        - branch
+      properties:
+        repo:
+          type: string
+          minLength: 3
+          maxLength: 140
+          pattern: "^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$"
+          description: GitHub repository slug in `owner/name` form.
+          example: acme/workflows
+        branch:
+          type: string
+          minLength: 1
+          maxLength: 255
+          pattern: "^[A-Za-z0-9/._-]+$"
+          description: >-
+            Required bare branch name used when neither tag nor SHA is present.
+            It is retained as context when an override is present and is not
+            an ancestry constraint.
+          example: main
+        tag:
+          type: string
+          minLength: 1
+          maxLength: 255
+          pattern: "^[A-Za-z0-9/._-]+$"
+          description: >-
+            Optional bare tag name. Without `sha`, this tag is resolved whenever
+            the automation fires. Prefixes such as `refs/tags/` are rejected.
+          example: v1.2.3
+        sha:
+          type: string
+          pattern: "^[0-9A-Fa-f]{40}$"
+          description: >-
+            Optional exact commit, authoritative over tag and branch. The
+            server lowercase-normalizes it and fetches it directly; it need
+            not be reachable from the named branch.
+
+    ResolvedAutomationGitWorkflowSource:
+      description: >-
+        Workflow source coordinate and exact commit captured when an
+        automation run was created. The requested selectors remain available
+        for audit context while `resolved_sha` identifies the immutable source
+        revision that supplied the workflow bytes.
+      type: object
+      additionalProperties: false
+      required:
+        - repo
+        - branch
+        - resolved_sha
+      properties:
+        repo:
+          type: string
+          description: GitHub repository slug in `owner/name` form.
+        branch:
+          type: string
+          description: Required branch fallback and audit context.
+        tag:
+          type: string
+          description: Optional tag requested by the automation.
+        sha:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+          description: Optional exact commit requested by the automation.
+        resolved_sha:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+          description: Exact lowercase Git commit that supplied the workflow bytes.
+
     Automation:
       description: Public automation definition.
       type: object
@@ -6778,7 +6856,10 @@ components:
         - revision
         - name
         - description
+        - environment_id
+        - last_error
         - target
+        - workflow
         - triggers
       properties:
         id:
@@ -6796,34 +6877,31 @@ components:
         description:
           type: ["string", "null"]
           example: Keeps dependencies fresh.
+        environment_id:
+          type: ["string", "null"]
+          description: |
+            Server-managed Docker or Daytona environment selected when the
+            automation fires. Null only for an incomplete definition migrated
+            from a release that predated environment selection.
+          example: daytona-smoke
+        last_error:
+          type: ["string", "null"]
+          description: Most recent scheduled-run failure, cleared after a scheduled run is queued successfully.
         target:
-          $ref: "#/components/schemas/AutomationTarget"
+          $ref: "#/components/schemas/RunTarget"
+        workflow:
+          type: string
+          description: >-
+            Workflow slug or path resolved in the run-target checkout when
+            `workflow_source` is omitted, or in the explicit workflow-source
+            checkout when present.
+          example: dependency-update
+        workflow_source:
+          $ref: "#/components/schemas/AutomationGitWorkflowSource"
         triggers:
           type: array
           items:
             $ref: "#/components/schemas/AutomationTrigger"
-
-    AutomationTarget:
-      description: Repository and workflow selected by an automation.
-      type: object
-      additionalProperties: false
-      required:
-        - repository
-        - ref
-        - workflow
-      properties:
-        repository:
-          type: string
-          description: GitHub repository slug in `owner/repo` form.
-          example: fabro-sh/fabro
-        ref:
-          type: string
-          description: Branch, tag, or SHA selector resolved when materializing a run.
-          example: main
-        workflow:
-          type: string
-          description: Workflow slug or path resolved in the target repository.
-          example: dependency-update
 
     AutomationTrigger:
       description: |
@@ -6963,7 +7041,9 @@ components:
       required:
         - id
         - name
+        - environment_id
         - target
+        - workflow
         - triggers
       properties:
         id:
@@ -6976,8 +7056,21 @@ components:
         description:
           type: ["string", "null"]
           example: Keeps dependencies fresh.
+        environment_id:
+          type: string
+          description: Server-managed Docker or Daytona environment selected when the automation fires.
+          example: daytona-smoke
         target:
-          $ref: "#/components/schemas/AutomationTarget"
+          $ref: "#/components/schemas/RunTarget"
+        workflow:
+          type: string
+          description: >-
+            Workflow slug or path resolved in the run-target checkout when
+            `workflow_source` is omitted, or in the explicit workflow-source
+            checkout when present.
+          example: dependency-update
+        workflow_source:
+          $ref: "#/components/schemas/AutomationGitWorkflowSource"
         triggers:
           type: array
           items:
@@ -6989,7 +7082,9 @@ components:
       additionalProperties: false
       required:
         - name
+        - environment_id
         - target
+        - workflow
         - triggers
       properties:
         name:
@@ -6998,8 +7093,21 @@ components:
         description:
           type: ["string", "null"]
           example: Keeps dependencies fresh.
+        environment_id:
+          type: string
+          description: Server-managed Docker or Daytona environment selected when the automation fires.
+          example: daytona-smoke
         target:
-          $ref: "#/components/schemas/AutomationTarget"
+          $ref: "#/components/schemas/RunTarget"
+        workflow:
+          type: string
+          description: >-
+            Workflow slug or path resolved in the run-target checkout when
+            `workflow_source` is omitted, or in the explicit workflow-source
+            checkout when present.
+          example: dependency-update
+        workflow_source:
+          $ref: "#/components/schemas/AutomationGitWorkflowSource"
         triggers:
           type: array
           items:
@@ -8935,39 +9043,6 @@ components:
         or catalog price estimation (estimated).
       enum: [authoritative, estimated]
 
-    # ── Playground ────────────────────────────────────────────────────────
-
-    CreatePlaygroundChatRequest:
-      description: >
-        Body of POST /api/v1/playground/chat. The server is stateless across
-        turns: the browser owns the draft and submits it as the literal
-        `workflow.fabro` contents with every turn. The server embeds the
-        file in the model's system prompt and exposes a single
-        `write_workflow_file` tool that emits the full new contents of
-        `workflow.fabro`; the browser parses, diffs, and animates the
-        result.
-      type: object
-      required: [messages, workflow_fabro]
-      properties:
-        messages:
-          type: array
-          description: assistant-ui-style message history for the turn.
-          items:
-            $ref: "#/components/schemas/CompletionMessage"
-        workflow_fabro:
-          type: string
-          description: >
-            Full current `workflow.fabro` (Graphviz DOT) contents as
-            rendered by the client — a complete `digraph <name> { ... }`
-            block including the `start` / `exit` terminals. This is the
-            same format the model writes back via `write_workflow_file`.
-        model:
-          type: string
-          description: Model ID or alias. Server picks a ready-provider default if omitted.
-        provider:
-          $ref: "#/components/schemas/ProviderId"
-          description: Optional provider pin.
-
     PaginatedSavedQueryList:
       description: Paginated list of saved queries.
       type: object
@@ -9355,6 +9430,174 @@ components:
       properties:
         workflow_version_id:
           $ref: "#/components/schemas/WorkflowVersionId"
+
+    CreateRunRequest:
+      description: >-
+        Transitional create body used while callers migrate independently from
+        self-contained manifests to immutable workflow-version intents.
+      oneOf:
+        - $ref: "#/components/schemas/RunManifest"
+        - $ref: "#/components/schemas/RunIntent"
+
+    RunIntent:
+      description: >-
+        A request to create, but not start, one run from an immutable workflow
+        version and an explicit workspace target.
+      type: object
+      additionalProperties: false
+      required:
+        - workflow_version_id
+        - target
+        - args
+      properties:
+        workflow_version_id:
+          $ref: "#/components/schemas/WorkflowVersionId"
+        target:
+          $ref: "#/components/schemas/RunTarget"
+        args:
+          $ref: "#/components/schemas/RunIntentArgs"
+        environment_id:
+          type: string
+          description: Server environment catalog ID. Omission selects `default`.
+        parent_id:
+          type: string
+          description: Optional orchestration parent run ID.
+        title:
+          type: string
+          maxLength: 100
+          description: Optional explicit run title, normalized by the server.
+        goal:
+          type: string
+          description: Optional inline goal override.
+
+    RunIntentArgs:
+      description: Structured run overrides accepted by workflow-version creation.
+      type: object
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+        provider:
+          type: string
+          description: LLM provider; this does not select the sandbox environment.
+        inputs:
+          type: object
+          additionalProperties:
+            anyOf:
+              - type: string
+              - type: number
+              - type: integer
+              - type: boolean
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        dry_run:
+          type: boolean
+          description: >-
+            Overrides `run.execution.mode`: true selects `dry_run`, false
+            selects `normal`, and omission inherits the lower-precedence setting.
+        auto_approve:
+          type: boolean
+          description: >-
+            Overrides `run.execution.approval`: true selects `auto`, false
+            selects `prompt`, and omission inherits the lower-precedence setting.
+        preserve_sandbox:
+          type: boolean
+          description: >-
+            Overrides `run.environment.lifecycle.preserve`; omission inherits
+            the lower-precedence setting.
+
+    RunTarget:
+      description: Workspace content and location requested for a run.
+      oneOf:
+        - $ref: "#/components/schemas/GitRunTarget"
+        - $ref: "#/components/schemas/NoneRunTarget"
+        - $ref: "#/components/schemas/FolderRunTarget"
+      discriminator:
+        propertyName: kind
+        mapping:
+          git: "#/components/schemas/GitRunTarget"
+          none: "#/components/schemas/NoneRunTarget"
+          folder: "#/components/schemas/FolderRunTarget"
+
+    GitRunTarget:
+      description: >-
+        Public github.com repository target. The branch names the attached
+        working branch. An optional tag selects a release at worker start, and
+        an optional exact SHA is authoritative when both are present.
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - repo
+        - branch
+      properties:
+        kind:
+          type: string
+          enum: [git]
+        repo:
+          type: string
+          description: GitHub repository slug in `owner/name` form.
+          example: acme/my-app
+        branch:
+          type: string
+          description: Required attached working branch name, preserved exactly.
+          example: feature/foo
+        tag:
+          type: string
+          minLength: 1
+          description: >-
+            Optional bare tag name. Prefixes such as `refs/tags/` and `tags/`
+            are rejected. Without `sha`, the worker resolves this tag when the
+            sandbox starts and fails if it is unavailable.
+          example: v1.2.3
+        sha:
+          type: string
+          pattern: "^[0-9A-Fa-f]{40}$"
+          description: >-
+            Optional exact commit. The server lowercase-normalizes its syntax
+            but does not resolve it, prove branch ancestry, or prove that it
+            matches an accompanying tag. When present, this exact commit wins.
+
+    NoneRunTarget:
+      description: >-
+        Empty workspace with no repository. Docker and Daytona accept this
+        target and suppress cloning even when workflow settings enable it.
+        Local environments reject it; Local scratch allocation is a separate
+        future capability.
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum: [none]
+
+    FolderRunTarget:
+      description: >-
+        Existing directory on the Fabro server, executed in place by a Local
+        environment. The submitted path must be absolute and name an existing
+        directory; Fabro resolves symlinks and persists its canonical UTF-8
+        path. This target is intended for trusted single-tenant deployments.
+        Docker and Daytona environments always reject it. This target does not
+        add Local Git cloning or Local scratch workspaces. Folder runs execute
+        in place without Fabro Git checkpoints, so fork and rewind are
+        unavailable.
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - path
+      properties:
+        kind:
+          type: string
+          enum: [folder]
+        path:
+          type: string
+          minLength: 1
+          description: Absolute path on the Fabro server, not on the API caller's machine.
 
     RunManifest:
       description: Self-contained workflow run manifest.
@@ -11578,6 +11821,16 @@ components:
           type: ["string", "null"]
         workflow_slug:
           type: ["string", "null"]
+        workflow_version_id:
+          description: Exact immutable root workflow version from which the run was admitted, when applicable.
+          oneOf:
+            - $ref: "#/components/schemas/WorkflowVersionId"
+            - type: "null"
+        target:
+          description: Canonical workspace target accepted for a version-backed run. Absent for legacy manifest runs.
+          oneOf:
+            - $ref: "#/components/schemas/RunTarget"
+            - type: "null"
         automation:
           oneOf:
             - $ref: "#/components/schemas/AutomationRef"
@@ -11593,6 +11846,8 @@ components:
         manifest_blob:
           type: ["string", "null"]
         definition_blob:
+          type: ["string", "null"]
+        spec_blob:
           type: ["string", "null"]
         git:
           oneOf:
@@ -12011,6 +12266,11 @@ components:
           type: ["string", "null"]
         trigger_id:
           type: ["string", "null"]
+        workflow_source:
+          description: Resolved workflow source for automation runs that declare one.
+          oneOf:
+            - $ref: "#/components/schemas/ResolvedAutomationGitWorkflowSource"
+            - type: "null"
 
     RunOrigin:
       type: object
@@ -14634,6 +14894,17 @@ components:
           type: object
           additionalProperties:
             type: string
+        additional_repositories:
+          type: array
+          description: |
+            Additional GitHub repositories, beyond the implicit run origin,
+            that the minted GITHUB_TOKEN must cover. Each entry is a full
+            `owner/repository` slug; every repository must share one owner
+            with the run origin. Omitted when empty; settings persisted
+            before this field existed deserialize to an empty set.
+          items:
+            type: string
+          uniqueItems: true
 
     RunGoal:
       oneOf:
@@ -14820,6 +15091,12 @@ components:
       properties:
         enabled:
           type: boolean
+        depth:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 100
+          description: Git history depth. Set to 0 to clone full history.
 
     RunBranchSettings:
       type: object

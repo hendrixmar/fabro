@@ -34,7 +34,7 @@ members = []
 version = "0.1.0"
 "#,
     );
-    git(fixture.path(), &["init"]);
+    git(fixture.path(), &["init", "-b", "main"]);
     git(fixture.path(), &["config", "user.name", "Release Test"]);
     git(fixture.path(), &[
         "config",
@@ -106,6 +106,10 @@ fn dry_run_computes_stable_version_from_date() {
     assert!(
         stdout.contains("git tag -a v0.100.0 -m v0.100.0"),
         "dry-run should print release tag command:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("git push --atomic origin main v0.100.0"),
+        "dry-run should print the atomic push command:\n{stdout}"
     );
     assert!(
         stdout.contains(

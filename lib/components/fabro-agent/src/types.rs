@@ -348,10 +348,16 @@ pub enum AgentEvent {
         delta: String,
     },
     ToolCallCompleted {
-        tool_name:    String,
-        tool_call_id: String,
-        output:       serde_json::Value,
-        is_error:     bool,
+        tool_name:             String,
+        tool_call_id:          String,
+        output:                serde_json::Value,
+        is_error:              bool,
+        #[serde(default)]
+        output_bytes_observed: usize,
+        #[serde(default)]
+        output_bytes_retained: usize,
+        #[serde(default)]
+        output_bytes_omitted:  usize,
     },
     /// Subordinate process outcome for a tool call that ran a command.
     /// Emitted before the owning `ToolCallCompleted`, which stays the single
@@ -359,12 +365,18 @@ pub enum AgentEvent {
     /// Session and tool-call identity come from the emitting envelope.
     ToolProcessCompleted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        exit_code:         Option<i32>,
-        termination:       CommandTermination,
-        duration_ms:       u64,
-        streams_separated: bool,
+        exit_code:             Option<i32>,
+        termination:           CommandTermination,
+        duration_ms:           u64,
+        streams_separated:     bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        exec_output_tail:  Option<ExecOutputTail>,
+        exec_output_tail:      Option<ExecOutputTail>,
+        #[serde(default)]
+        output_bytes_observed: usize,
+        #[serde(default)]
+        output_bytes_retained: usize,
+        #[serde(default)]
+        output_bytes_omitted:  usize,
     },
     Error {
         error: Error,
@@ -558,6 +570,9 @@ impl AgentEvent {
                 tool_name,
                 tool_call_id,
                 is_error,
+                output_bytes_observed,
+                output_bytes_retained,
+                output_bytes_omitted,
                 ..
             } => {
                 info!(
@@ -565,6 +580,9 @@ impl AgentEvent {
                     tool = tool_name.as_str(),
                     tool_call_id,
                     is_error,
+                    output_bytes_observed,
+                    output_bytes_retained,
+                    output_bytes_omitted,
                     "Tool call completed"
                 );
             }
@@ -574,6 +592,9 @@ impl AgentEvent {
                 duration_ms,
                 streams_separated,
                 exec_output_tail,
+                output_bytes_observed,
+                output_bytes_retained,
+                output_bytes_omitted,
             } => {
                 let tail = ExecOutputTail::trace_summary(exec_output_tail.as_ref());
                 debug!(
@@ -587,6 +608,9 @@ impl AgentEvent {
                     stderr_bytes = tail.stderr_bytes,
                     stdout_truncated = tail.stdout_truncated,
                     stderr_truncated = tail.stderr_truncated,
+                    output_bytes_observed,
+                    output_bytes_retained,
+                    output_bytes_omitted,
                     "Tool process completed"
                 );
             }
@@ -954,6 +978,21 @@ mod tests {
 
         assert!(matches!(event, AgentEvent::SubAgentSpawned {
             generation: 1,
+            ..
+        }));
+    }
+
+    #[test]
+    fn legacy_tool_completion_defaults_output_byte_counts() {
+        let event: AgentEvent = serde_json::from_str(
+            r#"{"ToolCallCompleted":{"tool_name":"shell","tool_call_id":"call_1","output":"ok","is_error":false}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(event, AgentEvent::ToolCallCompleted {
+            output_bytes_observed: 0,
+            output_bytes_retained: 0,
+            output_bytes_omitted: 0,
             ..
         }));
     }

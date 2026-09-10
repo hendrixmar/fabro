@@ -12,13 +12,19 @@ use tower::ServiceExt;
 
 use crate::helpers::{MINIMAL_DOT, api, minimal_manifest_json, response_json, test_settings};
 
-fn app_with_store(object_store: Arc<dyn ObjectStore>) -> axum::Router {
+fn app_with_store(
+    object_store: Arc<dyn ObjectStore>,
+    blobs: Arc<fabro_store::BlobStore>,
+    run_summaries: Arc<fabro_store::RunSummaryStore>,
+) -> axum::Router {
     let settings = test_settings();
-    let store = Arc::new(fabro_store::Database::new(
+    let store = Arc::new(fabro_store::test_support::test_database_with_stores(
         Arc::clone(&object_store),
         "event-race",
         Duration::from_millis(1),
         None,
+        blobs,
+        run_summaries,
     ));
     let artifact_store = fabro_store::ArtifactStore::new(object_store, "artifacts");
     let state = fabro_server::test_support::TestAppStateBuilder::new()
@@ -103,7 +109,13 @@ async fn append_status_and_body(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_event_appends_after_restart_keep_projection_cache_contiguous() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let first_app = app_with_store(Arc::clone(&object_store));
+    let blobs = fabro_store::test_support::test_blob_store();
+    let run_summaries = fabro_store::test_support::test_run_summary_store();
+    let first_app = app_with_store(
+        Arc::clone(&object_store),
+        Arc::clone(&blobs),
+        Arc::clone(&run_summaries),
+    );
     let run_id = create_run(&first_app).await;
 
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -111,7 +123,7 @@ async fn concurrent_event_appends_after_restart_keep_projection_cache_contiguous
     // Simulate a server restart: a fresh AppState opens the existing run with
     // an empty active-run cache, so concurrent appends all race through the
     // public event endpoint instead of sharing an already-open RunDatabase.
-    let restarted_app = app_with_store(object_store);
+    let restarted_app = app_with_store(object_store, blobs, run_summaries);
     let appends = 64;
     let barrier = Arc::new(Barrier::new(appends));
     let mut tasks = Vec::with_capacity(appends);

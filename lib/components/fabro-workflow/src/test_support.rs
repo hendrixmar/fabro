@@ -11,7 +11,7 @@ use fabro_interview::AutoApproveInterviewer;
 use fabro_model::Catalog;
 #[cfg(feature = "test-support")]
 use fabro_model::ProviderId;
-use fabro_store::{ArtifactStore, Database, RunProjection};
+use fabro_store::{ArtifactStore, RunProjection, test_support as store_test_support};
 use object_store::local::LocalFileSystem;
 
 use crate::artifact_upload::ArtifactSink;
@@ -52,7 +52,11 @@ pub(crate) fn test_configured_provider_ids(
 /// persisted before tests reopen the run store.
 async fn execute_and_emit_terminal(initialized: InitializedState) -> Executed {
     let executed = Box::pin(pipeline::execute(initialized.initialized)).await;
-    initialized.store_logger.flush().await;
+    initialized
+        .store_logger
+        .flush()
+        .await
+        .expect("test run events should persist");
     let state = executed.engine.run.run_store.state().await.ok();
     let billing = state.as_ref().and_then(billing_from_projection);
     let event = build_terminal_event(
@@ -65,7 +69,11 @@ async fn execute_and_emit_terminal(initialized: InitializedState) -> Executed {
         billing,
     );
     executed.engine.run.emitter.emit(&event);
-    initialized.store_logger.flush().await;
+    initialized
+        .store_logger
+        .flush()
+        .await
+        .expect("test run events should persist");
     executed
 }
 
@@ -166,8 +174,18 @@ async fn initialized(
     std::fs::create_dir_all(&run_options.run_dir).expect("failed to create run dir");
     let store_dir = test_store_dir(&run_options.run_dir);
     let _ = std::fs::remove_dir_all(&store_dir);
+    for database_path in [
+        store_test_support::test_blob_store_path(&store_dir),
+        store_test_support::test_run_summary_store_path(&store_dir),
+    ] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut sibling = database_path.clone().into_os_string();
+            sibling.push(suffix);
+            let _ = std::fs::remove_file(sibling);
+        }
+    }
     std::fs::create_dir_all(&store_dir).expect("failed to create local test run store dir");
-    let store = Arc::new(Database::new(
+    let store = Arc::new(store_test_support::test_database_at(
         Arc::new(
             LocalFileSystem::new_with_prefix(&store_dir)
                 .expect("failed to create local test run store"),
@@ -175,6 +193,7 @@ async fn initialized(
         "",
         Duration::from_millis(1),
         None,
+        &store_dir,
     ));
     let inner_store = store
         .create_run(&run_options.run_id)
@@ -182,33 +201,36 @@ async fn initialized(
         .expect("failed to create slate-backed test run store");
     let run_store = inner_store;
     append_event(&run_store, &run_options.run_id, &Event::RunCreated {
-        run_id:           run_options.run_id,
-        title:            None,
-        settings:         serde_json::to_value(&run_options.settings)
+        run_id:              run_options.run_id,
+        title:               None,
+        settings:            serde_json::to_value(&run_options.settings)
             .expect("failed to serialize settings"),
-        graph:            serde_json::to_value(graph).expect("failed to serialize graph"),
-        workflow_source:  None,
-        labels:           run_options
+        graph:               serde_json::to_value(graph).expect("failed to serialize graph"),
+        workflow_source:     None,
+        labels:              run_options
             .labels
             .clone()
             .into_iter()
             .collect::<BTreeMap<_, _>>(),
-        source_directory: Some(sandbox.working_directory().to_string()),
-        workflow_slug:    run_options.workflow_slug.clone(),
-        automation:       None,
-        provenance:       fabro_types::RunProvenance {
+        source_directory:    Some(sandbox.working_directory().to_string()),
+        workflow_slug:       run_options.workflow_slug.clone(),
+        workflow_version_id: None,
+        target:              None,
+        automation:          None,
+        provenance:          fabro_types::RunProvenance {
             server:  None,
             client:  None,
             subject: fabro_types::Principal::System {
                 system_kind: fabro_types::SystemActorKind::Engine,
             },
         },
-        manifest_blob:    None,
-        git:              run_options.pre_run_git.clone(),
-        fork_source_ref:  run_options.fork_source_ref.clone(),
-        retried_from:     None,
-        parent_id:        None,
-        web_url:          None,
+        manifest_blob:       None,
+        spec_blob:           None,
+        git:                 run_options.pre_run_git.clone(),
+        fork_source_ref:     run_options.fork_source_ref.clone(),
+        retried_from:        None,
+        parent_id:           None,
+        web_url:             None,
     })
     .await
     .expect("failed to seed run.created event in run store");
@@ -479,7 +501,11 @@ pub async fn run_graph_with_state_and_llm_source(
     )
     .await;
     let executed = pipeline::execute(initialized.initialized).await;
-    initialized.store_logger.flush().await;
+    initialized
+        .store_logger
+        .flush()
+        .await
+        .expect("test run events should persist");
     let outcome = executed.outcome?;
     let state = executed
         .engine

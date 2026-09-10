@@ -6,10 +6,15 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use fabro_db::{DbPool, ImportReport};
+use fabro_types::{GitRunTarget, RunTarget, repository};
+use serde::Deserialize;
 use tokio::fs;
 use tracing::info;
 
-use crate::{Automation, AutomationId, AutomationStoreError, store};
+use crate::{
+    Automation, AutomationId, AutomationReplace, AutomationRevision, AutomationStoreError,
+    AutomationTrigger, store,
+};
 
 pub(crate) const REMOVAL_DEADLINE: &str = "2026-10-11";
 
@@ -26,7 +31,7 @@ pub async fn import_legacy_directory_once(
         let bytes = fs::read(&path)
             .await
             .map_err(|source| AutomationStoreError::io(&path, source))?;
-        automations.push(Automation::from_persisted_path(id, &bytes, path)?);
+        automations.push(parse_legacy_automation(id, &bytes, &path)?);
     }
 
     let mut transaction = pool.begin().await?;
@@ -59,6 +64,90 @@ pub async fn import_legacy_directory_once(
         "Imported legacy automations directory into SQLite"
     );
     Ok(Some(report))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedAutomation {
+    name:        String,
+    #[serde(default)]
+    description: Option<String>,
+    target:      LegacyAutomationTarget,
+    #[serde(default)]
+    triggers:    Vec<AutomationTrigger>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyAutomationTarget {
+    repository: String,
+    #[serde(rename = "ref")]
+    selector:   String,
+    workflow:   String,
+}
+
+fn parse_legacy_automation(
+    id: AutomationId,
+    bytes: &[u8],
+    path: &Path,
+) -> Result<Automation, AutomationStoreError> {
+    let revision = AutomationRevision::from_bytes(bytes);
+    let content = std::str::from_utf8(bytes)
+        .map_err(|source| AutomationStoreError::invalid_utf8(path, source))?;
+    let legacy: LegacyPersistedAutomation =
+        toml::from_str(content).map_err(|source| AutomationStoreError::parse(path, source))?;
+    let LegacyAutomationTarget {
+        repository,
+        selector,
+        workflow,
+    } = legacy.target;
+    let target = legacy_target(repository, &selector, path)?;
+    Automation::from_stored(id.clone(), revision, AutomationReplace {
+        name: legacy.name,
+        description: legacy.description,
+        environment_id: None,
+        target,
+        workflow,
+        workflow_source: None,
+        triggers: legacy.triggers,
+    })
+    .map_err(|source| AutomationStoreError::StoredValidation { id, source })
+}
+
+fn legacy_target(
+    repository: String,
+    selector: &str,
+    path: &Path,
+) -> Result<RunTarget, AutomationStoreError> {
+    let (branch, tag, sha) = if let Some(sha) = repository::normalize_git_commit_sha(selector) {
+        ("main".to_string(), None, Some(sha))
+    } else if let Some(tag) = selector
+        .strip_prefix("refs/tags/")
+        .or_else(|| selector.strip_prefix("tags/"))
+    {
+        ("main".to_string(), Some(tag.to_string()), None)
+    } else if let Some(branch) = selector
+        .strip_prefix("refs/heads/")
+        .or_else(|| selector.strip_prefix("heads/"))
+    {
+        (branch.to_string(), None, None)
+    } else if selector == "HEAD" {
+        ("main".to_string(), None, None)
+    } else {
+        (selector.to_string(), None, None)
+    };
+    RunTarget::Git(GitRunTarget {
+        repo: repository,
+        branch,
+        tag,
+        sha,
+    })
+    .validate()
+    .map(|validated| validated.target)
+    .map_err(|source| AutomationStoreError::LegacyTarget {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 async fn legacy_automation_paths(

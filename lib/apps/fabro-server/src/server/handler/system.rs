@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use fabro_slack::config::{
@@ -9,6 +11,7 @@ use fabro_slack::config::{
 use fabro_static::EnvVars;
 use fabro_types::settings::server::{GithubIntegrationSettings, PlaneIntegrationSettings};
 use fabro_vault::Vault;
+use tokio::time::timeout;
 
 use super::super::{
     AggregateBilling, AggregateBillingTotals, ApiError, AppState, BilledTokenCounts,
@@ -20,6 +23,8 @@ use super::super::{
     counts_toward_scheduler_capacity, delete_run_internal, diagnostics, get, post,
     resource_sampler, spawn_blocking, system_sandbox_provider, to_i64,
 };
+
+const SERVER_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(25);
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -89,7 +94,7 @@ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>
         profile:          option_env!("FABRO_BUILD_PROFILE").map(str::to_string),
         os:               Some(std::env::consts::OS.to_string()),
         arch:             Some(std::env::consts::ARCH.to_string()),
-        storage_engine:   Some("slatedb".to_string()),
+        storage_engine:   Some("sqlite".to_string()),
         storage_dir:      Some(state.server_storage_dir().display().to_string()),
         uptime_secs:      Some(to_i64(state.started_at.elapsed().as_secs())),
         runs:             Some(SystemRunCounts {
@@ -456,12 +461,7 @@ async fn get_system_df(
     Query(params): Query<DfParams>,
 ) -> Response {
     let storage_dir = state.server_storage_dir();
-    let summaries = match state
-        .stores
-        .runs
-        .list_runs(&fabro_store::ListRunsQuery::default(), Utc::now())
-        .await
-    {
+    let summaries = match state.stores.run_summaries.list_all(Utc::now()).await {
         Ok(summaries) => summaries,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -522,12 +522,7 @@ async fn prune_runs(
     Json(body): Json<PruneRunsRequest>,
 ) -> Response {
     let storage_dir = state.server_storage_dir();
-    let summaries = match state
-        .stores
-        .runs
-        .list_runs(&fabro_store::ListRunsQuery::default(), Utc::now())
-        .await
-    {
+    let summaries = match state.stores.run_summaries.list_all(Utc::now()).await {
         Ok(summaries) => summaries,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -844,11 +839,34 @@ async fn get_github_repo(
 }
 
 async fn run_diagnostics(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {
-    (
-        StatusCode::OK,
-        Json(diagnostics::run_all(state.as_ref()).await),
+    diagnostics_response_with_timeout(
+        Box::pin(diagnostics::run_all(state.as_ref())),
+        SERVER_DIAGNOSTICS_TIMEOUT,
     )
-        .into_response()
+    .await
+}
+
+async fn diagnostics_response_with_timeout<F>(
+    diagnostics: F,
+    operation_timeout: Duration,
+) -> Response
+where
+    F: Future<Output = diagnostics::DiagnosticsReport>,
+{
+    let Ok(report) = timeout(operation_timeout, diagnostics).await else {
+        tracing::warn!(
+            timeout_secs = operation_timeout.as_secs(),
+            "server diagnostics timed out"
+        );
+        return ApiError::with_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            "Server diagnostics timed out.",
+            "diagnostics_timeout",
+        )
+        .into_response();
+    };
+
+    (StatusCode::OK, Json(report)).into_response()
 }
 
 pub(in crate::server) async fn openapi_spec() -> Response {
@@ -897,4 +915,27 @@ async fn get_aggregate_billing(
         by_model,
     };
     (StatusCode::OK, Json(response)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn diagnostics_response_returns_gateway_timeout_before_client_deadline() {
+        let response = diagnostics_response_with_timeout(
+            std::future::pending::<diagnostics::DiagnosticsReport>(),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let body = fabro_test::expect_axum_json(
+            response,
+            StatusCode::GATEWAY_TIMEOUT,
+            "GET /api/v1/system/diagnostics timeout",
+        )
+        .await;
+        assert_eq!(body["errors"][0]["code"], "diagnostics_timeout");
+        assert_eq!(body["errors"][0]["detail"], "Server diagnostics timed out.");
+    }
 }

@@ -24,13 +24,14 @@ pub(crate) fn template_render_store(
     current_dir: &Path,
     resolver: Arc<dyn FileResolver>,
     source_name: Option<&str>,
-    content: &str,
 ) -> Result<TemplateRenderStore, Error> {
     let root = template_root_for_current_dir(current_dir)?;
     let source_path = template_source_path_for_current_dir(current_dir, source_name, &root)?;
     let base_dir = template_store_base_dir(current_dir);
+    // The store's render substitutes the text being rendered, so the source
+    // carries only its path and template root.
     Ok(TemplateRenderStore::new(
-        TemplateSource::new(source_path, root, content.to_owned()),
+        TemplateSource::new(source_path, root, String::new()),
         Arc::new(FileResolverTemplateStore::new(base_dir, resolver)),
     ))
 }
@@ -184,7 +185,6 @@ impl FileInliningTransform {
                     &self.current_dir,
                     Arc::clone(&self.resolver),
                     self.source_name.as_deref(),
-                    &attr_value,
                 )?);
                 let rendered = render_template_for_target(
                     &attr_value,
@@ -232,7 +232,6 @@ impl FileInliningTransform {
                 &self.current_dir,
                 Arc::clone(&self.resolver),
                 self.source_name.as_deref(),
-                goal,
             )?);
         let rendered =
             render_template_for_target(goal, &ctx, self.render_mode, &target, diagnostics)?;

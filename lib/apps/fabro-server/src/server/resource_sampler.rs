@@ -138,8 +138,8 @@ impl ResourceSampler {
 
         let summaries = state
             .stores
-            .runs
-            .list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now())
+            .run_summaries
+            .list_all(chrono::Utc::now())
             .await
             .context("failed to list runs for resource sampling")?;
         let storage_path = storage_path.to_path_buf();
@@ -254,12 +254,8 @@ fn compute_fabro_storage_usage(
     })
 }
 
-fn sample_disk_resources(
-    storage_path: &Path,
-    fabro_usage: FabroStorageUsage,
-) -> SystemDiskResources {
-    let disks = Disks::new_with_refreshed_list();
-    let candidates = disks
+fn refreshed_disk_candidates() -> Vec<DiskCandidate> {
+    Disks::new_with_refreshed_list()
         .list()
         .iter()
         .map(|disk| DiskCandidate {
@@ -268,7 +264,14 @@ fn sample_disk_resources(
             total_bytes:     disk.total_space(),
             available_bytes: disk.available_space(),
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn sample_disk_resources(
+    storage_path: &Path,
+    fabro_usage: FabroStorageUsage,
+) -> SystemDiskResources {
+    let candidates = refreshed_disk_candidates();
 
     let Some(disk) = select_storage_disk(storage_path, &candidates) else {
         return SystemDiskResources {
@@ -337,6 +340,10 @@ fn select_storage_disk<'a>(
         .iter()
         .filter(|disk| storage_path.starts_with(&disk.mount_point))
         .max_by_key(|disk| disk.mount_point.components().count())
+}
+
+pub(crate) fn available_space_for_path(storage_path: &Path) -> Option<u64> {
+    select_storage_disk(storage_path, &refreshed_disk_candidates()).map(|disk| disk.available_bytes)
 }
 
 fn percent(used: u64, total: u64) -> Option<f64> {

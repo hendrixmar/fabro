@@ -68,7 +68,7 @@ Search file contents with regex. Use glob_filter to narrow results.
 Find files by name pattern.
 
 ## web_search
-Search the web using Brave Search. Returns titles, URLs, and descriptions.
+Search the web. Returns titles, URLs, and descriptions.
 
 ## web_fetch
 Fetch content from a URL and optionally summarize it. Pass a prompt to extract specific information instead of returning the full page. URLs must start with http:// or https://.

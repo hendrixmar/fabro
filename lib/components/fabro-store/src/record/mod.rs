@@ -4,23 +4,20 @@
 //! - [`Record`]: declares the key prefix, id type, and codec for one persisted
 //!   type.
 //! - [`RecordId`]: converts the typed id to and from key segments.
-//! - [`Repository`]: performs the generic get/put/delete/scan/gc operations.
-//! - [`transaction`]: batches multiple typed writes into one atomic SlateDB
-//!   write.
+//! - [`Repository`]: performs the generic get/put/delete/scan operations.
 //!
-//! Production callers should add a named domain store on top of this layer
-//! rather than exposing `Repository<R>` directly. See `slate/auth_codes.rs`,
-//! `slate/auth_tokens.rs`, `slate/blob_store.rs`, and
-//! `slate/run_catalog_index.rs` for the intended pattern.
+//! Production stores no longer read or write SlateDB records; this module is
+//! compiled only for tests that model the retired Slate layout and goes away
+//! with the remaining compatibility bridges.
 
 mod codec;
 mod record_id;
 mod repository;
-mod transaction;
 
-pub(crate) use codec::{Codec, JsonCodec, MarkerCodec, RawBytesCodec};
+#[cfg(test)]
+pub(crate) use codec::JsonCodec;
+pub(crate) use codec::{Codec, MarkerCodec, RawBytesCodec};
 pub(crate) use repository::Repository;
-pub(crate) use transaction::transaction;
 
 use crate::Result;
 
@@ -30,6 +27,7 @@ pub(crate) trait Record: Sized + Send + Sync + 'static {
 
     const PREFIX: &'static str;
 
+    #[cfg(test)]
     fn id(&self) -> Self::Id;
 }
 

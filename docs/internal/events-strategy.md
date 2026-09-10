@@ -186,4 +186,8 @@ Do not rebuild or mutate the `RunEvent` in downstream listeners.
 
 Any JSONL sink, the run store, and SSE should reflect the same canonical envelope bytes after redaction.
 
+An active workflow treats any run-event sink write failure as fatal. It cancels execution and
+attempts to persist `run.failed` through the direct sink path. Persistence-error logs must include
+the full source chain so an HTTP status or transport failure remains visible.
+
 `status.json` remains the authoritative completion signal for detached runs. Terminal run status should only be written after all post-run work is finished.

@@ -2,16 +2,18 @@ import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { useSWRConfig } from "swr";
 import { ChevronRightIcon } from "@heroicons/react/20/solid";
-import type { Automation } from "@qltysh/fabro-api-client";
+import type { Automation, Environment } from "@qltysh/fabro-api-client";
 
 import { ApiError, apiData, automationsApi } from "../lib/api-client";
-import { useAutomation } from "../lib/queries";
+import { useAutomation, useEnvironments } from "../lib/queries";
 import { queryKeys } from "../lib/query-keys";
 import {
   AutomationFormFields,
   automationToFormValues,
   isFormValid,
+  targetFromFormValues,
   triggersFromFormValues,
+  workflowSourceFromFormValues,
   type AutomationFormValues,
 } from "../components/automation-form";
 import { Panel, PanelSkeleton } from "../components/settings-panel";
@@ -31,12 +33,19 @@ export const handle = { hideHeader: true };
 export default function AutomationsEdit() {
   const { id } = useParams<{ id: string }>();
   const query = useAutomation(id);
+  const environmentsQuery = useEnvironments();
 
   return (
     <div className="space-y-6">
       <PageHeader id={id ?? ""} name={query.data?.name} />
       {query.data ? (
-        <EditAutomationForm key={query.data.id} automation={query.data} />
+        <EditAutomationForm
+          key={query.data.id}
+          automation={query.data}
+          environments={environmentsQuery.data?.data}
+          environmentsLoading={environmentsQuery.isLoading && !environmentsQuery.data}
+          environmentsError={Boolean(environmentsQuery.error)}
+        />
       ) : query.error ? (
         <Panel title="Automation">
           <div className="px-4 py-6 text-sm text-fg-2">
@@ -62,7 +71,17 @@ function PageHeader({ id, name }: { id: string; name: string | undefined }) {
   );
 }
 
-function EditAutomationForm({ automation }: { automation: Automation }) {
+function EditAutomationForm({
+  automation,
+  environments = [],
+  environmentsLoading,
+  environmentsError,
+}: {
+  automation: Automation;
+  environments?: Environment[];
+  environmentsLoading: boolean;
+  environmentsError: boolean;
+}) {
   const navigate = useNavigate();
   const { mutate } = useSWRConfig();
   const toast = useToast();
@@ -72,7 +91,10 @@ function EditAutomationForm({ automation }: { automation: Automation }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const canSubmit = isFormValid(values) && !submitting;
+  const canSubmit = isFormValid(values)
+    && !environmentsLoading
+    && !environmentsError
+    && !submitting;
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -85,11 +107,10 @@ function EditAutomationForm({ automation }: { automation: Automation }) {
         automationsApi.replaceAutomation(automation.id, automation.revision, {
           name:        trimmedName,
           description: values.description.trim() || null,
-          target:      {
-            repository: values.repository.trim(),
-            ref:        values.ref.trim(),
-            workflow:   values.workflow.trim(),
-          },
+          environment_id: values.environmentId.trim(),
+          target:      targetFromFormValues(values),
+          workflow:    values.workflow.trim(),
+          workflow_source: workflowSourceFromFormValues(values),
           triggers: triggersFromFormValues(values),
         }),
       );
@@ -109,7 +130,14 @@ function EditAutomationForm({ automation }: { automation: Automation }) {
 
   return (
     <form onSubmit={onSubmit} className="space-y-6">
-      <AutomationFormFields values={values} onChange={setValues} lockIdAndTarget />
+      <AutomationFormFields
+        values={values}
+        onChange={setValues}
+        lockIdAndTarget
+        environments={environments}
+        environmentsLoading={environmentsLoading}
+        environmentsError={environmentsError}
+      />
 
       {error ? <ErrorMessage message={error} /> : null}
 

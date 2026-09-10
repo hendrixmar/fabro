@@ -230,6 +230,12 @@ The preamble includes:
 
 Internal keys (prefixed with `internal.`, `current`, `graph.`, `thread.`, `response.`) are excluded from preambles to avoid noise.
 
+### Large preamble values
+
+In fidelity modes that render context or completed-stage output, one value can contribute at most 8 KiB of serialized JSON inline. Fabro stores larger values as content-addressed blobs, materializes them as readable files, and puts the size, file path, and a 300-character preview in the preamble. The agent can read the file when it needs the full value.
+
+This prompt limit is separate from durable artifact offloading. If Fabro cannot demote a value, it logs a warning and keeps that value inline so the stage can continue.
+
 ## Artifact offloading
 
 When a stage produces a large output (over 100KB of serialized JSON), Fabro stores the serialized bytes in a global content-addressed blob store and replaces the context value with a durable blob ref. Command output is always finalized into a blob ref after command completion, even when it is small or empty:
@@ -244,7 +250,7 @@ Checkpoints and checkpoint-completed events persist these `blob://` refs, not ho
 Before Fabro builds a preamble or starts the next stage, it resolves any blob refs into execution-local files so handlers and agents still see normal `file://` references:
 
 - Local execution materializes blobs under `{run_dir}/runtime/blobs/{blob_hash}.json`
-- Remote sandboxes materialize blobs under `{working_directory}/.fabro/blobs/{blob_hash}.json`
+- Remote sandboxes materialize blobs under the sandbox runtime directory, `{runtime_directory}/blobs/{blob_hash}.json`. This directory lives outside the repository checkout, so materialized blobs never appear in `git status` and are never committed by a checkpoint.
 
 These materialized `file://` paths are runtime-only. They are not written back into durable context snapshots.
 

@@ -1,5 +1,5 @@
 ---
-title: "Consistent workspace globs"
+title: "Consistent workspace globs and model-native agents"
 date: "2026-07-25"
 ---
 
@@ -21,3 +21,21 @@ Fabro now compiles workspace globs once and applies them to normalized relative 
 Artifact traversal also uses structured provider metadata for file-size limits and prunes dependency, cache, and build directories before matching.
 
 Artifact collection now treats each post-stage workspace state as authoritative instead of relying on modification timestamps. Fabro records the same path and content hash only once per run and captures the path again when its content changes.
+
+## Model-native Claude 5 and GPT-5.6 agents
+
+Claude 5 and GPT-5.6 Sol, Terra, and Luna now use profiles that match each model family's preferred tools and instructions. Child agents inherit the same task runtime, so background work and completion notifications behave consistently across profiles.
+
+## More
+
+<Accordion title="Fixes">
+- Fixed active-time totals for stages that are still running
+- Fixed background-agent completion notifications and event delivery
+- Fixed Daytona streaming completion and cleanup after failed probes
+- Removed the read-before-write guard that could reject valid agent edits
+</Accordion>
+
+<Accordion title="Improvements">
+- The stage activity panel now opens on Chat and shows disclosed reasoning in Thread details
+- Open browser tabs now report when a newer Fabro web build is available
+</Accordion>

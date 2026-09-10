@@ -795,6 +795,31 @@ async fn decode_usage_openrouter_cost_and_cache_write() {
     fabro_test::fabro_json_snapshot!(response);
 }
 
+/// Venice reports authoritative USD cost in a top-level object rather than
+/// the OpenRouter `usage.cost` field.
+#[tokio::test]
+async fn decode_usage_venice_top_level_cost() {
+    let response = decode_response(serde_json::json!({
+        "id": "chatcmpl_venice_test",
+        "object": "chat.completion",
+        "created": CREATED_TS,
+        "model": MODEL,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "cost": {"usd": 0.00042, "diem": 0.0},
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 2,
+            "total_tokens": 14
+        }
+    }))
+    .await;
+    fabro_test::fabro_json_snapshot!(response);
+}
+
 // ---------------------------------------------------------------------------
 // Stream
 // ---------------------------------------------------------------------------
@@ -835,6 +860,20 @@ async fn stream_usage_openrouter_cost() {
         r#"{"id":"gen_or_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}"#,
         r#"{"id":"gen_or_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
         r#"{"id":"gen_or_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":2,"total_tokens":14,"cost":0.00031,"prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":0}}}"#,
+        "[DONE]",
+    ]);
+    let (_capture, events) = stream_capture(&base_request(MODEL), &sse).await;
+    fabro_test::fabro_json_snapshot!(events);
+}
+
+/// Venice streams authoritative USD cost in a top-level object on the usage
+/// chunk.
+#[tokio::test]
+async fn stream_usage_venice_top_level_cost() {
+    let sse = support::sse_data_transcript(&[
+        r#"{"id":"chatcmpl_venice_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_venice_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        r#"{"id":"chatcmpl_venice_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[],"cost":{"usd":0.00031,"diem":0.0},"usage":{"prompt_tokens":12,"completion_tokens":2,"total_tokens":14}}"#,
         "[DONE]",
     ]);
     let (_capture, events) = stream_capture(&base_request(MODEL), &sse).await;

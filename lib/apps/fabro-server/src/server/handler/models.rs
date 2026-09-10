@@ -3,7 +3,7 @@ use std::sync::Arc;
 use fabro_auth::ApiCredential;
 use fabro_llm::client::Client as LlmClient;
 use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe};
-use fabro_model::ModelSelectionError;
+use fabro_model::{ModelSelectionError, ReasoningEffort};
 use fabro_redact::redact_string;
 
 use super::super::{
@@ -41,9 +41,11 @@ struct ModelListParams {
 #[derive(serde::Deserialize)]
 struct ModelTestParams {
     #[serde(default)]
-    mode:     Option<String>,
+    mode:             Option<String>,
     #[serde(default)]
-    provider: Option<String>,
+    provider:         Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 async fn list_models(
@@ -188,24 +190,32 @@ async fn test_providers(_auth: RequiredUser, State(state): State<Arc<AppState>>)
     }
 }
 
+fn parse_query_enum<T: FromStr>(value: Option<&str>, label: &str) -> Result<Option<T>, ApiError> {
+    value
+        .map(|value| {
+            T::from_str(value).map_err(|_| {
+                ApiError::new(StatusCode::BAD_REQUEST, format!("invalid {label}: {value}"))
+            })
+        })
+        .transpose()
+}
+
 async fn test_model(
     _auth: RequiredUser,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(params): Query<ModelTestParams>,
 ) -> Response {
-    let mode = match params.mode.as_deref() {
-        Some(value) => match ModelTestMode::from_str(value) {
-            Ok(mode) => mode,
-            Err(_) => {
-                return ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid model test mode: {value}"),
-                )
-                .into_response();
-            }
-        },
-        None => ModelTestMode::Basic,
+    let mode = match parse_query_enum(params.mode.as_deref(), "model test mode") {
+        Ok(mode) => mode.unwrap_or(ModelTestMode::Basic),
+        Err(error) => return error.into_response(),
+    };
+    let reasoning_effort = match parse_query_enum::<ReasoningEffort>(
+        params.reasoning_effort.as_deref(),
+        "reasoning effort",
+    ) {
+        Ok(reasoning_effort) => reasoning_effort,
+        Err(error) => return error.into_response(),
     };
     let llm_result = match state.resolve_llm_client().await {
         Ok(result) => result,
@@ -253,7 +263,7 @@ async fn test_model(
     }
     let client = Arc::new(llm_result.client);
 
-    let outcome = run_model_test(info, mode, client).await;
+    let outcome = run_model_test(info, mode, reasoning_effort, client).await;
     Json(serde_json::json!({
         "model_id": info.id,
         "provider": info.provider,

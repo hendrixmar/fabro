@@ -32,6 +32,8 @@ pub enum SandboxSpec {
         run_id:           Option<RunId>,
         clone_origin_url: Option<String>,
         clone_branch:     Option<String>,
+        clone_tag:        Option<String>,
+        clone_commit_sha: Option<String>,
     },
     #[cfg(feature = "daytona")]
     Daytona {
@@ -40,6 +42,8 @@ pub enum SandboxSpec {
         run_id:           Option<RunId>,
         clone_origin_url: Option<String>,
         clone_branch:     Option<String>,
+        clone_tag:        Option<String>,
+        clone_commit_sha: Option<String>,
         api_key:          Option<String>,
     },
 }
@@ -202,13 +206,17 @@ impl SandboxSpec {
                 run_id,
                 clone_origin_url,
                 clone_branch,
+                clone_tag,
+                clone_commit_sha,
             } => {
                 let mut sandbox = DockerSandbox::new(
                     config.clone(),
-                    github_app.clone(),
+                    github_app.as_ref(),
                     *run_id,
                     clone_origin_url.clone(),
                     clone_branch.clone(),
+                    clone_tag.clone(),
+                    clone_commit_sha.clone(),
                 )
                 .context("Failed to create Docker sandbox")?;
                 if let Some(callback) = event_callback {
@@ -223,6 +231,8 @@ impl SandboxSpec {
                 run_id,
                 clone_origin_url,
                 clone_branch,
+                clone_tag,
+                clone_commit_sha,
                 api_key,
             } => {
                 let mut sandbox = DaytonaSandbox::new(
@@ -231,6 +241,8 @@ impl SandboxSpec {
                     *run_id,
                     clone_origin_url.clone(),
                     clone_branch.clone(),
+                    clone_tag.clone(),
+                    clone_commit_sha.clone(),
                     api_key.clone(),
                 )
                 .await
@@ -276,6 +288,8 @@ mod tests {
             run_id:           None,
             clone_origin_url: Some("git@github.com:brynary/rack-test.git".to_string()),
             clone_branch:     Some("main".to_string()),
+            clone_tag:        None,
+            clone_commit_sha: None,
         };
         let mut sandbox = MockSandbox::linux();
         sandbox.working_dir = "/workspace/rack-test";
@@ -300,6 +314,35 @@ mod tests {
             runtime.primary_repo_link.as_deref(),
             Some("/workspace/rack-test")
         );
+        let runtime_json = serde_json::to_value(&runtime).expect("runtime should serialize");
+        assert!(runtime_json.get("clone_commit_sha").is_none());
+    }
+
+    #[cfg(feature = "docker")]
+    #[tokio::test]
+    async fn invalid_exact_checkout_spec_fails_before_provider_connection() {
+        let spec = SandboxSpec::Docker {
+            config:           DockerSandboxOptions::default(),
+            github_app:       None,
+            run_id:           None,
+            clone_origin_url: Some("https://github.com/acme/widgets".to_string()),
+            clone_branch:     Some("main".to_string()),
+            clone_tag:        None,
+            clone_commit_sha: Some("not-a-sha".to_string()),
+        };
+
+        let error = spec
+            .build(None)
+            .await
+            .err()
+            .expect("spec validation should run before Docker connection");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to create Docker sandbox")
+        );
+        assert!(format!("{error:#}").contains("40 ASCII hexadecimal"));
+        assert!(!format!("{error:#}").contains("Docker daemon"));
     }
 
     #[cfg(feature = "docker")]
@@ -314,6 +357,8 @@ mod tests {
             run_id:           None,
             clone_origin_url: Some("https://gitlab.com/acme/widgets".to_string()),
             clone_branch:     None,
+            clone_tag:        None,
+            clone_commit_sha: None,
         };
         let mut sandbox = MockSandbox::linux();
         sandbox.working_dir = "/workspace";

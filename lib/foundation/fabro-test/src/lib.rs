@@ -1955,7 +1955,7 @@ pub fn json_snapshot_filters(mut filters: Vec<(String, String)>) -> Vec<(String,
         r#""id": "[EVENT_ID]""#.to_string(),
     ));
     filters = json_elapsed_ms_snapshot_filters(filters);
-    for field in ["manifest_blob", "definition_blob"] {
+    for field in ["manifest_blob", "definition_blob", "spec_blob"] {
         filters.push((
             format!(r#""{field}":\s*"[0-9a-f]{{64}}""#),
             format!(r#""{field}": "[BLOB_HASH]""#),

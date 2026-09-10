@@ -1,4 +1,5 @@
 mod all_conditional_edges;
+mod auto_status_deprecated;
 mod backend_valid;
 mod command_requires_script;
 mod condition_syntax;
@@ -15,6 +16,7 @@ mod inert_attribute;
 mod join_policy_removed;
 mod model_support;
 mod node_model_known;
+mod on_failure_valid;
 mod orphan_custom_outcome;
 mod parallel_branch;
 mod parallel_branch_inert_attribute;
@@ -66,6 +68,8 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         reserved_keyword_node_id::rule(),
         all_conditional_edges::rule(),
         orphan_custom_outcome::rule(),
+        on_failure_valid::rule(),
+        auto_status_deprecated::rule(),
         script_absolute_cd::rule(),
         command_requires_script::rule(),
         harness_valid::rule(),

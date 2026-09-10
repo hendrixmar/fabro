@@ -28,7 +28,8 @@ use url::{Host, Url};
 
 use crate::auth::browser_shell::browser_shell;
 use crate::auth::{
-    self, AuthCode, AuthErrorCode, ConsumeOutcome, JwtSubject, REFRESH_TOKEN_PREFIX, RefreshToken,
+    self, AuthErrorCode, AuthSessionRecord, InitialRefreshToken, JwtSubject,
+    PendingCliAuthorization, REFRESH_TOKEN_PREFIX, RotateOutcome,
 };
 use crate::jwt_auth::{AuthMode, ConfiguredAuth, bearer_token_from_headers};
 use crate::principal_middleware::{
@@ -389,18 +390,12 @@ async fn token(
         );
     }
 
-    let auth_codes = match state.store_ref().auth_codes().await {
-        Ok(store) => store,
-        Err(err) => {
-            warn!(error = %err, "Failed to open auth code store");
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Could not complete authentication",
-            );
-        }
-    };
-    let Some(entry) = (match auth_codes.consume(code).await {
+    let Some(entry) = (match state
+        .stores
+        .auth_codes
+        .consume(code, chrono::Utc::now())
+        .await
+    {
         Ok(entry) => entry,
         Err(err) => {
             warn!(error = %err, "Failed to consume auth code");
@@ -466,32 +461,28 @@ async fn token(
     let refresh_expires_at = now + chrono::Duration::days(REFRESH_TOKEN_TTL_DAYS);
     let refresh_secret = random_secret();
     let refresh_token = format!("{REFRESH_TOKEN_PREFIX}{refresh_secret}");
-    let refresh_row = RefreshToken {
-        token_hash:   hash_refresh_secret(&refresh_secret),
-        chain_id:     uuid::Uuid::new_v4(),
+    let session = AuthSessionRecord {
+        id:           uuid::Uuid::new_v4(),
         identity:     entry.identity.clone(),
         login:        entry.login.clone(),
         name:         entry.name.clone(),
         email:        entry.email.clone(),
         avatar_url:   entry.avatar_url.clone(),
-        issued_at:    now,
-        expires_at:   refresh_expires_at,
-        last_used_at: now,
-        used:         false,
         user_agent:   sanitize_user_agent(request_user_agent(&headers)),
+        created_at:   now,
+        last_used_at: now,
     };
-    let auth_tokens = match state.store_ref().refresh_tokens().await {
-        Ok(store) => store,
-        Err(err) => {
-            warn!(error = %err, "Failed to open refresh token store");
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Could not complete authentication",
-            );
-        }
+    let refresh_row = InitialRefreshToken {
+        token_hash: hash_refresh_secret(&refresh_secret),
+        issued_at:  now,
+        expires_at: refresh_expires_at,
     };
-    if let Err(err) = auth_tokens.insert_refresh_token(refresh_row.clone()).await {
+    if let Err(err) = state
+        .stores
+        .auth_sessions
+        .create_session(&session, &refresh_row)
+        .await
+    {
         warn!(error = %err, "Failed to persist refresh token");
         return oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -516,7 +507,7 @@ async fn token(
     );
 
     log_cli_auth_tokens_issued(&entry.login, &entry.email);
-    auth_slot.replace(refresh_user_context(&refresh_row));
+    auth_slot.replace(refresh_user_context(&session));
 
     Json(CliTokenResponse {
         access_token,
@@ -524,10 +515,10 @@ async fn token(
         refresh_token,
         refresh_token_expires_at: refresh_expires_at,
         subject: subject_response(
-            &refresh_row.identity,
-            &refresh_row.login,
-            &refresh_row.name,
-            &refresh_row.email,
+            &session.identity,
+            &session.login,
+            &session.name,
+            &session.email,
         ),
     })
     .into_response()
@@ -570,37 +561,19 @@ async fn refresh(
             "Could not refresh authentication",
         );
     };
-    let auth_tokens = match state.store_ref().refresh_tokens().await {
-        Ok(store) => store,
-        Err(err) => {
-            warn!(error = %err, "Failed to open refresh token store");
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Could not refresh authentication",
-            );
-        }
-    };
+    let auth_sessions = &state.stores.auth_sessions;
 
     let now = chrono::Utc::now();
     let secret_hash = hash_refresh_secret(&secret);
-    let existing = match auth_tokens.find_refresh_token(&secret_hash).await {
-        Ok(existing) => existing,
-        Err(err) => {
-            warn!(error = %err, "Failed to load refresh token before rotation");
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Could not refresh authentication",
-            );
-        }
-    };
     let next_secret = random_secret();
     let next_user_agent = sanitize_user_agent(request_user_agent(&headers));
-    let outcome = match auth_tokens
-        .consume_and_rotate(
-            secret_hash,
-            next_refresh_row(existing.as_ref(), &next_secret, &next_user_agent, now),
+    let refresh_expires_at = now + chrono::Duration::days(REFRESH_TOKEN_TTL_DAYS);
+    let outcome = match auth_sessions
+        .rotate(
+            &secret_hash,
+            &hash_refresh_secret(&next_secret),
+            refresh_expires_at,
+            &next_user_agent,
             now,
         )
         .await
@@ -616,42 +589,31 @@ async fn refresh(
         }
     };
 
-    let (old, new_row) = match outcome {
-        ConsumeOutcome::NotFound | ConsumeOutcome::Expired => {
+    let session = match outcome {
+        RotateOutcome::NotFound | RotateOutcome::Expired => {
             auth_slot.replace(RequestAuthContext::invalid());
-            if auth_tokens.was_recently_replay_revoked(&secret_hash, now) {
-                return oauth_error(
-                    StatusCode::UNAUTHORIZED,
-                    "refresh_token_revoked",
-                    "Refresh token revoked",
-                );
-            }
             return oauth_error(
                 StatusCode::UNAUTHORIZED,
                 "refresh_token_expired",
                 "Refresh token expired",
             );
         }
-        ConsumeOutcome::Reused(old) => {
+        RotateOutcome::ReplayedAndRevoked(session) => {
             auth_slot.replace(RequestAuthContext::invalid());
-            auth_tokens.mark_refresh_token_replay(secret_hash, now);
-            if let Err(err) = auth_tokens.delete_chain(old.chain_id).await {
-                warn!(error = %err, chain_id = %old.chain_id, "Failed to revoke replayed refresh token chain");
-            }
-            log_refresh_token_replay(old.chain_id, old.identity.subject(), &next_user_agent);
+            log_refresh_token_replay(session.id, session.identity.subject(), &next_user_agent);
             return oauth_error(
                 StatusCode::UNAUTHORIZED,
                 "refresh_token_revoked",
                 "Refresh token revoked",
             );
         }
-        ConsumeOutcome::Rotated(old, new_row) => (old, *new_row),
+        RotateOutcome::Rotated(session) => session,
     };
 
-    if !login_allowed(state.as_ref(), &old.login) {
+    if !login_allowed(state.as_ref(), &session.login) {
         auth_slot.replace(RequestAuthContext::invalid());
-        if let Err(err) = auth_tokens.delete_chain(old.chain_id).await {
-            warn!(error = %err, chain_id = %old.chain_id, "Failed to revoke deauthorized refresh token chain");
+        if let Err(err) = auth_sessions.delete_session(session.id).await {
+            warn!(error = %err, session_id = %session.id, "Failed to revoke deauthorized refresh token chain");
         }
         return oauth_error(StatusCode::FORBIDDEN, "unauthorized", "Login not permitted");
     }
@@ -661,24 +623,29 @@ async fn refresh(
         jwt_key,
         jwt_issuer,
         &JwtSubject {
-            identity:    old.identity.clone(),
-            login:       old.login.clone(),
-            name:        old.name.clone(),
-            email:       old.email.clone(),
-            avatar_url:  old.avatar_url.clone(),
+            identity:    session.identity.clone(),
+            login:       session.login.clone(),
+            name:        session.name.clone(),
+            email:       session.email.clone(),
+            avatar_url:  session.avatar_url.clone(),
             user_url:    String::new(),
             auth_method: AuthMethod::Github,
         },
         chrono::Duration::minutes(ACCESS_TOKEN_TTL_MINUTES),
     );
-    auth_slot.replace(refresh_user_context(&old));
+    auth_slot.replace(refresh_user_context(&session));
 
     Json(CliTokenResponse {
         access_token,
         access_token_expires_at: access_expires_at,
         refresh_token: format!("{REFRESH_TOKEN_PREFIX}{next_secret}"),
-        refresh_token_expires_at: new_row.expires_at,
-        subject: subject_response(&old.identity, &old.login, &old.name, &old.email),
+        refresh_token_expires_at: refresh_expires_at,
+        subject: subject_response(
+            &session.identity,
+            &session.login,
+            &session.name,
+            &session.email,
+        ),
     })
     .into_response()
 }
@@ -701,20 +668,9 @@ async fn logout(
         }
         RefreshCredential::Present(secret) => secret,
     };
-    let auth_tokens = match state.store_ref().refresh_tokens().await {
-        Ok(store) => store,
-        Err(err) => {
-            warn!(error = %err, "Failed to open refresh token store");
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Could not complete logout",
-            );
-        }
-    };
-
-    let existing = match auth_tokens
-        .find_refresh_token(&hash_refresh_secret(&secret))
+    let auth_sessions = &state.stores.auth_sessions;
+    let existing = match auth_sessions
+        .find_session_by_token_hash(&hash_refresh_secret(&secret))
         .await
     {
         Ok(existing) => existing,
@@ -728,17 +684,17 @@ async fn logout(
         }
     };
 
-    if let Some(refresh_token) = existing {
-        auth_slot.replace(refresh_user_context(&refresh_token));
-        if let Err(err) = auth_tokens.delete_chain(refresh_token.chain_id).await {
-            warn!(error = %err, chain_id = %refresh_token.chain_id, "Failed to revoke refresh token chain during logout");
+    if let Some(session) = existing {
+        auth_slot.replace(refresh_user_context(&session));
+        if let Err(err) = auth_sessions.delete_session(session.id).await {
+            warn!(error = %err, session_id = %session.id, "Failed to revoke refresh token chain during logout");
             return oauth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "Could not complete logout",
             );
         }
-        log_cli_refresh_chain_logged_out(&refresh_token.login, &refresh_token.email);
+        log_cli_refresh_chain_logged_out(&session.login, &session.email);
     } else {
         auth_slot.replace(RequestAuthContext::invalid());
     }
@@ -956,13 +912,13 @@ fn refresh_credential_from_headers(headers: &HeaderMap) -> RefreshCredential {
     }
 }
 
-fn refresh_user_context(refresh_token: &RefreshToken) -> RequestAuthContext {
+fn refresh_user_context(session: &AuthSessionRecord) -> RequestAuthContext {
     RequestAuthContext::authenticated(
         Principal::user_with_avatar(
-            refresh_token.identity.clone(),
-            refresh_token.login.clone(),
+            session.identity.clone(),
+            session.login.clone(),
             AuthMethod::Github,
-            non_empty_avatar_url(&refresh_token.avatar_url),
+            non_empty_avatar_url(&session.avatar_url),
         ),
         None,
     )
@@ -970,31 +926,6 @@ fn refresh_user_context(refresh_token: &RefreshToken) -> RequestAuthContext {
 
 fn hash_refresh_secret(secret: &str) -> [u8; 32] {
     Sha256::digest(secret.as_bytes()).into()
-}
-
-fn next_refresh_row(
-    existing: Option<&RefreshToken>,
-    next_secret: &str,
-    user_agent: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> RefreshToken {
-    let fallback_identity = fabro_types::IdpIdentity::new("https://github.com", "0")
-        .expect("static identity should be valid");
-    RefreshToken {
-        token_hash:   hash_refresh_secret(next_secret),
-        chain_id:     existing.map_or_else(uuid::Uuid::new_v4, |token| token.chain_id),
-        identity:     existing
-            .map_or_else(|| fallback_identity.clone(), |token| token.identity.clone()),
-        login:        existing.map_or_else(String::new, |token| token.login.clone()),
-        name:         existing.map_or_else(String::new, |token| token.name.clone()),
-        email:        existing.map_or_else(String::new, |token| token.email.clone()),
-        avatar_url:   existing.map_or_else(String::new, |token| token.avatar_url.clone()),
-        issued_at:    now,
-        expires_at:   now + chrono::Duration::days(REFRESH_TOKEN_TTL_DAYS),
-        last_used_at: now,
-        used:         false,
-        user_agent:   user_agent.to_string(),
-    }
 }
 
 fn user_agent_fingerprint(user_agent: &str) -> String {
@@ -1006,9 +937,9 @@ fn log_cli_auth_tokens_issued(login: &str, email: &str) {
     info!(login = %login, email = %email, "Issued CLI auth tokens");
 }
 
-fn log_refresh_token_replay(chain_id: uuid::Uuid, idp_subject: &str, user_agent: &str) {
+fn log_refresh_token_replay(session_id: uuid::Uuid, idp_subject: &str, user_agent: &str) {
     warn!(
-        chain_id = %chain_id,
+        session_id = %session_id,
         idp_subject = %idp_subject,
         user_agent_fingerprint = %user_agent_fingerprint(user_agent),
         "Refresh token replay detected"
@@ -1180,8 +1111,7 @@ async fn issue_auth_code_response(
     let Some(redirect_uri) = canonical_loopback_redirect_uri(redirect_uri) else {
         return static_error_page(INVALID_REDIRECT_URI);
     };
-    let entry = AuthCode {
-        code: code.clone(),
+    let entry = PendingCliAuthorization {
         identity,
         login: session.login.clone(),
         name: session.name.clone(),
@@ -1192,20 +1122,7 @@ async fn issue_auth_code_response(
         expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
     };
 
-    let store = match state.store_ref().auth_codes().await {
-        Ok(store) => store,
-        Err(err) => {
-            warn!(error = %err, "Failed to open auth code store");
-            return redirect_with_error(
-                &redirect_uri,
-                state_token,
-                "server_error",
-                "Could not complete GitHub sign-in",
-            );
-        }
-    };
-
-    if let Err(err) = store.insert(entry).await {
+    if let Err(err) = state.stores.auth_codes.issue(&code, &entry).await {
         warn!(error = %err, "Failed to persist auth code");
         return redirect_with_error(
             &redirect_uri,
@@ -1248,9 +1165,12 @@ mod tests {
         CliFlowCookie, DEV_TOKEN_LOGIN_INSTRUCTIONS, add_cli_flow_cookie, read_private_cli_flow,
         user_agent_fingerprint, web_routes,
     };
-    use crate::auth::{self, AuthCode, AuthErrorCode, RefreshToken};
+    use crate::auth::{
+        self, AuthErrorCode, AuthSessionRecord, InitialRefreshToken, PendingCliAuthorization,
+    };
     use crate::jwt_auth::{AuthMode, ConfiguredAuth};
     use crate::principal_middleware::{AuthStatus, RequestAuthContext};
+    use crate::server::AppState;
     use crate::web_auth::SessionCookie;
 
     fn test_cookie_key() -> Key {
@@ -1391,10 +1311,10 @@ client_id = "github-client-id"
     }
 
     async fn insert_auth_code(state: &crate::server::AppState, code: &str, verifier: &str) {
-        let auth_codes = state.store_ref().auth_codes().await.unwrap();
-        auth_codes
-            .insert(AuthCode {
-                code:           code.to_string(),
+        state
+            .stores
+            .auth_codes
+            .issue(code, &PendingCliAuthorization {
                 identity:       fabro_types::IdpIdentity::new("https://github.com", "12345")
                     .expect("identity should be valid"),
                 login:          "octocat".to_string(),
@@ -1413,23 +1333,37 @@ client_id = "github-client-id"
         Sha256::digest(secret.as_bytes()).into()
     }
 
-    fn refresh_row(secret: &str) -> RefreshToken {
+    fn session_and_token(secret: &str) -> (AuthSessionRecord, InitialRefreshToken) {
         let now = chrono::Utc::now();
-        RefreshToken {
-            token_hash:   hash_refresh_secret(secret),
-            chain_id:     Uuid::new_v4(),
+        let session = AuthSessionRecord {
+            id:           Uuid::new_v4(),
             identity:     fabro_types::IdpIdentity::new("https://github.com", "12345")
                 .expect("identity should be valid"),
             login:        "octocat".to_string(),
             name:         "The Octocat".to_string(),
             email:        "octocat@example.com".to_string(),
             avatar_url:   "https://example.com/octocat.png".to_string(),
-            issued_at:    now,
-            expires_at:   now + chrono::Duration::days(30),
-            last_used_at: now,
-            used:         false,
             user_agent:   "fabro-test".to_string(),
-        }
+            created_at:   now,
+            last_used_at: now,
+        };
+        let token = InitialRefreshToken {
+            token_hash: hash_refresh_secret(secret),
+            issued_at:  now,
+            expires_at: now + chrono::Duration::days(30),
+        };
+        (session, token)
+    }
+
+    async fn open_cli_session(state: &AppState, secret: &str) -> Uuid {
+        let (session, token) = session_and_token(secret);
+        state
+            .stores
+            .auth_sessions
+            .create_session(&session, &token)
+            .await
+            .unwrap();
+        session.id
     }
 
     #[derive(Default)]
@@ -1769,9 +1703,10 @@ client_id = "github-client-id"
             .nth(1)
             .and_then(|segment| segment.split('&').next())
             .expect("auth code should be present");
-        let auth_codes = state.store_ref().auth_codes().await.unwrap();
-        let entry = auth_codes
-            .consume(code)
+        let entry = state
+            .stores
+            .auth_codes
+            .consume(code, chrono::Utc::now())
             .await
             .unwrap()
             .expect("code should exist");
@@ -2014,9 +1949,9 @@ client_id = "github-client-id"
             .unwrap()
             .strip_prefix("fabro_refresh_")
             .unwrap();
-        let auth_tokens = state.store_ref().refresh_tokens().await.unwrap();
-        let refresh = auth_tokens
-            .find_refresh_token(&hash_refresh_secret(refresh_secret))
+        let auth_sessions = &state.stores.auth_sessions;
+        let refresh = auth_sessions
+            .find_session_by_token_hash(&hash_refresh_secret(refresh_secret))
             .await
             .unwrap()
             .expect("refresh token should be stored");
@@ -2127,6 +2062,49 @@ client_id = "github-client-id"
     }
 
     #[tokio::test]
+    async fn token_storage_failure_returns_safe_oauth_error() {
+        let (app, state) = test_router(github_settings("https://fabro.example"));
+        state.stores.auth_codes.test_close().await;
+        let raw_code = "raw-code-that-must-not-escape";
+        let raw_verifier = "raw-verifier-that-must-not-escape";
+        let redirect_uri = "http://127.0.0.1:4444/callback";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/cli/token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "grant_type": "authorization_code",
+                            "code": raw_code,
+                            "code_verifier": raw_verifier,
+                            "redirect_uri": redirect_uri
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered).unwrap(),
+            json!({
+                "error": "server_error",
+                "error_description": "Could not complete authentication"
+            })
+        );
+        for sensitive in [raw_code, raw_verifier, redirect_uri] {
+            assert!(!rendered.contains(sensitive));
+        }
+    }
+
+    #[tokio::test]
     async fn token_rejects_userinfo_injected_redirect_uri() {
         let (app, state) = test_router(github_settings("https://fabro.example"));
         insert_auth_code(
@@ -2168,11 +2146,8 @@ client_id = "github-client-id"
     async fn refresh_rotates_tokens_and_replay_revokes_chain() {
         let (app, state) = test_router(github_settings("https://fabro.example"));
         let initial_secret = "refresh-secret-1";
-        let auth_tokens = state.store_ref().refresh_tokens().await.unwrap();
-        auth_tokens
-            .insert_refresh_token(refresh_row(initial_secret))
-            .await
-            .unwrap();
+        open_cli_session(&state, initial_secret).await;
+        let auth_sessions = &state.stores.auth_sessions;
 
         let refresh_request = || {
             Request::builder()
@@ -2211,15 +2186,15 @@ client_id = "github-client-id"
 
         let new_secret = rotated.strip_prefix("fabro_refresh_").unwrap();
         assert!(
-            auth_tokens
-                .find_refresh_token(&hash_refresh_secret(initial_secret))
+            auth_sessions
+                .find_session_by_token_hash(&hash_refresh_secret(initial_secret))
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
-            auth_tokens
-                .find_refresh_token(&hash_refresh_secret(new_secret))
+            auth_sessions
+                .find_session_by_token_hash(&hash_refresh_secret(new_secret))
                 .await
                 .unwrap()
                 .is_none()
@@ -2233,14 +2208,7 @@ client_id = "github-client-id"
             github_auth_mode(),
         );
         let initial_secret = "refresh-secret-auth-context";
-        state
-            .store_ref()
-            .refresh_tokens()
-            .await
-            .unwrap()
-            .insert_refresh_token(refresh_row(initial_secret))
-            .await
-            .unwrap();
+        open_cli_session(&state, initial_secret).await;
 
         let response = app
             .clone()
@@ -2296,11 +2264,8 @@ client_id = "github-client-id"
     async fn concurrent_refresh_has_one_winner_and_revokes_chain() {
         let (app, state) = test_router(github_settings("https://fabro.example"));
         let initial_secret = "refresh-secret-concurrent";
-        let auth_tokens = state.store_ref().refresh_tokens().await.unwrap();
-        auth_tokens
-            .insert_refresh_token(refresh_row(initial_secret))
-            .await
-            .unwrap();
+        open_cli_session(&state, initial_secret).await;
+        let auth_sessions = &state.stores.auth_sessions;
 
         let barrier = Arc::new(Barrier::new(33));
         let mut tasks = JoinSet::new();
@@ -2348,7 +2313,11 @@ client_id = "github-client-id"
                         .map(str::to_string);
                 }
                 StatusCode::UNAUTHORIZED => {
-                    assert_eq!(body["error"], "refresh_token_revoked");
+                    let error = body["error"].as_str().unwrap_or_default();
+                    assert!(
+                        error == "refresh_token_revoked" || error == "refresh_token_expired",
+                        "unexpected refresh error {error}"
+                    );
                     revoked += 1;
                 }
                 other => panic!("unexpected refresh status {other}: {body}"),
@@ -2359,15 +2328,15 @@ client_id = "github-client-id"
         assert_eq!(revoked, 31);
         let rotated_secret = rotated_secret.expect("one refresh should rotate the token");
         assert!(
-            auth_tokens
-                .find_refresh_token(&hash_refresh_secret(initial_secret))
+            auth_sessions
+                .find_session_by_token_hash(&hash_refresh_secret(initial_secret))
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
-            auth_tokens
-                .find_refresh_token(&hash_refresh_secret(&rotated_secret))
+            auth_sessions
+                .find_session_by_token_hash(&hash_refresh_secret(&rotated_secret))
                 .await
                 .unwrap()
                 .is_none()
@@ -2378,17 +2347,24 @@ client_id = "github-client-id"
     async fn logout_deletes_refresh_token_chain_and_returns_no_content() {
         let (app, state) = test_router(github_settings("https://fabro.example"));
         let secret = "refresh-secret-logout";
-        let token = refresh_row(secret);
-        let chain_id = token.chain_id;
-        let auth_tokens = state.store_ref().refresh_tokens().await.unwrap();
-        auth_tokens.insert_refresh_token(token).await.unwrap();
+        let (session, token) = session_and_token(secret);
+        let auth_sessions = &state.stores.auth_sessions;
+        auth_sessions
+            .create_session(&session, &token)
+            .await
+            .unwrap();
 
-        let sibling = RefreshToken {
-            token_hash: hash_refresh_secret("refresh-secret-logout-2"),
-            chain_id,
-            ..refresh_row("refresh-secret-logout-2")
-        };
-        auth_tokens.insert_refresh_token(sibling).await.unwrap();
+        let now = chrono::Utc::now();
+        auth_sessions
+            .rotate(
+                &hash_refresh_secret(secret),
+                &hash_refresh_secret("refresh-secret-logout-2"),
+                now + chrono::Duration::days(30),
+                "fabro-test",
+                now,
+            )
+            .await
+            .unwrap();
 
         let response = app
             .oneshot(
@@ -2407,15 +2383,15 @@ client_id = "github-client-id"
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(
-            auth_tokens
-                .find_refresh_token(&hash_refresh_secret(secret))
+            auth_sessions
+                .find_session_by_token_hash(&hash_refresh_secret(secret))
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
-            auth_tokens
-                .find_refresh_token(&hash_refresh_secret("refresh-secret-logout-2"))
+            auth_sessions
+                .find_session_by_token_hash(&hash_refresh_secret("refresh-secret-logout-2"))
                 .await
                 .unwrap()
                 .is_none()

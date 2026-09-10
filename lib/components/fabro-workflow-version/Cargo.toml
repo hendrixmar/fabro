@@ -23,5 +23,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+fabro-store = { path = "../fabro-store", features = ["test-support"] }
 object_store.workspace = true
 tokio = { workspace = true, features = ["full"] }

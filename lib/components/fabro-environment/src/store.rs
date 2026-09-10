@@ -28,7 +28,7 @@ use crate::{
 /// managed environments, and a run that selects an absent environment fails
 /// explicitly. `local` is intentionally absent from SQLite because it is a
 /// reserved, in-memory environment.
-const DEFAULT_ENVIRONMENT_ID: &str = "default";
+pub const DEFAULT_ENVIRONMENT_ID: &str = "default";
 
 /// `local` is a reserved environment: it is synthesized in memory only when the
 /// local sandbox provider is enabled, is never persisted, and cannot be

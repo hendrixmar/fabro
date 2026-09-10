@@ -4,13 +4,15 @@ use std::sync::Arc;
 
 use ::fabro_types::{RunEvent, RunId, RunProjection};
 use anyhow::Result;
-use fabro_store::RunDatabase;
+use chrono::{DateTime, Utc};
+use fabro_store::{Database, RunDatabase};
+use fabro_util::error::{SharedError, collect_chain};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 
 use super::emitter::Emitter;
 use super::redaction::{build_redacted_event_payload, redacted_event_json};
-use super::{Event, to_run_event};
+use super::{Event, to_run_event, to_run_event_at};
 use crate::runtime_store::RunStoreHandle;
 
 pub async fn append_event(run_store: &RunDatabase, run_id: &RunId, event: &Event) -> Result<()> {
@@ -20,6 +22,21 @@ pub async fn append_event(run_store: &RunDatabase, run_id: &RunId, event: &Event
         .append_event(&payload)
         .await
         .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
+/// Creates a run by committing its redacted `run.created` event and canonical
+/// current row in one SQLite transaction.
+pub async fn create_run(
+    store: &Database,
+    run_id: &RunId,
+    event: &Event,
+    timestamp: DateTime<Utc>,
+) -> Result<RunDatabase> {
+    let stored = to_run_event_at(run_id, event, timestamp, None);
+    let payload = build_redacted_event_payload(&stored, run_id)?;
+    Box::pin(store.create_run_with_first_event(run_id, &payload))
+        .await
         .map_err(anyhow::Error::from)
 }
 
@@ -42,9 +59,15 @@ pub async fn append_event_to_sink(
     sink: &RunEventSink,
     run_id: &RunId,
     event: &Event,
-) -> Result<()> {
+) -> Result<(), RunEventPersistenceError> {
     let stored = to_run_event(run_id, event);
-    sink.write_run_event(&stored).await
+    sink.write_run_event(&stored)
+        .await
+        .map_err(|err| RunEventPersistenceError::Write {
+            run_id: *run_id,
+            event:  stored.body.event_name().to_string(),
+            source: SharedError::new(err),
+        })
 }
 
 #[derive(Clone)]
@@ -149,86 +172,100 @@ impl RunEventSink {
 )]
 enum RunEventCommand {
     Event(RunEvent),
-    Flush(oneshot::Sender<()>),
+    Flush(oneshot::Sender<Result<(), RunEventPersistenceError>>),
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum RunEventPersistenceError {
+    #[error("failed to persist run event {event} for run {run_id}")]
+    Write {
+        run_id: RunId,
+        event:  String,
+        #[source]
+        source: SharedError,
+    },
+    #[error("run event persistence task stopped")]
+    TaskStopped,
 }
 
 #[derive(Clone)]
 pub struct RunEventLogger {
-    tx: mpsc::UnboundedSender<RunEventCommand>,
+    tx:         mpsc::UnboundedSender<RunEventCommand>,
+    failure_rx: watch::Receiver<Option<RunEventPersistenceError>>,
 }
 
 impl RunEventLogger {
     #[must_use]
     pub fn new(sink: RunEventSink) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (failure_tx, failure_rx) = watch::channel(None);
 
         tokio::spawn(async move {
-            // A dropped run event is unrecoverable history loss, so the first
-            // one is an ERROR worth investigating. A broken sink fails for
-            // every event that follows, so report the rest as a count at flush
-            // instead of one ERROR per event. Flush runs per stage and per
-            // agent turn, so only losses since the last summary are reported.
-            let mut write_failures: u64 = 0;
-            let mut summarized_failures: u64 = 0;
+            // The watch channel is the single record of the latched failure:
+            // the worker is its only writer, so borrowing it here cannot race.
             while let Some(command) = rx.recv().await {
                 match command {
                     RunEventCommand::Event(event) => {
+                        if failure_tx.borrow().is_some() {
+                            continue;
+                        }
                         if let Err(err) = sink.write_run_event(&event).await {
-                            write_failures += 1;
-                            if write_failures == 1 {
-                                tracing::error!(
-                                    run_id = %event.run_id,
-                                    event = %event.body.event_name(),
-                                    error = %err,
-                                    "Failed to write run event",
-                                );
-                            } else {
-                                tracing::debug!(
-                                    run_id = %event.run_id,
-                                    event = %event.body.event_name(),
-                                    failures = write_failures,
-                                    error = %err,
-                                    "Failed to write run event",
-                                );
-                            }
+                            let rendered_error = collect_chain(err.as_ref()).join(": ");
+                            tracing::error!(
+                                run_id = %event.run_id,
+                                event = %event.body.event_name(),
+                                error = %rendered_error,
+                                "Failed to persist run event; stopping workflow",
+                            );
+                            failure_tx.send_replace(Some(RunEventPersistenceError::Write {
+                                run_id: event.run_id,
+                                event:  event.body.event_name().to_string(),
+                                source: SharedError::new(err),
+                            }));
                         }
                     }
                     RunEventCommand::Flush(tx) => {
-                        if write_failures > summarized_failures {
-                            tracing::error!(
-                                lost = write_failures - summarized_failures,
-                                total = write_failures,
-                                "Run events were lost to write failures",
-                            );
-                            summarized_failures = write_failures;
-                        }
-                        let _ = tx.send(());
+                        let result = failure_tx.borrow().clone().map_or(Ok(()), Err);
+                        let _ = tx.send(result);
                     }
                 }
             }
         });
 
-        Self { tx }
+        Self { tx, failure_rx }
     }
 
     pub fn register(&self, emitter: &Emitter) {
         let tx = self.tx.clone();
         emitter.on_event(move |event| {
             if tx.send(RunEventCommand::Event(event.clone())).is_err() {
-                tracing::warn!("Run event logger channel closed while forwarding event");
+                tracing::error!(
+                    run_id = %event.run_id,
+                    event = %event.body.event_name(),
+                    "Run event persistence task stopped while forwarding event",
+                );
             }
         });
     }
 
-    pub async fn flush(&self) {
+    pub async fn wait_for_failure(&self) -> RunEventPersistenceError {
+        let mut failure_rx = self.failure_rx.clone();
+        let failure = failure_rx.wait_for(Option::is_some).await;
+        match failure {
+            Ok(failure) => failure
+                .clone()
+                .expect("wait_for only returns values matching the predicate"),
+            Err(_) => RunEventPersistenceError::TaskStopped,
+        }
+    }
+
+    pub async fn flush(&self) -> Result<(), RunEventPersistenceError> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(RunEventCommand::Flush(tx)).is_err() {
-            tracing::warn!("Run event logger channel closed before flush");
-            return;
+            return Err(RunEventPersistenceError::TaskStopped);
         }
-        if rx.await.is_err() {
-            tracing::warn!("Run event logger flush dropped before completion");
-        }
+        rx.await
+            .unwrap_or(Err(RunEventPersistenceError::TaskStopped))
     }
 }
 
@@ -249,14 +286,15 @@ impl StoreProgressLogger {
         self.inner.register(emitter);
     }
 
-    pub async fn flush(&self) {
-        self.inner.flush().await;
+    pub async fn flush(&self) -> Result<(), RunEventPersistenceError> {
+        self.inner.flush().await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ::fabro_types::{Graph, RunNoticeLevel, WorkflowSettings, fixtures};
     use fabro_types::test_support;
@@ -271,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_event_writes_store_event_shape() {
-        let store = fabro_store::Database::new(
+        let store = fabro_store::test_support::test_database(
             std::sync::Arc::new(object_store::memory::InMemory::new()),
             "",
             std::time::Duration::from_millis(1),
@@ -279,22 +317,25 @@ mod tests {
         );
         let run_store = store.create_run(&fixtures::RUN_7).await.unwrap();
         append_event(&run_store, &fixtures::RUN_7, &Event::RunCreated {
-            run_id:           fixtures::RUN_7,
-            title:            None,
-            settings:         serde_json::to_value(WorkflowSettings::default()).unwrap(),
-            graph:            serde_json::to_value(Graph::new("test")).unwrap(),
-            workflow_source:  None,
-            labels:           std::collections::BTreeMap::new(),
-            source_directory: None,
-            workflow_slug:    None,
-            automation:       None,
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            git:              None,
-            fork_source_ref:  None,
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+            run_id:              fixtures::RUN_7,
+            title:               None,
+            settings:            serde_json::to_value(WorkflowSettings::default()).unwrap(),
+            graph:               serde_json::to_value(Graph::new("test")).unwrap(),
+            workflow_source:     None,
+            labels:              std::collections::BTreeMap::new(),
+            source_directory:    None,
+            workflow_slug:       None,
+            workflow_version_id: None,
+            target:              None,
+            automation:          None,
+            provenance:          test_support::test_run_provenance(),
+            manifest_blob:       None,
+            spec_blob:           None,
+            git:                 None,
+            fork_source_ref:     None,
+            retried_from:        None,
+            parent_id:           None,
+            web_url:             None,
         })
         .await
         .unwrap();
@@ -437,7 +478,7 @@ mod tests {
         logger.register(&emitter);
 
         emitter.emit(&Event::RunPaused);
-        logger.flush().await;
+        logger.flush().await.unwrap();
 
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
@@ -445,5 +486,39 @@ mod tests {
 
         let payload = event_payload_from_redacted_json(line.trim_end(), &fixtures::RUN_8).unwrap();
         assert_eq!(payload.as_value()["event"], "run.paused");
+    }
+
+    #[tokio::test]
+    async fn run_event_logger_latches_write_failure_and_preserves_cause_chain() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writes_for_sink = Arc::clone(&writes);
+        let sink = RunEventSink::callback(move |_| {
+            writes_for_sink.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(
+                    anyhow::anyhow!("request failed with status 413 Payload Too Large")
+                        .context("worker lost canonical run store during append run event"),
+                )
+            }
+        });
+        let logger = RunEventLogger::new(sink);
+        let emitter = Emitter::new(fixtures::RUN_8);
+        logger.register(&emitter);
+
+        emitter.emit(&Event::RunPaused);
+
+        let failure = logger.wait_for_failure().await;
+        let rendered = collect_chain(&failure).join(": ");
+        assert!(rendered.contains("run.paused"), "{rendered}");
+        assert!(
+            rendered.contains("worker lost canonical run store"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("413 Payload Too Large"), "{rendered}");
+
+        emitter.emit(&Event::RunUnpaused);
+        let flush_failure = logger.flush().await.unwrap_err();
+        assert_eq!(collect_chain(&flush_failure), collect_chain(&failure));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 }

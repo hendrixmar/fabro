@@ -36,6 +36,12 @@ pub(super) fn shannon_entropy(s: &str) -> f64 {
 /// Returns regions where tokens match `[A-Za-z0-9+_=-]{10,}` and have
 /// Shannon entropy above the threshold (4.5 bits). Protects against
 /// consuming characters from JSON escape sequences.
+///
+/// An assignment token (`NAME=value`) is measured and redacted by its
+/// value alone. Measuring the pair merges the name's charset into the
+/// value's and pushes innocuous values (a pure-hex git SHA can never
+/// exceed 4.0 bits by itself) over the threshold, and redacting the
+/// pair destroys the name that says what was redacted.
 pub(super) fn find_entropy_regions(s: &str) -> Vec<Region> {
     let mut regions = Vec::new();
     for m in SECRET_PATTERN.find_iter(s) {
@@ -58,11 +64,37 @@ pub(super) fn find_entropy_regions(s: &str) -> Vec<Region> {
             }
         }
 
+        if let Some(offset) = assignment_value_offset(&s[start..end]) {
+            start += offset;
+        }
+
         if shannon_entropy(&s[start..end]) > ENTROPY_THRESHOLD {
             regions.push(Region { start, end });
         }
     }
     regions
+}
+
+/// For an assignment token (`NAME=value` with an identifier-shaped name),
+/// return the byte offset where the value begins. Entropy above the 4.5-bit
+/// threshold needs at least 23 distinct characters, so a value too short to
+/// qualify simply measures under the threshold; no length guard is needed.
+fn assignment_value_offset(token: &str) -> Option<usize> {
+    let eq = token.find('=')?;
+    let value = &token[eq + 1..];
+    if value.is_empty() || value.starts_with('=') {
+        return None;
+    }
+    let name = &token[..eq];
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(eq + 1)
 }
 
 #[cfg(test)]
@@ -98,12 +130,26 @@ mod tests {
 
     #[test]
     fn regions_finds_high_entropy_token() {
-        // `=` is in the regex pattern, so "key=xK9..." matches as one token
+        // "key=xK9..." matches as one token, but only the value is
+        // measured and flagged; the name survives redaction.
         let input = "key=xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6p";
         let regions = find_entropy_regions(input);
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].start, 0);
+        assert_eq!(regions[0].start, "key=".len());
         assert_eq!(regions[0].end, input.len());
+    }
+
+    #[test]
+    fn regions_find_padded_base64_tokens() {
+        for input in [
+            "WxFhjC5EAnh30M0JIe0Wa58Xb1BYf8kedTTdKUbbd9Y=",
+            "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEF==",
+        ] {
+            assert_eq!(find_entropy_regions(input), vec![Region {
+                start: 0,
+                end:   input.len(),
+            }]);
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use clap::Args;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
-use super::{PlannedCommand, capture_command, command, workspace_root};
+use super::{PlannedCommand, command, workspace_root};
 
 const TOOL_CONFIG_RELATIVE: &str = "target/bench-tests/nextest-tool.toml";
 const TOOL_CONFIG_BODY: &str = "\
@@ -67,7 +67,7 @@ pub(crate) fn bench_tests(args: BenchTestsArgs) -> Result<()> {
     }
 
     let root = workspace_root();
-    let git_sha = resolve_head_sha(&root)?;
+    let git_sha = super::resolve_git_revision(&root, "HEAD")?;
     let tool_config = ensure_tool_config(&root)?;
     let junit_path = root
         .join("target")
@@ -178,21 +178,6 @@ fn ensure_tool_config(root: &Path) -> Result<PathBuf> {
     }
     fs::write(&path, TOOL_CONFIG_BODY).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
-}
-
-fn resolve_head_sha(root: &Path) -> Result<String> {
-    let cmd = PlannedCommand::new("git").arg("rev-parse").arg("HEAD");
-    let output = capture_command(root, &cmd)?;
-    if !output.status.success() {
-        bail!(
-            "git rev-parse HEAD failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(String::from_utf8(output.stdout)
-        .context("git rev-parse HEAD returned non-UTF-8")?
-        .trim()
-        .to_string())
 }
 
 #[expect(

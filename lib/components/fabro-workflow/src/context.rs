@@ -68,6 +68,19 @@ pub mod keys {
     pub const RESPONSE_PREFIX: &str = "response.";
     pub const INTERNAL_RETRY_COUNT_PREFIX: &str = "internal.retry_count.";
 
+    /// Keys the prompt preamble never renders as context values: engine
+    /// bookkeeping, per-thread cursors, and values the per-stage sections
+    /// already present.
+    #[must_use]
+    pub(crate) fn is_preamble_hidden_key(key: &str) -> bool {
+        is_engine_internal_key(key)
+            || key.starts_with(RESPONSE_PREFIX)
+            || key == OUTCOME
+            || key == LAST_STAGE
+            || key == LAST_RESPONSE
+            || key == PREFERRED_LABEL
+    }
+
     // --- Helper functions for dynamic keys ---
 
     #[must_use]
@@ -156,8 +169,49 @@ use fabro_graphviz::Fidelity;
 use fabro_types::{ParallelBranchId, RunId, StageId};
 use serde::{Deserialize, Serialize};
 
-use crate::error::Error;
+use crate::error::{Error, FailureSignature, FailureSignatureExt};
 use crate::event::StageScope;
+use crate::outcome::{Outcome, OutcomeExt};
+
+/// Applies the context values derived from a completed node result.
+///
+/// Edge-policy projection and the durable `after_record` lifecycle use this
+/// same function so conditional routes observe identical values.
+pub(crate) fn apply_recorded_outcome_context(
+    context: &Context,
+    node_id: &str,
+    outcome: &Outcome,
+    retry_count: u32,
+) {
+    let failure_class = outcome.classified_failure_category();
+    let failure_signature = failure_class
+        .map(|category| {
+            let signature_hint = outcome
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.signature.as_deref());
+            FailureSignature::new(node_id, category, signature_hint, outcome.failure_reason())
+                .to_string()
+        })
+        .unwrap_or_default();
+
+    context.set(
+        keys::retry_count_key(node_id),
+        serde_json::json!(retry_count),
+    );
+    context.set(keys::OUTCOME, serde_json::json!(outcome.status.to_string()));
+    context.set(
+        keys::FAILURE_CLASS,
+        serde_json::json!(failure_class.map_or(String::new(), |class| class.to_string())),
+    );
+    context.set(
+        keys::FAILURE_SIGNATURE,
+        serde_json::json!(failure_signature),
+    );
+    if let Some(preferred_label) = &outcome.preferred_label {
+        context.set(keys::PREFERRED_LABEL, serde_json::json!(preferred_label));
+    }
+}
 
 /// Keys whose values changed or were added in `after` relative to `before`.
 /// Takes `after` by value so changed entries move instead of clone.

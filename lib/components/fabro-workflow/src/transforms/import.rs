@@ -6,7 +6,7 @@ use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 use fabro_graphviz::parser;
 use fabro_template::{TemplateContext, validate_static_reference};
 use fabro_types::graph::ReferenceKind;
-use fabro_validate::Diagnostic;
+use fabro_validate::{Diagnostic, Severity};
 
 use super::file_inlining::template_render_store;
 use super::{FileInliningTransform, Transform};
@@ -43,6 +43,23 @@ struct PreparedImport {
 enum ImportPrepareError {
     Hard(Error),
     Soft(String),
+}
+
+const IMPORTED_MODEL_STYLESHEET_IGNORED_RULE: &str = "imported_model_stylesheet_ignored";
+
+fn imported_model_stylesheet_ignored_diagnostic(source_name: &str) -> Diagnostic {
+    Diagnostic {
+        rule: IMPORTED_MODEL_STYLESHEET_IGNORED_RULE.to_string(),
+        severity: Severity::Warning,
+        message: "imported graph attribute `model_stylesheet` is ignored; only the root graph stylesheet is applied"
+            .to_string(),
+        fix: Some(
+            "move the stylesheet to the root graph; it can target imported nodes by ID, class, or shape"
+                .to_string(),
+        ),
+        source_path: Some(source_name.to_string()),
+        ..Diagnostic::default()
+    }
 }
 
 impl From<Error> for ImportPrepareError {
@@ -197,6 +214,10 @@ impl ImportTransform {
                     resolved_file.path.display()
                 ))
             })?;
+
+            if !graph.model_stylesheet().is_empty() {
+                diagnostics.push(imported_model_stylesheet_ignored_diagnostic(&source_name));
+            }
 
             let import_base_dir = resolved_file
                 .path
@@ -665,7 +686,6 @@ impl ImportTransform {
                 &self.current_dir,
                 Arc::clone(&self.resolver),
                 self.source_name.as_deref(),
-                graph.goal(),
             )?);
         let parent_goal = render_template_for_target(
             graph.goal(),
@@ -820,6 +840,69 @@ mod tests {
         assert!(rendered.contains("child.fabro"), "{rendered}");
         assert!(rendered.contains("inputs.foo"), "{rendered}");
         assert!(!rendered.contains("<string>"), "{rendered}");
+    }
+
+    #[test]
+    fn imported_model_stylesheets_are_ignored_with_a_warning() {
+        for stylesheet in [
+            "* { reasoning_effort: high; }",
+            "{% if inputs.deep %}* { reasoning_effort: high; }{% endif %}",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_file(
+                &dir.path().join("child.fabro"),
+                &format!(
+                    r#"digraph Child {{
+                        graph [model_stylesheet="{stylesheet}"]
+                        start [shape=Mdiamond]
+                        work [prompt="Do it"]
+                        exit [shape=Msquare]
+                        start -> work -> exit
+                    }}"#,
+                ),
+            );
+            let graph = parse_graph(
+                r#"digraph Test {
+                    start [shape=Mdiamond]
+                    child [import="./child.fabro"]
+                    exit [shape=Msquare]
+                    start -> child -> exit
+                }"#,
+            );
+
+            let (graph, diagnostics) = ImportTransform::new(
+                dir.path().to_path_buf(),
+                Arc::new(FilesystemFileResolver::new(None)),
+                TemplateContext::new(),
+            )
+            .apply_with_diagnostics(graph)
+            .unwrap();
+
+            assert_eq!(
+                graph.nodes["child.work"]
+                    .attrs
+                    .get("reasoning_effort")
+                    .and_then(AttrValue::as_str),
+                None
+            );
+            let warning = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.rule == IMPORTED_MODEL_STYLESHEET_IGNORED_RULE)
+                .expect("expected ignored imported stylesheet warning");
+            assert!(
+                warning
+                    .source_path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("child.fabro")),
+                "{warning:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.rule != "detemplated_attribute"),
+                "{diagnostics:?}"
+            );
+        }
     }
 
     fn basic_import_source() -> &'static str {

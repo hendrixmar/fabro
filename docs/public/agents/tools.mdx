@@ -20,7 +20,7 @@ These tools are registered for every provider profile:
 | `write_file` | write | Create or overwrite a file |
 | `grep` | read | Search file contents with regex patterns |
 | `glob` | read | Find files by name pattern |
-| `web_search` | shell | Search the web via Brave Search |
+| `web_search` | shell | Search the web via Brave or Venice |
 | `web_fetch` | shell | Fetch and optionally summarize a URL |
 
 ## Provider-specific tools
@@ -123,14 +123,18 @@ Patterns are case-sensitive and relative to `path`: `*` and `?` stay within one 
 
 ### web_search
 
-Searches the web using the Brave Search API.
+Searches the web using Brave Search or Venice Search. Fabro selects the backend automatically from the available credentials.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `query` | string | yes | Search query |
+| `query` | string | yes | Search query. Venice rejects queries longer than 400 characters before the HTTP call. |
 | `max_results` | integer | no | Maximum results (default: 5, max: 20) |
 
-Requires `BRAVE_SEARCH_API_KEY` to be configured for the current runtime. Runs read it from the server vault (`fabro secret set BRAVE_SEARCH_API_KEY <key>`) — workers start from a cleared environment and this key is not inherited, so exporting it in the server's shell has no effect. The standalone agent CLI reads it from the invoking shell instead. Returns numbered results with title, URL, and description.
+Fabro uses direct [Brave Search](/integrations/brave-search) when `BRAVE_SEARCH_API_KEY` is present. Otherwise it uses [Venice Search](/integrations/venice-search) when `VENICE_API_KEY` is present. If both credentials are present, Brave wins. Venice always uses its Brave search engine.
+
+Runs read both keys from the server vault. Workers start from a cleared environment, so exporting a key in the server's shell has no effect. The standalone agent CLI reads the keys from the invoking shell instead.
+
+The tool is registered when either credential is available. Once Fabro selects a backend, a failed call returns an error; it does not retry through the other backend. Results contain numbered titles, URLs, and descriptions. Venice includes `date` on a fourth line when present.
 
 ### web_fetch
 

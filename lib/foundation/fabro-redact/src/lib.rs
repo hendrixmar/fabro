@@ -112,6 +112,27 @@ mod tests {
     }
 
     #[test]
+    fn redact_string_keeps_assignment_with_low_entropy_value() {
+        // A pinned git SHA is pure hex, so the value alone can never exceed
+        // 4.0 bits of entropy. Only the merged NAME=value token crosses the
+        // 4.5-bit threshold, because the uppercase name widens the charset.
+        // Measuring the name together with the value redacts innocuous
+        // pins; the pair must survive.
+        let input = "ARG DOCKER_INSTALL_COMMIT=5ce20f2eef3615d08fea941eda5a109e949e8ebf";
+        assert_eq!(redact_string(input), input);
+    }
+
+    #[test]
+    fn redact_string_keeps_assignment_key_for_high_entropy_value() {
+        // The value alone is above the entropy threshold, so it is
+        // redacted either way — but the name says which setting was
+        // redacted and must survive, as the gitleaks layer already
+        // does for `key=REDACTED`.
+        let result = redact_string("BUILD_STAMP=xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6p");
+        assert_eq!(result, "BUILD_STAMP=REDACTED");
+    }
+
+    #[test]
     fn redact_string_overlapping_detections_produce_single_redacted() {
         // A high-entropy string that also matches a gitleaks pattern
         // should produce one REDACTED, not two

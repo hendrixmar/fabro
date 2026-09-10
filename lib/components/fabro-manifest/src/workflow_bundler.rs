@@ -1,16 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use fabro_api::types;
 use fabro_config::project::WorkflowLocation;
-use fabro_config::{EnvironmentDockerfileLayer, EnvironmentImageLayer, SettingsLayer};
+use fabro_config::{
+    EnvironmentDockerfileLayer, EnvironmentImageLayer, RunGoalLayer, SettingsLayer,
+};
 use fabro_graphviz::parser;
 use fabro_template::{
-    BundleTemplateStore, FilesystemTemplateStore, GraphReference, GraphReferenceError,
-    RecordingTemplateStore, TemplateContext, TemplateDependencyClosure, TemplateRenderMode,
-    TemplateSource, validate_static_reference, visit_graph_references,
+    BundleTemplateStore, FilesystemTemplateStore, GraphPosition, GraphReference,
+    GraphReferenceError, RecordingTemplateStore, TemplateContext, TemplateDependencyClosure,
+    TemplateRenderMode, TemplateSource, validate_static_reference, visit_graph_references,
 };
 use fabro_types::ManifestPath;
 use fabro_types::graph::ReferenceKind;
@@ -18,21 +20,33 @@ use fabro_types::graph::ReferenceKind;
 use crate::{manifest_path_from_absolute, normalize_absolute_path};
 
 pub(super) struct WorkflowBundler<'a> {
-    cwd:               &'a Path,
-    inputs:            &'a HashMap<String, toml::Value>,
-    template_store:    FilesystemTemplateStore,
-    workflows:         HashMap<String, types::ManifestWorkflow>,
+    package_root: &'a Path,
+    inputs: &'a HashMap<String, toml::Value>,
+    template_store: FilesystemTemplateStore,
+    workflows: HashMap<String, CollectedWorkflowSource>,
     visited_workflows: HashSet<String>,
+    workflow_version_projection: bool,
+}
+
+pub(super) struct CollectedWorkflowSources {
+    pub(super) root_key:  String,
+    pub(super) workflows: HashMap<String, CollectedWorkflowSource>,
+}
+
+pub(super) struct CollectedWorkflowSource {
+    pub(super) workflow:        types::ManifestWorkflow,
+    pub(super) dependency_keys: BTreeSet<String>,
 }
 
 impl<'a> WorkflowBundler<'a> {
-    pub(super) fn new(cwd: &'a Path, inputs: &'a HashMap<String, toml::Value>) -> Self {
+    pub(super) fn new(package_root: &'a Path, inputs: &'a HashMap<String, toml::Value>) -> Self {
         Self {
-            cwd,
+            package_root,
             inputs,
-            template_store: FilesystemTemplateStore::new(cwd),
+            template_store: FilesystemTemplateStore::new(package_root),
             workflows: HashMap::new(),
             visited_workflows: HashSet::new(),
+            workflow_version_projection: false,
         }
     }
 
@@ -41,35 +55,52 @@ impl<'a> WorkflowBundler<'a> {
         workflow: &Path,
         project_config: Option<(&ManifestPath, &str)>,
     ) -> Result<HashMap<String, types::ManifestWorkflow>> {
-        let root_key = self.collect_workflow_entry(workflow, self.cwd)?;
+        let root_key = self.collect_workflow_entry(workflow, self.package_root)?;
 
         if let Some((config_path, source)) = project_config {
             let mut root = self
                 .workflows
                 .remove(&root_key)
                 .ok_or_else(|| anyhow!("root workflow missing from manifest bundle"))?;
-            self.collect_config_dockerfile(config_path, source, &mut root.files)?;
+            let entrypoint = ManifestPath::from_wire(&root_key)
+                .ok_or_else(|| anyhow!("invalid root workflow path: {root_key}"))?;
+            self.collect_config_files(config_path, source, &entrypoint, &mut root.workflow.files)?;
             self.workflows.insert(root_key, root);
         }
 
-        Ok(self.workflows)
+        Ok(self
+            .workflows
+            .into_iter()
+            .map(|(key, source)| (key, source.workflow))
+            .collect())
+    }
+
+    pub(super) fn collect_versions(
+        mut self,
+        root: &WorkflowLocation,
+    ) -> Result<CollectedWorkflowSources> {
+        self.workflow_version_projection = true;
+        let root_key = self.collect_workflow_location(root)?;
+        Ok(CollectedWorkflowSources {
+            root_key,
+            workflows: self.workflows,
+        })
     }
 
     /// Collects the workflow at `location` and returns its manifest key.
     fn collect_workflow_location(&mut self, location: &WorkflowLocation) -> Result<String> {
-        let dot_path = manifest_path_from_absolute(&location.graph, self.cwd)?;
+        let dot_path = manifest_path_from_absolute(&location.graph, self.package_root)?;
         let dot_key = dot_path.to_string();
         if !self.visited_workflows.insert(dot_key.clone()) {
             return Ok(dot_key);
         }
 
-        let source = std::fs::read_to_string(&location.graph)
-            .with_context(|| format!("Failed to read {}", location.graph.display()))?;
+        let source = self.read_package_file(&location.graph)?;
         let config = if let Some(workflow_toml_path) = location.toml.as_ref() {
             Some(types::ManifestWorkflowConfig {
-                path:   manifest_path_from_absolute(workflow_toml_path, self.cwd)?.to_string(),
-                source: std::fs::read_to_string(workflow_toml_path)
-                    .with_context(|| format!("Failed to read {}", workflow_toml_path.display()))?,
+                path:   manifest_path_from_absolute(workflow_toml_path, self.package_root)?
+                    .to_string(),
+                source: self.read_package_file(workflow_toml_path)?,
             })
         } else {
             None
@@ -77,23 +108,33 @@ impl<'a> WorkflowBundler<'a> {
 
         let scan = WorkflowScanInput {
             absolute_dot_path: location.graph.clone(),
-            dot_path,
-            source: source.clone(),
+            dot_path:          dot_path.clone(),
+            source:            source.clone(),
         };
         let mut files = HashMap::new();
         let mut visited_imports = HashSet::new();
+        let mut dependency_keys = BTreeSet::new();
         if let Some(config) = config.as_ref() {
             let config_path = ManifestPath::from_wire(&config.path)
                 .ok_or_else(|| anyhow!("invalid manifest workflow config path: {}", config.path))?;
-            self.collect_config_dockerfile(&config_path, &config.source, &mut files)?;
+            self.collect_config_files(&config_path, &config.source, &dot_path, &mut files)?;
         }
-        self.collect_workflow_files(&scan, &mut files, &mut visited_imports)?;
+        self.collect_workflow_files(
+            &scan,
+            &mut files,
+            &mut visited_imports,
+            &mut dependency_keys,
+            GraphPosition::Entrypoint,
+        )?;
 
         self.workflows
-            .insert(dot_key.clone(), types::ManifestWorkflow {
-                config,
-                files,
-                source,
+            .insert(dot_key.clone(), CollectedWorkflowSource {
+                workflow: types::ManifestWorkflow {
+                    config,
+                    files,
+                    source,
+                },
+                dependency_keys,
             });
 
         Ok(dot_key)
@@ -123,6 +164,8 @@ impl<'a> WorkflowBundler<'a> {
         workflow: &WorkflowScanInput,
         files: &mut HashMap<String, types::ManifestFileEntry>,
         visited_imports: &mut HashSet<String>,
+        dependency_keys: &mut BTreeSet<String>,
+        position: GraphPosition,
     ) -> Result<()> {
         let graph = parser::parse(&workflow.source)
             .with_context(|| format!("Failed to parse {}", workflow.absolute_dot_path.display()))?;
@@ -130,14 +173,18 @@ impl<'a> WorkflowBundler<'a> {
             .absolute_dot_path
             .parent()
             .unwrap_or_else(|| Path::new("."));
-        let workflow_template_root = manifest_parent_or_dot(&workflow.dot_path)?;
+        let workflow_template_root = if self.workflow_version_projection {
+            workflow_package_root()
+        } else {
+            manifest_parent_or_dot(&workflow.dot_path)?
+        };
 
         // Imports and child workflows require a mutable borrow of self, so
         // collect them during the walk and recurse after the visitor returns.
         let mut imports = Vec::new();
         let mut children = Vec::new();
 
-        visit_graph_references(&graph, |reference| -> Result<()> {
+        visit_graph_references(&graph, position, |reference| -> Result<()> {
             match reference {
                 GraphReference::GoalFile { reference } => {
                     let bundled = self.collect_bundled_file(
@@ -151,15 +198,17 @@ impl<'a> WorkflowBundler<'a> {
                     self.collect_bundled_template_includes(files, &bundled, &workflow_template_root)
                 }
                 GraphReference::GoalInline { content }
-                | GraphReference::InlinePrompt { content } => self.collect_template_include_files(
-                    files,
-                    TemplateSource::new(
-                        workflow.dot_path.clone(),
-                        workflow_template_root.clone(),
-                        content.to_owned(),
+                | GraphReference::InlinePrompt { content }
+                | GraphReference::ModelStylesheetInline { content } => self
+                    .collect_template_include_files(
+                        files,
+                        TemplateSource::new(
+                            workflow.dot_path.clone(),
+                            workflow_template_root.clone(),
+                            content.to_owned(),
+                        ),
+                        Some(&workflow.dot_path),
                     ),
-                    Some(&workflow.dot_path),
-                ),
                 GraphReference::FileInline { key, reference } => {
                     let bundled = self.collect_bundled_file(
                         files,
@@ -203,20 +252,25 @@ impl<'a> WorkflowBundler<'a> {
 
         for imported in imports {
             if visited_imports.insert(imported.path.to_string()) {
-                let imported_source = std::fs::read_to_string(&imported.absolute_path)
-                    .with_context(|| {
-                        format!("Failed to read {}", imported.absolute_path.display())
-                    })?;
+                let imported_source = self.read_package_file(&imported.absolute_path)?;
                 let imported_scan = WorkflowScanInput {
                     absolute_dot_path: imported.absolute_path,
                     dot_path:          imported.path,
                     source:            imported_source,
                 };
-                self.collect_workflow_files(&imported_scan, files, visited_imports)?;
+                self.collect_workflow_files(
+                    &imported_scan,
+                    files,
+                    visited_imports,
+                    dependency_keys,
+                    GraphPosition::Imported,
+                )?;
             }
         }
         for child in children {
-            self.collect_workflow_entry(Path::new(child), workflow_base_dir)?;
+            let dependency_key =
+                self.collect_workflow_entry(Path::new(child), workflow_base_dir)?;
+            dependency_keys.insert(dependency_key);
         }
 
         Ok(())
@@ -228,8 +282,7 @@ impl<'a> WorkflowBundler<'a> {
         bundled: &BundledFile,
         workflow_template_root: &ManifestPath,
     ) -> Result<()> {
-        let source = std::fs::read_to_string(&bundled.absolute_path)
-            .with_context(|| format!("Failed to read {}", bundled.absolute_path.display()))?;
+        let source = self.read_package_file(&bundled.absolute_path)?;
         let template_root = template_root_for_bundled_file(&bundled.path, workflow_template_root)?;
         self.collect_template_include_files(
             files,
@@ -307,16 +360,17 @@ impl<'a> WorkflowBundler<'a> {
         Ok(())
     }
 
-    fn collect_config_dockerfile(
+    fn collect_config_files(
         &self,
         config_path: &ManifestPath,
         source: &str,
+        entrypoint: &ManifestPath,
         files: &mut HashMap<String, types::ManifestFileEntry>,
     ) -> Result<()> {
         let layer = source
             .parse::<SettingsLayer>()
             .context("Failed to parse run config TOML")?;
-        let absolute_config_path = self.cwd.join(config_path.as_path());
+        let absolute_config_path = self.package_root.join(config_path.as_path());
         let base_dir = absolute_config_path
             .parent()
             .unwrap_or_else(|| Path::new("."));
@@ -324,7 +378,47 @@ impl<'a> WorkflowBundler<'a> {
         for image in layer.environment_images() {
             self.collect_environment_dockerfile(files, base_dir, config_path, image)?;
         }
+        if self.workflow_version_projection {
+            self.collect_config_goal_files(files, base_dir, config_path, entrypoint, &layer)?;
+        }
         Ok(())
+    }
+
+    fn collect_config_goal_files(
+        &self,
+        files: &mut HashMap<String, types::ManifestFileEntry>,
+        base_dir: &Path,
+        config_path: &ManifestPath,
+        entrypoint: &ManifestPath,
+        layer: &SettingsLayer,
+    ) -> Result<()> {
+        let Some(goal) = layer.run.as_ref().and_then(|run| run.goal.as_ref()) else {
+            return Ok(());
+        };
+        let content = match goal {
+            RunGoalLayer::Inline(goal) => goal.as_source(),
+            RunGoalLayer::File { file } => {
+                let reference = file.as_source();
+                let bundled = self.collect_bundled_file(
+                    files,
+                    base_dir,
+                    &reference,
+                    types::ManifestFileRefType::FileInline,
+                    ReferenceKind::RunGoalFile,
+                    Some(config_path.clone()),
+                )?;
+                files
+                    .get(&bundled.path.to_string())
+                    .expect("collect_bundled_file inserts the goal file it returns")
+                    .content
+                    .clone()
+            }
+        };
+        self.collect_template_include_files(
+            files,
+            TemplateSource::new(entrypoint.clone(), workflow_package_root(), content),
+            Some(config_path),
+        )
     }
 
     fn collect_environment_dockerfile(
@@ -361,11 +455,10 @@ impl<'a> WorkflowBundler<'a> {
 
         let absolute_path = normalize_absolute_path(base_dir, reference)
             .ok_or_else(|| anyhow!("unsupported manifest reference: {reference}"))?;
-        let path = manifest_path_from_absolute(&absolute_path, self.cwd)?;
+        let path = manifest_path_from_absolute(&absolute_path, self.package_root)?;
         let key = path.to_string();
         if !files.contains_key(&key) {
-            let content = std::fs::read_to_string(&absolute_path)
-                .with_context(|| format!("Failed to read {}", absolute_path.display()))?;
+            let content = self.read_package_file(&absolute_path)?;
             files.insert(key.clone(), types::ManifestFileEntry {
                 content,
                 ref_: types::ManifestFileRef {
@@ -379,6 +472,32 @@ impl<'a> WorkflowBundler<'a> {
         Ok(BundledFile {
             absolute_path,
             path,
+        })
+    }
+
+    fn read_package_file(&self, path: &Path) -> Result<String> {
+        if !self.workflow_version_projection {
+            return std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read {}", path.display()));
+        }
+        let canonical = path.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize workflow package file `{}`",
+                path.display()
+            )
+        })?;
+        if !canonical.starts_with(self.package_root) {
+            bail!(
+                "workflow package file `{}` escapes source root `{}`",
+                path.display(),
+                self.package_root.display()
+            );
+        }
+        std::fs::read_to_string(&canonical).with_context(|| {
+            format!(
+                "failed to read workflow package file `{}`",
+                canonical.display()
+            )
         })
     }
 }
@@ -398,6 +517,10 @@ fn manifest_parent_or_dot(path: &ManifestPath) -> Result<ManifestPath> {
     let parent = path.parent_or_dot().to_string_lossy();
     ManifestPath::from_wire(&parent)
         .ok_or_else(|| anyhow!("invalid manifest parent path for {path}: {parent}"))
+}
+
+fn workflow_package_root() -> ManifestPath {
+    ManifestPath::from_wire(".").expect("the workflow package root must be a valid manifest path")
 }
 
 fn template_root_for_bundled_file(
@@ -472,6 +595,101 @@ mod tests {
         let goal = &workflows["workflow.fabro"].files["@goal.md"];
         assert_eq!(goal.content, "goal\n");
         assert_eq!(goal.ref_.original, "@goal.md");
+    }
+
+    #[test]
+    fn root_model_stylesheet_bundles_nested_static_includes() {
+        let temp = tempfile::tempdir().expect("temp directory should be created");
+        let graph = temp.path().join("workflow.fabro");
+        write_file(
+            &graph,
+            r#"digraph Root {
+                graph [model_stylesheet="{% include 'styles/base.css' %}"]
+                start [shape=Mdiamond]
+                exit [shape=Msquare]
+                start -> exit
+            }"#,
+        );
+        write_file(
+            &temp.path().join("styles/base.css"),
+            "{% include 'nested.css' %}",
+        );
+        write_file(
+            &temp.path().join("styles/nested.css"),
+            "* { reasoning_effort: low; }",
+        );
+
+        let workflows = bundle_graph(temp.path(), &graph).expect("workflow should bundle");
+        let files = &workflows["workflow.fabro"].files;
+
+        assert_eq!(
+            files["styles/base.css"].content,
+            "{% include 'nested.css' %}"
+        );
+        assert_eq!(
+            files["styles/nested.css"].content,
+            "* { reasoning_effort: low; }"
+        );
+    }
+
+    #[test]
+    fn root_model_stylesheet_rejects_invalid_includes() {
+        for template in [
+            "{% include 'missing.css' %}",
+            "{% include inputs.stylesheet %}",
+            "{% include '../outside.css' %}",
+        ] {
+            let temp = tempfile::tempdir().expect("temp directory should be created");
+            let graph = temp.path().join("workflow.fabro");
+            write_file(
+                &graph,
+                &format!(
+                    r#"digraph Root {{
+                        graph [model_stylesheet="{template}"]
+                        start [shape=Mdiamond]
+                        exit [shape=Msquare]
+                        start -> exit
+                    }}"#,
+                ),
+            );
+
+            let error = bundle_graph(temp.path(), &graph)
+                .expect_err("invalid stylesheet include should fail bundling");
+            assert!(
+                error.to_string().contains("template dependencies"),
+                "template: {template}; error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_model_stylesheet_includes_are_not_bundled() {
+        let temp = tempfile::tempdir().expect("temp directory should be created");
+        let graph = temp.path().join("workflow.fabro");
+        write_file(
+            &graph,
+            r#"digraph Root {
+                start [shape=Mdiamond]
+                child [import="child.fabro"]
+                exit [shape=Msquare]
+                start -> child -> exit
+            }"#,
+        );
+        write_file(
+            &temp.path().join("child.fabro"),
+            r#"digraph Child {
+                graph [model_stylesheet="{% include 'missing.css' %}"]
+                start [shape=Mdiamond]
+                exit [shape=Msquare]
+                start -> exit
+            }"#,
+        );
+
+        let workflows = bundle_graph(temp.path(), &graph).expect("workflow should bundle");
+        let files = &workflows["workflow.fabro"].files;
+
+        assert!(files.contains_key("child.fabro"));
+        assert!(!files.contains_key("missing.css"));
     }
 
     #[test]

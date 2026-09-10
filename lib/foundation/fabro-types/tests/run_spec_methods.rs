@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use fabro_types::graph::Graph;
 use fabro_types::run::{DirtyStatus, GitContext, RunSpec};
 use fabro_types::settings::{ProjectNamespace, WorkflowNamespace};
-use fabro_types::test_support::test_run_provenance;
+use fabro_types::test_support::test_run_spec;
 use fabro_types::{WorkflowSettings, fixtures};
 
 fn sample_run_spec() -> RunSpec {
@@ -20,24 +20,18 @@ fn sample_run_spec() -> RunSpec {
     };
 
     RunSpec {
-        run_id: fixtures::RUN_1,
         settings,
         graph: Graph::new("ship"),
-        graph_source: None,
         workflow_slug: Some("demo".to_string()),
-        automation: None,
         source_directory: Some("/Users/client/project".to_string()),
         labels: HashMap::from([("team".to_string(), "platform".to_string())]),
-        provenance: test_run_provenance(),
-        manifest_blob: None,
-        definition_blob: None,
         git: Some(GitContext {
             origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
             branch:     "main".to_string(),
             sha:        Some("abc123".to_string()),
             dirty:      DirtyStatus::Dirty,
         }),
-        fork_source_ref: None,
+        ..test_run_spec()
     }
 }
 

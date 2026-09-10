@@ -199,9 +199,27 @@ fn bare_fabro_with_unbound_inputs_validates_structurally_with_warning() {
     Workflow: TemplatedUnbound (3 nodes, 2 edges)
     Graph: [FIXTURES]/templated_unbound.fabro
     warning: [FIXTURES]/templated_unbound.fabro:2:26: undefined template variable `inputs.app_dir` in graph attribute `goal` (template_undefined_variable)
-      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
+      fix: bind `app_dir` via `[run.inputs]` in workflow.toml, or pass `--input app_dir=<value>`
     warning: [FIXTURES]/templated_unbound.fabro:7:44: undefined template variable `inputs.app_dir` in node `work` attribute `prompt` [node: work] (template_undefined_variable)
-      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
+      fix: bind `app_dir` via `[run.inputs]` in workflow.toml, or pass `--input app_dir=<value>`
+    Validation: OK
+    ");
+}
+
+#[test]
+fn unbound_model_stylesheet_input_warns_without_css_error() {
+    let context = test_context!();
+    let mut cmd = context.validate();
+    cmd.arg(fixture("model_stylesheet_unbound.fabro"));
+    fabro_snapshot!(context.filters(), cmd, @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    ----- stderr -----
+    Workflow: ModelStylesheetUnbound (3 nodes, 2 edges)
+    Graph: [FIXTURES]/model_stylesheet_unbound.fabro
+    warning: [FIXTURES]/model_stylesheet_unbound.fabro:4:38: undefined template variable `inputs.effort` in graph attribute `model_stylesheet` (template_undefined_variable)
+      fix: bind `effort` via `[run.inputs]` in workflow.toml, or pass `--input effort=<value>`
     Validation: OK
     ");
 }
@@ -224,7 +242,7 @@ fn bare_fabro_with_unbound_inputs_in_imported_prompt_validates_structurally_with
     Workflow: TemplatedUnboundImported (3 nodes, 2 edges)
     Graph: [FIXTURES]/templated_unbound_imported/workflow.fabro
     warning: [FIXTURES]/templated_unbound_imported/work.md:1:12: undefined template variable `inputs.app_dir` in node `work` attribute `prompt` [node: work] (template_undefined_variable)
-      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
+      fix: bind `app_dir` via `[run.inputs]` in workflow.toml, or pass `--input app_dir=<value>`
     Validation: OK
     ");
 }
@@ -246,7 +264,7 @@ fn bare_fabro_with_unbound_inputs_in_template_partial_validates_structurally_wit
     Workflow: TemplatedUnboundPartial (3 nodes, 2 edges)
     Graph: [FIXTURES]/templated_unbound_partial/workflow.fabro
     warning: [FIXTURES]/templated_unbound_partial/test-include.partial.md:1:4: undefined template variable `inputs.hello` in node `test_imported_include` attribute `prompt` [node: test_imported_include] (template_undefined_variable)
-      fix: bind `inputs.hello` via `[run.inputs]` in workflow.toml, or pass `--input inputs.hello=<value>`
+      fix: bind `hello` via `[run.inputs]` in workflow.toml, or pass `--input hello=<value>`
     Validation: OK
     ");
 }
@@ -355,6 +373,60 @@ fn invalid() {
       fix: Add a node with shape=Mdiamond or id 'start'
     error [node: exit]: Exit node 'exit' has 1 outgoing edge(s) but must have none (exit_no_outgoing)
       fix: Remove outgoing edges from the exit node
+      × Validation failed
+    ");
+}
+
+#[test]
+fn invalid_node_on_failure_is_a_validation_failure() {
+    let context = test_context!();
+    let mut cmd = context.validate();
+    cmd.arg(fixture("on_failure_node_invalid.fabro"));
+    fabro_snapshot!(context.filters(), cmd, @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    ----- stderr -----
+    Workflow: InvalidNodeOnFailure (3 nodes, 2 edges)
+    Graph: [FIXTURES]/on_failure_node_invalid.fabro
+    error [node: work]: Node 'work' has invalid on_failure value 'stop' (on_failure_valid)
+      fix: Use one of: route, exit, succeed
+      × Validation failed
+    ");
+}
+
+#[test]
+fn deprecated_auto_status_warns_with_succeed_policy_replacement() {
+    let context = test_context!();
+    let mut cmd = context.validate();
+    cmd.arg(fixture("auto_status_deprecated.fabro"));
+    fabro_snapshot!(context.filters(), cmd, @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    ----- stderr -----
+    Workflow: DeprecatedAutoStatus (3 nodes, 2 edges)
+    Graph: [FIXTURES]/auto_status_deprecated.fabro
+    warning [node: scan]: Node 'scan' sets deprecated 'auto_status=true' (auto_status_deprecated)
+      fix: Use on_failure=\"succeed\" instead
+    Validation: OK
+    ");
+}
+
+#[test]
+fn invalid_on_failure_is_a_validation_failure() {
+    let context = test_context!();
+    let mut cmd = context.validate();
+    cmd.arg(fixture("on_failure_invalid.fabro"));
+    fabro_snapshot!(context.filters(), cmd, @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    ----- stderr -----
+    Workflow: InvalidOnFailure (2 nodes, 1 edges)
+    Graph: [FIXTURES]/on_failure_invalid.fabro
+    error: Graph has invalid on_failure value 'stop' (on_failure_valid)
+      fix: Use one of: route, exit, succeed
       × Validation failed
     ");
 }

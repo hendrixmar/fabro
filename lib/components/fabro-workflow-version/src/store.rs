@@ -64,6 +64,13 @@ impl LoadedWorkflowVersionClosure {
         self.root.version()
     }
 
+    /// The certified root version, for consumers that need guarantees only
+    /// [`ValidatedWorkflowVersion`] provides (e.g. goal-file resolution).
+    #[must_use]
+    pub fn validated_root(&self) -> &ValidatedWorkflowVersion {
+        &self.root
+    }
+
     #[must_use]
     pub fn get(&self, id: &WorkflowVersionId) -> Option<&WorkflowVersion> {
         if *id == self.root_id {
@@ -220,7 +227,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use fabro_store::{BlobStore, Database};
+    use fabro_store::{BlobStore, test_support};
     use fabro_types::{WorkflowPath, WorkflowVersion, WorkflowVersionId};
     use object_store::memory::InMemory;
 
@@ -252,21 +259,21 @@ mod tests {
         ))
     }
 
-    async fn stores() -> (Arc<BlobStore>, WorkflowVersionStore) {
-        let database = Database::new(
+    fn stores() -> (Arc<BlobStore>, WorkflowVersionStore) {
+        let database = test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
             None,
         );
-        let blobs = database.blobs().await.unwrap();
+        let blobs = database.blobs();
         let versions = WorkflowVersionStore::new(Arc::clone(&blobs));
         (blobs, versions)
     }
 
     #[tokio::test]
     async fn put_get_reuses_exact_blob_digest() {
-        let (blobs, store) = stores().await;
+        let (blobs, store) = stores();
         let version = version("digraph W {}", BTreeMap::new());
         let expected_bytes = version.version().canonical_bytes().unwrap();
         let expected_id = version_id(&version);
@@ -283,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn identical_content_is_idempotent() {
-        let (_, store) = stores().await;
+        let (_, store) = stores();
         let original = version("digraph W {}", BTreeMap::new());
 
         assert_eq!(
@@ -300,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn dependency_must_be_stored_first() {
-        let (blobs, store) = stores().await;
+        let (blobs, store) = stores();
         let child = version("digraph Child {}", BTreeMap::new());
         let child_id = version_id(&child);
         let root = version(
@@ -321,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn dependency_closure_must_be_complete_before_root_write() {
-        let (blobs, store) = stores().await;
+        let (blobs, store) = stores();
         let missing_grandchild_id = WorkflowVersionId::from(fabro_types::BlobHash::new(b"missing"));
         let child = version(
             r#"digraph Child { grandchild [stack.child_workflow="grandchild.fabro"] }"#,
@@ -350,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_closure_returns_root_and_transitive_dependencies() {
-        let (_, store) = stores().await;
+        let (_, store) = stores();
         let grandchild = version("digraph Grandchild {}", BTreeMap::new());
         let grandchild_id = store.put(&grandchild).await.unwrap();
         let child = version(
@@ -385,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_closure_deduplicates_a_diamond() {
-        let (_, store) = stores().await;
+        let (_, store) = stores();
         let leaf = version("digraph Leaf {}", BTreeMap::new());
         let leaf_id = store.put(&leaf).await.unwrap();
         let left = version(
@@ -419,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_closure_preserves_noncanonical_dependency_errors() {
-        let (blobs, store) = stores().await;
+        let (blobs, store) = stores();
         let dependency = version("digraph Dependency {}", BTreeMap::new());
         let pretty = serde_json::to_vec_pretty(dependency.version()).unwrap();
         let dependency_id = WorkflowVersionId::from(blobs.write(&pretty).await.unwrap());
@@ -450,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_projects_the_same_validated_root_as_get_closure() {
-        let (_, store) = stores().await;
+        let (_, store) = stores();
         let child = version("digraph Child {}", BTreeMap::new());
         let child_id = store.put(&child).await.unwrap();
         let root = version(
@@ -470,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_rejects_arbitrary_and_noncanonical_blobs() {
-        let (blobs, store) = stores().await;
+        let (blobs, store) = stores();
         let arbitrary = WorkflowVersionId::from(blobs.write(b"not json").await.unwrap());
         assert!(matches!(
             store.get(&arbitrary).await.unwrap_err(),

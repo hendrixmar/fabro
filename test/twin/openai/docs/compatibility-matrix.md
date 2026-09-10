@@ -38,6 +38,9 @@ Supported `/v1/chat/completions` fields:
 - `stop`
 - reasoning-bearing assistant content
 
+Unknown top-level fields are accepted and ignored. The twin does not simulate the behavior of
+fields that are not listed above.
+
 Structured output subset:
 
 - object roots

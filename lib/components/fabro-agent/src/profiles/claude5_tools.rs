@@ -19,6 +19,7 @@ use crate::session::Session;
 use crate::subagent::{SessionFactory, SubAgentResult, SubAgentStatus, SubAgentSupervisor};
 use crate::tool_registry::{RegisteredTool, ToolContext, ToolSource};
 use crate::tools::{self, WebFetchSummarizer};
+use crate::web_search::{self, SearchBackend};
 
 fn definition(
     tool: NativeTool,
@@ -114,8 +115,8 @@ pub(crate) fn make_bash_tool(options: &NativeToolOptions) -> RegisteredTool {
 }
 
 #[must_use]
-pub(crate) fn make_web_search_tool(api_key: String) -> RegisteredTool {
-    let mut tool = tools::make_web_search_tool_with_api_key(api_key);
+pub(crate) fn make_web_search_tool(backend: SearchBackend) -> RegisteredTool {
+    let mut tool = web_search::make_web_search_tool(backend);
     tool.definition = definition(
         NativeTool::WebSearch,
         "Search the web when current external information is needed. Returns result titles, URLs, \
@@ -536,9 +537,16 @@ mod tests {
         assert_schema(&make_web_fetch_tool(None), &["prompt", "url"], &[
             "prompt", "url",
         ]);
-        assert_schema(&make_web_search_tool("key".to_string()), &["query"], &[
-            "query",
-        ]);
+        assert_schema(
+            &make_web_search_tool(SearchBackend::brave("key".to_string())),
+            &["query"],
+            &["query"],
+        );
+        assert_schema(
+            &make_web_search_tool(SearchBackend::venice("key".to_string())),
+            &["query"],
+            &["query"],
+        );
 
         let todo_runtime = Arc::new(TodoRuntime::new());
         assert_schema(

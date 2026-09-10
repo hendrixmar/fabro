@@ -23,6 +23,48 @@ fn stage_status_from_string(status: &str) -> StageOutcome {
     })
 }
 
+fn output_byte_count(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Project the sandbox layer's runtime push attempts into the durable
+/// `git.push` attempt shape.
+///
+/// This is the only place the runtime attempt record crosses into stored
+/// events: the token snapshot flattens into the three flat `token_*` fields
+/// (a nested provenance enum never appears in stored events), and the retry
+/// classifier's verdict becomes `classified_reason`.
+fn git_push_attempt_props(
+    attempts: &[fabro_sandbox::PushAttempt],
+) -> Vec<fabro_types::GitPushAttemptProps> {
+    attempts
+        .iter()
+        .map(|attempt| fabro_types::GitPushAttemptProps {
+            attempt:           attempt.attempt,
+            started_at:        attempt.started_at,
+            success:           attempt.success,
+            classified_reason: attempt.retry_reason,
+            exec_output_tail:  attempt.exec_output_tail.clone(),
+            token_generation:  attempt.token.map(|token| token.generation),
+            token_provenance:  attempt.token.map(|token| match token.provenance {
+                fabro_sandbox::TokenProvenance::Minted { .. } => {
+                    fabro_types::GitTokenProvenance::Minted
+                }
+                fabro_sandbox::TokenProvenance::Reused { .. } => {
+                    fabro_types::GitTokenProvenance::Reused
+                }
+                fabro_sandbox::TokenProvenance::Static => fabro_types::GitTokenProvenance::Static,
+            }),
+            token_age_ms:      attempt
+                .token
+                .and_then(|token| token.age_at(attempt.started_at))
+                .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+            credential_action: attempt.credential_action,
+            refresh_error:     attempt.refresh_error,
+        })
+        .collect()
+}
+
 fn event_body_from_event(event: &Event) -> EventBody {
     match event {
         Event::RunCreated {
@@ -33,9 +75,12 @@ fn event_body_from_event(event: &Event) -> EventBody {
             labels,
             source_directory,
             workflow_slug,
+            workflow_version_id,
+            target,
             automation,
             provenance,
             manifest_blob,
+            spec_blob,
             git,
             fork_source_ref,
             retried_from,
@@ -51,9 +96,12 @@ fn event_body_from_event(event: &Event) -> EventBody {
             labels:           labels.clone(),
             source_directory: source_directory.clone(),
             workflow_slug:    workflow_slug.clone(),
+            workflow_version_id: *workflow_version_id,
+            target:           target.clone(),
             automation:       automation.clone(),
             provenance:       provenance.clone(),
             manifest_blob:    *manifest_blob,
+            spec_blob:        *spec_blob,
             git:              git.clone(),
             fork_source_ref:  fork_source_ref.clone(),
             retried_from:     *retried_from,
@@ -520,10 +568,12 @@ fn event_body_from_event(event: &Event) -> EventBody {
             branch,
             success,
             exec_output_tail,
+            attempts,
         } => EventBody::GitPush(fabro_types::GitPushProps {
             branch:           branch.clone(),
             success:          *success,
             exec_output_tail: exec_output_tail.clone(),
+            attempts:         git_push_attempt_props(attempts),
         }),
         Event::GitFetch { branch, success } => EventBody::GitFetch(fabro_types::GitFetchProps {
             branch:  branch.clone(),
@@ -646,12 +696,18 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 tool_call_id,
                 output,
                 is_error,
+                output_bytes_observed,
+                output_bytes_retained,
+                output_bytes_omitted,
             } => EventBody::AgentToolCompleted(fabro_types::AgentToolCompletedProps {
                 tool_name:    tool_name.clone(),
                 tool_call_id: tool_call_id.clone(),
                 output:       output.clone(),
                 is_error:     *is_error,
                 visit:        *visit,
+                output_bytes_observed: Some(output_byte_count(*output_bytes_observed)),
+                output_bytes_retained: Some(output_byte_count(*output_bytes_retained)),
+                output_bytes_omitted:  Some(output_byte_count(*output_bytes_omitted)),
                 tool_result:  None,
                 turn_id:      None,
             }),
@@ -661,6 +717,9 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 duration_ms,
                 streams_separated,
                 exec_output_tail,
+                output_bytes_observed,
+                output_bytes_retained,
+                output_bytes_omitted,
             } => EventBody::AgentToolProcessCompleted(
                 fabro_types::AgentToolProcessCompletedProps {
                     exit_code:         *exit_code,
@@ -668,6 +727,9 @@ fn event_body_from_event(event: &Event) -> EventBody {
                     duration_ms:       *duration_ms,
                     streams_separated: *streams_separated,
                     exec_output_tail:  exec_output_tail.clone(),
+                    output_bytes_observed: Some(output_byte_count(*output_bytes_observed)),
+                    output_bytes_retained: Some(output_byte_count(*output_bytes_retained)),
+                    output_bytes_omitted:  Some(output_byte_count(*output_bytes_omitted)),
                     visit:             *visit,
                 },
             ),
@@ -1415,7 +1477,7 @@ mod tests {
     use ::fabro_types::{
         AutomationRef, EventBody, FailureReason, ParallelBranchId, Principal, RunNoticeCode,
         RunNoticeLevel, RunProvenance, StageId, SystemActorKind, fixtures,
-        run_event as fabro_types,
+        run_event as fabro_types, test_support,
     };
     use chrono::Utc;
     use fabro_agent::{
@@ -1588,11 +1650,14 @@ mod tests {
             stage:             "code".to_string(),
             visit:             2,
             event:             AgentEvent::ToolProcessCompleted {
-                exit_code:         Some(7),
-                termination:       ::fabro_types::CommandTermination::Exited,
-                duration_ms:       12,
-                streams_separated: true,
-                exec_output_tail:  Some(exec_tail()),
+                exit_code:             Some(7),
+                termination:           ::fabro_types::CommandTermination::Exited,
+                duration_ms:           12,
+                streams_separated:     true,
+                output_bytes_observed: 120,
+                output_bytes_retained: 100,
+                output_bytes_omitted:  20,
+                exec_output_tail:      Some(exec_tail()),
             },
             session_id:        Some("ses_child".to_string()),
             parent_session_id: Some("ses_parent".to_string()),
@@ -1619,6 +1684,9 @@ mod tests {
         assert_eq!(properties["termination"], "exited");
         assert_eq!(properties["duration_ms"], 12);
         assert_eq!(properties["streams_separated"], true);
+        assert_eq!(properties["output_bytes_observed"], 120);
+        assert_eq!(properties["output_bytes_retained"], 100);
+        assert_eq!(properties["output_bytes_omitted"], 20);
         assert_eq!(properties["exec_output_tail"]["stdout"], "last stdout line");
         assert_eq!(properties["visit"], 2);
     }
@@ -2182,12 +2250,142 @@ mod tests {
         }
     }
 
+    /// The `git.push` attempts contract: every runtime attempt fact
+    /// round-trips through `GitPushAttemptProps`, the token snapshot is
+    /// flattened to the three flat token fields (a nested provenance enum
+    /// never appears in stored events), and optional failure fields are
+    /// omitted when absent.
+    #[test]
+    fn git_push_attempts_round_trip_through_the_durable_shape() {
+        let started_at = Utc::now();
+        let minted_at = started_at - chrono::Duration::milliseconds(180);
+        let expires_at = started_at + chrono::Duration::minutes(60);
+        let runtime_attempts = vec![
+            fabro_sandbox::PushAttempt {
+                attempt: 1,
+                started_at,
+                success: false,
+                retry_reason: Some(fabro_sandbox::GitRetryReason::TokenReplication),
+                exec_output_tail: Some(exec_tail()),
+                token: Some(fabro_sandbox::TokenSnapshot {
+                    generation: 14,
+                    provenance: fabro_sandbox::TokenProvenance::Minted {
+                        minted_at,
+                        expires_at,
+                    },
+                }),
+                credential_action: Some(fabro_sandbox::RemoteCredentialAction::Embedded),
+                refresh_error: None,
+            },
+            // Terminal classified failure with a refresh error: the last
+            // attempt carries its classification too.
+            fabro_sandbox::PushAttempt {
+                attempt:           2,
+                started_at:        started_at + chrono::Duration::seconds(3),
+                success:           false,
+                retry_reason:      Some(fabro_sandbox::GitRetryReason::TransientInfra),
+                exec_output_tail:  Some(exec_tail()),
+                token:             Some(fabro_sandbox::TokenSnapshot {
+                    generation: 14,
+                    provenance: fabro_sandbox::TokenProvenance::Reused {
+                        minted_at,
+                        expires_at,
+                    },
+                }),
+                credential_action: Some(fabro_sandbox::RemoteCredentialAction::Unchanged),
+                refresh_error:     Some(fabro_sandbox::RefreshErrorKind::SetUrl),
+            },
+        ];
+        let expected_attempts = git_push_attempt_props(&runtime_attempts);
+
+        let stored = to_run_event(&fixtures::RUN_1, &Event::GitPush {
+            branch:           "fabro/run/01M0DH033P2XSTHAGVBHG6922F".to_string(),
+            success:          false,
+            exec_output_tail: Some(exec_tail()),
+            attempts:         runtime_attempts,
+        });
+
+        let json = serde_json::to_value(&stored).unwrap();
+        let serialized = &json["properties"]["attempts"];
+        assert_eq!(serialized[0]["attempt"], 1);
+        assert_eq!(serialized[0]["classified_reason"], "token_replication");
+        assert_eq!(serialized[0]["token_generation"], 14);
+        assert_eq!(serialized[0]["token_provenance"], "minted");
+        assert_eq!(serialized[0]["token_age_ms"], 180);
+        assert_eq!(serialized[0]["credential_action"], "embedded");
+        assert!(serialized[0].get("refresh_error").is_none());
+        assert_eq!(serialized[1]["classified_reason"], "transient_infra");
+        assert_eq!(serialized[1]["token_provenance"], "reused");
+        assert_eq!(serialized[1]["refresh_error"], "set_url");
+        // The provenance enum never nests in stored events.
+        assert!(serialized[0].get("token").is_none());
+
+        let round_tripped: ::fabro_types::RunEvent = serde_json::from_value(json).unwrap();
+        match round_tripped.body {
+            EventBody::GitPush(props) => {
+                assert!(!props.success);
+                assert_eq!(props.attempts, expected_attempts);
+            }
+            other => panic!("expected GitPush body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successful_single_attempt_push_omits_failure_fields() {
+        let attempts = vec![fabro_sandbox::PushAttempt {
+            attempt:           1,
+            started_at:        Utc::now(),
+            success:           true,
+            retry_reason:      None,
+            exec_output_tail:  None,
+            token:             Some(fabro_sandbox::TokenSnapshot {
+                generation: 0,
+                provenance: fabro_sandbox::TokenProvenance::Static,
+            }),
+            credential_action: Some(fabro_sandbox::RemoteCredentialAction::Unchanged),
+            refresh_error:     None,
+        }];
+        let stored = to_run_event(&fixtures::RUN_1, &Event::GitPush {
+            branch: "fabro/run/run-1".to_string(),
+            success: true,
+            exec_output_tail: None,
+            attempts,
+        });
+
+        let json = serde_json::to_value(&stored).unwrap();
+        let attempt = &json["properties"]["attempts"][0];
+        assert_eq!(attempt["success"], true);
+        assert_eq!(attempt["token_provenance"], "static");
+        for absent in [
+            "classified_reason",
+            "exec_output_tail",
+            "token_age_ms",
+            "refresh_error",
+        ] {
+            assert!(attempt.get(absent).is_none(), "{absent} should be omitted");
+        }
+    }
+
+    /// Events stored before attempts were recorded deserialize with the field
+    /// absent; the pre-existing three fields are untouched.
+    #[test]
+    fn stored_git_push_without_attempts_still_deserializes() {
+        let json = serde_json::json!({
+            "branch": "fabro/run/old",
+            "success": true
+        });
+        let props: fabro_types::GitPushProps = serde_json::from_value(json).unwrap();
+        assert!(props.attempts.is_empty());
+        assert!(props.exec_output_tail.is_none());
+    }
+
     #[test]
     fn git_push_maps_exec_output_tail_to_props() {
         let stored = to_run_event(&fixtures::RUN_1, &Event::GitPush {
             branch:           "refs/heads/run:refs/heads/run".to_string(),
             success:          false,
             exec_output_tail: Some(exec_tail()),
+            attempts:         Vec::new(),
         });
 
         match stored.body {
@@ -2664,10 +2862,12 @@ mod tests {
             subject: user_principal("alice"),
         };
         let automation = AutomationRef {
-            id:         "nightly".to_string(),
-            name:       Some("Nightly".to_string()),
-            trigger_id: Some("schedule_1".to_string()),
+            id:              "nightly".to_string(),
+            name:            Some("Nightly".to_string()),
+            trigger_id:      Some("schedule_1".to_string()),
+            workflow_source: None,
         };
+        let workflow_version_id = test_support::test_workflow_version_id();
 
         let stored = to_run_event(&fixtures::RUN_1, &Event::RunCreated {
             run_id: fixtures::RUN_1,
@@ -2678,9 +2878,12 @@ mod tests {
             labels: BTreeMap::default(),
             source_directory: Some("/tmp/run".to_string()),
             workflow_slug: None,
+            workflow_version_id: Some(workflow_version_id),
+            target: None,
             automation: Some(automation.clone()),
             provenance,
             manifest_blob: None,
+            spec_blob: None,
             git: None,
             fork_source_ref: None,
             retried_from: None,
@@ -2693,6 +2896,7 @@ mod tests {
             panic!("expected run.created body");
         };
         assert_eq!(props.automation, Some(automation));
+        assert_eq!(props.workflow_version_id, Some(workflow_version_id));
     }
 
     #[test]

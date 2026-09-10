@@ -5,14 +5,18 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "docker")]
 use fabro_types::settings::ResolveError;
 #[cfg(feature = "daytona")]
 use fabro_types::settings::run::DockerfileSource as ResolvedDockerfileSource;
-use fabro_types::settings::run::{EnvironmentNetworkMode, RunEnvironmentSettings};
+use fabro_types::settings::run::{
+    EnvironmentNetworkMode, RunCloneSettings, RunEnvironmentSettings,
+};
 
 #[cfg(feature = "daytona")]
 use crate::config::{
-    DaytonaNetwork, DaytonaSnapshotSettings, DockerfileSource as SandboxDockerfileSource,
+    DaytonaNetwork, DaytonaSnapshotSettings, DaytonaSnapshotSource,
+    DockerfileSource as SandboxDockerfileSource,
 };
 #[cfg(feature = "daytona")]
 use crate::daytona::DaytonaConfig;
@@ -23,37 +27,41 @@ use crate::docker::DockerSandboxOptions;
 #[must_use]
 pub fn daytona_config_from_environment(
     settings: &RunEnvironmentSettings,
-    skip_clone: bool,
+    clone: &RunCloneSettings,
 ) -> DaytonaConfig {
+    // fabro-config rejects Daytona environments that set both image.docker
+    // and image.dockerfile. If both still arrive here, the image wins, which
+    // matches how the Docker provider treats the pair.
+    let source = match (&settings.image.docker, &settings.image.dockerfile) {
+        (Some(image), _) => Some(DaytonaSnapshotSource::Image(image.clone())),
+        (None, Some(ResolvedDockerfileSource::Inline(text))) => Some(
+            DaytonaSnapshotSource::Dockerfile(SandboxDockerfileSource::Inline(text.clone())),
+        ),
+        (None, Some(ResolvedDockerfileSource::Path { path })) => Some(
+            DaytonaSnapshotSource::Dockerfile(SandboxDockerfileSource::Path { path: path.clone() }),
+        ),
+        (None, None) => None,
+    };
+    let snapshot = source.map(|source| DaytonaSnapshotSettings {
+        cpu: settings.resources.cpu,
+        memory: settings
+            .resources
+            .memory
+            .map(|size| size_to_gb_i32(size.as_bytes())),
+        disk: settings
+            .resources
+            .disk
+            .map(|size| size_to_gb_i32(size.as_bytes())),
+        source,
+    });
+
     DaytonaConfig {
         auto_stop_interval: settings
             .lifecycle
             .auto_stop
             .map(|duration| duration_to_minutes_i32(duration.as_std())),
         labels: (!settings.labels.is_empty()).then(|| settings.labels.clone()),
-        snapshot: settings
-            .image
-            .dockerfile
-            .as_ref()
-            .map(|dockerfile| DaytonaSnapshotSettings {
-                cpu:        settings.resources.cpu,
-                memory:     settings
-                    .resources
-                    .memory
-                    .map(|size| size_to_gb_i32(size.as_bytes())),
-                disk:       settings
-                    .resources
-                    .disk
-                    .map(|size| size_to_gb_i32(size.as_bytes())),
-                dockerfile: Some(match dockerfile {
-                    ResolvedDockerfileSource::Inline(text) => {
-                        SandboxDockerfileSource::Inline(text.clone())
-                    }
-                    ResolvedDockerfileSource::Path { path } => {
-                        SandboxDockerfileSource::Path { path: path.clone() }
-                    }
-                }),
-            }),
+        snapshot,
         network: Some(match settings.network.mode {
             EnvironmentNetworkMode::Block => DaytonaNetwork::Block,
             EnvironmentNetworkMode::AllowAll => DaytonaNetwork::AllowAll,
@@ -61,7 +69,8 @@ pub fn daytona_config_from_environment(
                 DaytonaNetwork::AllowList(settings.network.allow.clone())
             }
         }),
-        skip_clone,
+        clone_depth: clone.depth_limit(),
+        skip_clone: !clone.enabled,
     }
 }
 
@@ -69,7 +78,7 @@ pub fn daytona_config_from_environment(
 #[must_use]
 pub fn docker_config_from_environment(
     settings: &RunEnvironmentSettings,
-    skip_clone: bool,
+    clone: &RunCloneSettings,
 ) -> DockerSandboxOptions {
     // No vault is available on this path (server preflight / manifest), so a
     // `{{ secrets.* }}` value keeps its source form. Nothing else is left to
@@ -84,25 +93,23 @@ pub fn docker_config_from_environment(
         .iter()
         .map(|(key, value)| (key.clone(), value.as_source()))
         .collect();
-    docker_config_from_environment_env(settings, skip_clone, env)
+    docker_config_from_environment_env(settings, clone, env)
 }
 
 #[cfg(feature = "docker")]
 pub fn docker_config_from_environment_with_secrets(
     settings: &RunEnvironmentSettings,
-    skip_clone: bool,
+    clone: &RunCloneSettings,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<DockerSandboxOptions, ResolveError> {
     let env = settings.resolve_env(secrets_lookup)?;
-    Ok(docker_config_from_environment_env(
-        settings, skip_clone, env,
-    ))
+    Ok(docker_config_from_environment_env(settings, clone, env))
 }
 
 #[cfg(feature = "docker")]
 fn docker_config_from_environment_env(
     settings: &RunEnvironmentSettings,
-    skip_clone: bool,
+    clone: &RunCloneSettings,
     env: std::collections::HashMap<String, String>,
 ) -> DockerSandboxOptions {
     let mut env_vars = env
@@ -133,7 +140,10 @@ fn docker_config_from_environment_env(
             .cpu
             .map(|cpu| i64::from(cpu).saturating_mul(100_000)),
         env_vars,
-        skip_clone,
+        clone_depth: clone
+            .depth_limit()
+            .and_then(|depth| usize::try_from(depth).ok()),
+        skip_clone: !clone.enabled,
         ..DockerSandboxOptions::default()
     }
 }
@@ -162,7 +172,6 @@ pub fn local_working_directory_from_environment(
     )))
 }
 
-#[cfg(feature = "docker")]
 #[cfg(feature = "daytona")]
 fn duration_to_minutes_i32(duration: std::time::Duration) -> i32 {
     let minutes = duration.as_secs() / 60;
@@ -240,5 +249,22 @@ mod tests {
             "unexpected error: {message}"
         );
         assert!(!missing.exists());
+    }
+
+    #[cfg(feature = "daytona")]
+    #[test]
+    fn daytona_config_maps_docker_image_to_snapshot() {
+        let mut settings = run_environment(EnvironmentProvider::Daytona);
+        settings.image.docker = Some("ubuntu:24.04".to_string());
+        settings.resources.cpu = Some(2);
+
+        let config = daytona_config_from_environment(&settings, &RunCloneSettings::default());
+        let snapshot = config.snapshot.expect("image should configure a snapshot");
+
+        assert_eq!(
+            snapshot.source,
+            DaytonaSnapshotSource::Image("ubuntu:24.04".to_string())
+        );
+        assert_eq!(snapshot.cpu, Some(2));
     }
 }

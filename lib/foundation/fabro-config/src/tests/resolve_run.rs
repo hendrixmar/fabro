@@ -126,6 +126,7 @@ fn resolves_run_defaults_from_empty_settings() {
     assert!(!settings.environment.lifecycle.preserve);
     assert!(settings.environment.lifecycle.stop_on_terminal);
     assert!(settings.clone.enabled);
+    assert_eq!(settings.clone.depth, 100);
     assert!(settings.run_branch.enabled);
     assert!(settings.run_branch.push);
     assert!(settings.meta_branch.enabled);
@@ -296,6 +297,7 @@ _version = 1
 
 [run.clone]
 enabled = false
+depth = 1
 
 [run.run_branch]
 enabled = true
@@ -310,10 +312,50 @@ push = false
     .run;
 
     assert!(!settings.clone.enabled);
+    assert_eq!(settings.clone.depth, 1);
     assert!(settings.run_branch.enabled);
     assert!(!settings.run_branch.push);
     assert!(settings.meta_branch.enabled);
     assert!(!settings.meta_branch.push);
+}
+
+#[test]
+fn zero_clone_depth_requests_full_history() {
+    let settings = super::workflow_settings_from_toml(
+        r"
+_version = 1
+
+[run.clone]
+depth = 0
+",
+    )
+    .expect("zero clone depth should resolve")
+    .run;
+
+    assert_eq!(settings.clone.depth, 0);
+}
+
+#[test]
+fn rejects_negative_clone_depth() {
+    let error = super::workflow_settings_from_toml(
+        r"
+_version = 1
+
+[run.clone]
+depth = -1
+",
+    )
+    .expect_err("negative clone depth should not resolve");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("run.clone.depth"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("at least 0"),
+        "unexpected error: {message}"
+    );
 }
 
 #[test]
@@ -616,8 +658,8 @@ dockerfile = { path = "Dockerfile" }
 }
 
 #[test]
-fn daytona_image_docker_errors() {
-    let err = workflow_settings_from_toml_with_catalog(
+fn daytona_image_docker_resolves() {
+    let settings = workflow_settings_from_toml_with_catalog(
         r#"
 _version = 1
 
@@ -632,12 +674,41 @@ provider = "daytona"
 docker = "ubuntu:24.04"
 "#,
     )
-    .expect_err("daytona should reject docker image selection");
+    .expect("daytona should accept docker image selection")
+    .run;
+
+    assert_eq!(settings.environment.provider, EnvironmentProvider::Daytona);
+    assert_eq!(
+        settings.environment.image.docker.as_deref(),
+        Some("ubuntu:24.04")
+    );
+    assert!(settings.environment.image.dockerfile.is_none());
+}
+
+#[test]
+fn daytona_rejects_docker_image_and_dockerfile_together() {
+    let err = workflow_settings_from_toml_with_catalog(
+        r#"
+_version = 1
+
+[run.environment]
+id = "cloud"
+"#,
+        r#"
+[environments.cloud]
+provider = "daytona"
+
+[environments.cloud.image]
+docker = "ubuntu:24.04"
+dockerfile = "FROM ubuntu:24.04"
+"#,
+    )
+    .expect_err("daytona should reject two snapshot sources");
 
     let message = err.to_string();
     assert!(
-        message.contains("image.docker") && message.contains("daytona"),
-        "expected daytona image.docker diagnostic, got: {message}"
+        message.contains("image.docker") && message.contains("image.dockerfile"),
+        "expected mutually exclusive image diagnostic, got: {message}"
     );
 }
 
@@ -876,6 +947,447 @@ issues = "{{ env.GH_PERM_LEVEL }}"
         // Resolver does NOT eagerly resolve env tokens; the `InterpString`
         // form is preserved for late binding by the consumer.
         assert_eq!(issues.as_source(), "{{ env.GH_PERM_LEVEL }}");
+    }
+}
+
+mod run_integrations_github_additional_repositories {
+    //! Layer + resolver tests for
+    //! `[run.integrations.github].additional_repositories`.
+    //!
+    //! The list replaces wholesale across layers (`[]` is an explicit clear),
+    //! resolves independently from `permissions`, and validates each entry as
+    //! a full `owner/repository` slug with indexed error paths.
+
+    use crate::SettingsLayer;
+    use crate::layers::Combine;
+
+    fn parse_settings(source: &str) -> SettingsLayer {
+        source
+            .parse::<SettingsLayer>()
+            .expect("fixture should parse via SettingsLayer")
+    }
+
+    fn invalid_paths_and_reasons(error: crate::Error) -> Vec<(String, String)> {
+        let errors = match error {
+            crate::Error::Resolve { errors, .. } => errors,
+            other => panic!("expected structured resolve errors, got {other:#}"),
+        };
+        errors
+            .into_iter()
+            .map(|error| match error {
+                crate::ResolveError::Invalid { path, reason } => (path, reason),
+                other => panic!("expected invalid-value error, got {other}"),
+            })
+            .collect()
+    }
+
+    fn resolved_repositories(settings: &fabro_types::WorkflowSettings) -> Vec<String> {
+        settings
+            .run
+            .integrations
+            .github
+            .additional_repositories
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn resolves_one_and_multiple_repositories() {
+        let one = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+permissions = { contents = "read" }
+"#,
+        )
+        .expect("one additional repository should resolve");
+        assert_eq!(resolved_repositories(&one), vec!["fabro-sh/keystone"]);
+        assert!(one.run.integrations.github.has_additional_repositories());
+
+        let many = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone", "fabro-sh/arc"]
+permissions = { contents = "write" }
+"#,
+        )
+        .expect("multiple additional repositories should resolve");
+        assert_eq!(resolved_repositories(&many), vec![
+            "fabro-sh/arc",
+            "fabro-sh/keystone",
+        ]);
+    }
+
+    #[test]
+    fn rejects_malformed_slugs_with_indexed_paths() {
+        let error = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = [
+    "fabro-sh/keystone",
+    "https://github.com/fabro-sh/arc",
+    "git@github.com:fabro-sh/arc.git",
+    "fabro-sh/arc@main",
+    "not-a-slug",
+]
+permissions = { contents = "read" }
+"#,
+        )
+        .expect_err("malformed slugs should not resolve");
+
+        let invalid = invalid_paths_and_reasons(error);
+        assert_eq!(
+            invalid
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "run.integrations.github.additional_repositories[1]",
+                "run.integrations.github.additional_repositories[2]",
+                "run.integrations.github.additional_repositories[3]",
+                "run.integrations.github.additional_repositories[4]",
+            ]
+        );
+        assert!(
+            invalid[0].1.contains("owner/repository"),
+            "reason should explain the slug grammar: {}",
+            invalid[0].1
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_and_case_variant_duplicate_slugs() {
+        let error = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone", "Fabro-SH/Keystone"]
+permissions = { contents = "read" }
+"#,
+        )
+        .expect_err("case-variant duplicate slugs should not resolve");
+
+        let invalid = invalid_paths_and_reasons(error);
+        assert_eq!(
+            invalid
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run.integrations.github.additional_repositories[1]"]
+        );
+        assert!(
+            invalid[0].1.contains("case-insensitive"),
+            "reason should mention case-insensitive identity: {}",
+            invalid[0].1
+        );
+    }
+
+    #[test]
+    fn rejects_cross_owner_additional_repositories() {
+        let error = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone", "lithoscomputer/conveyor"]
+permissions = { contents = "read" }
+"#,
+        )
+        .expect_err("cross-owner additional repositories should not resolve");
+
+        let invalid = invalid_paths_and_reasons(error);
+        assert_eq!(
+            invalid
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run.integrations.github.additional_repositories[1]"]
+        );
+        assert!(
+            invalid[0].1.contains("share one owner"),
+            "reason should explain the single-owner requirement: {}",
+            invalid[0].1
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_the_installation_token_repository_limit() {
+        let repositories = (0..500)
+            .map(|index| format!("\"owner/repo-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let error = super::workflow_settings_from_toml(&format!(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = [{repositories}]
+permissions = {{ contents = "read" }}
+"#,
+        ))
+        .expect_err("500 additional repositories should not resolve");
+
+        let invalid = invalid_paths_and_reasons(error);
+        assert_eq!(
+            invalid[0].0,
+            "run.integrations.github.additional_repositories"
+        );
+        assert!(invalid[0].1.contains("499"), "{}", invalid[0].1);
+    }
+
+    #[test]
+    fn rejects_additional_repositories_without_permissions() {
+        let error = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+"#,
+        )
+        .expect_err("additional repositories without permissions should not resolve");
+
+        let invalid = invalid_paths_and_reasons(error);
+        assert_eq!(
+            invalid
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run.integrations.github.additional_repositories"]
+        );
+    }
+
+    #[test]
+    fn rejects_additional_repositories_without_the_contents_permission() {
+        let error = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+permissions = { issues = "read" }
+"#,
+        )
+        .expect_err("additional repositories require the contents permission");
+
+        let invalid = invalid_paths_and_reasons(error);
+        assert_eq!(
+            invalid
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run.integrations.github.permissions"]
+        );
+    }
+
+    #[test]
+    fn rejects_a_literal_contents_permission_that_is_not_read_or_write() {
+        let error = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+permissions = { contents = "admin" }
+"#,
+        )
+        .expect_err("literal contents permission must be read or write");
+
+        let invalid = invalid_paths_and_reasons(error);
+        assert_eq!(
+            invalid
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run.integrations.github.permissions.contents"]
+        );
+    }
+
+    #[test]
+    fn defers_a_templated_contents_permission_to_the_runtime_boundary() {
+        let settings = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+permissions = { contents = "{{ vars.GH_CONTENTS }}" }
+"#,
+        )
+        .expect("templated contents permission resolves; the value is re-checked at runtime");
+
+        assert_eq!(resolved_repositories(&settings), vec!["fabro-sh/keystone"]);
+    }
+
+    #[test]
+    fn higher_layer_replaces_the_repository_list_wholesale() {
+        let workflow = parse_settings(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+"#,
+        );
+        let user = parse_settings(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/arc", "fabro-sh/widgets"]
+permissions = { contents = "read" }
+"#,
+        );
+        let merged = workflow.combine(user);
+
+        let resolved =
+            super::workflow_settings_from_layer(merged).expect("merged settings should resolve");
+
+        // The lists never union: the higher layer's single entry wins, while
+        // the permission map inherits independently from the lower layer.
+        assert_eq!(resolved_repositories(&resolved), vec!["fabro-sh/keystone"]);
+        assert_eq!(
+            resolved.run.integrations.github.permissions.len(),
+            1,
+            "permissions should inherit from the lower layer"
+        );
+    }
+
+    #[test]
+    fn absent_higher_layer_inherits_the_lower_repository_list() {
+        let workflow = parse_settings("_version = 1\n");
+        let user = parse_settings(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+permissions = { contents = "read" }
+"#,
+        );
+        let merged = workflow.combine(user);
+
+        let resolved =
+            super::workflow_settings_from_layer(merged).expect("merged settings should resolve");
+        assert_eq!(resolved_repositories(&resolved), vec!["fabro-sh/keystone"]);
+    }
+
+    #[test]
+    fn empty_higher_layer_list_clears_inherited_repositories() {
+        let workflow = parse_settings(
+            r"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = []
+",
+        );
+        let user = parse_settings(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+permissions = { contents = "read" }
+"#,
+        );
+        let merged = workflow.combine(user);
+
+        let resolved =
+            super::workflow_settings_from_layer(merged).expect("merged settings should resolve");
+
+        assert!(
+            resolved
+                .run
+                .integrations
+                .github
+                .additional_repositories
+                .is_empty(),
+            "explicit [] should clear the inherited repository list"
+        );
+        // Permissions survive the repository clear: each field resolves
+        // independently.
+        assert!(resolved.run.integrations.github.is_token_requested());
+    }
+
+    #[test]
+    fn rejects_repositories_that_survive_a_cross_layer_permission_clear() {
+        let workflow = parse_settings(
+            r"
+_version = 1
+
+[run.integrations.github]
+permissions = {}
+",
+        );
+        let user = parse_settings(
+            r#"
+_version = 1
+
+[run.integrations.github]
+additional_repositories = ["fabro-sh/keystone"]
+permissions = { contents = "read" }
+"#,
+        );
+        let merged = workflow.combine(user);
+
+        let error = super::workflow_settings_from_layer(merged)
+            .map(|_| ())
+            .expect_err("repositories with cleared permissions should not resolve");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("additional_repositories"),
+            "error should name the invalid combination: {message}"
+        );
+    }
+
+    #[test]
+    fn permissions_only_and_fully_empty_shapes_are_preserved() {
+        let permissions_only = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.integrations.github.permissions]
+issues = "read"
+"#,
+        )
+        .expect("permissions-only settings should resolve");
+        assert!(
+            permissions_only
+                .run
+                .integrations
+                .github
+                .additional_repositories
+                .is_empty()
+        );
+        assert!(
+            permissions_only
+                .run
+                .integrations
+                .github
+                .is_token_requested()
+        );
+
+        let empty = super::workflow_settings_from_toml("_version = 1\n")
+            .expect("empty settings should resolve");
+        assert!(
+            empty
+                .run
+                .integrations
+                .github
+                .additional_repositories
+                .is_empty()
+        );
+        assert!(!empty.run.integrations.github.is_token_requested());
     }
 }
 

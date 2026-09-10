@@ -303,7 +303,7 @@ script = "workflow-setup"
 // ---------------------------------------------------------------------------
 
 #[test]
-fn create_explicit_workflow_path_uses_project_config_relative_to_workflow() {
+fn create_explicit_workflow_warns_without_transmitting_machine_or_project_run_settings() {
     let mut context = test_context!();
     let (project, storage_dir) = setup_external_workflow_fixture(&mut context);
     context.ensure_home_server_auth_methods();
@@ -320,10 +320,20 @@ fn create_explicit_workflow_path_uses_project_config_relative_to_workflow() {
             "--dry-run",
             "--model",
             "gpt-5.4-pro",
+            "--environment",
+            "local",
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let stderr = String::from_utf8_lossy(&create.get_output().stderr);
+    assert!(stderr.contains("settings.toml contains run"), "{stderr}");
+    assert!(stderr.contains("project.toml contains run"), "{stderr}");
+    assert!(
+        stderr.contains("do not transmit these settings"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("workflow.toml"), "{stderr}");
     let run_id = created_run_id(create.get_output());
 
     let runs_dir = storage_dir.join("scratch");
@@ -348,6 +358,8 @@ fn create_explicit_workflow_path_uses_project_config_relative_to_workflow() {
     let run_spec = serde_json::to_value(&state.spec).unwrap();
     assert_eq!(
         run_spec["settings"]["run"]["execution"]["approval"].as_str(),
+        // The CLI did not transmit its machine setting. The in-process server
+        // may still apply its own active configuration independently.
         Some("auto")
     );
     assert_eq!(

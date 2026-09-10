@@ -3,6 +3,7 @@ extern crate self as fabro_types;
 pub mod artifact;
 pub mod auth;
 pub mod billing;
+pub mod billing_rollup;
 pub mod blob_hash;
 pub mod blob_ref;
 pub mod checkpoint;
@@ -32,6 +33,7 @@ pub mod run;
 pub mod run_event;
 pub mod run_failure;
 pub mod run_id;
+pub mod run_intent;
 pub mod run_projection;
 pub mod run_sandbox;
 pub mod run_summary;
@@ -80,10 +82,13 @@ pub use external_agent::{ExternalAgentHarness, ExternalAgentProfile, ExternalAge
 pub use fabro_model::ReasoningEffort;
 pub use failure_signature::FailureSignature;
 pub use graph::{
-    AttrValue, ContextKeyAttr, Edge, Graph, KNOWN_HANDLER_TYPES, Node, is_known_handler_type,
-    is_llm_handler_type, shape_to_handler_type,
+    AttrValue, AttributeScope, ContextKeyAttr, Edge, Graph, KNOWN_HANDLER_TYPES, Node, OnFailure,
+    ResolvedOnFailure, is_known_handler_type, is_llm_handler_type, shape_to_handler_type,
 };
-pub use input_scalar::{JsonScalarToTomlError, json_scalar_to_toml_value};
+pub use input_scalar::{
+    JsonScalarToTomlError, TomlScalarToJsonError, json_scalar_to_toml_value,
+    toml_scalar_to_json_value,
+};
 pub use interview::{
     InterviewQuestionRecord, QuestionType, ReviewTarget, ReviewTargetError, ReviewTargetKind,
 };
@@ -119,7 +124,10 @@ pub use pull_request::{
     PullRequestRef, PullRequestResponse, PullRequestTimestamps, PullRequestUser,
 };
 pub use reasoning::ReasoningOutput;
-pub use repository::{GitHubRepositorySlug, RepositoryProvider, RepositoryRef};
+pub use repository::{
+    GitHubRepositorySlug, GitHubRepositorySlugError, RepositoryProvider, RepositoryRef,
+    is_valid_git_branch_name, is_valid_git_tag_name, normalize_git_commit_sha,
+};
 pub use run::{
     DirtyStatus, ForkSourceRef, GitContext, RunClientProvenance, RunProvenance,
     RunServerProvenance, RunSpec,
@@ -134,6 +142,10 @@ pub use run_event::{
 };
 pub use run_failure::RunFailure;
 pub use run_id::{RunId, fixtures};
+pub use run_intent::{
+    GitCoordinateValidationError, GitRunTarget, RunIntent, RunIntentArgs, RunTarget,
+    TargetValidationError, ValidatedGitRunTarget, ValidatedRunTarget,
+};
 pub use run_projection::{
     ActivatedSkill, AgentControlState, CheckpointRecord, McpServerProjection, McpServerStatus,
     PendingInterviewRecord, RunProjection, SkillsProjection, StageContextWindow,
@@ -147,9 +159,9 @@ pub use run_sandbox::{
     RunSandboxRuntime,
 };
 pub use run_summary::{
-    AskFabro, AskFabroUnavailableReason, AutomationRef, Run, RunApproval, RunApprovalState,
-    RunBillingSummary, RunError, RunLifecycle, RunLinks, RunModel, RunOrigin, RunOriginKind,
-    RunSize, RunTimestamps, WorkflowRef,
+    AskFabro, AskFabroUnavailableReason, AutomationRef, ResolvedAutomationGitWorkflowSource, Run,
+    RunApproval, RunApprovalState, RunBillingSummary, RunError, RunLifecycle, RunLinks, RunModel,
+    RunOrigin, RunOriginKind, RunSize, RunTimestamps, WorkflowRef,
 };
 pub use run_title::{
     MAX_RUN_TITLE_CHARS, RunTitleError, infer_run_title, normalize_explicit_run_title,

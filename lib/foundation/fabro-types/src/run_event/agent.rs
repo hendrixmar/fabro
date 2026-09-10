@@ -167,18 +167,27 @@ pub struct AgentToolStartedProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentToolCompletedProps {
     // Narrow legacy fields retained for consumer compatibility.
-    pub tool_name:    String,
-    pub tool_call_id: String,
-    pub output:       Value,
-    pub is_error:     bool,
-    pub visit:        u32,
+    pub tool_name:             String,
+    pub tool_call_id:          String,
+    pub output:                Value,
+    pub is_error:              bool,
+    pub visit:                 u32,
+    /// UTF-8 bytes in the rendered tool output before hard retention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes_observed: Option<u64>,
+    /// Tool-output bytes kept in `output`, excluding truncation notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes_retained: Option<u64>,
+    /// Tool-output bytes discarded before this event was emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes_omitted:  Option<u64>,
     /// Canonical tool result payload. Carries the structured output, error
     /// state, and supported media/artifact fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_result:  Option<ToolResult>,
+    pub tool_result:           Option<ToolResult>,
     /// Turn that owned this tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id:      Option<TurnId>,
+    pub turn_id:               Option<TurnId>,
 }
 
 /// Subordinate diagnostic for a tool call that ran a process: the real
@@ -189,15 +198,24 @@ pub struct AgentToolCompletedProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentToolProcessCompletedProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code:         Option<i32>,
-    pub termination:       CommandTermination,
-    pub duration_ms:       u64,
+    pub exit_code:             Option<i32>,
+    pub termination:           CommandTermination,
+    pub duration_ms:           u64,
     /// `false` when the provider could not separate stdout from stderr. The
     /// combined output is then carried in `exec_output_tail.stdout`.
-    pub streams_separated: bool,
+    pub streams_separated:     bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exec_output_tail:  Option<ExecOutputTail>,
-    pub visit:             u32,
+    pub exec_output_tail:      Option<ExecOutputTail>,
+    /// Raw stdout and stderr bytes drained from the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes_observed: Option<u64>,
+    /// Raw process-output bytes kept by the streaming capture buffers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes_retained: Option<u64>,
+    /// Raw process-output bytes discarded by the streaming capture buffers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes_omitted:  Option<u64>,
+    pub visit:                 u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -642,6 +660,9 @@ mod tests {
         let props: AgentToolCompletedProps = serde_json::from_value(v).unwrap();
         assert!(props.tool_result.is_none());
         assert!(props.turn_id.is_none());
+        assert!(props.output_bytes_observed.is_none());
+        assert!(props.output_bytes_retained.is_none());
+        assert!(props.output_bytes_omitted.is_none());
     }
 
     #[test]
@@ -649,16 +670,22 @@ mod tests {
         let tr = ToolResult::success("call_1", json!({"stdout": "ok"}));
         let turn = TurnId::new();
         let props = AgentToolCompletedProps {
-            tool_name:    "Bash".to_string(),
-            tool_call_id: "call_1".to_string(),
-            output:       json!({"stdout": "ok"}),
-            is_error:     false,
-            visit:        1,
-            tool_result:  Some(tr.clone()),
-            turn_id:      Some(turn),
+            tool_name:             "Bash".to_string(),
+            tool_call_id:          "call_1".to_string(),
+            output:                json!({"stdout": "ok"}),
+            is_error:              false,
+            visit:                 1,
+            output_bytes_observed: Some(120),
+            output_bytes_retained: Some(100),
+            output_bytes_omitted:  Some(20),
+            tool_result:           Some(tr.clone()),
+            turn_id:               Some(turn),
         };
         let v = serde_json::to_value(&props).unwrap();
         assert_eq!(v["tool_result"]["content"]["stdout"], "ok");
+        assert_eq!(v["output_bytes_observed"], 120);
+        assert_eq!(v["output_bytes_retained"], 100);
+        assert_eq!(v["output_bytes_omitted"], 20);
         let back: AgentToolCompletedProps = serde_json::from_value(v).unwrap();
         assert_eq!(back, props);
     }

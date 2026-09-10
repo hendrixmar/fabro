@@ -18,7 +18,10 @@ use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::lifecycle::event::stage_scope_for;
 use crate::outcome::BilledModelUsage;
-use crate::run_metadata::{MetadataSnapshot, RunMetadataRuntime, RunMetadataWriterHandle};
+use crate::run_metadata::{
+    MetadataSnapshot, RunMetadataRuntime, RunMetadataWriterHandle,
+    metadata_push_failure_is_transient,
+};
 use crate::run_options::RunOptions;
 use crate::runtime_store::RunStoreHandle;
 use crate::sandbox_git::{
@@ -72,18 +75,22 @@ pub(crate) struct PushResult {
     pub branch:           String,
     pub success:          bool,
     pub exec_output_tail: Option<fabro_types::ExecOutputTail>,
+    pub attempts:         Vec<fabro_sandbox::PushAttempt>,
 }
 
 /// Push a run branch to its remote counterpart.
 ///
 /// Owns the refspec convention so the checkpoint push and the terminal publish
-/// push cannot drift apart.
+/// push cannot drift apart. The caller picks the retry budget: cheap for
+/// checkpoint pushes (the next checkpoint re-pushes the same branch anyway),
+/// generous for the terminal publish push.
 pub(crate) async fn push_run_branch(
     sandbox: &dyn fabro_sandbox::Sandbox,
     branch: &str,
-) -> fabro_sandbox::Result<()> {
+    plan: &fabro_sandbox::RetryPlan,
+) -> Result<fabro_sandbox::PushReport, fabro_sandbox::PushError> {
     sandbox
-        .git_push_ref(&format!("refs/heads/{branch}:refs/heads/{branch}"))
+        .git_push_ref(&format!("refs/heads/{branch}:refs/heads/{branch}"), plan)
         .await
 }
 
@@ -117,7 +124,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
             "git lifecycle mutex should not be poisoned: no code panics while holding this lock",
         ) = None;
         if let Some(meta_branch) = self.metadata_branch().map(str::to_string) {
-            if self.metadata_writer.is_none() || self.metadata_runtime.metadata_degraded() {
+            if self.metadata_writer.is_none() || self.metadata_runtime.metadata_suspended() {
                 return Ok(());
             }
             let phase = MetadataSnapshotPhase::Init;
@@ -154,6 +161,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                         self.emit_metadata_warning(
                             RunNoticeCode::CheckpointMetadataWriteFailed,
                             message,
+                            false,
                         );
                     }
                 },
@@ -174,6 +182,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                     self.emit_metadata_warning(
                         RunNoticeCode::CheckpointMetadataWriteFailed,
                         message,
+                        false,
                     );
                 }
             }
@@ -208,7 +217,9 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
             None,
         );
         let shadow_sha = if let Some(meta_branch) = self.metadata_branch().map(str::to_string) {
-            if self.metadata_writer.is_none() || self.metadata_runtime.metadata_degraded() {
+            if self.metadata_writer.is_none()
+                || self.metadata_runtime.metadata_checkpoint_suspended()
+            {
                 None
             } else {
                 let phase = MetadataSnapshotPhase::Checkpoint;
@@ -253,6 +264,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                                 self.emit_metadata_warning(
                                     RunNoticeCode::CheckpointMetadataWriteFailed,
                                     message,
+                                    false,
                                 );
                                 None
                             }
@@ -276,6 +288,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                         self.emit_metadata_warning(
                             RunNoticeCode::CheckpointMetadataWriteFailed,
                             message,
+                            false,
                         );
                         None
                     }
@@ -320,30 +333,41 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                         .as_ref()
                         .and_then(|g| g.run_branch.as_ref())
                     {
-                        let (push_ok, exec_output_tail) =
-                            match push_run_branch(self.sandbox.as_ref(), branch).await {
-                                Ok(()) => (true, None),
-                                Err(err) => {
+                        let plan = fabro_sandbox::RetryPlan::checkpoint_push();
+                        let (push_ok, exec_output_tail, attempts) =
+                            match push_run_branch(self.sandbox.as_ref(), branch, &plan).await {
+                                Ok(report) => {
+                                    self.sandbox_git.record_successful_push();
+                                    (true, None, report.attempts)
+                                }
+                                Err(push_error) => {
                                     let exec_output_tail =
-                                        fabro_sandbox::default_redacted_output_tail(&err);
+                                        fabro_sandbox::default_redacted_output_tail(
+                                            &push_error.error,
+                                        );
                                     tracing::warn!(
                                         branch = %branch,
-                                        error = %fabro_sandbox::display_for_log(&err),
+                                        attempts = push_error.report.attempts.len(),
+                                        error = %fabro_sandbox::display_for_log(&push_error.error),
                                         "git push from run lifecycle failed"
                                     );
                                     self.emitter.notice_with_tail(
                                         RunNoticeLevel::Warn,
                                         RunNoticeCode::GitPushFailed,
-                                        format!("Failed to push run branch {branch}: {err}"),
+                                        format!(
+                                            "Failed to push run branch {branch}: {}",
+                                            push_error.error
+                                        ),
                                         exec_output_tail.clone(),
                                     );
-                                    (false, exec_output_tail)
+                                    (false, exec_output_tail, push_error.report.attempts)
                                 }
                             };
                         git_result.push_results.push(PushResult {
                             branch: branch.clone(),
                             success: push_ok,
                             exec_output_tail,
+                            attempts,
                         });
                     }
                 }
@@ -452,7 +476,10 @@ impl GitLifecycle {
         message: &str,
         scope: Option<&StageScope>,
     ) -> Option<String> {
-        if self.metadata_runtime.metadata_degraded() {
+        if self.metadata_runtime.metadata_suspended()
+            || (phase == MetadataSnapshotPhase::Checkpoint
+                && self.metadata_runtime.metadata_checkpoint_suspended())
+        {
             return None;
         }
         let writer = self.metadata_writer.as_ref()?;
@@ -477,8 +504,12 @@ impl GitLifecycle {
                     self.emit_metadata_warning(
                         RunNoticeCode::CheckpointMetadataPushFailed,
                         message,
+                        metadata_push_failure_is_transient(detail, snapshot.token.as_ref()),
                     );
                 } else {
+                    // One good snapshot ends the degradation; a later
+                    // independent failure warns again.
+                    self.metadata_runtime.clear_metadata_degraded();
                     self.emit_metadata_snapshot_completed(
                         phase,
                         meta_branch,
@@ -503,7 +534,11 @@ impl GitLifecycle {
                     None,
                     scope,
                 );
-                self.emit_metadata_warning(RunNoticeCode::CheckpointMetadataWriteFailed, message);
+                self.emit_metadata_warning(
+                    RunNoticeCode::CheckpointMetadataWriteFailed,
+                    message,
+                    false,
+                );
                 None
             }
         }
@@ -588,8 +623,8 @@ impl GitLifecycle {
         }
     }
 
-    fn emit_metadata_warning(&self, code: RunNoticeCode, message: String) {
-        if self.metadata_runtime.mark_metadata_degraded() {
+    fn emit_metadata_warning(&self, code: RunNoticeCode, message: String, transient: bool) {
+        if self.metadata_runtime.mark_metadata_degraded(transient) {
             self.emitter.notice(RunNoticeLevel::Warn, code, message);
         }
     }
@@ -611,7 +646,7 @@ mod tests {
     use fabro_core::state::ExecutionState;
     use fabro_graphviz::graph::types::{AttrValue, Edge, Graph, Node};
     use fabro_model::Catalog;
-    use fabro_store::{Database, EventEnvelope, RunDatabase, RunProjection};
+    use fabro_store::{EventEnvelope, RunDatabase, RunProjection};
     use fabro_types::run_event::{MetadataSnapshotFailureKind, MetadataSnapshotPhase};
     use fabro_types::{BlobHash, EventBody, RunEvent, WorkflowSettings, fixtures, test_support};
     use object_store::memory::InMemory;
@@ -731,7 +766,7 @@ mod tests {
     }
 
     async fn run_store(run_id: fabro_types::RunId) -> RunDatabase {
-        let store = Arc::new(Database::new(
+        let store = Arc::new(fabro_store::test_support::test_database(
             Arc::new(InMemory::new()),
             "",
             Duration::from_millis(1),
@@ -747,9 +782,12 @@ mod tests {
             labels: BTreeMap::new(),
             source_directory: Some("/tmp/project".to_string()),
             workflow_slug: Some("metadata".to_string()),
+            workflow_version_id: None,
+            target: None,
             automation: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
+            spec_blob: None,
             git: None,
             fork_source_ref: None,
             retried_from: None,
@@ -1202,7 +1240,7 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         init_git_repo(repo_dir.path());
         let runtime = Arc::new(RunMetadataRuntime::new());
-        runtime.mark_metadata_degraded();
+        runtime.mark_metadata_degraded(false);
         let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
         let events = record_events(&emitter);
         let lifecycle = git_lifecycle(

@@ -29,7 +29,7 @@ fn unchanged_matching_artifact_is_captured_once_across_stages() {
 "#,
     );
     context.write_temp(
-        "run.toml",
+        "workflow.toml",
         r#"_version = 1
 
 [workflow]
@@ -50,7 +50,7 @@ include = ["assets/**"]
     context
         .run_cmd()
         .args(["--auto-approve", "--environment", "local"])
-        .arg(context.temp_dir.join("run.toml"))
+        .arg(context.temp_dir.join("workflow.toml"))
         .assert()
         .success();
 

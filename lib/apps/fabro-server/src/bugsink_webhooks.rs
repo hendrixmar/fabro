@@ -191,7 +191,8 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use fabro_automation::{AutomationDraft, AutomationId, AutomationStore, AutomationTarget};
+    use fabro_automation::{AutomationDraft, AutomationId, AutomationStore};
+    use fabro_types::{GitRunTarget, RunTarget};
     use fabro_types::settings::server::{BugsinkIntegrationSettings, BugsinkProjectSettings};
     use fabro_vault::{SecretStore, SecretType};
     use tower::ServiceExt as _;
@@ -255,15 +256,19 @@ mod tests {
         }
         AutomationStore::new(pool.clone())
             .create(AutomationDraft {
-                id:          AutomationId::new("incident-loop").unwrap(),
-                name:        "Incident intake".into(),
-                description: None,
-                target:      AutomationTarget {
-                    repository:   "test/incident-workflows".into(),
-                    ref_selector: "a".repeat(40),
-                    workflow:     "incident-loop".into(),
-                },
-                triggers:    vec![],
+                id:              AutomationId::new("incident-loop").unwrap(),
+                name:            "Incident intake".into(),
+                description:     None,
+                environment_id:  None,
+                target:          RunTarget::Git(GitRunTarget {
+                    repo:   "test/incident-workflows".into(),
+                    branch: "main".into(),
+                    tag:    None,
+                    sha:    Some("a".repeat(40)),
+                }),
+                workflow:        "incident-loop".into(),
+                workflow_source: None,
+                triggers:        vec![],
             })
             .await
             .unwrap();

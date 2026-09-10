@@ -129,7 +129,7 @@ async fn get_system_info_returns_runtime_fields() {
     let body = response_json(response, StatusCode::OK, "GET /api/v1/system/info").await;
     assert!(body["version"].as_str().is_some());
     assert_eq!(body["server_url"], configured_server_url);
-    assert_eq!(body["storage_engine"], "slatedb");
+    assert_eq!(body["storage_engine"], "sqlite");
     assert_eq!(
         body["storage_dir"],
         expected_storage_dir.display().to_string()

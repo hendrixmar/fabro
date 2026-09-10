@@ -1,46 +1,212 @@
+# Model IDs, capabilities, contexts, and prices are from Venice's published
+# model catalog, verified 2026-08-21:
+# https://github.com/veniceai/api-docs/blob/59a300b1d036c0c0acc0e5f75c0ab0dd07c40c1c/data/static-models.json
+
 [providers.venice]
 display_name = "Venice"
 adapter = "openai_compatible"
 base_url = "https://api.venice.ai/api/v1"
 priority = 35
 aliases = ["venice-ai"]
+billing_policy = "openai"
 
 [providers.venice.auth]
 credentials = ["env:VENICE_API_KEY", "vault:VENICE_API_KEY"]
 
-[providers.venice.models."venice-uncensored-1-2"]
-display_name = "Venice Uncensored 1.2"
-family = "venice-uncensored"
+[providers.venice.models."kimi-k3"]
+display_name = "Kimi K3"
+family = "kimi-k3"
+agent_profile = "kimi"
+aliases = ["kimi"]
+
+[providers.venice.models."kimi-k3".limits]
+context_window = 1000000
+max_output = 131072
+
+[providers.venice.models."kimi-k3".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_by_default = true
+prompt_cache = true
+sampling_params = false
+
+[providers.venice.models."kimi-k3".costs]
+input_cost_per_mtok = 3.75
+output_cost_per_mtok = 18.75
+cache_input_cost_per_mtok = 0.375
+
+[providers.venice.models."kimi-k3-fast"]
+api_id = "kimi-k3-fast-api"
+display_name = "Kimi K3 Fast"
+family = "kimi-k3"
+agent_profile = "kimi"
+aliases = ["kimi-fast"]
+
+[providers.venice.models."kimi-k3-fast".limits]
+context_window = 1000000
+max_output = 131072
+
+[providers.venice.models."kimi-k3-fast".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_by_default = true
+prompt_cache = true
+sampling_params = false
+
+[providers.venice.models."kimi-k3-fast".costs]
+input_cost_per_mtok = 4.5
+output_cost_per_mtok = 22.5
+cache_input_cost_per_mtok = 0.45
+
+[providers.venice.models."grok-4.6"]
+api_id = "grok-4-6"
+display_name = "Grok 4.6"
+family = "grok-4"
+aliases = ["grok", "grok46", "grok-46"]
+
+[providers.venice.models."grok-4.6".limits]
+context_window = 500000
+max_output = 32000
+
+[providers.venice.models."grok-4.6".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "levels"
+reasoning_by_default = true
+prompt_cache = true
+
+[providers.venice.models."grok-4.6".controls]
+reasoning_effort = ["low", "medium", "high", "xhigh"]
+
+[providers.venice.models."grok-4.6".costs]
+input_cost_per_mtok = 2.27
+output_cost_per_mtok = 6.8
+cache_input_cost_per_mtok = 0.57
+
+[providers.venice.models."glm-5.3"]
+api_id = "z-ai-glm-5-3"
+display_name = "GLM 5.3"
+family = "glm-5"
+aliases = ["glm", "glm5", "glm53", "glm5.3", "glm-5-3"]
+
+[providers.venice.models."glm-5.3".limits]
+context_window = 1000000
+max_output = 131072
+
+[providers.venice.models."glm-5.3".features]
+tools = true
+vision = false
+reasoning = true
+reasoning_effort = "levels"
+reasoning_by_default = true
+prompt_cache = true
+
+[providers.venice.models."glm-5.3".controls]
+reasoning_effort = ["low", "high", "max"]
+
+[providers.venice.models."glm-5.3".costs]
+input_cost_per_mtok = 1.75
+output_cost_per_mtok = 5.5
+cache_input_cost_per_mtok = 0.325
+
+[providers.venice.models."deepseek-v4-flash"]
+api_id = "deepseek-v4-flash-0731"
+display_name = "DeepSeek V4 Flash"
+family = "deepseek-v4"
+agent_profile = "openai"
 default = true
-aliases = ["venice-uncensored", "vu"]
+aliases = ["deepseek-v4", "deepseek", "deepseek-flash"]
 
-[providers.venice.models."venice-uncensored-1-2".limits]
-context_window = 128000
-max_output = 8192
+[providers.venice.models."deepseek-v4-flash".limits]
+context_window = 1000000
+max_output = 32768
 
-[providers.venice.models."venice-uncensored-1-2".features]
+[providers.venice.models."deepseek-v4-flash".features]
+tools = true
+vision = false
+reasoning = true
+reasoning_effort = "levels"
+reasoning_by_default = true
+prompt_cache = true
+sampling_params = false
+
+[providers.venice.models."deepseek-v4-flash".controls]
+reasoning_effort = ["low", "high", "max"]
+
+[providers.venice.models."deepseek-v4-flash".costs]
+input_cost_per_mtok = 0.175
+output_cost_per_mtok = 0.35
+cache_input_cost_per_mtok = 0.035
+
+[providers.venice.models."deepseek-v4-pro"]
+api_id = "deepseek-v4-pro-0813"
+display_name = "DeepSeek V4 Pro"
+family = "deepseek-v4"
+agent_profile = "openai"
+aliases = ["deepseek-pro"]
+
+[providers.venice.models."deepseek-v4-pro".limits]
+context_window = 1000000
+max_output = 32768
+
+[providers.venice.models."deepseek-v4-pro".features]
+tools = true
+vision = false
+reasoning = true
+reasoning_by_default = true
+prompt_cache = true
+sampling_params = false
+
+[providers.venice.models."deepseek-v4-pro".costs]
+input_cost_per_mtok = 1.65
+output_cost_per_mtok = 4.95
+cache_input_cost_per_mtok = 0.165
+
+[providers.venice.models."qwen3.8-max"]
+api_id = "qwen-3-8-max"
+display_name = "Qwen 3.8 Max"
+family = "qwen3"
+aliases = ["qwen", "qwen-max", "qwen3.8", "qwen-3.8", "qwen38", "qwen-3.8-max", "qwen38-max"]
+
+[providers.venice.models."qwen3.8-max".limits]
+context_window = 1000000
+max_output = 131072
+
+[providers.venice.models."qwen3.8-max".features]
 tools = true
 vision = true
-reasoning = false
+reasoning = true
+reasoning_by_default = true
+prompt_cache = true
 
-[providers.venice.models."venice-uncensored-1-2".costs]
-input_cost_per_mtok = 0.2
-output_cost_per_mtok = 0.9
+[providers.venice.models."qwen3.8-max".costs]
+input_cost_per_mtok = 2.5
+output_cost_per_mtok = 7.5
+cache_input_cost_per_mtok = 0.3125
 
-[providers.venice.models."venice-uncensored-role-play"]
-display_name = "Venice Uncensored Role Play"
-family = "venice-uncensored"
-aliases = ["venice-roleplay", "vrp"]
+[providers.venice.models."qwen3.8-27b"]
+api_id = "qwen-3-8-27b"
+display_name = "Qwen 3.8 27B"
+family = "qwen3.8"
+aliases = ["qwen-27b", "qwen-3.8-27b", "qwen38-27b"]
 
-[providers.venice.models."venice-uncensored-role-play".limits]
-context_window = 128000
-max_output = 4096
+[providers.venice.models."qwen3.8-27b".limits]
+context_window = 262144
+max_output = 131072
 
-[providers.venice.models."venice-uncensored-role-play".features]
+[providers.venice.models."qwen3.8-27b".features]
 tools = true
 vision = true
-reasoning = false
+reasoning = true
+reasoning_effort = "levels"
+reasoning_by_default = true
 
-[providers.venice.models."venice-uncensored-role-play".costs]
-input_cost_per_mtok = 0.5
-output_cost_per_mtok = 2.0
+[providers.venice.models."qwen3.8-27b".controls]
+reasoning_effort = ["low", "medium", "xhigh"]
+
+[providers.venice.models."qwen3.8-27b".costs]
+input_cost_per_mtok = 0.45
+output_cost_per_mtok = 3.2

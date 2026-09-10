@@ -31,7 +31,7 @@ use crate::sandbox::{GrepOptions, format_lines_numbered};
 use crate::tool_registry::{RegisteredTool, ToolSource};
 use crate::tools::{
     DEFAULT_READ_LINES, emit_shell_process_completed, execute_grep, execute_shell_command,
-    grep_result_path, make_edit_file_tool, optional_usize_arg, required_str,
+    grep_result_path, make_edit_file_tool, optional_usize_arg, required_str, retain_shell_output,
 };
 
 const DEFAULT_GREP_RESULTS: usize = 250;
@@ -143,6 +143,7 @@ explicitly asked. Never run commands requiring superuser privileges unless expli
                     let _ = write!(out, "Command failed with exit code: {code}");
                 }
                 let is_success = result.is_success();
+                let out = retain_shell_output(&ctx, &streaming, out);
                 emit_shell_process_completed(&ctx, streaming).await;
                 if is_success { Ok(out) } else { Err(out) }
             })

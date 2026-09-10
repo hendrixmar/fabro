@@ -86,8 +86,8 @@ async fn get_checkpoint(
         Ok(id) => id,
         Err(response) => return response,
     };
-    match state.cached_run(&id).await {
-        Ok(cached) => match cached.projection.current_checkpoint() {
+    match state.load_run_projection(&id).await {
+        Ok(projection) => match projection.current_checkpoint() {
             Some(cp) => (StatusCode::OK, Json(cp.clone())).into_response(),
             None => (StatusCode::OK, Json(serde_json::json!(null))).into_response(),
         },
@@ -131,11 +131,18 @@ async fn read_run_blob(
 }
 
 async fn ensure_run_exists(state: &AppState, run_id: &RunId) -> Result<(), Response> {
-    state
-        .cached_run(run_id)
+    match state
+        .stores
+        .run_summaries
+        .get(run_id, chrono::Utc::now())
         .await
-        .map(|_| ())
-        .map_err(IntoResponse::into_response)
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(ApiError::not_found("Run not found.").into_response()),
+        Err(err) => {
+            Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
+        }
+    }
 }
 
 async fn list_run_artifacts(
@@ -330,8 +337,8 @@ async fn download_run_artifacts(
         Ok(id) => id,
         Err(response) => return response,
     };
-    let cached = match state.cached_run(&id).await {
-        Ok(cached) => cached,
+    let projection = match state.load_run_projection(&id).await {
+        Ok(projection) => projection,
         Err(error) => return error.into_response(),
     };
     let entries = match state.artifact_store.list_for_run(&id).await {
@@ -345,7 +352,7 @@ async fn download_run_artifacts(
             .into_response();
         }
     };
-    let artifacts = latest_run_artifacts(entries, &cached.projection);
+    let artifacts = latest_run_artifacts(entries, &projection);
 
     let content_disposition = format!("attachment; filename=\"fabro-artifacts-{id}.zip\"");
     let body = artifact_archive_body(state.artifact_store.clone(), id, artifacts);

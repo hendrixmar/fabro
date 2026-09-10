@@ -18,7 +18,7 @@ pub use self::redaction::{
     build_redacted_event_payload, event_payload_from_redacted_json, redacted_event_json,
 };
 pub use self::sink::{
-    RunEventLogger, RunEventSink, StoreProgressLogger, append_event, append_event_if,
-    append_event_to_sink,
+    RunEventLogger, RunEventPersistenceError, RunEventSink, StoreProgressLogger, append_event,
+    append_event_if, append_event_to_sink, create_run,
 };
 pub use crate::stage_scope::StageScope;

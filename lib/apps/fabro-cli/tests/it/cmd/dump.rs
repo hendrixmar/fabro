@@ -168,7 +168,7 @@ fn dump_exports_blob_refs_and_artifacts_together() {
     )
     .unwrap();
     fs::write(
-        workspace_dir.join("run.toml"),
+        workspace_dir.join("workflow.toml"),
         r#"_version = 1
 
 [workflow]
@@ -189,7 +189,7 @@ include = ["assets/**"]
     let mut run_cmd = context.run_cmd();
     run_cmd.current_dir(&workspace_dir);
     run_cmd.timeout(Duration::from_secs(30));
-    run_cmd.args(["--environment", "local", "run.toml"]);
+    run_cmd.args(["--environment", "local", "workflow.toml"]);
     let run_output = run_cmd.output().expect("command should execute");
     assert!(
         run_output.status.success(),

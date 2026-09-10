@@ -12,7 +12,11 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+clap = ["dep:clap"]
+
 [dependencies]
+clap = { workspace = true, optional = true }
 fabro-static.workspace = true
 http = "1"
 rust-embed.workspace = true

@@ -16,4 +16,8 @@
 
 export interface RunIntegrationsGithubSettings {
     'permissions': { [key: string]: string; };
+    /**
+     * Additional GitHub repositories, beyond the implicit run origin, that the minted GITHUB_TOKEN must cover. Each entry is a full `owner/repository` slug; every repository must share one owner with the run origin. Omitted when empty; settings persisted before this field existed deserialize to an empty set.
+     */
+    'additional_repositories'?: Array<string>;
 }

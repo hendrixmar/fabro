@@ -12,7 +12,7 @@ use fabro_agent::Sandbox;
 use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 use fabro_types::{RunEvent, WorkflowSettings, fixtures};
 use fabro_workflow::event::Emitter;
-use fabro_workflow::git::{branch_needs_push, push_branch, push_ref};
+use fabro_workflow::git;
 use fabro_workflow::handler::HandlerRegistry;
 use fabro_workflow::handler::exit::ExitHandler;
 use fabro_workflow::handler::start::StartHandler;
@@ -178,7 +178,7 @@ fn push_ref_to_bare_remote() {
 
     rename_branch(&repo_dir, "test-push");
     let url = format!("file://{}", remote_dir.display());
-    push_ref(&repo_dir, &url, "refs/heads/test-push").unwrap();
+    git::push_ref(&repo_dir, &url, "refs/heads/test-push").unwrap();
 
     assert!(list_branch(&remote_dir, "test-push").contains("test-push"));
 }
@@ -194,7 +194,7 @@ fn push_branch_to_remote() {
     add_origin(&repo_dir, &remote_dir);
     rename_branch(&repo_dir, "main");
 
-    push_branch(&repo_dir, "origin", "main").unwrap();
+    git::push_branch(&repo_dir, "origin", "main").unwrap();
 
     assert!(list_branch(&remote_dir, "main").contains("main"));
 }
@@ -210,10 +210,10 @@ fn branch_needs_push_when_ahead() {
     add_origin(&repo_dir, &remote_dir);
     rename_branch(&repo_dir, "main");
 
-    push_branch(&repo_dir, "origin", "main").unwrap();
+    git::push_branch(&repo_dir, "origin", "main").unwrap();
     empty_commit(&repo_dir, "second");
 
-    assert!(branch_needs_push(&repo_dir, "origin", "main"));
+    assert!(git::branch_needs_push(&repo_dir, "origin", "main"));
 }
 
 #[test]
@@ -227,9 +227,39 @@ fn branch_needs_push_when_in_sync() {
     add_origin(&repo_dir, &remote_dir);
     rename_branch(&repo_dir, "main");
 
-    push_branch(&repo_dir, "origin", "main").unwrap();
+    git::push_branch(&repo_dir, "origin", "main").unwrap();
 
-    assert!(!branch_needs_push(&repo_dir, "origin", "main"));
+    assert!(!git::branch_needs_push(&repo_dir, "origin", "main"));
+}
+
+#[test]
+fn remote_branch_sha_ignores_a_locally_rewritten_tracking_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let remote_dir = dir.path().join("remote.git");
+
+    init_bare_remote(&remote_dir);
+    init_repo(&repo_dir);
+    add_origin(&repo_dir, &remote_dir);
+    rename_branch(&repo_dir, "main");
+    git::push_branch(&repo_dir, "origin", "main").unwrap();
+    let remote_sha = git::head_sha(&repo_dir).unwrap();
+
+    empty_commit(&repo_dir, "local-only");
+    let local_sha = git::head_sha(&repo_dir).unwrap();
+    let update_tracking = Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
+        .current_dir(&repo_dir)
+        .output()
+        .expect("git update-ref should run");
+    assert_success(&update_tracking, "git update-ref");
+    assert!(!git::branch_needs_push(&repo_dir, "origin", "main"));
+
+    assert_eq!(
+        git::remote_branch_sha_noninteractive(&repo_dir, "origin", "main").unwrap(),
+        Some(remote_sha.clone()),
+    );
+    assert_ne!(local_sha, remote_sha);
 }
 
 #[tokio::test]
@@ -297,4 +327,236 @@ async fn git_checkpoint_skips_start_node() {
         .collect();
     assert!(!checkpoint_node_ids.contains(&"start"));
     assert!(checkpoint_node_ids.contains(&"work"));
+}
+
+/// Sandbox double for remote-style runs: commands and files operate on a real
+/// local checkout, but the workflow engine's run directory is reported as
+/// inaccessible (as it is for Docker/Daytona) and the sandbox exposes a
+/// runtime directory outside the checkout.
+struct RemoteRuntimeSandbox {
+    inner:             fabro_agent::LocalSandbox,
+    hidden_path:       String,
+    runtime_directory: String,
+}
+
+#[async_trait::async_trait]
+impl Sandbox for RemoteRuntimeSandbox {
+    async fn read_file_bytes(&self, path: &str) -> fabro_sandbox::Result<Vec<u8>> {
+        self.inner.read_file_bytes(path).await
+    }
+
+    async fn write_file(&self, path: &str, content: &str) -> fabro_sandbox::Result<()> {
+        self.inner.write_file(path, content).await
+    }
+
+    async fn delete_file(&self, path: &str) -> fabro_sandbox::Result<()> {
+        self.inner.delete_file(path).await
+    }
+
+    async fn file_exists(&self, path: &str) -> fabro_sandbox::Result<bool> {
+        if path == self.hidden_path {
+            return Ok(false);
+        }
+        self.inner.file_exists(path).await
+    }
+
+    async fn list_directory(
+        &self,
+        path: &str,
+        depth: Option<usize>,
+    ) -> fabro_sandbox::Result<Vec<fabro_agent::DirEntry>> {
+        self.inner.list_directory(path, depth).await
+    }
+
+    async fn exec_command(
+        &self,
+        command: &str,
+        timeout_ms: u64,
+        working_dir: Option<&str>,
+        env_vars: Option<&HashMap<String, String>>,
+        cancel_token: Option<CancellationToken>,
+    ) -> fabro_sandbox::Result<fabro_agent::ExecResult> {
+        self.inner
+            .exec_command(command, timeout_ms, working_dir, env_vars, cancel_token)
+            .await
+    }
+
+    async fn grep(
+        &self,
+        pattern: &str,
+        path: &str,
+        options: &fabro_sandbox::GrepOptions,
+    ) -> fabro_sandbox::Result<Vec<String>> {
+        self.inner.grep(pattern, path, options).await
+    }
+
+    async fn download_file_to_local(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> fabro_sandbox::Result<()> {
+        self.inner
+            .download_file_to_local(remote_path, local_path)
+            .await
+    }
+
+    async fn upload_file_from_local(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+    ) -> fabro_sandbox::Result<()> {
+        self.inner
+            .upload_file_from_local(local_path, remote_path)
+            .await
+    }
+
+    async fn initialize(&self) -> fabro_sandbox::Result<()> {
+        Ok(())
+    }
+
+    async fn cleanup(&self) -> fabro_sandbox::Result<()> {
+        Ok(())
+    }
+
+    fn working_directory(&self) -> &str {
+        self.inner.working_directory()
+    }
+
+    fn runtime_directory(&self) -> Option<&str> {
+        Some(&self.runtime_directory)
+    }
+
+    fn platform(&self) -> &str {
+        self.inner.platform()
+    }
+
+    fn os_version(&self) -> String {
+        self.inner.os_version()
+    }
+}
+
+fn git_status_porcelain(repo_dir: &Path) -> String {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_dir)
+        .output()
+        .expect("git status --porcelain should run");
+    assert_success(&output, "git status --porcelain");
+    String::from_utf8(output.stdout).expect("git status output should be UTF-8")
+}
+
+fn git_committed_files(repo_dir: &Path, sha: &str) -> String {
+    let output = Command::new("git")
+        .args(["show", "--name-only", "--format=", sha])
+        .current_dir(repo_dir)
+        .output()
+        .expect("git show --name-only should run");
+    assert_success(&output, "git show --name-only");
+    String::from_utf8(output.stdout).expect("git show output should be UTF-8")
+}
+
+/// Remote-style prompt demotion must materialize blobs in the sandbox runtime
+/// directory, outside the checkout, so a real checkpoint commit can never pick
+/// them up, and re-resolution must recreate a deleted materialized file from
+/// the durable blob store. Regression test for issue #798.
+#[tokio::test]
+async fn remote_prompt_demotion_stays_outside_checkout_and_survives_checkpoint() {
+    use std::time::Duration;
+
+    use fabro_store::test_support as store_test_support;
+    use fabro_types::settings::run::RunCheckpointSettings;
+    use fabro_workflow::context::Context;
+    use fabro_workflow::git::GitAuthor;
+    use fabro_workflow::runtime_store::RunStoreHandle;
+    use fabro_workflow::{artifact, sandbox_git};
+    use object_store::memory::InMemory;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    init_repo(&repo_dir);
+    let runtime_dir = dir.path().join("fabro").join("runtime");
+    let run_dir = dir.path().join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    let sandbox = RemoteRuntimeSandbox {
+        inner:             fabro_agent::LocalSandbox::new(repo_dir.clone()),
+        hidden_path:       run_dir.to_string_lossy().to_string(),
+        runtime_directory: runtime_dir.to_string_lossy().to_string(),
+    };
+
+    let store = store_test_support::test_database(
+        Arc::new(InMemory::new()),
+        "runs/",
+        Duration::from_millis(1),
+        None,
+    );
+    let run_store: RunStoreHandle = store.create_run(&fixtures::RUN_2).await.unwrap().into();
+
+    let oversized = serde_json::json!("x".repeat(64 * 1024));
+    let oversized_bytes = serde_json::to_vec(&oversized).unwrap();
+    let mut values = HashMap::from([("dataset".to_string(), oversized.clone())]);
+    artifact::demote_large_values_for_prompt(
+        &mut values,
+        &mut HashMap::new(),
+        &run_store,
+        &sandbox,
+        &run_dir,
+    )
+    .await;
+
+    let marker = values["dataset"]
+        .get("fabroLargeValue")
+        .expect("oversized value should demote to a marker");
+    let blob_path = marker["path"].as_str().unwrap().to_string();
+    assert!(
+        blob_path.starts_with(&runtime_dir.to_string_lossy().to_string()),
+        "materialized blob {blob_path} should live under the sandbox runtime directory"
+    );
+    assert!(
+        !blob_path.starts_with(&repo_dir.to_string_lossy().to_string()),
+        "materialized blob {blob_path} must not live inside the checkout"
+    );
+
+    // The agent-facing path is readable through the sandbox.
+    let contents = sandbox.read_file_bytes(&blob_path).await.unwrap();
+    assert_eq!(contents, oversized_bytes);
+
+    // Materialization leaves the checkout clean, and a real checkpoint commit
+    // stages no runtime blob file.
+    assert_eq!(git_status_porcelain(&repo_dir), "");
+    let sha = sandbox_git::git_checkpoint(
+        &sandbox,
+        &fixtures::RUN_2.to_string(),
+        "work",
+        "succeeded",
+        1,
+        None,
+        &RunCheckpointSettings::default(),
+        &GitAuthor::default(),
+    )
+    .await
+    .expect("checkpoint commit should succeed");
+    assert_eq!(git_committed_files(&repo_dir, &sha).trim(), "");
+    assert_eq!(git_status_porcelain(&repo_dir), "");
+
+    // Removing the materialized file and resolving the value again recreates
+    // it from the durable blob store.
+    std::fs::remove_file(&blob_path).unwrap();
+    let blob_hash = fabro_types::BlobHash::new(&oversized_bytes);
+    let context = Context::new();
+    context.set(
+        "report",
+        serde_json::json!(fabro_types::format_blob_ref(&blob_hash)),
+    );
+    let resolved = artifact::resolved_context_snapshot(&context, &run_store, &sandbox, &run_dir)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved["report"],
+        serde_json::json!(format!("file://{blob_path}"))
+    );
+    assert_eq!(
+        sandbox.read_file_bytes(&blob_path).await.unwrap(),
+        oversized_bytes
+    );
 }

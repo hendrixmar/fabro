@@ -15,10 +15,13 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { AutomationTarget } from './automation-target';
+import type { AutomationGitWorkflowSource } from './automation-git-workflow-source';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { AutomationTrigger } from './automation-trigger';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { RunTarget } from './run-target';
 
 /**
  * Public automation definition.
@@ -31,6 +34,19 @@ export interface Automation {
     'revision': string;
     'name': string;
     'description': string | null;
-    'target': AutomationTarget;
+    /**
+     * Server-managed Docker or Daytona environment selected when the automation fires. Null only for an incomplete definition migrated from a release that predated environment selection.
+     */
+    'environment_id': string | null;
+    /**
+     * Most recent scheduled-run failure, cleared after a scheduled run is queued successfully.
+     */
+    'last_error': string | null;
+    'target': RunTarget;
+    /**
+     * Workflow slug or path resolved in the run-target checkout when `workflow_source` is omitted, or in the explicit workflow-source checkout when present.
+     */
+    'workflow': string;
+    'workflow_source'?: AutomationGitWorkflowSource;
     'triggers': Array<AutomationTrigger>;
 }

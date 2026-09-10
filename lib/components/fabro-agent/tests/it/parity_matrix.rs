@@ -230,6 +230,7 @@ macro_rules! web_search_provider_test {
                         "BRAVE_SEARCH_API_KEY must be set for web-search tests",
                     ),
                 ),
+                ..ToolSecrets::default()
             }
         );
     };

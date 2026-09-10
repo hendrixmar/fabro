@@ -69,11 +69,10 @@ async fn list_run_stages(
         Err(response) => return response,
     };
 
-    let cached = match state.cached_run(&id).await {
-        Ok(cached) => cached,
+    let projection = match state.load_run_projection(&id).await {
+        Ok(projection) => projection,
         Err(err) => return err.into_response(),
     };
-    let projection = cached.projection;
 
     let now = Utc::now();
     let graph = projection.spec().graph();
@@ -91,11 +90,10 @@ async fn get_run_billing(
     State(state): State<Arc<AppState>>,
     Path(id): Path<RunId>,
 ) -> Response {
-    let cached = match state.cached_run(&id).await {
-        Ok(cached) => cached,
+    let projection = match state.load_run_projection(&id).await {
+        Ok(projection) => projection,
         Err(err) => return err.into_response(),
     };
-    let projection = cached.projection;
 
     let catalog = state.catalog();
     let rollup = fabro_workflow::billing_rollup_from_projection(&projection, Some(&catalog));

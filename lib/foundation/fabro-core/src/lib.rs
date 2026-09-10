@@ -15,7 +15,7 @@ pub mod test_fixtures;
 pub use context::Context;
 pub use error::{Error, HandlerErrorDetail, Result, VisitLimitSource};
 pub use executor::{Executor, ExecutorBuilder, ExecutorOptions};
-pub use graph::{EdgeSelection, EdgeSpec, Graph, NodeSpec};
+pub use graph::{EdgeSelection, EdgeSelectionReason, EdgeSpec, Graph, NodeSpec};
 pub use handler::NodeHandler;
 pub use lifecycle::{
     AttemptContext, AttemptResultContext, CompositeLifecycle, EdgeContext, EdgeDecision,

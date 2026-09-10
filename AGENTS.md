@@ -30,7 +30,19 @@ macOS note: if `cargo nextest run` fails with `Too many open files (os error 24)
 ### Docker sandbox provider
 - Docker is the default runtime sandbox provider from `defaults.toml`. The Fabro process must have a working Docker client environment (`DOCKER_HOST`, socket access, Docker Desktop behavior, TLS settings, groups/permissions, and any remote daemon policy are operator responsibilities).
 - The packaged compose service mounts `/var/run/docker.sock` so the server can create sibling run containers on the host daemon. This is host-root-equivalent under Docker's security model; only use it in the trusted, single-tenant deployment model described by the sandbox code/docs.
-- Docker and Daytona are clone-based providers. When a run manifest has a GitHub origin, they clone it into the provider workspace. Present non-GitHub origins fail unless the provider has `skip_clone = true`; absent origins or `skip_clone = true` create an empty workspace without repository files.
+- Docker and Daytona are clone-based providers. When a run manifest has a GitHub origin, they clone it into the provider workspace. Present non-GitHub origins fail unless the provider has `skip_clone = true`; absent origins or `skip_clone = true` create an empty workspace without repository files. For an exact commit, the submitted branch names the working branch and the syntactically valid SHA is requested directly. No layer proves branch/SHA ancestry: a fetchable commit is checked out, an unavailable commit fails setup, and branch HEAD is never substituted.
+- The sandbox layer also accepts an optional exact commit for future admitted
+  runs. An exact commit always requires a non-empty branch. Docker initializes
+  an empty repository, shallow-fetches the SHA at the same depth as a branch
+  clone, and checks it out; Daytona uses its official SDK clone with both
+  `branch` and `commit_id`. Both providers then point the admitted branch at
+  the commit and verify HEAD, so the workspace still reports the admitted
+  branch name. Keep those provider transports distinct, never fall back to a
+  newer branch HEAD, and do not wire this capability directly from legacy
+  `GitContext.sha`. The sandbox layer does not verify that the commit is
+  reachable from the branch; admission owns that check. Current production
+  callers remain branch-only until the RunIntent admission cutover supplies a
+  validated branch/SHA pair.
 
 ### Release automation
 - `cargo dev release` — creates the next stable release tag. Use `cargo dev release --nightly` for a nightly prerelease. Use `--dry-run` to print planned commands without mutating git or running Cargo, `--skip-tests` only after running the release-mode smoke yourself, and `--release-date YYYY-MM-DD` or `FABRO_RELEASE_DATE` for deterministic version computation.

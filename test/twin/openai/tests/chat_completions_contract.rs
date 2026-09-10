@@ -369,20 +369,24 @@ async fn chat_completions_reject_reasoning_parts_on_non_assistant_messages() {
 }
 
 #[tokio::test]
-async fn chat_completions_reject_unknown_top_level_fields() {
+async fn chat_completions_accept_unknown_top_level_fields() {
     let server = common::spawn_server().await.expect("server should start");
 
-    let response = server
-        .post_chat(json!({
+    let (status, chunks) = server
+        .post_chat_stream(json!({
             "model": "gpt-test",
             "messages": [{ "role": "user", "content": "hello" }],
-            "unexpected_field": true
+            "stream": true,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "prompt_cache_key": "conversation-123"
         }))
         .await;
 
-    assert_eq!(response.status(), 400);
-    let body = response.json::<serde_json::Value>().await.expect("json");
-    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(status, 200);
+    let transcript =
+        common::parse_sse_transcript(chunks.join("").as_bytes()).expect("valid SSE transcript");
+    assert!(transcript.done);
 }
 
 #[tokio::test]

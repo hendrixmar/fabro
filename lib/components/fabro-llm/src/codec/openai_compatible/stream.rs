@@ -29,8 +29,8 @@ pub(super) struct StreamState {
     /// True after `finish_events()` has run (guards against duplicates).
     finished:              bool,
     rate_limit:            Option<RateLimitInfo>,
-    /// In-band USD cost from the usage chunk (OpenRouter), surfaced as
-    /// authoritative on the final response.
+    /// In-band USD cost from the response, surfaced as authoritative on the
+    /// final response.
     cost_usd:              Option<f64>,
 }
 
@@ -56,7 +56,7 @@ impl StreamState {
     }
 
     /// Process a parsed SSE chunk and return events to emit, if any.
-    fn process_chunk(&mut self, mut chunk: StreamChunk) -> Option<Vec<StreamEvent>> {
+    fn process_chunk(&mut self, mut chunk: StreamChunk) -> Result<Option<Vec<StreamEvent>>, Error> {
         // Capture response metadata from the first chunk.
         if let Some(id) = &chunk.id {
             if self.response_id.is_empty() {
@@ -72,12 +72,20 @@ impl StreamState {
         // Capture usage if present (often in a dedicated chunk).
         if let Some(usage) = &chunk.usage {
             self.usage = usage.token_counts();
-            // Keep a previously seen cost when a later usage chunk omits it.
-            self.cost_usd = usage.cost.or(self.cost_usd);
         }
+        let cost_usd = chunk
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cost)
+            .or_else(|| chunk.cost.as_ref().and_then(|cost| cost.usd));
+        self.cost_usd = cost_usd.or(self.cost_usd);
 
-        let choices = chunk.choices.as_mut()?;
-        let choice = choices.first_mut()?;
+        let Some(choices) = chunk.choices.as_mut() else {
+            return Ok(None);
+        };
+        let Some(choice) = choices.first_mut() else {
+            return Ok(None);
+        };
 
         let mut events = Vec::new();
 
@@ -86,7 +94,9 @@ impl StreamState {
             self.finish_reason = map_finish_reason(Some(reason.as_str()));
         }
 
-        let delta = choice.delta.as_mut()?;
+        let Some(delta) = choice.delta.as_mut() else {
+            return Ok(None);
+        };
 
         // Accumulate reasoning/thinking content (Kimi, etc.).
         if let Some(reasoning) = delta.reasoning() {
@@ -117,8 +127,22 @@ impl StreamState {
             for tc in tool_calls {
                 let index = tc.index;
 
-                // Grow the accumulated tool calls vector if needed.
-                while self.tool_calls.len() <= index {
+                // A delta may only continue an already-started tool call or
+                // open the next slot. Padding a skipped slot would materialize
+                // a phantom tool call with an empty id and name, which poisons
+                // the conversation once echoed back to the provider.
+                if index > self.tool_calls.len() {
+                    return Err(Error::Stream {
+                        message: format!(
+                            "malformed tool call stream from {}: delta for tool_calls[{index}] \
+                             arrived before tool_calls[{}] was started",
+                            self.provider_name,
+                            self.tool_calls.len()
+                        ),
+                        source:  None,
+                    });
+                }
+                if index == self.tool_calls.len() {
                     self.tool_calls.push(AccumulatedToolCall {
                         id:        String::new(),
                         name:      String::new(),
@@ -159,9 +183,9 @@ impl StreamState {
         }
 
         if events.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(events)
+            Ok(Some(events))
         }
     }
 
@@ -258,7 +282,7 @@ impl StreamDecoder for StreamState {
         let chunk: StreamChunk = serde_json::from_str(ev.data)
             .map_err(|e| Error::stream_error(format!("failed to parse SSE chunk: {e}"), e))?;
 
-        Ok(self.process_chunk(chunk).unwrap_or_default())
+        Ok(self.process_chunk(chunk)?.unwrap_or_default())
     }
 
     fn finish(&mut self) -> Vec<StreamEvent> {
@@ -369,7 +393,7 @@ mod tests {
         let chunk1: StreamChunk = serde_json::from_str(
             r#"{"id":"c1","model":"m1","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#,
         ).unwrap();
-        let events1 = state.process_chunk(chunk1).unwrap();
+        let events1 = state.process_chunk(chunk1).unwrap().unwrap();
         assert_eq!(events1.len(), 2);
         assert!(matches!(events1[0], StreamEvent::TextStart { .. }));
         assert!(matches!(events1[1], StreamEvent::TextDelta { .. }));
@@ -377,7 +401,7 @@ mod tests {
         let chunk2: StreamChunk = serde_json::from_str(
             r#"{"id":"c1","model":"m1","choices":[{"delta":{"content":" world"},"finish_reason":null}]}"#,
         ).unwrap();
-        let events2 = state.process_chunk(chunk2).unwrap();
+        let events2 = state.process_chunk(chunk2).unwrap().unwrap();
         assert_eq!(events2.len(), 1);
         assert!(matches!(events2[0], StreamEvent::TextDelta { .. }));
 
@@ -391,14 +415,14 @@ mod tests {
         let chunk1: StreamChunk = serde_json::from_str(
             r#"{"id":"c1","model":"m1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"fn1","arguments":"{\"k"}}]},"finish_reason":null}]}"#,
         ).unwrap();
-        let events1 = state.process_chunk(chunk1).unwrap();
+        let events1 = state.process_chunk(chunk1).unwrap().unwrap();
         assert_eq!(events1.len(), 1);
         assert!(matches!(events1[0], StreamEvent::ToolCallStart { .. }));
 
         let chunk2: StreamChunk = serde_json::from_str(
             r#"{"id":"c1","model":"m1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ey\"}"}}]},"finish_reason":null}]}"#,
         ).unwrap();
-        let events2 = state.process_chunk(chunk2).unwrap();
+        let events2 = state.process_chunk(chunk2).unwrap().unwrap();
         assert_eq!(events2.len(), 1);
         assert!(matches!(events2[0], StreamEvent::ToolCallDelta { .. }));
 
@@ -473,6 +497,37 @@ mod tests {
             }
             other => panic!("Expected Finish, got {other:?}"),
         }
+    }
+
+    // Reproduces run 01M11JZVT7V507R56BCJJHZB1B: venice (proxying Anthropic)
+    // numbered tool_calls[].index by content block, so the first tool call
+    // arrived with index 1 when text preceded it. Padding the skipped slot
+    // used to materialize a phantom tool call with an empty id and name that
+    // the provider rejected once echoed back (tool_use.id must match
+    // '^[a-zA-Z0-9_-]+$'). A gap in the index sequence is indistinguishable
+    // from lost chunks, so the stream must fail instead.
+    #[test]
+    fn sparse_tool_call_index_is_a_stream_error() {
+        let mut state = test_state("venice", "claude-opus-5");
+
+        let text_chunk: StreamChunk = serde_json::from_str(
+            r#"{"id":"c1","model":"claude-opus-5","choices":[{"delta":{"content":"I'll start by reading the state file."},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        state.process_chunk(text_chunk).unwrap();
+
+        let tool_chunk: StreamChunk = serde_json::from_str(
+            r#"{"id":"c1","model":"claude-opus-5","choices":[{"delta":{"tool_calls":[{"index":1,"id":"toolu_01EgMidFVtGhitWE22jXQ9Eo","function":{"name":"Read","arguments":"{\"file_path\":\"state.json\"}"}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        let err = state.process_chunk(tool_chunk).unwrap_err();
+
+        assert!(err.retryable(), "malformed stream should be retryable");
+        let message = err.to_string();
+        assert!(
+            message.contains("tool_calls[1]") && message.contains("venice"),
+            "unexpected error message: {message}"
+        );
     }
 
     #[test]

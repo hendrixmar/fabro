@@ -13,9 +13,7 @@ use fabro_config::user::default_settings_path;
 use fabro_config::{RuntimeDirectory, Storage};
 use fabro_server::jwt_auth::auth_method_name;
 use fabro_server::serve::{DEFAULT_TCP_PORT, ServeArgs, resolve_runtime_server_settings_for_start};
-use fabro_server::{
-    migrate_startup_vault, process_env_snapshot, validate_startup, validate_startup_configuration,
-};
+use fabro_server::{process_env_snapshot, validate_startup, validate_startup_configuration};
 use fabro_static::EnvVars;
 use fabro_types::settings::{LogDestination, ServerAuthMethod};
 use fabro_util::printer::Printer;
@@ -291,7 +289,6 @@ async fn execute_daemon(
     }
     validate_startup_configuration(&resolved_settings)?;
     let storage = Storage::new(storage_dir);
-    migrate_startup_vault(storage.secrets_path());
     let startup_vault = SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
         .await
         .context("loading secrets for startup validation")?;

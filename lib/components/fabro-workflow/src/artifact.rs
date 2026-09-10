@@ -6,9 +6,10 @@ use fabro_config::RunScratch;
 use fabro_types::{
     BlobHash, ParallelBranchResult, format_blob_ref, parse_blob_ref, parse_managed_blob_file_ref,
 };
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, try_join_all};
 use serde_json::Value;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use crate::context::{self, Context};
 use crate::error::{Error, Result};
@@ -19,8 +20,44 @@ use crate::runtime_store::RunStoreHandle;
 /// Threshold above which values are persisted as blobs (100KB).
 const BLOB_OFFLOAD_THRESHOLD: usize = 100 * 1024;
 
+/// Largest serialized JSON one context or outcome value may contribute to a
+/// prompt preamble before it is demoted to a preview plus a file reference.
+const PROMPT_INLINE_VALUE_MAX: usize = 8 * 1024;
+
+/// Largest serialized JSON one `for_each` item may contribute to a branch
+/// prompt before it is demoted. The item is the branch's work assignment, so
+/// its budget is deliberately more generous than [`PROMPT_INLINE_VALUE_MAX`].
+const PROMPT_INLINE_ITEM_MAX: usize = 64 * 1024;
+
+/// Rendered head carried inline by a demotion marker so the reader can tell
+/// what the value is without opening the file.
+const LARGE_VALUE_PREVIEW_CHARS: usize = 300;
+
+const LARGE_VALUE_MARKER_KEY: &str = "fabroLargeValue";
+const LARGE_VALUE_HINT: &str = "too large to inline; read this file for the full value";
+
 /// Prefix used to identify artifact pointer strings in context values.
 const ARTIFACT_POINTER_PREFIX: &str = "file://";
+
+/// Prompt-facing details held by an internal large-value marker.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PromptLargeValue<'a> {
+    pub bytes:   u64,
+    pub path:    &'a str,
+    pub preview: &'a str,
+}
+
+impl PromptLargeValue<'_> {
+    /// Concise metadata shown next to the context key or stage-output label.
+    #[must_use]
+    pub(crate) fn location_summary(self) -> String {
+        format!(
+            "{}; full value: `{}`",
+            format_prompt_bytes(self.bytes),
+            self.path
+        )
+    }
+}
 
 /// Offload context values exceeding the blob threshold into the blob store.
 ///
@@ -91,24 +128,271 @@ async fn offload_parallel_result_updates(
 }
 
 async fn offload_value(value: &mut Value, run_store: &RunStoreHandle) -> Result<()> {
-    // JSON escaping expands a string to at most 6 bytes per char plus quotes,
-    // so short strings can never cross the threshold — skip serializing them.
-    if let Value::String(text) = &*value {
-        if text.len().saturating_mul(6) + 2 <= BLOB_OFFLOAD_THRESHOLD {
-            return Ok(());
+    let Some(bytes) = serialized_if_over(value, BLOB_OFFLOAD_THRESHOLD)? else {
+        return Ok(());
+    };
+    let blob_hash = run_store
+        .write_blob(&bytes)
+        .await
+        .map_err(|e| Error::engine_with_anyhow("artifact blob write failed", e))?;
+    *value = Value::String(format_blob_ref(&blob_hash));
+    Ok(())
+}
+
+/// Serialize `value` only when it can exceed `threshold` bytes, returning the
+/// serialized form when it does.
+fn serialized_if_over(value: &Value, threshold: usize) -> Result<Option<Vec<u8>>> {
+    match value {
+        // Scalars can never reach an offload threshold.
+        Value::Null | Value::Bool(_) | Value::Number(_) => return Ok(None),
+        // JSON escaping expands a string to at most 6 bytes per char plus
+        // quotes, so short strings can never cross the threshold — skip
+        // serializing them.
+        Value::String(text) if text.len().saturating_mul(6) + 2 <= threshold => return Ok(None),
+        _ => {}
+    }
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| Error::engine_with_source("artifact serialize failed", e))?;
+    Ok((bytes.len() > threshold).then_some(bytes))
+}
+
+/// Bound every value the prompt preamble may inline.
+///
+/// The resolved context snapshot and outcomes passed here exist only to
+/// render prompt text, so any value whose serialized JSON exceeds
+/// [`PROMPT_INLINE_VALUE_MAX`] is replaced with a small marker object holding
+/// a preview and the sandbox path of the full value. The agent reads the file
+/// when it needs the data; the preamble stays within its budget no matter how
+/// much state the run has accumulated.
+///
+/// Context keys the preamble never renders are skipped. Outcome updates are
+/// demoted wholesale: the set is small, and over-demoting a prompt-only copy
+/// is harmless.
+///
+/// Demotion is an optimization of prompt size, not a correctness gate: a
+/// value that fails to demote is left inline and logged rather than failing
+/// the node.
+pub async fn demote_large_values_for_prompt(
+    values: &mut HashMap<String, Value>,
+    node_outcomes: &mut HashMap<String, Outcome>,
+    run_store: &RunStoreHandle,
+    env: &dyn Sandbox,
+    run_dir: &Path,
+) {
+    let mut locality = SandboxLocality::default();
+    for (key, value) in &mut *values {
+        if context::keys::is_preamble_hidden_key(key) {
+            continue;
+        }
+        if let Err(err) = demote_value_for_prompt(
+            value,
+            PROMPT_INLINE_VALUE_MAX,
+            run_store,
+            env,
+            run_dir,
+            &mut locality,
+        )
+        .await
+        {
+            tracing::warn!(key, %err, "prompt value demotion failed; kept inline");
         }
     }
-    let bytes = serde_json::to_vec(&*value)
-        .map_err(|e| Error::engine_with_source("artifact serialize failed", e))?;
-
-    if bytes.len() > BLOB_OFFLOAD_THRESHOLD {
-        let blob_hash = run_store
-            .write_blob(&bytes)
+    for (node_id, outcome) in &mut *node_outcomes {
+        for (key, value) in &mut outcome.context_updates {
+            if let Err(err) = demote_value_for_prompt(
+                value,
+                PROMPT_INLINE_VALUE_MAX,
+                run_store,
+                env,
+                run_dir,
+                &mut locality,
+            )
             .await
-            .map_err(|e| Error::engine_with_anyhow("artifact blob write failed", e))?;
-        *value = Value::String(format_blob_ref(&blob_hash));
+            {
+                tracing::warn!(
+                    node_id,
+                    key,
+                    %err,
+                    "prompt value demotion failed; kept inline"
+                );
+            }
+        }
     }
+}
+
+/// Bound every `for_each` item rendered into a branch prompt.
+///
+/// Items above [`PROMPT_INLINE_ITEM_MAX`] are demoted the same way as context
+/// values; the branch reads the file for its full assignment. An item that
+/// fails to demote is left inline and logged.
+pub async fn demote_large_items_for_prompt(
+    items: &mut [Value],
+    run_store: &RunStoreHandle,
+    env: &dyn Sandbox,
+    run_dir: &Path,
+) {
+    let mut locality = SandboxLocality::default();
+    for (index, item) in items.iter_mut().enumerate() {
+        if let Err(err) = demote_value_for_prompt(
+            item,
+            PROMPT_INLINE_ITEM_MAX,
+            run_store,
+            env,
+            run_dir,
+            &mut locality,
+        )
+        .await
+        {
+            tracing::warn!(index, %err, "for_each item demotion failed; kept inline");
+        }
+    }
+}
+
+/// Replace `value` with a preview-plus-path marker when its serialized JSON
+/// exceeds `max_inline_bytes`. Returns whether the value was demoted.
+///
+/// The full value is persisted as a content-addressed blob and materialized
+/// as a real file in the sandbox, so the marker's `path` is readable by the
+/// agent that receives the prompt.
+async fn demote_value_for_prompt(
+    value: &mut Value,
+    max_inline_bytes: usize,
+    run_store: &RunStoreHandle,
+    env: &dyn Sandbox,
+    run_dir: &Path,
+    locality: &mut SandboxLocality,
+) -> Result<bool> {
+    let Some(bytes) = serialized_if_over(value, max_inline_bytes)? else {
+        return Ok(false);
+    };
+    let path = materialize_value_bytes(&bytes, run_store, env, run_dir, locality).await?;
+    *value = large_value_marker(&path, bytes.len(), &rendered_head(value, &bytes));
+    Ok(true)
+}
+
+/// Write `bytes` to the sandbox blob file for their content hash and return
+/// the file's path.
+///
+/// Content addressing makes an existing file authoritative, so a value that
+/// was already materialized — the common case, since demotion re-runs before
+/// every node over copies that are dropped after the preamble is built —
+/// costs one existence probe and nothing else. First touch also persists the
+/// blob in `run_store`, keeping the file recoverable through the managed
+/// blob-reference machinery.
+async fn materialize_value_bytes(
+    bytes: &[u8],
+    run_store: &RunStoreHandle,
+    env: &dyn Sandbox,
+    run_dir: &Path,
+    locality: &mut SandboxLocality,
+) -> Result<String> {
+    let blob_hash = BlobHash::new(bytes);
+    if locality.is_local(env, run_dir).await? {
+        let path = local_materialized_blob_path(run_dir, &blob_hash);
+        if !path.exists() {
+            persist_blob(bytes, run_store).await?;
+            write_local_blob_file(&path, bytes).await?;
+        }
+        return Ok(path.display().to_string());
+    }
+
+    let remote_path = remote_materialized_blob_path(env, &blob_hash)?;
+    if !env
+        .file_exists(&remote_path)
+        .await
+        .map_err(|e| Error::engine_with_source("failed to check blob existence", e))?
+    {
+        persist_blob(bytes, run_store).await?;
+        write_remote_blob_file(env, &remote_path, bytes).await?;
+    }
+    Ok(remote_path)
+}
+
+/// The sandbox file that materializes one blob for agent reads.
+///
+/// The file lives beneath the sandbox's run-scoped runtime directory, never
+/// the repository checkout, so materialization cannot dirty `git status` and
+/// a later checkpoint can never commit it. The `runtime/blobs` suffix keeps
+/// the path recognizable as a managed blob reference, so durable storage
+/// still records `blob://sha256/...` instead of this execution-local path.
+fn remote_materialized_blob_path(env: &dyn Sandbox, blob_hash: &BlobHash) -> Result<String> {
+    let runtime_directory = env.runtime_directory().ok_or_else(|| {
+        Error::engine("sandbox exposes no runtime directory for blob materialization")
+    })?;
+    Ok(format!("{runtime_directory}/blobs/{blob_hash}.json"))
+}
+
+async fn write_remote_blob_file(env: &dyn Sandbox, path: &str, bytes: &[u8]) -> Result<()> {
+    let content = std::str::from_utf8(bytes)
+        .map_err(|e| Error::engine_with_source("artifact blob was not valid UTF-8 JSON", e))?;
+    env.write_file(path, content)
+        .await
+        .map_err(|e| Error::engine_with_source("failed to write artifact blob to sandbox", e))
+}
+
+async fn persist_blob(bytes: &[u8], run_store: &RunStoreHandle) -> Result<()> {
+    run_store
+        .write_blob(bytes)
+        .await
+        .map_err(|e| Error::engine_with_anyhow("artifact blob write failed", e))?;
     Ok(())
+}
+
+/// Head of the value as the preamble would have rendered it: the raw text for
+/// strings, compact JSON otherwise.
+fn rendered_head(value: &Value, serialized: &[u8]) -> String {
+    if let Some(text) = value.as_str() {
+        return text.chars().take(LARGE_VALUE_PREVIEW_CHARS).collect();
+    }
+    // Four bytes covers the widest UTF-8 character, so this slice always
+    // holds at least LARGE_VALUE_PREVIEW_CHARS characters of the rendering.
+    let head = &serialized[..serialized.len().min(LARGE_VALUE_PREVIEW_CHARS * 4)];
+    String::from_utf8_lossy(head)
+        .chars()
+        .take(LARGE_VALUE_PREVIEW_CHARS)
+        .collect()
+}
+
+fn large_value_marker(path: &str, bytes: usize, preview: &str) -> Value {
+    serde_json::json!({
+        "fabroLargeValue": {
+            "bytes": bytes,
+            "path": path,
+            "hint": LARGE_VALUE_HINT,
+            "preview": preview,
+        }
+    })
+}
+
+/// Read the prompt-facing fields from a marker created by
+/// [`demote_large_values_for_prompt`] or [`demote_large_items_for_prompt`].
+#[must_use]
+pub(crate) fn prompt_large_value(value: &Value) -> Option<PromptLargeValue<'_>> {
+    let marker = value.get(LARGE_VALUE_MARKER_KEY)?.as_object()?;
+    if marker.get("hint")?.as_str()? != LARGE_VALUE_HINT {
+        return None;
+    }
+    Some(PromptLargeValue {
+        bytes:   marker.get("bytes")?.as_u64()?,
+        path:    marker.get("path")?.as_str()?,
+        preview: marker.get("preview")?.as_str()?,
+    })
+}
+
+fn format_prompt_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Extract the file path from an artifact pointer value.
@@ -237,23 +521,51 @@ pub async fn resolve_text_or_blob_ref(value: &Value, run_store: &RunStoreHandle)
     }
 }
 
-/// Resolve a structured JSON value from inline context or a Fabro-managed
-/// blob reference.
+/// Resolve a structured JSON value from inline context or Fabro-managed blob
+/// references at any depth.
 ///
 /// Managed `file://` references are normalized through their content-addressed
 /// blob hash instead of reading an execution-local path. Ordinary strings and
 /// ordinary file references remain unchanged for the caller to validate.
-pub(crate) async fn resolve_json_value(value: Value, run_store: &RunStoreHandle) -> Result<Value> {
-    let blob_hash = value.as_str().and_then(|reference| {
-        parse_blob_ref(reference).or_else(|| parse_managed_blob_file_ref(reference))
-    });
-    let Some(blob_hash) = blob_hash else {
-        return Ok(value);
-    };
-
-    let bytes = read_required_blob(&blob_hash, run_store).await?;
-    serde_json::from_slice(&bytes)
-        .map_err(|err| Error::engine_with_source("artifact blob was not valid JSON", err))
+pub(crate) fn resolve_json_value(
+    value: Value,
+    run_store: &RunStoreHandle,
+) -> BoxFuture<'_, Result<Value>> {
+    Box::pin(async move {
+        match value {
+            Value::String(reference) => {
+                let blob_hash =
+                    parse_blob_ref(&reference).or_else(|| parse_managed_blob_file_ref(&reference));
+                let Some(blob_hash) = blob_hash else {
+                    return Ok(Value::String(reference));
+                };
+                let bytes = read_required_blob(&blob_hash, run_store).await?;
+                let resolved = serde_json::from_slice(&bytes).map_err(|err| {
+                    Error::engine_with_source("artifact blob was not valid JSON", err)
+                })?;
+                resolve_json_value(resolved, run_store).await
+            }
+            Value::Array(items) => {
+                let resolved = try_join_all(
+                    items
+                        .into_iter()
+                        .map(|item| resolve_json_value(item, run_store)),
+                )
+                .await?;
+                Ok(Value::Array(resolved))
+            }
+            Value::Object(items) => {
+                let resolved = try_join_all(items.into_iter().map(|(key, item)| async move {
+                    resolve_json_value(item, run_store)
+                        .await
+                        .map(|value| (key, value))
+                }))
+                .await?;
+                Ok(Value::Object(resolved.into_iter().collect()))
+            }
+            primitive => Ok(primitive),
+        }
+    })
 }
 
 /// Resolve a flat workflow context key (`context.NAME` or `NAME`) to a
@@ -445,36 +757,50 @@ async fn materialize_blob_ref(
         let path = local_materialized_blob_path(run_dir, blob_hash);
         if !path.exists() {
             let bytes = read_required_blob(blob_hash, run_store).await?;
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await.map_err(|err| {
-                    Error::Io(format!(
-                        "creating artifact blob directory {}: {err}",
-                        parent.display()
-                    ))
-                })?;
-            }
-            fs::write(&path, &bytes).await.map_err(|err| {
-                Error::Io(format!("writing artifact blob {}: {err}", path.display()))
-            })?;
+            write_local_blob_file(&path, &bytes).await?;
         }
         return Ok(format!("{ARTIFACT_POINTER_PREFIX}{}", path.display()));
     }
 
-    let remote_path = format!("{}/.fabro/blobs/{blob_hash}.json", env.working_directory());
+    let remote_path = remote_materialized_blob_path(env, blob_hash)?;
     if !env
         .file_exists(&remote_path)
         .await
         .map_err(|e| Error::engine_with_source("failed to check blob existence", e))?
     {
         let bytes = read_required_blob(blob_hash, run_store).await?;
-        let content = String::from_utf8(bytes.to_vec())
-            .map_err(|e| Error::engine_with_source("artifact blob was not valid UTF-8 JSON", e))?;
-        env.write_file(&remote_path, &content).await.map_err(|e| {
-            Error::engine_with_source("failed to write artifact blob to sandbox", e)
-        })?;
+        write_remote_blob_file(env, &remote_path, &bytes).await?;
     }
 
     Ok(format!("{ARTIFACT_POINTER_PREFIX}{remote_path}"))
+}
+
+/// Write a materialized blob file, keeping created directories and the file
+/// itself owner-private where the platform supports modes.
+async fn write_local_blob_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(parent).await.map_err(|err| {
+            Error::Io(format!(
+                "creating artifact blob directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|err| Error::Io(format!("writing artifact blob {}: {err}", path.display())))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|err| Error::Io(format!("writing artifact blob {}: {err}", path.display())))
 }
 
 async fn read_required_blob(
@@ -562,7 +888,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use fabro_store::Database;
     use object_store::memory::InMemory;
     use ulid::Ulid;
 
@@ -576,7 +901,12 @@ mod tests {
 
     async fn make_run_store(label: &str) -> fabro_store::RunDatabase {
         let object_store = Arc::new(InMemory::new());
-        let store = Database::new(object_store, "runs/", Duration::from_millis(1), None);
+        let store = fabro_store::test_support::test_database(
+            object_store,
+            "runs/",
+            Duration::from_millis(1),
+            None,
+        );
         store.create_run(&test_run_id(label)).await.unwrap()
     }
 
@@ -661,6 +991,40 @@ mod tests {
                 .await
                 .unwrap(),
             value
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_json_value_hydrates_nested_parallel_branch_values() {
+        let run_store = make_run_store("nested-structured-json-resolution").await;
+        let finder_output = serde_json::json!({
+            "findings": [{"file": "src/lib.rs", "line": 7}]
+        });
+        let finder_blob = run_store
+            .write_blob(&serde_json::to_vec(&finder_output).unwrap())
+            .await
+            .unwrap();
+        let parallel_results = serde_json::json!([{
+            "id": "finder",
+            "index": 0,
+            "status": "succeeded",
+            "context_updates": {
+                "output.finder": format_blob_ref(&finder_blob),
+                "small": "kept inline"
+            }
+        }]);
+
+        let resolved = resolve_json_value(parallel_results, &run_store.into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved[0]["context_updates"]["output.finder"],
+            finder_output
+        );
+        assert_eq!(
+            resolved[0]["context_updates"]["small"],
+            serde_json::json!("kept inline")
         );
     }
 
@@ -996,6 +1360,7 @@ mod tests {
         accessible:   bool,
         written:      Mutex<Vec<(String, String)>>,
         working_dir:  String,
+        runtime_dir:  Option<String>,
         exists_calls: Mutex<usize>,
     }
 
@@ -1005,8 +1370,14 @@ mod tests {
                 accessible,
                 written: Mutex::new(Vec::new()),
                 working_dir: working_dir.to_string(),
+                runtime_dir: None,
                 exists_calls: Mutex::new(0),
             }
+        }
+
+        fn with_runtime_directory(mut self, runtime_dir: &str) -> Self {
+            self.runtime_dir = Some(runtime_dir.to_string());
+            self
         }
     }
 
@@ -1097,6 +1468,10 @@ mod tests {
             &self.working_dir
         }
 
+        fn runtime_directory(&self) -> Option<&str> {
+            self.runtime_dir.as_deref()
+        }
+
         fn platform(&self) -> &str {
             "linux"
         }
@@ -1167,5 +1542,187 @@ mod tests {
         assert_eq!(updates["name"], serde_json::json!("Alice"));
         assert_eq!(updates["count"], serde_json::json!(42));
         assert_eq!(updates["nested"], serde_json::json!({"a": 1}));
+    }
+
+    #[tokio::test]
+    async fn demote_replaces_oversized_prompt_values_with_preview_markers() {
+        let run_store: RunStoreHandle = make_run_store("prompt-demote").await.into();
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let sandbox = fabro_agent::LocalSandbox::new(tmp.path().to_path_buf());
+
+        let dataset = serde_json::json!({
+            "rows": vec![serde_json::json!({"payload": "x".repeat(64)}); 256]
+        });
+        let mut values = HashMap::from([
+            ("dataset".to_string(), dataset.clone()),
+            ("small".to_string(), serde_json::json!("kept inline")),
+        ]);
+        let mut outcomes = HashMap::from([("work".to_string(), Outcome {
+            context_updates: HashMap::from([(
+                context::keys::COMMAND_OUTPUT.to_string(),
+                serde_json::json!("o".repeat(PROMPT_INLINE_VALUE_MAX + 1)),
+            )]),
+            ..Outcome::success()
+        })]);
+
+        demote_large_values_for_prompt(&mut values, &mut outcomes, &run_store, &sandbox, &run_dir)
+            .await;
+
+        let details = values["dataset"]
+            .get("fabroLargeValue")
+            .expect("oversized context value should demote");
+        assert_eq!(
+            usize::try_from(details["bytes"].as_u64().unwrap()).unwrap(),
+            serde_json::to_vec(&dataset).unwrap().len()
+        );
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(details["path"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(stored, dataset);
+        assert!(
+            details["preview"]
+                .as_str()
+                .unwrap()
+                .starts_with("{\"rows\"")
+        );
+        assert_eq!(
+            details["preview"].as_str().unwrap().chars().count(),
+            LARGE_VALUE_PREVIEW_CHARS
+        );
+        assert!(serde_json::to_vec(&values["dataset"]).unwrap().len() <= PROMPT_INLINE_VALUE_MAX);
+
+        assert_eq!(values["small"], serde_json::json!("kept inline"));
+
+        let details = outcomes["work"].context_updates[context::keys::COMMAND_OUTPUT]
+            .get("fabroLargeValue")
+            .expect("oversized command output should demote");
+        assert!(details["preview"].as_str().unwrap().starts_with("ooo"));
+    }
+
+    #[tokio::test]
+    async fn demote_materializes_remote_values_under_sandbox_runtime_directory() {
+        let run_store: RunStoreHandle = make_run_store("prompt-demote-remote").await.into();
+        let run_dir = tempfile::tempdir().unwrap();
+        let env =
+            TestSyncEnv::new(false, "/workspace").with_runtime_directory("/tmp/fabro/runtime");
+
+        let oversized = serde_json::json!("x".repeat(PROMPT_INLINE_VALUE_MAX + 1));
+        let expected_bytes = serde_json::to_vec(&oversized).unwrap();
+        let expected_path = format!(
+            "/tmp/fabro/runtime/blobs/{}.json",
+            BlobHash::new(&expected_bytes)
+        );
+        let mut values = HashMap::from([("dataset".to_string(), oversized)]);
+
+        demote_large_values_for_prompt(
+            &mut values,
+            &mut HashMap::new(),
+            &run_store,
+            &env,
+            run_dir.path(),
+        )
+        .await;
+
+        let details = prompt_large_value(&values["dataset"])
+            .expect("oversized remote context value should demote");
+        assert_eq!(details.path, expected_path);
+        let written = env.written.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].0, expected_path);
+        assert_eq!(written[0].1.as_bytes(), expected_bytes);
+        assert!(
+            !written[0].0.starts_with("/workspace"),
+            "materialization must stay outside the repository checkout"
+        );
+    }
+
+    #[tokio::test]
+    async fn demote_keeps_value_inline_when_sandbox_has_no_runtime_directory() {
+        let run_store: RunStoreHandle = make_run_store("prompt-demote-no-runtime").await.into();
+        let run_dir = tempfile::tempdir().unwrap();
+        let env = TestSyncEnv::new(false, "/workspace");
+
+        let oversized = serde_json::json!("x".repeat(PROMPT_INLINE_VALUE_MAX + 1));
+        let mut values = HashMap::from([("dataset".to_string(), oversized.clone())]);
+
+        demote_large_values_for_prompt(
+            &mut values,
+            &mut HashMap::new(),
+            &run_store,
+            &env,
+            run_dir.path(),
+        )
+        .await;
+
+        assert_eq!(values["dataset"], oversized);
+        assert!(env.written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_context_materializes_remote_blob_refs_under_runtime_directory() {
+        let run_store = make_run_store("remote-blob-ref-resolution").await;
+        let report = serde_json::json!({"kind": "report"});
+        let report_bytes = serde_json::to_vec(&report).unwrap();
+        let blob_hash = run_store.write_blob(&report_bytes).await.unwrap();
+        let context = Context::new();
+        context.set("report", fabro_types::format_blob_ref(&blob_hash).into());
+        let env =
+            TestSyncEnv::new(false, "/workspace").with_runtime_directory("/tmp/fabro/runtime");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let resolved =
+            resolved_context_snapshot(&context, &run_store.clone().into(), &env, run_dir.path())
+                .await
+                .unwrap();
+
+        let expected_path = format!("/tmp/fabro/runtime/blobs/{blob_hash}.json");
+        assert_eq!(
+            resolved["report"],
+            serde_json::json!(format!("file://{expected_path}"))
+        );
+        let written = env.written.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].0, expected_path);
+        assert_eq!(written[0].1.as_bytes(), report_bytes);
+
+        // Durable normalization keeps the blob reference, not the
+        // execution-local runtime path.
+        let mut durable = resolved;
+        normalize_durable_updates(&mut durable);
+        assert_eq!(
+            durable["report"],
+            serde_json::json!(fabro_types::format_blob_ref(&blob_hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn demote_skips_keys_the_preamble_never_renders() {
+        let run_store: RunStoreHandle = make_run_store("prompt-demote-hidden").await.into();
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let sandbox = fabro_agent::LocalSandbox::new(tmp.path().to_path_buf());
+
+        let inherited_preamble = "p".repeat(PROMPT_INLINE_VALUE_MAX + 1);
+        let mut values = HashMap::from([(
+            context::keys::CURRENT_PREAMBLE.to_string(),
+            serde_json::json!(inherited_preamble.clone()),
+        )]);
+
+        demote_large_values_for_prompt(
+            &mut values,
+            &mut HashMap::new(),
+            &run_store,
+            &sandbox,
+            &run_dir,
+        )
+        .await;
+
+        assert_eq!(
+            values[context::keys::CURRENT_PREAMBLE],
+            serde_json::json!(inherited_preamble)
+        );
     }
 }

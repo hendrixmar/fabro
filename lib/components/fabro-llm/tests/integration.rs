@@ -73,7 +73,7 @@ async fn assert_deep_tool_round_trip(
         .get_on_provider(provider, model_id)
         .unwrap_or_else(|| panic!("{provider} {model_id} should be present"));
 
-    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
+    let outcome = run_model_test(model, ModelTestMode::Deep, None, client).await;
     assert_eq!(
         outcome.status,
         ModelTestStatus::Ok,

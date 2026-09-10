@@ -36,6 +36,8 @@ import type { CloseRunPullRequestResponse } from '../models';
 // @ts-ignore
 import type { CreateRunPullRequestRequest } from '../models';
 // @ts-ignore
+import type { CreateRunRequest } from '../models';
+// @ts-ignore
 import type { DeleteRunResponse } from '../models';
 // @ts-ignore
 import type { DenyRunRequest } from '../models';
@@ -370,15 +372,15 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
             };
         },
         /**
-         * Creates a new workflow run in `submitted` status from a self-contained manifest.
+         * Creates a new workflow run in `submitted` status from either a self-contained legacy manifest or an immutable workflow-version intent. Creation does not start or schedule the run.  Failures return the standard error body. The intent lane responds `404` (`workflow_version_not_found`, `environment_not_found`), `422` (`run_intent_invalid`, `target_invalid`, `target_environment_unsupported`, `workflow_version_unusable`, `run_compile_invalid`), `503` (`integration_unavailable`), or `500` (`workflow_version_store_error`, `credential_store_error`, `variable_store_error`, `run_persistence_failed`).
          * @summary Create Run
-         * @param {RunManifest} runManifest
+         * @param {CreateRunRequest} createRunRequest
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        createRun: async (runManifest: RunManifest, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
-            // verify required parameter 'runManifest' is not null or undefined
-            assertParamExists('createRun', 'runManifest', runManifest)
+        createRun: async (createRunRequest: CreateRunRequest, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'createRunRequest' is not null or undefined
+            assertParamExists('createRun', 'createRunRequest', createRunRequest)
             const localVarPath = `/api/v1/runs`;
             // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
@@ -403,7 +405,7 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
             setSearchParams(localVarUrlObj, localVarQueryParameter);
             let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
             localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
-            localVarRequestOptions.data = serializeDataIfNeeded(runManifest, localVarRequestOptions, configuration)
+            localVarRequestOptions.data = serializeDataIfNeeded(createRunRequest, localVarRequestOptions, configuration)
 
             return {
                 url: toPathString(localVarUrlObj),
@@ -1675,14 +1677,14 @@ export const RunsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Creates a new workflow run in `submitted` status from a self-contained manifest.
+         * Creates a new workflow run in `submitted` status from either a self-contained legacy manifest or an immutable workflow-version intent. Creation does not start or schedule the run.  Failures return the standard error body. The intent lane responds `404` (`workflow_version_not_found`, `environment_not_found`), `422` (`run_intent_invalid`, `target_invalid`, `target_environment_unsupported`, `workflow_version_unusable`, `run_compile_invalid`), `503` (`integration_unavailable`), or `500` (`workflow_version_store_error`, `credential_store_error`, `variable_store_error`, `run_persistence_failed`).
          * @summary Create Run
-         * @param {RunManifest} runManifest
+         * @param {CreateRunRequest} createRunRequest
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async createRun(runManifest: RunManifest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<Run>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.createRun(runManifest, options);
+        async createRun(createRunRequest: CreateRunRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<Run>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.createRun(createRunRequest, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['RunsApi.createRun']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
@@ -2135,14 +2137,14 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
             return localVarFp.closeRunPullRequest(id, options).then((request) => request(axios, basePath));
         },
         /**
-         * Creates a new workflow run in `submitted` status from a self-contained manifest.
+         * Creates a new workflow run in `submitted` status from either a self-contained legacy manifest or an immutable workflow-version intent. Creation does not start or schedule the run.  Failures return the standard error body. The intent lane responds `404` (`workflow_version_not_found`, `environment_not_found`), `422` (`run_intent_invalid`, `target_invalid`, `target_environment_unsupported`, `workflow_version_unusable`, `run_compile_invalid`), `503` (`integration_unavailable`), or `500` (`workflow_version_store_error`, `credential_store_error`, `variable_store_error`, `run_persistence_failed`).
          * @summary Create Run
-         * @param {RunManifest} runManifest
+         * @param {CreateRunRequest} createRunRequest
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        createRun(runManifest: RunManifest, options?: RawAxiosRequestConfig): AxiosPromise<Run> {
-            return localVarFp.createRun(runManifest, options).then((request) => request(axios, basePath));
+        createRun(createRunRequest: CreateRunRequest, options?: RawAxiosRequestConfig): AxiosPromise<Run> {
+            return localVarFp.createRun(createRunRequest, options).then((request) => request(axios, basePath));
         },
         /**
          * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
@@ -2516,14 +2518,14 @@ export class RunsApi extends BaseAPI {
     }
 
     /**
-     * Creates a new workflow run in `submitted` status from a self-contained manifest.
+     * Creates a new workflow run in `submitted` status from either a self-contained legacy manifest or an immutable workflow-version intent. Creation does not start or schedule the run.  Failures return the standard error body. The intent lane responds `404` (`workflow_version_not_found`, `environment_not_found`), `422` (`run_intent_invalid`, `target_invalid`, `target_environment_unsupported`, `workflow_version_unusable`, `run_compile_invalid`), `503` (`integration_unavailable`), or `500` (`workflow_version_store_error`, `credential_store_error`, `variable_store_error`, `run_persistence_failed`).
      * @summary Create Run
-     * @param {RunManifest} runManifest
+     * @param {CreateRunRequest} createRunRequest
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */
-    public createRun(runManifest: RunManifest, options?: RawAxiosRequestConfig) {
-        return RunsApiFp(this.configuration).createRun(runManifest, options).then((request) => request(this.axios, this.basePath));
+    public createRun(createRunRequest: CreateRunRequest, options?: RawAxiosRequestConfig) {
+        return RunsApiFp(this.configuration).createRun(createRunRequest, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

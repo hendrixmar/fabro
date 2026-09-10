@@ -35,14 +35,14 @@ async fn worker_control_stream(
     Query(query): Query<WorkerControlStreamQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let cached = match state.cached_run(&id).await {
-        Ok(cached) => cached,
+    let projection = match state.load_run_projection(&id).await {
+        Ok(projection) => projection,
         Err(err) => return err.into_response(),
     };
-    if cached.projection.archived_at.is_some() {
+    if projection.archived_at.is_some() {
         return ApiError::new(StatusCode::CONFLICT, "Run is archived.").into_response();
     }
-    if cached.projection.status.is_terminal() {
+    if projection.status.is_terminal() {
         return ApiError::new(
             StatusCode::CONFLICT,
             "Run is terminal and cannot accept worker control streams.",
