@@ -129,7 +129,7 @@ pub(super) async fn validate_enablement(state: &super::AppState) -> anyhow::Resu
             .map_err(|_| anyhow::anyhow!("Bugsink automation lookup failed"))?
             .context("Bugsink configured automation does not exist")?;
         ensure!(
-            automation.target.workflow == "incident-loop",
+            automation.workflow == "incident-loop",
             "Bugsink automation must target incident-loop"
         );
         ensure!(
@@ -137,7 +137,12 @@ pub(super) async fn validate_enablement(state: &super::AppState) -> anyhow::Resu
             "Bugsink incident workflow supports projects 25 and 26 only"
         );
         ensure!(
-            worker::pinned_revision(&automation.target.ref_selector),
+            worker::pinned_revision(
+                automation
+                    .git_target()
+                    .and_then(|target| target.sha.as_deref())
+                    .unwrap_or("")
+            ),
             "Bugsink workflow requires an immutable source revision"
         );
     }
