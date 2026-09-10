@@ -394,10 +394,13 @@ fn automations_from_rows(
         };
         let trigger = plane_trigger_from_row(row, &automation_id)?;
         let mut replace = AutomationReplace {
-            name:        automation.name,
-            description: automation.description,
-            target:      automation.target,
-            triggers:    automation.triggers,
+            name:            automation.name,
+            description:     automation.description,
+            environment_id:  automation.environment_id,
+            target:          automation.target,
+            workflow:        automation.workflow,
+            workflow_source: automation.workflow_source,
+            triggers:        automation.triggers,
         };
         replace.triggers.push(AutomationTrigger::Plane(trigger));
         let rebuilt = Automation::from_stored(automation_id.clone(), automation.revision, replace)

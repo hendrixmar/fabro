@@ -17,7 +17,7 @@ pub use migrations::{
 };
 pub use model::{
     ApiTrigger, Automation, AutomationDraft, AutomationGitWorkflowSource, AutomationReplace,
-    AutomationTrigger, PlaneTrigger, ScheduleTrigger, parse_github_repository_slug,
-    parse_schedule_expression, validate_workflow_source,
+    AutomationTrigger, PlaneTrigger, ScheduleTrigger, parse_schedule_expression,
+    validate_workflow_source,
 };
 pub use store::AutomationStore;

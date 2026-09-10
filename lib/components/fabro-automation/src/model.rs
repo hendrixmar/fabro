@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use croner::Cron;
 use croner::errors::CronError;
 use croner::parser::{CronParser, Seconds, Year};
-use fabro_types::{ExternalAgentHarness, GitHubRepositorySlug, GitRunTarget, RunTarget, repository};
+use fabro_types::{ExternalAgentHarness, GitRunTarget, RunTarget};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -472,29 +472,6 @@ fn normalize_replace(
 
     value.triggers = triggers;
     Ok(value)
-}
-pub fn parse_github_repository_slug(
-    value: &str,
-) -> Result<GitHubRepositorySlug, AutomationValidationError> {
-    GitHubRepositorySlug::try_new(value).ok_or_else(|| {
-        AutomationValidationError::InvalidRepositorySlug {
-            value: value.to_string(),
-        }
-    })
-}
-
-fn validate_repository_slug(value: &str) -> Result<(), AutomationValidationError> {
-    parse_github_repository_slug(value).map(|_| ())
-}
-
-fn validate_git_ref_selector(value: &str) -> Result<(), AutomationValidationError> {
-    if repository::is_valid_github_ref_selector(value) {
-        Ok(())
-    } else {
-        Err(AutomationValidationError::InvalidGitRefSelector {
-            value: value.to_string(),
-        })
-    }
 }
 
 fn validate_target(target: RunTarget) -> Result<RunTarget, AutomationValidationError> {
