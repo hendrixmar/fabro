@@ -543,6 +543,7 @@ async fn insert_plane_triggers(
         .await?;
     }
     Ok(())
+}
 fn stored_workflow_source(
     row: &SqliteRow,
     id: &AutomationId,
