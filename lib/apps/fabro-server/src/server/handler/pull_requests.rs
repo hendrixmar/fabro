@@ -187,8 +187,7 @@ pub(in crate::server) async fn verified_draft_for_run(
     state: &Arc<AppState>,
     id: &RunId,
 ) -> Result<Option<String>, ApiError> {
-    let cached = state.cached_run(id).await?;
-    let projection = &cached.projection;
+    let projection = state.load_run_projection(id).await?;
     if !matches!(projection.status, fabro_types::RunStatus::Succeeded { .. }) {
         return Ok(None);
     }

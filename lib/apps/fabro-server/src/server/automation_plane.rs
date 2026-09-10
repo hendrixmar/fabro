@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use chrono::{DateTime, Utc};
-use fabro_api::types::{ManifestGoal, ManifestGoalType};
 use fabro_automation::{
     Automation, PlaneDispatchEffects, PlaneDispatchRecord, PlaneDispatchStore, PlaneTrigger,
 };
@@ -933,14 +932,19 @@ struct LiveRunPort {
 #[async_trait]
 impl RunPort for LiveRunPort {
     async fn preflight(&self, automation: &Automation) -> anyhow::Result<()> {
+        let target = automation
+            .git_target()
+            .cloned()
+            .context("Stored automation target is not Git-backed")?;
         let run_id = RunId::new();
         self.state
             .materialize_automation_run(AutomationRunMaterializeInput {
-                automation_id: automation.id.clone(),
-                target: automation.target.clone(),
+                automation_id:   automation.id.clone(),
+                target,
+                workflow_source: automation.workflow_source.clone(),
+                workflow:        automation.workflow.clone(),
                 run_id,
-                user_settings_path: self.state.active_config_path().to_path_buf(),
-                temp_root: self.state.automation_temp_root(),
+                temp_root:       self.state.automation_temp_root(),
             })
             .await
             .context("materializing automation target")?;
@@ -955,72 +959,78 @@ impl RunPort for LiveRunPort {
         issue: &Issue,
         harness: ExternalAgentHarness,
     ) -> anyhow::Result<RunId> {
-        let existing = self
-            .state
-            .stores
-            .runs
-            .get_cached_projection(&run_id)
-            .await?;
-        if let Some(existing) = existing {
-            anyhow::ensure!(
-                existing
-                    .spec
-                    .automation
-                    .as_ref()
-                    .is_some_and(|reference| reference.id == automation.id.to_string()
-                        && reference.trigger_id.as_deref() == Some(trigger.id.as_str())),
-                "reserved run identity belongs to another automation"
-            );
-            if existing.status != RunStatus::Submitted {
+        let _ = harness;
+        match self.state.stores.runs.open_run_reader(&run_id).await {
+            Ok(existing) => {
+                let existing = existing.state().await?;
+                anyhow::ensure!(
+                    existing
+                        .spec
+                        .automation
+                        .as_ref()
+                        .is_some_and(|reference| reference.id == automation.id.to_string()
+                            && reference.trigger_id.as_deref() == Some(trigger.id.as_str())),
+                    "reserved run identity belongs to another automation"
+                );
+                if existing.status != RunStatus::Submitted {
+                    return Ok(run_id);
+                }
+                super::handler::lifecycle::queue_run_start(
+                    self.state.as_ref(),
+                    run_id,
+                    false,
+                    Principal::System {
+                        system_kind: SystemActorKind::Engine,
+                    },
+                )
+                .await
+                .map_err(|err| anyhow::anyhow!("{}", err.detail()))?;
                 return Ok(run_id);
             }
-            super::handler::lifecycle::queue_run_start(
-                self.state.as_ref(),
-                run_id,
-                false,
-                Principal::System {
-                    system_kind: SystemActorKind::Engine,
-                },
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("{}", err.detail()))?;
-            return Ok(run_id);
+            Err(fabro_store::Error::RunNotFound(_)) => {}
+            Err(err) => return Err(err.into()),
         }
-        let mut materialized = self
+        let target = automation
+            .git_target()
+            .cloned()
+            .context("Stored automation target is not Git-backed")?;
+        let environment_id = super::handler::automations::resolve_automation_environment(
+            self.state.as_ref(),
+            automation.environment_id.as_deref(),
+            StatusCode::CONFLICT,
+        )
+        .map_err(|err| anyhow::anyhow!("{}", err.detail()))?;
+        let materialized = self
             .state
             .materialize_automation_run(AutomationRunMaterializeInput {
-                automation_id: automation.id.clone(),
-                target: automation.target.clone(),
+                automation_id:   automation.id.clone(),
+                target,
+                workflow_source: automation.workflow_source.clone(),
+                workflow:        automation.workflow.clone(),
                 run_id,
-                user_settings_path: self.state.active_config_path().to_path_buf(),
-                temp_root: self.state.automation_temp_root(),
+                temp_root:       self.state.automation_temp_root(),
             })
             .await?;
-        materialized.manifest.title = ticket_run_title(issue).parse().ok();
-        materialized.manifest.goal = Some(ManifestGoal {
-            type_: ManifestGoalType::Value,
-            text:  ticket_goal(issue, &trigger.project_id),
-        });
-        materialized.manifest.external_agent_harness = Some(harness);
-        materialized.submitted_manifest_bytes = serde_json::to_vec(&materialized.manifest)?;
+        let mut run_intent = materialized.clone().into_run_intent(environment_id);
+        run_intent.title = ticket_run_title(issue).parse().ok();
+        run_intent.goal = Some(ticket_goal(issue, &trigger.project_id));
         let actor = Principal::System {
             system_kind: SystemActorKind::Engine,
         };
         let automation_ref = AutomationRef {
-            id:         automation.id.to_string(),
-            name:       Some(automation.name.clone()),
-            trigger_id: Some(trigger.id.to_string()),
+            id:              automation.id.to_string(),
+            name:            Some(automation.name.clone()),
+            trigger_id:      Some(trigger.id.to_string()),
+            workflow_source: materialized.workflow_source.clone(),
         };
-        let response = Box::pin(super::handler::runs::create_run_from_manifest(
+        let response = Box::pin(super::handler::runs::create_run_from_intent(
             Arc::clone(&self.state),
-            super::handler::runs::CreateRunFromManifestRequest {
-                manifest:                 materialized.manifest,
-                submitted_manifest_bytes: materialized.submitted_manifest_bytes,
-                explicit_run_id:          Some(run_id),
-                explicit_title_supplied:  true,
-                actor:                    actor.clone(),
-                headers:                  HeaderMap::new(),
-                automation:               Some(automation_ref),
+            super::handler::runs::CreateRunFromIntentRequest {
+                intent:          run_intent,
+                explicit_run_id: Some(run_id),
+                actor:           actor.clone(),
+                headers:         HeaderMap::new(),
+                automation:      Some(automation_ref),
             },
         ))
         .await;
@@ -1038,9 +1048,10 @@ impl RunPort for LiveRunPort {
             .state
             .stores
             .runs
-            .get_cached_projection(run_id)
+            .open_run_reader(run_id)
             .await?
-            .context("run projection not found")?;
+            .state()
+            .await?;
         let creation = projection.pull_request_creation.as_ref();
         let pr_pending = creation.is_some_and(fabro_types::PullRequestCreation::is_pending);
         let pr_failed = creation.is_some_and(|creation| {
@@ -1057,7 +1068,7 @@ impl RunPort for LiveRunPort {
             None
         };
         Ok(ObservedRun {
-            status: projection.status,
+            status: projection.status.clone(),
             pull_request_url,
             pr_pending,
             pr_failed,
@@ -1066,8 +1077,10 @@ impl RunPort for LiveRunPort {
     }
 
     async fn cancel_run(&self, run_id: &RunId) -> anyhow::Result<()> {
-        let Some(projection) = self.state.stores.runs.get_cached_projection(run_id).await? else {
-            return Ok(()); // Reservation exists, but creation never committed.
+        let projection = match self.state.stores.runs.open_run_reader(run_id).await {
+            Ok(store) => store.state().await?,
+            Err(fabro_store::Error::RunNotFound(_)) => return Ok(()),
+            Err(err) => return Err(err.into()),
         };
         if projection.status.is_terminal() {
             return Ok(());
@@ -1979,14 +1992,15 @@ mod tests {
         let state = crate::test_support::test_app_state();
         let run_id = RunId::new();
         completed_gated_run(&state, run_id).await;
-        let mut projection = (*state
+        let mut projection = state
             .stores
             .runs
-            .get_cached_projection(&run_id)
+            .open_run_reader(&run_id)
             .await
             .unwrap()
-            .unwrap())
-        .clone();
+            .state()
+            .await
+            .unwrap();
         let checkpoint = &mut projection.checkpoints.last_mut().unwrap().checkpoint;
         checkpoint.next_node_id = Some("clarification".into());
         checkpoint

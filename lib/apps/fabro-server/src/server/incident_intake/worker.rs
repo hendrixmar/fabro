@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
-use axum::http::HeaderMap;
-use fabro_api::types::ManifestArgs;
+use axum::http::{HeaderMap, StatusCode};
 use fabro_automation::{Automation, AutomationId};
 use fabro_types::run_event::EventBody;
 use fabro_types::{
@@ -107,7 +106,10 @@ pub(crate) async fn reconcile_once(state: &Arc<AppState>, now_ms: i64) -> anyhow
             .reserve(
                 &client.origin,
                 mapping.project_id,
-                &automation.target.ref_selector,
+                automation
+                    .git_target()
+                    .and_then(|target| target.sha.as_deref())
+                    .unwrap_or(""),
             )
             .await?
         {
@@ -175,7 +177,10 @@ pub(crate) async fn operator_retry(
             event,
             actor,
             allow_additional_run,
-            &automation.target.ref_selector,
+            automation
+                .git_target()
+                .and_then(|target| target.sha.as_deref())
+                .unwrap_or(""),
             generation,
             now,
         )
@@ -201,8 +206,13 @@ pub(super) async fn mapped_automation(
         .await?
         .context("automation_missing")?;
     ensure!(
-        automation.target.workflow == "incident-loop"
-            && pinned_revision(&automation.target.ref_selector),
+        automation.workflow == "incident-loop"
+            && pinned_revision(
+                automation
+                    .git_target()
+                    .and_then(|target| target.sha.as_deref())
+                    .unwrap_or("")
+            ),
         "workflow_source_not_pinned"
     );
     Ok(automation)
@@ -325,86 +335,70 @@ fn engine() -> Principal {
 async fn materialize_create(state: &Arc<AppState>, intent: &Intent) -> anyhow::Result<()> {
     let store = state.incident_store();
     let automation = mapped_automation(state, intent.project).await?;
-    if automation.target.ref_selector != intent.revision {
+    let Some(target) = automation.git_target().cloned() else {
+        return store
+            .transition_run(intent, "uncertain", Some("workflow_mapping_changed"))
+            .await;
+    };
+    if target.sha.as_deref() != Some(intent.revision.as_str()) {
         return store
             .transition_run(intent, "uncertain", Some("workflow_mapping_changed"))
             .await;
     }
+    let environment_id = match super::super::handler::automations::resolve_automation_environment(
+        state.as_ref(),
+        automation.environment_id.as_deref(),
+        StatusCode::CONFLICT,
+    ) {
+        Ok(environment_id) => environment_id,
+        Err(_) => {
+            return store
+                .transition_run(intent, "failed", Some("materialization_failed"))
+                .await;
+        }
+    };
     let materialized = state
         .materialize_automation_run(AutomationRunMaterializeInput {
-            automation_id:      automation.id.clone(),
-            target:             automation.target.clone(),
-            run_id:             intent.run_id,
-            user_settings_path: state.active_config_path().to_path_buf(),
-            temp_root:          state.automation_temp_root(),
+            automation_id:   automation.id.clone(),
+            target,
+            workflow_source: automation.workflow_source.clone(),
+            workflow:        automation.workflow.clone(),
+            run_id:          intent.run_id,
+            temp_root:       state.automation_temp_root(),
         })
         .await;
-    let Ok(mut materialized) = materialized else {
+    let Ok(materialized) = materialized else {
         return store
             .transition_run(intent, "failed", Some("materialization_failed"))
             .await;
     };
-    if materialized
-        .manifest
-        .git
-        .as_ref()
-        .is_none_or(|git| git.sha.as_deref() != Some(intent.revision.as_str()))
-    {
+    if materialized.target.sha.as_deref() != Some(intent.revision.as_str()) {
         return store
             .transition_run(intent, "failed", Some("workflow_source_mismatch"))
             .await;
     }
-    let mut args = materialized
-        .manifest
-        .args
-        .take()
-        .unwrap_or_else(|| ManifestArgs {
-            auto_approve:     None,
-            dry_run:          None,
-            label:            Vec::new(),
-            model:            None,
-            preserve_sandbox: None,
-            provider:         None,
-            environment:      None,
-            input:            Vec::new(),
-            verbose:          None,
-        });
-    let inputs = intent.inputs();
-    args.input.retain(|value| {
-        !inputs.iter().any(|(key, _)| {
-            value
-                .split_once('=')
-                .is_some_and(|(existing, _)| existing.trim() == key)
-        })
-    });
-    // TOML quoting preserves all five declared string inputs, including decimal
-    // episodes.
-    for (key, value) in inputs {
-        args.input
-            .push(format!("{key}={}", serde_json::to_string(&value)?));
+    let mut run_intent = materialized.clone().into_run_intent(environment_id);
+    for (key, value) in intent.inputs() {
+        run_intent.args.inputs.insert(key, Value::String(value));
     }
-    materialized.manifest.args = Some(args);
-    materialized.submitted_manifest_bytes = serde_json::to_vec(&materialized.manifest)?;
-    if !store
-        .begin_create(intent, &materialized.submitted_manifest_bytes)
-        .await?
-    {
+    let submitted = serde_json::to_vec(&run_intent)?;
+    if !store.begin_create(intent, &submitted).await? {
         return Ok(());
     }
-    let response = Box::pin(super::super::handler::runs::create_run_from_manifest(
+    let automation_ref = AutomationRef {
+        id:              automation.id.to_string(),
+        name:            Some(automation.name.clone()),
+        trigger_id:      None,
+        workflow_source: materialized.workflow_source.clone(),
+    };
+    let response = Box::pin(super::super::handler::runs::create_run_from_intent(
         Arc::clone(state),
-        super::super::handler::runs::CreateRunFromManifestRequest {
-            manifest:                 materialized.manifest,
-            submitted_manifest_bytes: materialized.submitted_manifest_bytes,
-            explicit_run_id:          Some(intent.run_id),
-            explicit_title_supplied:  true,
-            actor:                    engine(),
-            headers:                  HeaderMap::new(),
-            automation:               Some(AutomationRef {
-                id:         automation.id.to_string(),
-                name:       Some(automation.name.clone()),
-                trigger_id: None,
-            }),
+        super::super::handler::runs::CreateRunFromIntentRequest {
+            intent:          run_intent,
+            explicit_run_id: Some(intent.run_id),
+            actor:           engine(),
+            headers:         HeaderMap::new(),
+            automation:      Some(automation_ref),
         },
     ))
     .await;
