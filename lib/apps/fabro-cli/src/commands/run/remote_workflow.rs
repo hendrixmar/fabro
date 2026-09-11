@@ -70,6 +70,8 @@ impl NativeGit {
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
+                "core.fsmonitor=false",
+                "-c",
                 "filter.lfs.smudge=",
                 "-c",
                 "filter.lfs.process=",
@@ -574,8 +576,25 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
+        // The fsmonitor hook runs during checkout even with hooksPath disabled.
+        std::fs::write(
+            hooks.join("fsmonitor"),
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'token\\0/\\0'\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            hooks.join("fsmonitor"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         config
             .set_str("core.hooksPath", hooks.to_str().unwrap())
+            .unwrap();
+        config
+            .set_str("core.fsmonitor", hooks.join("fsmonitor").to_str().unwrap())
             .unwrap();
         config
             .set_str(
