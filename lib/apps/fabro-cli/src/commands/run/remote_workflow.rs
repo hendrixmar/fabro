@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use fabro_manifest::CollectedWorkflowClosure;
+use fabro_proc::ProcessError;
 use fabro_types::{GitHubRepositorySlug, GitRunTarget, repository};
-use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
-use tokio::{fs, signal as tokio_signal, task, time};
+use tokio::{fs, signal as tokio_signal, task};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -17,6 +17,33 @@ use super::selection::RemoteWorkflowRevision;
 use crate::args::RunArgs;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// Configuration overrides that keep an untrusted checkout from running code
+/// or rewriting bytes: no hooks or fsmonitor, no LFS smudge, no submodule
+/// recursion, no `ext::` transport, no background maintenance, no line-ending
+/// conversion.
+const HARDENED_GIT_CONFIG: &[&str] = &[
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "filter.lfs.smudge=",
+    "-c",
+    "filter.lfs.process=",
+    "-c",
+    "filter.lfs.required=false",
+    "-c",
+    "submodule.recurse=false",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "maintenance.auto=0",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "core.autocrlf=false",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RemoteWorkflowError {
@@ -69,29 +96,9 @@ impl NativeGit {
         }
         let mut command = Command::new("git");
         command
+            .stdin(Stdio::null())
             .current_dir(cwd)
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "filter.lfs.smudge=",
-                "-c",
-                "filter.lfs.process=",
-                "-c",
-                "filter.lfs.required=false",
-                "-c",
-                "submodule.recurse=false",
-                "-c",
-                "protocol.ext.allow=never",
-                "-c",
-                "maintenance.auto=0",
-                "-c",
-                "gc.auto=0",
-                "-c",
-                "core.autocrlf=false",
-            ])
+            .args(HARDENED_GIT_CONFIG)
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_LFS_SKIP_SMUDGE", "1")
@@ -99,48 +106,33 @@ impl NativeGit {
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_OBJECT_DIRECTORY")
-            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
         #[cfg(test)]
         command.envs(self.environment.iter().cloned());
-        let mut child = command.spawn()?;
-        let process_id = child.id();
-        let mut stdout = child.stdout.take().expect("piped Git stdout exists");
-        let mut stderr = child.stderr.take().expect("piped Git stderr exists");
-        let result = tokio::select! {
-            biased;
-            () = cancel.cancelled() => Err(RemoteWorkflowError::Cancelled),
-            () = time::sleep(self.timeout) => Err(RemoteWorkflowError::Timeout),
-            result = async {
-                let (status, (stdout, overflow), _) = tokio::try_join!(
-                    child.wait(), capture(&mut stdout), capture(&mut stderr)
-                )?;
-                if !status.success() {
-                    // Output may contain arbitrary helper/config secrets, even after pattern
-                    // redaction. Never retain it in an error/cause chain or tracing event.
-                    return Err(RemoteWorkflowError::Process { operation, status });
-                }
-                if overflow { return Err(RemoteWorkflowError::OutputLimit); }
-                Ok(stdout)
-            } => result,
-        };
-        // A timed-out, cancelled, or failed Git may leave helpers running in
-        // its process group; terminate the group, then reap Git. A successful
-        // Git has closed its pipes, and helpers it deliberately left behind
-        // (such as `credential-cache--daemon`) keep serving later commands.
-        if result.is_err() {
-            #[cfg(unix)]
-            if let Some(id) = process_id {
-                fabro_proc::sigkill_process_group(id);
-            }
-            child.kill().await?;
+        let output = fabro_proc::capture(
+            &mut command,
+            Some(self.timeout),
+            cancel,
+            Some(OUTPUT_LIMIT),
+        )
+            .await
+            .map_err(|error| match error {
+                ProcessError::TimedOut => RemoteWorkflowError::Timeout,
+                ProcessError::Cancelled => RemoteWorkflowError::Cancelled,
+                ProcessError::Io(source) => RemoteWorkflowError::Io(source),
+            })?;
+        if !output.output.status.success() {
+            // Output may contain arbitrary helper/config secrets, even after pattern
+            // redaction. Never retain it in an error/cause chain or tracing event.
+            return Err(RemoteWorkflowError::Process {
+                operation,
+                status: output.output.status,
+            });
         }
-        result
+        if output.stdout_truncated {
+            return Err(RemoteWorkflowError::OutputLimit);
+        }
+        Ok(output.output.stdout)
     }
 
     /// Create and initialize an empty scratch repository. Temporary files are
@@ -360,21 +352,6 @@ impl NativeGit {
     }
 }
 
-async fn capture(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut captured = Vec::new();
-    let mut overflow = false;
-    let mut buffer = vec![0; 8192];
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok((captured, overflow));
-        }
-        let keep = count.min(OUTPUT_LIMIT - captured.len());
-        captured.extend_from_slice(&buffer[..keep]);
-        overflow |= keep != count;
-    }
-}
-
 fn exact_record(records: &str, reference: &str) -> anyhow::Result<Option<String>> {
     let mut found = None;
     for line in records.lines() {
@@ -544,6 +521,7 @@ mod tests {
     use nix::sys::signal::{self, Signal};
     use nix::sys::stat::Mode;
     use nix::unistd;
+    use tokio::time;
 
     use super::super::test_support::{commit_all, write_workflow};
     use super::*;
