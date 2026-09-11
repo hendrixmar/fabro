@@ -223,12 +223,25 @@ impl NativeGit {
                     .await?;
                 Ok(default_head(&records)?.1)
             }
-            RemoteWorkflowRevision::Ref(reference) => {
-                let candidates = RefCandidates::new(reference);
+            RemoteWorkflowRevision::Branch(reference) => {
                 let records = self
-                    .records(root, repository, &candidates.patterns(), cancel)
+                    .records(root, repository, std::slice::from_ref(reference), cancel)
                     .await?;
-                candidates.resolve(&records)
+                exact_record(&records, reference)?.context(REF_NOT_FOUND)
+            }
+            RemoteWorkflowRevision::Tag(reference) => {
+                let records = self
+                    .records(root, repository, &tag_patterns(reference), cancel)
+                    .await?;
+                tag_commit(&records, reference)?.context(REF_NOT_FOUND)
+            }
+            RemoteWorkflowRevision::Name(name) => {
+                let branch = format!("refs/heads/{name}");
+                let tag = format!("refs/tags/{name}");
+                let mut patterns = vec![branch.clone()];
+                patterns.extend(tag_patterns(&tag));
+                let records = self.records(root, repository, &patterns, cancel).await?;
+                resolve_name(&records, &branch, &tag)
             }
         }
     }
@@ -416,72 +429,32 @@ fn default_target_branch(records: &str) -> anyhow::Result<(String, String)> {
     Ok((branch, sha))
 }
 
-/// The fully qualified refs a validated `--workflow-ref` may name. A bare name
-/// may be a branch or a tag; a `refs/heads/` or `refs/tags/` name is exactly
-/// one.
-struct RefCandidates {
-    branch: Option<String>,
-    tag:    Option<String>,
+const REF_NOT_FOUND: &str = "workflow ref was not found; no alternative revision was selected";
+
+/// `ls-remote` patterns for a tag: the tag itself and its peeled commit.
+fn tag_patterns(tag: &str) -> [String; 2] {
+    [tag.to_owned(), format!("{tag}^{{}}")]
 }
 
-impl RefCandidates {
-    fn new(reference: &str) -> Self {
-        if reference.starts_with("refs/") {
-            let qualified = Some(reference.to_owned());
-            if reference.starts_with("refs/heads/") {
-                Self {
-                    branch: qualified,
-                    tag:    None,
-                }
-            } else {
-                Self {
-                    branch: None,
-                    tag:    qualified,
-                }
-            }
-        } else {
-            Self {
-                branch: Some(format!("refs/heads/{reference}")),
-                tag:    Some(format!("refs/tags/{reference}")),
-            }
-        }
-    }
+/// The commit a tag names, preferring the peeled commit of an annotated tag
+/// over the tag object.
+fn tag_commit(records: &str, tag: &str) -> anyhow::Result<Option<String>> {
+    let Some(sha) = exact_record(records, tag)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        exact_record(records, &format!("{tag}^{{}}"))?.unwrap_or(sha),
+    ))
+}
 
-    /// `ls-remote` patterns, including the peeled form of any tag candidate.
-    fn patterns(&self) -> Vec<String> {
-        self.branch
-            .iter()
-            .cloned()
-            .chain(
-                self.tag
-                    .iter()
-                    .flat_map(|tag| [tag.clone(), format!("{tag}^{{}}")]),
-            )
-            .collect()
-    }
-
-    fn resolve(&self, records: &str) -> anyhow::Result<String> {
-        let branch = match &self.branch {
-            Some(name) => exact_record(records, name)?,
-            None => None,
-        };
-        let tag = match &self.tag {
-            Some(name) => exact_record(records, name)?.map(|sha| (name, sha)),
-            None => None,
-        };
-        match (branch, tag) {
-            (Some(_), Some(_)) => bail!(
-                "workflow ref is ambiguous between a branch and tag; use refs/heads/... or refs/tags/..."
-            ),
-            (Some(sha), None) => Ok(sha),
-            // Prefer the peeled commit of an annotated tag over the tag object.
-            (None, Some((name, sha))) => {
-                Ok(exact_record(records, &format!("{name}^{{}}"))?.unwrap_or(sha))
-            }
-            (None, None) => {
-                bail!("workflow ref was not found; no alternative revision was selected")
-            }
-        }
+/// A bare name may be a branch or a tag; it must be exactly one.
+fn resolve_name(records: &str, branch: &str, tag: &str) -> anyhow::Result<String> {
+    match (exact_record(records, branch)?, tag_commit(records, tag)?) {
+        (Some(_), Some(_)) => bail!(
+            "workflow ref is ambiguous between a branch and tag; use refs/heads/... or refs/tags/..."
+        ),
+        (Some(sha), None) | (None, Some(sha)) => Ok(sha),
+        (None, None) => bail!(REF_NOT_FOUND),
     }
 }
 
@@ -809,7 +782,7 @@ mod tests {
                 .resolve_revision(
                     scratch.path(),
                     &Fixture::repository(),
-                    &RemoteWorkflowRevision::Ref("trunk".into()),
+                    &RemoteWorkflowRevision::Name("trunk".into()),
                     &cancel
                 )
                 .await
@@ -817,18 +790,21 @@ mod tests {
                 .to_string()
                 .contains("ambiguous")
         );
-        for reference in ["missing", "refs/tags/missing"] {
+        for reference in ["missing", "refs/tags/missing", "refs/heads/missing"] {
             assert!(
                 fixture
                     .git
                     .resolve_revision(
                         scratch.path(),
                         &Fixture::repository(),
-                        &RemoteWorkflowRevision::Ref(reference.into()),
+                        &RemoteWorkflowRevision::parse(Some(reference)).unwrap(),
                         &cancel
                     )
                     .await
-                    .is_err()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("was not found"),
+                "{reference}"
             );
         }
         let target = fixture
@@ -991,9 +967,12 @@ mod tests {
     fn remote_workflow_matches_records_exactly_and_rejects_host_symlinks() {
         let sha = "1234567890123456789012345678901234567890";
         assert!(
-            RefCandidates::new("main")
-                .resolve(&format!("{sha}\trefs/heads/nested/main\n"))
-                .is_err()
+            resolve_name(
+                &format!("{sha}\trefs/heads/nested/main\n"),
+                "refs/heads/main",
+                "refs/tags/main"
+            )
+            .is_err()
         );
         let root = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();

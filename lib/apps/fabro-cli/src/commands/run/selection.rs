@@ -28,10 +28,17 @@ pub(super) enum TargetSelection {
     },
 }
 
+/// A validated `--workflow-ref`, classified once so resolution never re-derives
+/// which ref namespaces a value may name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RemoteWorkflowRevision {
     DefaultBranch,
-    Ref(String),
+    /// A fully qualified `refs/heads/...` branch.
+    Branch(String),
+    /// A fully qualified `refs/tags/...` tag.
+    Tag(String),
+    /// A bare name that may be a branch or a tag.
+    Name(String),
     Commit(String),
 }
 
@@ -43,14 +50,19 @@ impl RemoteWorkflowRevision {
                 if let Some(sha) = repository::normalize_git_commit_sha(value) {
                     return Ok(Self::Commit(sha));
                 }
-                if !repository::is_valid_github_ref_selector(value)
-                    || (value.starts_with("refs/")
-                        && !value.starts_with("refs/heads/")
-                        && !value.starts_with("refs/tags/"))
-                {
+                if !repository::is_valid_github_ref_selector(value) {
                     bail!("workflow ref must be a branch, tag, HEAD, or full 40-hex commit SHA");
                 }
-                Ok(Self::Ref(value.to_owned()))
+                let reference = value.to_owned();
+                if value.starts_with("refs/heads/") {
+                    Ok(Self::Branch(reference))
+                } else if value.starts_with("refs/tags/") {
+                    Ok(Self::Tag(reference))
+                } else if value.starts_with("refs/") {
+                    bail!("workflow ref must be a branch, tag, HEAD, or full 40-hex commit SHA");
+                } else {
+                    Ok(Self::Name(reference))
+                }
             }
         }
     }
@@ -139,15 +151,34 @@ mod tests {
         ] {
             assert!(validate_remote_selector(Path::new(path)).is_err(), "{path}");
         }
-        for value in [
-            "topic/slash",
-            "refs/heads/release",
-            "refs/tags/v1",
-            "HEAD",
-            "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd",
+        for (value, expected) in [
+            (
+                "topic/slash",
+                RemoteWorkflowRevision::Name("topic/slash".into()),
+            ),
+            (
+                "refs/heads/release",
+                RemoteWorkflowRevision::Branch("refs/heads/release".into()),
+            ),
+            (
+                "refs/tags/v1",
+                RemoteWorkflowRevision::Tag("refs/tags/v1".into()),
+            ),
+            ("HEAD", RemoteWorkflowRevision::DefaultBranch),
+            (
+                "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd",
+                RemoteWorkflowRevision::Commit("abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd".into()),
+            ),
         ] {
-            RemoteWorkflowRevision::parse(Some(value)).unwrap();
+            assert_eq!(
+                RemoteWorkflowRevision::parse(Some(value)).unwrap(),
+                expected
+            );
         }
+        assert_eq!(
+            RemoteWorkflowRevision::parse(None).unwrap(),
+            RemoteWorkflowRevision::DefaultBranch
+        );
         for value in [
             "--upload-pack=x",
             "topic*",
@@ -199,7 +230,7 @@ mod adapter_tests {
                     WorkflowSelection::Git {
                         repository: "acme/workflows".parse().unwrap(),
                         selector:   "review".into(),
-                        revision:   RemoteWorkflowRevision::Ref("v1".into()),
+                        revision:   RemoteWorkflowRevision::Name("v1".into()),
                     },
                     TargetSelection::Git {
                         repository: "acme/app".parse().unwrap(),
