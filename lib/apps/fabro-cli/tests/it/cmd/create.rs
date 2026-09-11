@@ -1889,7 +1889,17 @@ fn remote_workflow_explicit_acquisition_failure_has_no_fallback_or_server_mutati
     let source = root.path().join("source");
     write_workflow(&source, ".fabro/workflows/other", "Other");
     init_remote_fixture(&source, "trunk");
-    write_workflow(root.path(), ".fabro/workflows/review", "Caller");
+    // The caller is a GitHub-origin checkout with an unpushed branch, which
+    // Docker target observation would publish if it ran first.
+    let caller = root.path().join("caller");
+    let origin = root.path().join("origin.git");
+    git2::Repository::init_bare(&origin).unwrap();
+    write_workflow(&caller, ".fabro/workflows/review", "Caller");
+    init_remote_fixture(&caller, "main");
+    git2::Repository::open(&caller)
+        .unwrap()
+        .remote("origin", "https://github.com/acme/app")
+        .unwrap();
     write_workflow(
         &context.home_dir.join(".fabro/workflows"),
         "review",
@@ -1899,8 +1909,9 @@ fn remote_workflow_explicit_acquisition_failure_has_no_fallback_or_server_mutati
     std::fs::write(
         &config,
         format!(
-            "[url \"file://{}\"]\n insteadOf = https://github.com/acme/workflows\n",
-            source.display()
+            "[url \"file://{}\"]\n insteadOf = https://github.com/acme/workflows\n[url \"file://{}\"]\n insteadOf = https://github.com/acme/app\n",
+            source.display(),
+            origin.display()
         ),
     )
     .unwrap();
@@ -1911,7 +1922,7 @@ fn remote_workflow_explicit_acquisition_failure_has_no_fallback_or_server_mutati
     ] {
         let output = context
             .create_cmd()
-            .current_dir(root.path())
+            .current_dir(&caller)
             .env("GIT_CONFIG_GLOBAL", &config)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_COUNT", "0")
@@ -1932,4 +1943,12 @@ fn remote_workflow_explicit_acquisition_failure_has_no_fallback_or_server_mutati
     environment.assert_calls(3);
     version.assert_calls(0);
     create.assert_calls(0);
+    // Acquisition failed before target observation, so nothing was pushed.
+    assert!(
+        git2::Repository::open_bare(&origin)
+            .unwrap()
+            .find_reference("refs/heads/main")
+            .is_err(),
+        "a failed remote workflow acquisition must not publish the target branch"
+    );
 }

@@ -44,7 +44,7 @@ pub(crate) async fn create_run(
         )
     };
     // Preserve local lookup diagnostics before contacting the server. Remote
-    // acquisition waits until parent, environment, and target are validated.
+    // acquisition waits until the parent and environment are validated.
     let local_package = match &workflow_selection {
         WorkflowSelection::Local(_) => Some(resolve_workflow().await?),
         WorkflowSelection::Git { .. } => None,
@@ -84,6 +84,12 @@ pub(crate) async fn create_run(
         },
         resolve_run_environment(client.as_ref(), args.environment.as_deref()),
     )?;
+    // Observing a local Git target may push its branch. Acquire the remote
+    // workflow first so a bad --workflow-ref never causes that side effect.
+    let package = match local_package {
+        Some(package) => package,
+        None => resolve_workflow().await?,
+    };
     let (target, dirty_worktree) = resolution::target(
         &target_selection,
         environment.settings.provider,
@@ -97,10 +103,6 @@ pub(crate) async fn create_run(
             styles.yellow.apply_to("Warning:"),
         );
     }
-    let package = match local_package {
-        Some(package) => package,
-        None => resolve_workflow().await?,
-    };
     let workflow_version_id = package.closure().root_id();
     client
         .register_workflow_versions(
