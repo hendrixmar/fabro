@@ -276,7 +276,6 @@ impl NativeGit {
         // it and clean up before reporting cancellation.
         let collection_cancel = cancel.clone();
         let closure = task::spawn_blocking(move || {
-            check_source_symlinks(checkout.path())?;
             if collection_cancel.is_cancelled() {
                 return Err(RemoteWorkflowError::Cancelled.into());
             }
@@ -456,23 +455,6 @@ fn resolve_name(records: &str, branch: &str, tag: &str) -> anyhow::Result<String
         (Some(sha), None) | (None, Some(sha)) => Ok(sha),
         (None, None) => bail!(REF_NOT_FOUND),
     }
-}
-
-fn check_source_symlinks(root: &Path) -> anyhow::Result<()> {
-    let root = root.canonicalize()?;
-    let git_dir = root.join(".git");
-    // Validate links before the collector's initial TOML lookup can read them.
-    for entry in walkdir::WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| entry.path() != git_dir)
-    {
-        let entry = entry?;
-        if entry.file_type().is_symlink() && !entry.path().canonicalize()?.starts_with(&root) {
-            bail!("remote workflow checkout contains a symlink outside its source root");
-        }
-    }
-    Ok(())
 }
 
 /// The task owns its child processes and temporary checkout. Dropping the
@@ -665,6 +647,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_workflow_tolerates_symlinks_the_selected_workflow_never_reads() {
+        let fixture = Fixture::new();
+        let source = fixture.repo.workdir().unwrap();
+        // Submodule-style dangling links and links outside the checkout are
+        // common in workflow repositories and irrelevant to the selection.
+        std::os::unix::fs::symlink("../missing-submodule", source.join("vendor")).unwrap();
+        std::os::unix::fs::symlink("/usr/local/lib/node_modules", source.join("tools")).unwrap();
+        let sha = commit_all(&fixture.repo, "add links");
+        let local = fabro_manifest::collect_workflow_versions(Path::new("review"), source).unwrap();
+        let remote = fixture
+            .git
+            .collect(
+                Fixture::repository(),
+                "review".into(),
+                RemoteWorkflowRevision::Commit(sha),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local.root_id(), remote.root_id());
+    }
+
+    #[tokio::test]
     async fn remote_workflow_rejects_toml_symlink_before_reading_host_content() {
         let fixture = Fixture::new();
         let host = tempfile::tempdir().unwrap();
@@ -690,7 +695,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("outside its source root"));
+        assert!(
+            format!("{error:?}").contains("outside its source root"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -964,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_workflow_matches_records_exactly_and_rejects_host_symlinks() {
+    fn remote_workflow_matches_records_exactly() {
         let sha = "1234567890123456789012345678901234567890";
         assert!(
             resolve_name(
@@ -974,10 +982,6 @@ mod tests {
             )
             .is_err()
         );
-        let root = tempfile::tempdir().unwrap();
-        let host = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(host.path(), root.path().join("outside")).unwrap();
-        assert!(check_source_symlinks(root.path()).is_err());
     }
 
     fn fake_git(script: &str) -> (tempfile::TempDir, NativeGit) {
