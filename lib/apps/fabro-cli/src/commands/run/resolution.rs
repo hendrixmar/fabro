@@ -54,7 +54,7 @@ pub(super) async fn workflow(
             selector,
             revision,
         } => {
-            let git = NativeGit::new(cwd.to_path_buf());
+            let git = NativeGit::new();
             let (repository, selector, revision) =
                 (repository.clone(), selector.clone(), revision.clone());
             let closure = remote_workflow::owned(move |cancel| async move {
@@ -80,7 +80,7 @@ pub(super) async fn target(
             if !provider.is_clone_based() {
                 bail!("Git targets require a clone-enabled Docker or Daytona environment");
             }
-            let git = NativeGit::new(cwd.to_path_buf());
+            let git = NativeGit::new();
             let (repository, branch) = (repository.clone(), branch.clone());
             let target = remote_workflow::owned(move |cancel| async move {
                 git.resolve_target(repository, branch, &cancel).await

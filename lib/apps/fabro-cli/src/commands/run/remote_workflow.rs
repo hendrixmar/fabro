@@ -35,20 +35,22 @@ pub(super) enum RemoteWorkflowError {
     Io(#[from] std::io::Error),
 }
 
+/// Every command runs inside a scratch repository Fabro owns, never the
+/// caller's working directory, so metadata lookup, fetch, and checkout all see
+/// the same Git configuration: the user's global and system config applies,
+/// repository-local config from wherever the CLI was invoked does not.
 pub(super) struct NativeGit {
-    cwd:                    PathBuf,
     timeout:                Duration,
     #[cfg(test)]
     pub(super) environment: Vec<(String, String)>,
 }
 
 impl NativeGit {
-    pub(super) fn new(cwd: PathBuf) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            cwd,
-            timeout: Duration::from_mins(2),
+            timeout:                  Duration::from_mins(2),
             #[cfg(test)]
-            environment: Vec::new(),
+            environment:              Vec::new(),
         }
     }
 
@@ -139,8 +141,28 @@ impl NativeGit {
         result
     }
 
+    /// Create and initialize an empty scratch repository. Temporary files are
+    /// removed when the returned directory drops.
+    async fn scratch_repository(
+        &self,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<tempfile::TempDir> {
+        let scratch = tempfile::Builder::new()
+            .prefix("fabro-workflow-")
+            .tempdir()?;
+        self.command(
+            "repository initialization",
+            scratch.path(),
+            &["init", "--quiet", "--template="],
+            cancel,
+        )
+        .await?;
+        Ok(scratch)
+    }
+
     async fn records(
         &self,
+        root: &Path,
         repository: &GitHubRepositorySlug,
         patterns: &[String],
         cancel: &CancellationToken,
@@ -148,9 +170,7 @@ impl NativeGit {
         let url = repository.https_url();
         let mut args = vec!["ls-remote", "--symref", &url];
         args.extend(patterns.iter().map(String::as_str));
-        let bytes = self
-            .command("metadata lookup", &self.cwd, &args, cancel)
-            .await?;
+        let bytes = self.command("metadata lookup", root, &args, cancel).await?;
         Ok(std::str::from_utf8(&bytes)
             .context("local Git returned invalid metadata encoding")?
             .to_owned())
@@ -162,15 +182,19 @@ impl NativeGit {
         branch: Option<String>,
         cancel: &CancellationToken,
     ) -> anyhow::Result<GitRunTarget> {
+        let scratch = self.scratch_repository(cancel).await?;
+        let root = scratch.path();
         let (branch, sha) = if let Some(branch) = branch {
             let reference = format!("refs/heads/{branch}");
             let records = self
-                .records(&repository, std::slice::from_ref(&reference), cancel)
+                .records(root, &repository, std::slice::from_ref(&reference), cancel)
                 .await?;
             let sha = exact_record(&records, &reference)?.context("target branch was not found")?;
             (branch, sha)
         } else {
-            let records = self.records(&repository, &["HEAD".into()], cancel).await?;
+            let records = self
+                .records(root, &repository, &["HEAD".into()], cancel)
+                .await?;
             default_head(&records)?
         };
         let target = GitRunTarget {
@@ -182,8 +206,11 @@ impl NativeGit {
         Ok(target.validate()?.into_target())
     }
 
-    pub(super) async fn resolve_revision(
+    /// Resolve `revision` to a commit SHA using metadata lookups run from
+    /// `root`, an initialized scratch repository.
+    async fn resolve_revision(
         &self,
+        root: &Path,
         repository: &GitHubRepositorySlug,
         revision: &RemoteWorkflowRevision,
         cancel: &CancellationToken,
@@ -191,13 +218,15 @@ impl NativeGit {
         match revision {
             RemoteWorkflowRevision::Commit(sha) => Ok(sha.clone()),
             RemoteWorkflowRevision::DefaultBranch => {
-                let records = self.records(repository, &["HEAD".into()], cancel).await?;
+                let records = self
+                    .records(root, repository, &["HEAD".into()], cancel)
+                    .await?;
                 Ok(default_head(&records)?.1)
             }
             RemoteWorkflowRevision::Ref(reference) => {
                 let candidates = RefCandidates::new(reference);
                 let records = self
-                    .records(repository, &candidates.patterns(), cancel)
+                    .records(root, repository, &candidates.patterns(), cancel)
                     .await?;
                 candidates.resolve(&records)
             }
@@ -211,12 +240,10 @@ impl NativeGit {
         revision: RemoteWorkflowRevision,
         cancel: CancellationToken,
     ) -> anyhow::Result<CollectedWorkflowClosure> {
+        let checkout = self.scratch_repository(&cancel).await?;
         let sha = self
-            .resolve_revision(&repository, &revision, &cancel)
+            .resolve_revision(checkout.path(), &repository, &revision, &cancel)
             .await?;
-        let checkout = tempfile::Builder::new()
-            .prefix("fabro-workflow-")
-            .tempdir()?;
         self.collect_checkout(repository, selector, sha, checkout, cancel)
             .await
     }
@@ -251,6 +278,8 @@ impl NativeGit {
         Ok(closure)
     }
 
+    /// Fetch and check out `sha` into `root`, an initialized scratch
+    /// repository.
     async fn checkout(
         &self,
         repository: &GitHubRepositorySlug,
@@ -258,13 +287,6 @@ impl NativeGit {
         root: &Path,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
-        self.command(
-            "repository initialization",
-            root,
-            &["init", "--quiet", "--template="],
-            cancel,
-        )
-        .await?;
         self.command(
             "fetch",
             root,
@@ -530,7 +552,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let mut git = NativeGit::new(root.path().to_path_buf());
+            let mut git = NativeGit::new();
             git.environment = vec![
                 ("GIT_CONFIG_GLOBAL".into(), config.to_str().unwrap().into()),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
@@ -606,12 +628,13 @@ mod tests {
         let sha = commit_all(&fixture.repo, "update workflow");
         let local = fabro_manifest::collect_workflow_versions(Path::new("review"), source).unwrap();
         assert_eq!(local.versions().count(), 2);
+        let cancel = CancellationToken::new();
         for selector in [
             "review",
             ".fabro/workflows/review/workflow.fabro",
             "missing",
         ] {
-            let checkout = tempfile::tempdir().unwrap();
+            let checkout = fixture.git.scratch_repository(&cancel).await.unwrap();
             let checkout_path = checkout.path().to_path_buf();
             let result = fixture
                 .git
@@ -636,7 +659,7 @@ mod tests {
             }
             assert!(!sentinel.exists());
         }
-        let checkout = tempfile::tempdir().unwrap();
+        let checkout = fixture.git.scratch_repository(&cancel).await.unwrap();
         let path = checkout.path().to_path_buf();
         assert!(
             fixture
@@ -646,7 +669,7 @@ mod tests {
                     "review".into(),
                     "1111111111111111111111111111111111111111".into(),
                     checkout,
-                    CancellationToken::new()
+                    cancel
                 )
                 .await
                 .is_err()
@@ -740,6 +763,7 @@ mod tests {
             .tag("annotated", &object, &signature, "release", false)
             .unwrap();
         let cancel = CancellationToken::new();
+        let scratch = fixture.git.scratch_repository(&cancel).await.unwrap();
         for reference in [
             None,
             Some("HEAD"),
@@ -755,7 +779,7 @@ mod tests {
             assert_eq!(
                 fixture
                     .git
-                    .resolve_revision(&Fixture::repository(), &revision, &cancel)
+                    .resolve_revision(scratch.path(), &Fixture::repository(), &revision, &cancel)
                     .await
                     .unwrap(),
                 fixture.sha
@@ -769,6 +793,7 @@ mod tests {
             fixture
                 .git
                 .resolve_revision(
+                    scratch.path(),
                     &Fixture::repository(),
                     &RemoteWorkflowRevision::Ref("trunk".into()),
                     &cancel
@@ -783,6 +808,7 @@ mod tests {
                 fixture
                     .git
                     .resolve_revision(
+                        scratch.path(),
                         &Fixture::repository(),
                         &RemoteWorkflowRevision::Ref(reference.into()),
                         &cancel
@@ -868,9 +894,11 @@ mod tests {
     async fn remote_workflow_fetches_observed_commit_after_branch_moves() {
         let fixture = Fixture::new();
         let cancel = CancellationToken::new();
+        let checkout = fixture.git.scratch_repository(&cancel).await.unwrap();
         let captured = fixture
             .git
             .resolve_revision(
+                checkout.path(),
                 &Fixture::repository(),
                 &RemoteWorkflowRevision::DefaultBranch,
                 &cancel,
@@ -896,7 +924,6 @@ mod tests {
             )
             .unwrap();
         assert_ne!(next.to_string(), captured);
-        let checkout = tempfile::tempdir().unwrap();
         fixture
             .git
             .checkout(&Fixture::repository(), &captured, checkout.path(), &cancel)
@@ -945,7 +972,7 @@ mod tests {
         let path = root.path().join("git");
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut git = NativeGit::new(root.path().to_path_buf());
+        let mut git = NativeGit::new();
         git.environment
             .push(("PATH".into(), root.path().to_str().unwrap().into()));
         (root, git)
