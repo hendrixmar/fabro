@@ -11,8 +11,10 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
 use tokio::{fs, signal as tokio_signal, task, time};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::selection::RemoteWorkflowRevision;
+use crate::args::RunArgs;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -457,26 +459,75 @@ fn resolve_name(records: &str, branch: &str, tag: &str) -> anyhow::Result<String
     }
 }
 
-/// The task owns its child processes and temporary checkout. Dropping the
-/// waiter requests cooperative cleanup, not task abortion. Ctrl-C waits for
-/// cleanup; an in-progress blocking collection must finish first.
-pub(super) async fn owned<T: Send + 'static, TFuture>(
-    work: impl FnOnce(CancellationToken) -> TFuture + Send + 'static,
-) -> anyhow::Result<T>
-where
-    TFuture: Future<Output = anyhow::Result<T>> + Send + 'static,
-{
-    let cancel = CancellationToken::new();
-    let _cancel_on_drop = cancel.clone().drop_guard();
-    let mut task = tokio::spawn(work(cancel.clone()));
-    tokio::select! {
-        result = &mut task => result.context("local Git task failed")?,
-        signal = tokio_signal::ctrl_c() => {
-            cancel.cancel();
-            let _result = task.await.context("local Git cleanup task failed")?;
-            signal.context("failed to listen for interruption")?;
-            Err(RemoteWorkflowError::Cancelled.into())
+/// Cooperative Ctrl-C handling for commands that acquire sources with native
+/// Git.
+///
+/// Tokio's Ctrl-C listener permanently replaces the default SIGINT disposition
+/// for the process, so it is installed only when native Git is in play, and the
+/// command keeps it armed for every phase up to the point where `attach`
+/// installs its own listener or the process exits. Interruption cancels owned
+/// Git tasks and waits for their cleanup; an in-progress blocking collection
+/// must finish first.
+#[derive(Clone)]
+pub(crate) struct Interruption {
+    cancel:  CancellationToken,
+    tasks:   TaskTracker,
+    listens: bool,
+}
+
+impl Interruption {
+    /// `native_git` reports whether any selection runs native Git. Without it
+    /// the default SIGINT disposition is left untouched and `guard` is a
+    /// pass-through.
+    pub(crate) fn new(native_git: bool) -> Self {
+        Self {
+            cancel:  CancellationToken::new(),
+            tasks:   TaskTracker::new(),
+            listens: native_git,
         }
+    }
+
+    pub(crate) fn for_run_args(args: &RunArgs) -> Self {
+        Self::new(args.workflow_git.is_some() || args.target_git.is_some())
+    }
+
+    /// Run `work` to completion, or until Ctrl-C cancels it and every owned
+    /// Git task has cleaned up.
+    pub(crate) async fn guard<T>(
+        &self,
+        work: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        if !self.listens {
+            return work.await;
+        }
+        tokio::select! {
+            result = work => result,
+            signal = tokio_signal::ctrl_c() => {
+                self.cancel.cancel();
+                self.tasks.close();
+                self.tasks.wait().await;
+                signal.context("failed to listen for interruption")?;
+                Err(RemoteWorkflowError::Cancelled.into())
+            }
+        }
+    }
+
+    /// The task owns its child processes and temporary checkout. Dropping the
+    /// waiter requests cooperative cleanup, not task abortion; the task keeps
+    /// running until its Git children are reaped and its files are removed.
+    pub(super) async fn owned<T: Send + 'static, TFuture>(
+        &self,
+        work: impl FnOnce(CancellationToken) -> TFuture + Send + 'static,
+    ) -> anyhow::Result<T>
+    where
+        TFuture: Future<Output = anyhow::Result<T>> + Send + 'static,
+    {
+        let cancel = self.cancel.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        self.tasks
+            .spawn(work(cancel.clone()))
+            .await
+            .context("local Git task failed")?
     }
 }
 
@@ -487,7 +538,10 @@ where
 )]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use nix::sys::signal::{self, Signal};
     use nix::sys::stat::Mode;
     use nix::unistd;
 
@@ -706,16 +760,20 @@ mod tests {
         let (fake, git) = fake_git("printf '%s' $$ > pid; exec /bin/sleep 60");
         let checkout = tempfile::tempdir().unwrap();
         let path = checkout.path().to_path_buf();
-        let worker = tokio::spawn(owned(move |cancel| async move {
-            git.collect_checkout(
-                "acme/workflows".parse().unwrap(),
-                "review".into(),
-                "1111111111111111111111111111111111111111".into(),
-                checkout,
-                cancel,
-            )
-            .await
-        }));
+        let worker = tokio::spawn(async move {
+            Interruption::new(true)
+                .owned(move |cancel| async move {
+                    git.collect_checkout(
+                        "acme/workflows".parse().unwrap(),
+                        "review".into(),
+                        "1111111111111111111111111111111111111111".into(),
+                        checkout,
+                        cancel,
+                    )
+                    .await
+                })
+                .await
+        });
         time::timeout(Duration::from_secs(5), async {
             while !path.join("pid").exists() {
                 time::sleep(Duration::from_millis(10)).await;
@@ -738,6 +796,45 @@ mod tests {
         .unwrap();
         assert!(!fabro_proc::process_exists(pid));
         drop(fake);
+    }
+
+    /// Each nextest test runs in its own process, so raising SIGINT here only
+    /// reaches the listener `guard` installed before polling `work`.
+    #[tokio::test]
+    async fn remote_workflow_guard_cancels_owned_tasks_and_waits_for_cleanup_on_ctrl_c() {
+        let interruption = Interruption::new(true);
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let result: anyhow::Result<()> = interruption
+            .guard({
+                let interruption = interruption.clone();
+                let cleaned = Arc::clone(&cleaned);
+                async move {
+                    interruption
+                        .owned(move |cancel| async move {
+                            signal::raise(Signal::SIGINT).unwrap();
+                            cancel.cancelled().await;
+                            // Cleanup after cancellation must finish before
+                            // `guard` reports the interruption.
+                            time::sleep(Duration::from_millis(200)).await;
+                            cleaned.store(true, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .await
+                }
+            })
+            .await;
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<RemoteWorkflowError>(),
+            Some(RemoteWorkflowError::Cancelled)
+        ));
+        assert!(cleaned.load(Ordering::SeqCst));
+        assert_eq!(
+            Interruption::new(false)
+                .guard(async { Ok::<_, anyhow::Error>(7) })
+                .await
+                .unwrap(),
+            7
+        );
     }
 
     #[tokio::test]

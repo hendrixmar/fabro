@@ -6,7 +6,7 @@ use fabro_types::settings::run::EnvironmentProvider;
 use fabro_types::{DirtyStatus, RunTarget};
 use tokio::task;
 
-use super::remote_workflow::{self, NativeGit};
+use super::remote_workflow::{Interruption, NativeGit};
 use super::selection::{TargetSelection, WorkflowSelection};
 
 /// Owns the canonical collector result without copying its contents. Local
@@ -29,6 +29,7 @@ pub(super) async fn workflow(
     selection: &WorkflowSelection,
     cwd: &Path,
     user_workflows: Option<&Path>,
+    interruption: &Interruption,
 ) -> anyhow::Result<ResolvedWorkflow> {
     match selection {
         WorkflowSelection::Local(path) => {
@@ -57,10 +58,11 @@ pub(super) async fn workflow(
             let git = NativeGit::new();
             let (repository, selector, revision) =
                 (repository.clone(), selector.clone(), revision.clone());
-            let closure = remote_workflow::owned(move |cancel| async move {
-                git.collect(repository, selector, revision, cancel).await
-            })
-            .await?;
+            let closure = interruption
+                .owned(move |cancel| async move {
+                    git.collect(repository, selector, revision, cancel).await
+                })
+                .await?;
             Ok(ResolvedWorkflow::Git(closure))
         }
     }
@@ -70,6 +72,7 @@ pub(super) async fn target(
     selection: &TargetSelection,
     provider: EnvironmentProvider,
     cwd: &Path,
+    interruption: &Interruption,
 ) -> anyhow::Result<(RunTarget, bool)> {
     let path = match selection {
         TargetSelection::Path(path) => cwd
@@ -82,10 +85,11 @@ pub(super) async fn target(
             }
             let git = NativeGit::new();
             let (repository, branch) = (repository.clone(), branch.clone());
-            let target = remote_workflow::owned(move |cancel| async move {
-                git.resolve_target(repository, branch, &cancel).await
-            })
-            .await?;
+            let target = interruption
+                .owned(move |cancel| async move {
+                    git.resolve_target(repository, branch, &cancel).await
+                })
+                .await?;
             // Canonical admission retains ownership of provider capabilities.
             return Ok((RunTarget::Git(target), false));
         }
@@ -199,8 +203,9 @@ mod tests {
         write_workflow(&root, ".fabro/workflows/review");
         std::fs::create_dir(root.join("target")).unwrap();
         let selected = TargetSelection::Path("target".into());
+        let interruption = Interruption::new(false);
         assert_eq!(
-            target(&selected, EnvironmentProvider::Local, &root)
+            target(&selected, EnvironmentProvider::Local, &root, &interruption)
                 .await
                 .unwrap()
                 .0,
@@ -210,7 +215,10 @@ mod tests {
         );
         for provider in [EnvironmentProvider::Docker, EnvironmentProvider::Daytona] {
             assert_eq!(
-                target(&selected, provider, &root).await.unwrap().0,
+                target(&selected, provider, &root, &interruption)
+                    .await
+                    .unwrap()
+                    .0,
                 RunTarget::None {}
             );
         }
@@ -218,7 +226,8 @@ mod tests {
             target(
                 &TargetSelection::Path(".".into()),
                 EnvironmentProvider::Local,
-                &root
+                &root,
+                &interruption
             )
             .await
             .unwrap()
@@ -234,7 +243,8 @@ mod tests {
                     branch:     None,
                 },
                 EnvironmentProvider::Local,
-                &root
+                &root,
+                &interruption
             )
             .await
             .unwrap_err()
@@ -246,7 +256,8 @@ mod tests {
                 target(
                     &TargetSelection::Path(path.into()),
                     EnvironmentProvider::Local,
-                    &root
+                    &root,
+                    &interruption
                 )
                 .await
                 .is_err(),
@@ -267,13 +278,16 @@ mod tests {
         std::fs::write(project.join(".fabro/project.toml"), "_version = 1\n").unwrap();
         git2::Repository::init(&checkout).unwrap();
         let selected = WorkflowSelection::Local("review".into());
+        let interruption = Interruption::new(false);
         for (cwd, expected_root) in [
             (checkout.as_path(), checkout.as_path()),
             (project.as_path(), project.as_path()),
             (root.path(), user.as_path()),
         ] {
             let ResolvedWorkflow::Local(package) =
-                workflow(&selected, cwd, Some(&user)).await.unwrap()
+                workflow(&selected, cwd, Some(&user), &interruption)
+                    .await
+                    .unwrap()
             else {
                 panic!("local package");
             };
@@ -283,7 +297,8 @@ mod tests {
             workflow(
                 &WorkflowSelection::Local("missing.toml".into()),
                 &checkout,
-                Some(&user)
+                Some(&user),
+                &interruption
             )
             .await
             .is_err()

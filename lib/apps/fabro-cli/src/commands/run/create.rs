@@ -7,6 +7,7 @@ use fabro_types::{RunId, RunIntent};
 use fabro_util::terminal::Styles;
 
 use super::overrides::prepare_intent_overrides;
+use super::remote_workflow::Interruption;
 use super::resolution::ResolvedWorkflow;
 use super::selection::WorkflowSelection;
 use super::{resolution, selection};
@@ -23,10 +24,14 @@ pub(crate) struct CreatedRun {
 /// run from an immutable workflow intent, leaving it in the submitted state.
 ///
 /// This does NOT start the workflow — starting is a separate request.
+///
+/// Native Git acquisition runs under `interruption`; the caller guards this
+/// call (and any later phase before `attach`) with the same handle.
 pub(crate) async fn create_run(
     ctx: &CommandContext,
     args: &RunArgs,
     styles: &Styles,
+    interruption: &Interruption,
 ) -> anyhow::Result<CreatedRun> {
     let (workflow_selection, target_selection) = selection::parse(args)?;
     let canonical_cwd = ctx.cwd().canonicalize().with_context(|| {
@@ -41,6 +46,7 @@ pub(crate) async fn create_run(
             &workflow_selection,
             &canonical_cwd,
             Some(&user_workflows_root),
+            interruption,
         )
     };
     // Preserve local lookup diagnostics before contacting the server. Remote
@@ -94,6 +100,7 @@ pub(crate) async fn create_run(
         &target_selection,
         environment.settings.provider,
         &canonical_cwd,
+        interruption,
     )
     .await?;
     if dirty_worktree {

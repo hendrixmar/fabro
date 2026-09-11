@@ -1,6 +1,7 @@
 use anyhow::Result;
 use fabro_util::terminal::Styles;
 
+use super::remote_workflow::Interruption;
 use crate::args::RunArgs;
 use crate::command_context::CommandContext;
 use crate::shared::print_json_pretty;
@@ -15,25 +16,38 @@ pub(crate) async fn execute(mut args: RunArgs, base_ctx: &CommandContext) -> Res
 
     let quiet = args.detach;
     let prevent_idle_sleep = ctx.user_settings().cli.exec.prevent_idle_sleep;
-    let created_run = Box::pin(super::create::create_run(&ctx, &args, styles)).await?;
+    // Ctrl-C stays owned here through start; `attach` installs its own listener.
+    let interruption = Interruption::for_run_args(&args);
+    let (created_run, client) = interruption
+        .guard(async {
+            let created_run = Box::pin(super::create::create_run(
+                &ctx,
+                &args,
+                styles,
+                &interruption,
+            ))
+            .await?;
 
-    if !quiet {
-        fabro_util::printerr!(
-            printer,
-            "    {} {}",
-            styles.dim.apply_to("Run:"),
-            styles.dim.apply_to(&created_run.run_id),
-        );
-    }
+            if !quiet {
+                fabro_util::printerr!(
+                    printer,
+                    "    {} {}",
+                    styles.dim.apply_to("Run:"),
+                    styles.dim.apply_to(&created_run.run_id),
+                );
+            }
+
+            let client = ctx.server().await?;
+            super::start::start_run_with_client(&client, &created_run.run_id, false).await?;
+            Ok((created_run, client))
+        })
+        .await?;
 
     #[cfg(feature = "sleep_inhibitor")]
     let _sleep_guard = sleep_inhibitor::guard(prevent_idle_sleep);
 
     #[cfg(not(feature = "sleep_inhibitor"))]
     let _ = prevent_idle_sleep;
-
-    let client = ctx.server().await?;
-    super::start::start_run_with_client(&client, &created_run.run_id, false).await?;
 
     let json = ctx.json_output();
     if args.detach {
