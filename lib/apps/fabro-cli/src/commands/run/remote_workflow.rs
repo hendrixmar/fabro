@@ -195,7 +195,7 @@ impl NativeGit {
             let records = self
                 .records(root, &repository, &["HEAD".into()], cancel)
                 .await?;
-            default_head(&records)?
+            default_target_branch(&records)?
         };
         let target = GitRunTarget {
             repo: repository.to_string(),
@@ -400,6 +400,20 @@ fn default_head(records: &str) -> anyhow::Result<(String, String)> {
         branch.context("remote default HEAD must name a branch")?,
         exact_record(records, "HEAD")?.context("remote default HEAD has no commit")?,
     ))
+}
+
+/// The remote default branch as a run target. `GitRunTarget` requires a bare
+/// working branch name, which is stricter than the ref grammar `default_head`
+/// accepts for workflow acquisition; report the mismatch with the flag that
+/// resolves it instead of a generic branch-grammar error.
+fn default_target_branch(records: &str) -> anyhow::Result<(String, String)> {
+    let (branch, sha) = default_head(records)?;
+    if !repository::is_valid_git_branch_name(&branch) {
+        bail!(
+            "remote default branch `{branch}` cannot name a run target branch; pass --target-branch to select a working branch"
+        );
+    }
+    Ok((branch, sha))
 }
 
 /// The fully qualified refs a validated `--workflow-ref` may name. A bare name
@@ -951,6 +965,26 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn remote_workflow_default_target_branch_requires_a_working_branch_name() {
+        let sha = "1234567890123456789012345678901234567890";
+        for (head, valid) in [
+            ("trunk", true),
+            ("topic/slash", true),
+            ("heads/main", false),
+            ("tags/release", false),
+            (sha, false),
+        ] {
+            let records = format!("ref: refs/heads/{head}\tHEAD\n{sha}\tHEAD\n");
+            assert_eq!(default_head(&records).unwrap().0, head);
+            let target = default_target_branch(&records);
+            assert_eq!(target.is_ok(), valid, "{head}");
+            if !valid {
+                assert!(target.unwrap_err().to_string().contains("--target-branch"));
+            }
+        }
     }
 
     #[test]
