@@ -10,8 +10,8 @@ use httpmock::MockServer;
 use serde_json::Value;
 
 use super::support::{
-    created_run_id, mock_environment, mock_workflow_version_registrations, output_stderr,
-    remote_run_summary_json, run_state, wait_for_event_names,
+    created_run_id, init_remote_fixture, mock_environment, mock_workflow_version_registrations,
+    output_stderr, remote_run_summary_json, run_state, wait_for_event_names, write_workflow,
 };
 use crate::support::{LightweightCli, run_output_filters, run_projection_json, unique_run_id};
 
@@ -1165,4 +1165,101 @@ fn detach_creates_run_dir_with_detach_log() {
     }
     "#
     );
+}
+
+#[test]
+fn run_starts_remote_workflow_once_and_failures_do_not_refetch() {
+    let context = test_context!();
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    write_workflow(&source, ".fabro/workflows/review", "Remote");
+    init_remote_fixture(&source, "trunk");
+    let config = root.path().join("gitconfig");
+    std::fs::write(
+        &config,
+        format!(
+            "[url \"file://{}\"]\n insteadOf = https://github.com/acme/workflows\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    for failure in ["none", "upload", "create", "start"] {
+        let server = MockServer::start();
+        let environment = mock_environment(&server, "default", "docker");
+        let version = if failure == "upload" {
+            server.mock(|when, then| {
+                when.method("POST").path("/api/v1/workflow-versions");
+                then.status(422).body("fixture registration rejection");
+            })
+        } else {
+            mock_workflow_version_registrations(&server)
+        };
+        let run_id = unique_run_id();
+        let create = server.mock(|when, then| {
+            when.method("POST").path("/api/v1/runs");
+            if failure == "create" {
+                then.status(422).body("fixture create rejection");
+            } else {
+                then.status(201)
+                    .header("content-type", "application/json")
+                    .body(run_status_response(&run_id, "submitted").to_string());
+            }
+        });
+        let start = server.mock(|when, then| {
+            when.method("POST")
+                .path(format!("/api/v1/runs/{run_id}/start"));
+            if failure == "start" {
+                then.status(422).body("fixture start rejection");
+            } else {
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(run_status_response(&run_id, "submitted").to_string());
+            }
+        });
+        let trace = root.path().join(format!("trace-{failure}"));
+        let output = context
+            .run_cmd()
+            .current_dir(root.path())
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("GIT_TRACE", &trace)
+            .args([
+                "review",
+                "--workflow-git",
+                "acme/workflows",
+                "--server",
+                &format!("{}/api/v1", server.base_url()),
+                "--dry-run",
+                "--detach",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            failure == "none",
+            "{failure}: {}",
+            output_stderr(&output)
+        );
+        environment.assert();
+        version.assert();
+        create.assert_calls(usize::from(failure != "upload"));
+        start.assert_calls(usize::from(matches!(failure, "none" | "start")));
+        if failure == "none" {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                serde_json::json!({"run_id":run_id})
+            );
+        }
+        let trace = std::fs::read_to_string(&trace).unwrap();
+        assert_eq!(
+            trace
+                .lines()
+                .filter(|line| line.contains("built-in: git fetch "))
+                .count(),
+            1,
+            "{failure}: source fetched more than once"
+        );
+    }
 }

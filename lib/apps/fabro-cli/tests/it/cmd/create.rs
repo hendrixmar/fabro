@@ -12,10 +12,10 @@ use insta::assert_snapshot;
 use serde_json::json;
 
 use super::support::{
-    created_run_id, environment_json, fixture, mock_environment,
+    created_run_id, environment_json, fixture, init_remote_fixture, mock_environment,
     mock_workflow_version_registrations, mock_workflow_version_registrations_recording,
     output_stderr, output_stdout, remote_run_summary_json, resolve_run, run_count_for_test_case,
-    run_git, run_state,
+    run_git, run_state, write_workflow,
 };
 use crate::support::unique_run_id;
 
@@ -58,24 +58,6 @@ fn mock_intent_create<'a>(
                 .build()
         });
     })
-}
-
-fn write_workflow(root: &std::path::Path, directory: &str, graph_name: &str) -> std::path::PathBuf {
-    let directory = root.join(directory);
-    std::fs::create_dir_all(&directory).expect("workflow fixture directory should be created");
-    std::fs::write(
-        directory.join("workflow.toml"),
-        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
-    )
-    .expect("workflow fixture manifest should be written");
-    std::fs::write(
-        directory.join("workflow.fabro"),
-        format!(
-            "digraph {graph_name} {{ start [shape=Mdiamond] exit [shape=Msquare] start -> exit }}"
-        ),
-    )
-    .expect("workflow fixture graph should be written");
-    directory.join("workflow.toml")
 }
 
 #[test]
@@ -1639,25 +1621,6 @@ draft = false
     assert!(!pull_request.draft);
 }
 
-fn init_remote_fixture(path: &std::path::Path, branch: &str) -> String {
-    let repo = git2::Repository::init_opts(
-        path,
-        git2::RepositoryInitOptions::new().initial_head(branch),
-    )
-    .expect("fixture repository should initialize");
-    let mut index = repo.index().expect("fixture index should open");
-    index
-        .add_all(["."], git2::IndexAddOption::DEFAULT, None)
-        .expect("fixture files should stage");
-    let tree_id = index.write_tree().expect("fixture tree should write");
-    let tree = repo.find_tree(tree_id).expect("fixture tree should exist");
-    let signature = git2::Signature::now("Fixture", "fixture@example.test")
-        .expect("fixture signature should be valid");
-    repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
-        .expect("fixture commit should succeed")
-        .to_string()
-}
-
 #[test]
 fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_independent() {
     let context = test_context!();
@@ -1779,7 +1742,7 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
 }
 
 #[test]
-fn remote_workflow_run_starts_once_create_leaves_submitted_and_failures_do_not_refetch() {
+fn create_leaves_remote_workflow_run_submitted_without_starting() {
     let context = test_context!();
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
@@ -1794,88 +1757,57 @@ fn remote_workflow_run_starts_once_create_leaves_submitted_and_failures_do_not_r
         ),
     )
     .unwrap();
-    for failure in ["none", "run", "upload", "create", "start"] {
-        let server = MockServer::start();
-        let environment = mock_environment(&server, "default", "docker");
-        let version = if failure == "upload" {
-            server.mock(|when, then| {
-                when.method("POST").path("/api/v1/workflow-versions");
-                then.status(422).body("fixture registration rejection");
-            })
-        } else {
-            mock_workflow_version_registrations(&server)
-        };
-        let run_id = unique_run_id();
-        let create = server.mock(|when, then| {
-            when.method("POST").path("/api/v1/runs");
-            if failure == "create" {
-                then.status(422).body("fixture create rejection");
-            } else {
-                then.status(201)
-                    .header("content-type", "application/json")
-                    .body(run_status_response(&run_id, "submitted").to_string());
-            }
-        });
-        let start = server.mock(|when, then| {
-            when.method("POST")
-                .path(format!("/api/v1/runs/{run_id}/start"));
-            if failure == "start" {
-                then.status(422).body("fixture start rejection");
-            } else {
-                then.status(200)
-                    .header("content-type", "application/json")
-                    .body(run_status_response(&run_id, "submitted").to_string());
-            }
-        });
-        let trace = root.path().join(format!("trace-{failure}"));
-        let mut command = if failure == "none" {
-            context.create_cmd()
-        } else {
-            context.run_cmd()
-        };
-        command
-            .current_dir(root.path())
-            .env("GIT_CONFIG_GLOBAL", &config)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_COUNT", "0")
-            .env("GIT_TRACE", &trace)
-            .args([
-                "review",
-                "--workflow-git",
-                "acme/workflows",
-                "--server",
-                &format!("{}/api/v1", server.base_url()),
-                "--dry-run",
-                "--detach",
-                "--json",
-            ]);
-        let output = command.output().unwrap();
-        assert_eq!(
-            output.status.success(),
-            matches!(failure, "none" | "run"),
-            "{}",
-            output_stderr(&output)
-        );
-        environment.assert();
-        version.assert();
-        create.assert_calls(usize::from(failure != "upload"));
-        start.assert_calls(usize::from(matches!(failure, "run" | "start")));
-        if failure == "none" {
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-                json!({"run_id":run_id})
-            );
-        }
-        let trace = std::fs::read_to_string(&trace).unwrap();
-        assert_eq!(
-            trace
-                .lines()
-                .filter(|line| line.contains("built-in: git fetch "))
-                .count(),
-            1,
-            "source fetched more than once"
-        );
-    }
+    let server = MockServer::start();
+    let environment = mock_environment(&server, "default", "docker");
+    let version = mock_workflow_version_registrations(&server);
+    let run_id = unique_run_id();
+    let create = server.mock(|when, then| {
+        when.method("POST").path("/api/v1/runs");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(run_status_response(&run_id, "submitted").to_string());
+    });
+    let start = server.mock(|when, _then| {
+        when.method("POST")
+            .path(format!("/api/v1/runs/{run_id}/start"));
+    });
+    let trace = root.path().join("trace");
+    let output = context
+        .create_cmd()
+        .current_dir(root.path())
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_TRACE", &trace)
+        .args([
+            "review",
+            "--workflow-git",
+            "acme/workflows",
+            "--server",
+            &format!("{}/api/v1", server.base_url()),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_stderr(&output));
+    environment.assert();
+    version.assert();
+    create.assert();
+    start.assert_calls(0);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        json!({"run_id":run_id})
+    );
+    let trace = std::fs::read_to_string(&trace).unwrap();
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.contains("built-in: git fetch "))
+            .count(),
+        1,
+        "source fetched more than once"
+    );
 }
 
 #[test]
