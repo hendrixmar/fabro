@@ -125,16 +125,17 @@ impl NativeGit {
                 Ok(stdout)
             } => result,
         };
-        // Helpers may inherit pipes or survive their Git parent. Terminate the
-        // owned process group on both completion and interruption, then reap Git.
-        #[cfg(unix)]
-        if let Some(id) = process_id {
-            fabro_proc::sigkill_process_group(id);
-        }
+        // A timed-out, cancelled, or failed Git may leave helpers running in
+        // its process group; terminate the group, then reap Git. A successful
+        // Git has closed its pipes, and helpers it deliberately left behind
+        // (such as `credential-cache--daemon`) keep serving later commands.
         if result.is_err() {
+            #[cfg(unix)]
+            if let Some(id) = process_id {
+                fabro_proc::sigkill_process_group(id);
+            }
             child.kill().await?;
         }
-        child.wait().await?;
         result
     }
 
