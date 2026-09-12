@@ -181,6 +181,10 @@ Temporary files are removed after collection or failure. Interrupting acquisitio
 stops owned Git processes before cleanup; collection already in progress must
 finish before its files can be removed.
 
+For local workflows without target flags, the existing `run.scm` repository
+configuration still participates in target inference. Explicit `--target-path`
+and `--target-git` selections take precedence over that inferred repository.
+
 Target selection depends on the environment:
 
 | Selection | Local environment | Clone-based environment (Docker, Daytona, or plugin) |

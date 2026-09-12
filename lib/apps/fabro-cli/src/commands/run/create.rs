@@ -96,10 +96,21 @@ pub(crate) async fn create_run(
         Some(package) => package,
         None => resolve_workflow().await?,
     };
+    // Preserve configured repository inference for the existing local workflow
+    // path. Explicit targets select their own repository independently.
+    let configured_repo_origin_url = match &package {
+        ResolvedWorkflow::Local(package)
+            if args.target_path.is_none() && args.target_git.is_none() =>
+        {
+            fabro_manifest::configured_repo_origin_url_for_location(package.workflow_location())?
+        }
+        _ => None,
+    };
     let (target, dirty_worktree) = resolution::target(
         &target_selection,
         &environment.settings.provider,
         &canonical_cwd,
+        configured_repo_origin_url.as_deref(),
         interruption,
     )
     .await?;

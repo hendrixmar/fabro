@@ -676,6 +676,85 @@ fn create_preserves_named_user_other_checkout_and_loose_file_selection() {
 }
 
 #[test]
+fn create_preserves_configured_repository_inference_but_explicit_target_path_wins() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let environment = mock_environment(&server, "default", "docker");
+    let versions = mock_workflow_version_registrations(&server);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let create = mock_intent_create(&server, &unique_run_id(), Arc::clone(&requests));
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let workflow = write_workflow(&checkout, "workflow", "ConfiguredRepository");
+    std::fs::write(&workflow, "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n[run.scm]\nowner = \"acme\"\nrepository = \"configured\"\n").unwrap();
+    let sha = init_remote_fixture(&checkout, "topic");
+    let origin = root.path().join("origin.git");
+    let bare = git2::Repository::init_bare(&origin).unwrap();
+    run_git(&checkout, &[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/actual.git",
+    ]);
+    run_git(&checkout, &[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        &format!("file://{}", origin.display()),
+    ]);
+    let server_url = format!("{}/api/v1", server.base_url());
+    let inferred = context
+        .create_cmd()
+        .current_dir(&checkout)
+        .args(["--server", &server_url, workflow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!inferred.status.success());
+    assert!(
+        output_stderr(&inferred)
+            .contains("run.scm repository that is not the local checkout's origin")
+    );
+    assert!(
+        bare.find_reference("refs/heads/topic").is_err(),
+        "rejected inference must not publish the branch"
+    );
+    versions.assert_calls(0);
+    create.assert_calls(0);
+
+    let explicit = context
+        .create_cmd()
+        .current_dir(&checkout)
+        .args([
+            "--server",
+            &server_url,
+            workflow.to_str().unwrap(),
+            "--target-path",
+            ".",
+        ])
+        .output()
+        .unwrap();
+    assert!(explicit.status.success(), "{}", output_stderr(&explicit));
+    assert_eq!(
+        requests.lock().unwrap()[0]["target"],
+        json!({
+            "kind": "git", "repo": "acme/actual", "branch": "topic", "sha": sha
+        })
+    );
+    assert_eq!(
+        bare.find_reference("refs/heads/topic")
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string(),
+        sha
+    );
+    environment.assert_calls(2);
+    versions.assert_calls(1);
+    create.assert_calls(1);
+}
+
+#[test]
 fn create_clone_targets_require_exact_git_observations() {
     let context = test_context!();
     let server = MockServer::start();
@@ -896,9 +975,9 @@ fn create_rejects_unusable_git_checkouts_instead_of_sending_an_empty_target() {
     for (working_directory, expected_error) in [
         (
             detached.path(),
-            "the target Git checkout has a detached HEAD",
+            "the caller Git checkout has a detached HEAD",
         ),
-        (unborn.path(), "the target Git checkout has no commits"),
+        (unborn.path(), "the caller Git checkout has no commits"),
     ] {
         let output = context
             .create_cmd()

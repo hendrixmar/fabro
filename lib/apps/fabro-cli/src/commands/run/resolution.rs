@@ -1,15 +1,16 @@
 use std::path::Path;
 
-use anyhow::{Context as _, anyhow, bail};
+use anyhow::{Context as _, bail};
 use fabro_manifest::{CollectedWorkflowClosure, ResolvedLocalWorkflowPackage};
-use fabro_types::{DirtyStatus, RunTarget, SandboxProviderKind};
+use fabro_types::{RunTarget, SandboxProviderKind};
 use tokio::task;
 
 use super::remote_workflow::{Interruption, NativeGit};
 use super::selection::{TargetSelection, WorkflowSelection};
 
 /// Owns the canonical collector result without copying its contents. Local
-/// location metadata remains available solely for existing settings warnings.
+/// location metadata remains available for settings warnings and target
+/// inference.
 pub(super) enum ResolvedWorkflow {
     Local(ResolvedLocalWorkflowPackage),
     Git(CollectedWorkflowClosure),
@@ -71,6 +72,7 @@ pub(super) async fn target(
     selection: &TargetSelection,
     provider: &SandboxProviderKind,
     cwd: &Path,
+    configured_repo_origin_url: Option<&str>,
     interruption: &Interruption,
 ) -> anyhow::Result<(RunTarget, bool)> {
     let path = match selection {
@@ -99,92 +101,17 @@ pub(super) async fn target(
     // The existing observer can push/query Git synchronously. Preserve its
     // behavior without blocking a Tokio worker or promising a new timeout.
     let provider = provider.clone();
-    task::spawn_blocking(move || run_target_for_environment(&provider, &path))
-        .await
-        .context("target observation task failed")?
-}
-
-/// Derives the run target from the selected directory for the environment's
-/// provider. Returns the target plus whether a clone-based observation found a
-/// dirty Git worktree, so the caller can warn about it.
-fn run_target_for_environment(
-    provider: &SandboxProviderKind,
-    canonical_cwd: &Path,
-) -> anyhow::Result<(RunTarget, bool)> {
-    if !provider.clones_workspace() {
-        let path = canonical_cwd.to_str().ok_or_else(|| {
-            anyhow!(
-                "target directory is not valid UTF-8: {}",
-                canonical_cwd.display()
-            )
-        })?;
-        return Ok((
-            RunTarget::Folder {
-                path: path.to_string(),
-            },
-            false,
-        ));
-    }
-    let Some(observation) = fabro_manifest::observe_git_run_target(canonical_cwd, None) else {
-        return Ok((none_target_for_unversioned_directory(canonical_cwd)?, false));
-    };
-    let dirty = observation.legacy_git_context.dirty == DirtyStatus::Dirty;
-    let target = observation.run_target.ok_or_else(|| {
-        anyhow!("the target Git checkout cannot be represented as a canonical GitHub run target")
-    })?;
-    if target.sha.is_none() {
-        bail!(
-            "the exact local Git commit could not be made available from the canonical GitHub origin; push the commit and try again"
-        );
-    }
-    Ok((RunTarget::Git(target), dirty))
-}
-
-fn none_target_for_unversioned_directory(canonical_cwd: &Path) -> anyhow::Result<RunTarget> {
-    let repository = match git2::Repository::discover(canonical_cwd) {
-        Ok(repository) => repository,
-        Err(source) if source.code() == git2::ErrorCode::NotFound => return Ok(RunTarget::None {}),
-        Err(source) => {
-            return Err(anyhow::Error::new(source)).with_context(|| {
-                format!(
-                    "failed to inspect target directory {} for Git metadata",
-                    canonical_cwd.display()
-                )
-            });
-        }
-    };
-
-    if repository.is_bare() {
-        bail!(
-            "the target directory resolves to a bare Git repository; clone-based runs require a non-bare checkout with an attached branch"
-        );
-    }
-    match repository.head() {
-        Err(source)
-            if matches!(
-                source.code(),
-                git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
-            ) =>
-        {
-            bail!(
-                "the target Git checkout has no commits; create a commit before using a clone-based environment"
-            );
-        }
-        Err(source) => {
-            return Err(anyhow::Error::new(source))
-                .context("failed to inspect the target Git checkout HEAD");
-        }
-        Ok(head) if !head.is_branch() => {
-            bail!(
-                "the target Git checkout has a detached HEAD; check out a branch before using a clone-based environment"
-            );
-        }
-        Ok(_) => {}
-    }
-
-    bail!(
-        "the target Git checkout does not have a usable attached branch for a clone-based run target"
-    )
+    let configured_repo_origin_url = configured_repo_origin_url.map(str::to_owned);
+    let derived = task::spawn_blocking(move || {
+        fabro_manifest::derive_run_target_for_provider(
+            &provider,
+            &path,
+            configured_repo_origin_url.as_deref(),
+        )
+    })
+    .await
+    .context("target observation task failed")??;
+    Ok((derived.target, derived.dirty_worktree))
 }
 
 #[cfg(test)]
@@ -205,10 +132,16 @@ mod tests {
         let selected = TargetSelection::Path("target".into());
         let interruption = Interruption::new(false);
         assert_eq!(
-            target(&selected, &SandboxProviderKind::LOCAL, &root, &interruption)
-                .await
-                .unwrap()
-                .0,
+            target(
+                &selected,
+                &SandboxProviderKind::LOCAL,
+                &root,
+                None,
+                &interruption
+            )
+            .await
+            .unwrap()
+            .0,
             RunTarget::Folder {
                 path: root.join("target").to_str().unwrap().into(),
             }
@@ -219,7 +152,7 @@ mod tests {
             SandboxProviderKind::try_new("host").unwrap(),
         ] {
             assert_eq!(
-                target(&selected, &provider, &root, &interruption)
+                target(&selected, &provider, &root, None, &interruption)
                     .await
                     .unwrap()
                     .0,
@@ -231,6 +164,7 @@ mod tests {
                 &TargetSelection::Path(".".into()),
                 &SandboxProviderKind::LOCAL,
                 &root,
+                None,
                 &interruption
             )
             .await
@@ -248,6 +182,7 @@ mod tests {
                 },
                 &SandboxProviderKind::LOCAL,
                 &root,
+                None,
                 &interruption
             )
             .await
@@ -261,6 +196,7 @@ mod tests {
                     &TargetSelection::Path(path.into()),
                     &SandboxProviderKind::LOCAL,
                     &root,
+                    None,
                     &interruption
                 )
                 .await
