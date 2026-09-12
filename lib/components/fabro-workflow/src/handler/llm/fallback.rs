@@ -14,6 +14,7 @@ use fabro_types::FailoverProps;
 use lithos_llm::catalog::ProviderId;
 use lithos_llm::types::ReasoningEffort;
 use pebble_coding_agent::FallbackRoute;
+use pebble_coding_agent::events::FailoverContinuation;
 
 use super::controls::EffectiveRequestControls;
 use crate::event::{Emitter, Event, StageScope};
@@ -116,13 +117,16 @@ impl FallbackPlan {
     ///
     /// `from` may be a route that failed during activation without serving
     /// traffic; `error` says why it was abandoned. Consecutive payloads
-    /// chain: one's `to` is the next one's `from`.
+    /// chain: one's `to` is the next one's `from`. `continuation` is how
+    /// pebble said the new route carried the prompt on; a one-shot stage,
+    /// which re-sends its request itself, has none to report.
     pub(crate) fn failover_props(
         &self,
         from: &str,
         to: &str,
         attempt: u32,
         error: &str,
+        continuation: Option<FailoverContinuation>,
     ) -> FailoverProps {
         let (from_provider, from_model) = split_selector(from);
         let (to_provider, to_model) = split_selector(to);
@@ -141,6 +145,7 @@ impl FallbackPlan {
             requested_reasoning_effort: self.original.controls.reasoning_effort,
             effective_reasoning_effort,
             error: error.to_string(),
+            continuation: continuation.map(|continuation| continuation.as_str().to_string()),
         }
     }
 }
@@ -283,6 +288,7 @@ pub(crate) fn emit_failover(
                 &plan.current().selector(),
                 plan.attempt(),
                 error,
+                None,
             ),
         },
         stage_scope,
@@ -375,5 +381,64 @@ mod tests {
         assert_eq!(plan.attempt(), 2);
         assert!(!plan.has_next());
         assert!(!plan.advance());
+    }
+
+    #[test]
+    fn failover_props_carry_the_continuation_pebble_reported() {
+        let policy =
+            ModelFallbackPolicy::new(BTreeMap::from([("claude-fable-5".to_string(), vec![
+                FallbackTarget::new("openai", "gpt-5.6-sol"),
+            ])]));
+        let (plan, notices) = fallback_plan(
+            &enabled_fallback_catalog(),
+            &policy,
+            "claude-fable-5",
+            &builtin::anthropic(),
+            EffectiveRequestControls {
+                reasoning_effort: Some(ReasoningEffort::Medium),
+                speed:            None,
+            },
+        );
+        assert!(notices.is_empty());
+
+        let continued = plan.failover_props(
+            "anthropic/claude-fable-5",
+            "openai/gpt-5.6-sol",
+            1,
+            "overloaded",
+            Some(FailoverContinuation::ContinueTurn),
+        );
+        assert_eq!(continued.continuation.as_deref(), Some("continue_turn"));
+        assert_eq!(continued.original_provider.as_deref(), Some("anthropic"));
+        assert_eq!(continued.original_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(continued.attempt, Some(1));
+        assert_eq!(continued.from_provider, "anthropic");
+        assert_eq!(continued.from_model, "claude-fable-5");
+        assert_eq!(continued.to_provider, "openai");
+        assert_eq!(continued.to_model, "gpt-5.6-sol");
+        assert_eq!(
+            continued.requested_reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(continued.error, "overloaded");
+
+        let replayed = plan.failover_props(
+            "anthropic/claude-fable-5",
+            "openai/gpt-5.6-sol",
+            1,
+            "overloaded",
+            Some(FailoverContinuation::ReplayPrompt),
+        );
+        assert_eq!(replayed.continuation.as_deref(), Some("replay_prompt"));
+
+        // A one-shot stage walks the plan itself and reports no continuation.
+        let one_shot = plan.failover_props(
+            "anthropic/claude-fable-5",
+            "openai/gpt-5.6-sol",
+            1,
+            "overloaded",
+            None,
+        );
+        assert_eq!(one_shot.continuation, None);
     }
 }

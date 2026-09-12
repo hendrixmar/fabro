@@ -44,7 +44,7 @@ use fabro_workflow::test_support::WorkflowRunner;
 use httpmock::Method::POST;
 use httpmock::MockServer;
 use lithos_llm::catalog::ProviderId;
-use pebble_coding_agent::events::CodingEvent;
+use pebble_coding_agent::events::{CodingEvent, FailoverStop};
 use tokio_util::sync::CancellationToken;
 
 const MODEL: &str = "mock-model";
@@ -1103,6 +1103,11 @@ async fn failover_continues_the_conversation_without_rerunning_tools() {
         "got {}",
         failover.error
     );
+    assert_eq!(
+        failover.continuation.as_deref(),
+        Some("continue_turn"),
+        "the primary committed a tool result, so the backup continued the turn"
+    );
     let tool_completions = coding_events(&stage.events)
         .into_iter()
         .filter(|(_, event)| matches!(event, CodingEvent::ToolCallCompleted { .. }))
@@ -1114,6 +1119,129 @@ async fn failover_continues_the_conversation_without_rerunning_tools() {
             .as_ref()
             .and_then(|used| used.provider.clone()),
         Some("backup".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exhausted_fallback_chain_stores_the_stopped_failover() {
+    let stage = Stage::new().await;
+    let revoked = |then: httpmock::Then, key: &str| {
+        then.status(401)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({
+                "error": { "message": format!("{key} key revoked"), "type": "invalid_request_error" }
+            }));
+    };
+    let primary = stage
+        .server
+        .mock_async(|when, then| {
+            when.method(POST).path("/primary/v1/chat/completions");
+            revoked(then, "primary");
+        })
+        .await;
+    let backup = stage
+        .server
+        .mock_async(|when, then| {
+            when.method(POST).path("/backup/v1/chat/completions");
+            revoked(then, "backup");
+        })
+        .await;
+
+    let overlay = format!(
+        "{}\n{}",
+        provider_toml(
+            "primary",
+            "primary-model",
+            &stage.server.url("/primary/v1"),
+            "openai"
+        ),
+        provider_toml(
+            "backup",
+            "backup-model",
+            &stage.server.url("/backup/v1"),
+            "openai"
+        ),
+    );
+    let catalog = Arc::new(fabro_llm::test_support::test_catalog_with_overlay(&overlay));
+    let primary_provider = ProviderId::new("primary");
+    let fallbacks = model_fallback::resolve_model_fallbacks(
+        &catalog,
+        &[primary_provider.clone(), ProviderId::new("backup")],
+        &BTreeMap::from([("primary-model".to_string(), vec![
+            "backup/backup-model".parse::<ModelRef>().unwrap(),
+        ])]),
+    )
+    .expect("the fallback chain resolves");
+    let backend = PebbleBackend::new_with_catalog(
+        "primary-model".to_string(),
+        primary_provider,
+        fallbacks.policy,
+        mock_credentials(),
+        Arc::clone(&stage.hub),
+        catalog,
+    );
+
+    let mut graph = agent_graph("Exhausted", "Say hello");
+    let work = graph.nodes.get_mut("work").unwrap();
+    work.attrs
+        .insert("max_retries".to_string(), AttrValue::Integer(0));
+    graph.edges.retain(|edge| edge.from != "work");
+    let mut fail_edge = Edge::new("work", "exit");
+    fail_edge.attrs.insert(
+        "condition".to_string(),
+        AttrValue::String("outcome=failed".to_string()),
+    );
+    graph.edges.push(fail_edge);
+
+    let (_, state) = stage
+        .run(backend, &graph, CancellationToken::new())
+        .await
+        .expect("the fail edge carries the run to exit");
+
+    assert_eq!(primary.calls_async().await, 1);
+    assert_eq!(backup.calls_async().await, 1);
+    assert_eq!(
+        work_stage(&state)
+            .completion
+            .as_ref()
+            .expect("the work stage completes")
+            .outcome,
+        StageOutcome::Failed {
+            retry_requested: false,
+        }
+    );
+
+    // The move to the backup is fabro's own event; the stop on the backup
+    // is pebble's, stored under its derived name after the error it reports.
+    assert_eq!(count(&stage.events, "agent.failover"), 1);
+    assert_eq!(count(&stage.events, "agent.route.failover.stopped"), 1);
+    let stopped_at = position(&stage.events, "agent.route.failover.stopped").unwrap();
+    assert!(work_stage_event(&stage.events, stopped_at));
+    let error_at = position(&stage.events, "agent.error").expect("the model error is stored");
+    assert!(
+        error_at < stopped_at,
+        "the stop follows the error, got {:?}",
+        names(&stage.events)
+    );
+    let (route, attempt, reason, error) = coding_events(&stage.events)
+        .into_iter()
+        .find_map(|(_, event)| match event {
+            CodingEvent::RouteFailoverStopped {
+                route,
+                attempt,
+                reason,
+                error,
+            } => Some((route, attempt, reason, error)),
+            _ => None,
+        })
+        .expect("the stopped failover is stored as pebble's event");
+    assert_eq!(route, "backup/backup-model");
+    assert_eq!(attempt, 1);
+    assert_eq!(reason, FailoverStop::Exhausted);
+    assert!(
+        error.message.contains("backup key revoked"),
+        "got {}",
+        error.message
     );
 }
 

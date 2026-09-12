@@ -1498,6 +1498,7 @@ impl Event {
                     to_model = %props.to_model,
                     requested_reasoning_effort = ?props.requested_reasoning_effort,
                     effective_reasoning_effort = ?props.effective_reasoning_effort,
+                    continuation = ?props.continuation,
                     error = %props.error,
                     "LLM provider failover"
                 );

@@ -1618,7 +1618,8 @@ Emitted when the agent fails over to a different LLM provider/model.
     "from_model": "claude-sonnet-4-20250514",
     "to_provider": "openai",
     "to_model": "gpt-4o",
-    "error": "rate limited"
+    "error": "rate limited",
+    "continuation": "continue_turn"
   }
 }
 ```
@@ -1630,6 +1631,19 @@ Emitted when the agent fails over to a different LLM provider/model.
 | `to_provider` | string | Failover provider |
 | `to_model` | string | Failover model |
 | `error` | string | Error that triggered failover |
+| `continuation` | string? | How the new route carried the prompt on, as pebble reported it: `replay_prompt` (nothing the prompt committed was in the conversation, so the new route was asked the prompt again) or `continue_turn` (the conversation held assistant output or tool results, so the new route continued from there). Absent on events written before pebble reported it and on one-shot prompt stages, which re-send their request themselves |
+
+### `agent.route.failover.stopped`
+
+Pebble's `RouteFailoverStopped` event, stored verbatim like every other
+pebble event fabro does not mirror. An agent stage with fallback routes
+publishes it when a model failure ends the prompt on its current route
+anyway: the failure does not qualify for failover (`reason: "ineligible"`)
+or every route has been taken (`reason: "exhausted"`). It follows the
+`agent.error` that reports the failure; a stage without fallback routes and
+a cancelled prompt publish nothing here. The properties are pebble's
+envelope (`seq`, `stream_id`, `session_id`, `timestamp`) plus
+`event.RouteFailoverStopped` with `route`, `attempt`, `reason`, and `error`.
 
 ### Agent events that are never serialized
 
