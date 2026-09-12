@@ -198,7 +198,7 @@ impl EventSink for WorkflowEventSink {
                 );
                 return Ok(());
             }
-            CodingEvent::McpServerReady { server, tools } => {
+            CodingEvent::McpServerReady { server, tools, .. } => {
                 self.emitter.emit_scoped(
                     &Event::AgentMcpReady {
                         node_id:     self.node_id.clone(),
@@ -217,7 +217,7 @@ impl EventSink for WorkflowEventSink {
                 );
                 return Ok(());
             }
-            CodingEvent::McpServerFailed { server, error } => {
+            CodingEvent::McpServerFailed { server, error, .. } => {
                 self.emitter.emit_scoped(
                     &Event::AgentMcpFailed {
                         node_id:     self.node_id.clone(),
