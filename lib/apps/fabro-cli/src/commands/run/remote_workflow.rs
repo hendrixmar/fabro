@@ -109,18 +109,14 @@ impl NativeGit {
             .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
         #[cfg(test)]
         command.envs(self.environment.iter().cloned());
-        let output = fabro_proc::capture(
-            &mut command,
-            Some(self.timeout),
-            cancel,
-            Some(OUTPUT_LIMIT),
-        )
-            .await
-            .map_err(|error| match error {
-                ProcessError::TimedOut => RemoteWorkflowError::Timeout,
-                ProcessError::Cancelled => RemoteWorkflowError::Cancelled,
-                ProcessError::Io(source) => RemoteWorkflowError::Io(source),
-            })?;
+        let output =
+            fabro_proc::capture(&mut command, Some(self.timeout), cancel, Some(OUTPUT_LIMIT))
+                .await
+                .map_err(|error| match error {
+                    ProcessError::TimedOut => RemoteWorkflowError::Timeout,
+                    ProcessError::Cancelled => RemoteWorkflowError::Cancelled,
+                    ProcessError::Io(source) => RemoteWorkflowError::Io(source),
+                })?;
         if !output.output.status.success() {
             // Output may contain arbitrary helper/config secrets, even after pattern
             // redaction. Never retain it in an error/cause chain or tracing event.
@@ -1097,6 +1093,41 @@ mod tests {
             .unwrap_err(),
             RemoteWorkflowError::OutputLimit
         ));
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_cancelled_command_never_spawns() {
+        let (root, git) = fake_git("printf started > spawned");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = git
+            .command("fetch", root.path(), &["fetch"], &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RemoteWorkflowError::Cancelled));
+        assert!(!root.path().join("spawned").exists());
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_spawn_failure_preserves_io_source() {
+        use std::error::Error as _;
+
+        let (root, git) = fake_git("exit 0");
+        let error = git
+            .command(
+                "fetch",
+                &root.path().join("missing"),
+                &["fetch"],
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[tokio::test]

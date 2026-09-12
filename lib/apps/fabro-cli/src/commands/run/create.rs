@@ -98,7 +98,7 @@ pub(crate) async fn create_run(
     };
     let (target, dirty_worktree) = resolution::target(
         &target_selection,
-        environment.settings.provider,
+        &environment.settings.provider,
         &canonical_cwd,
         interruption,
     )

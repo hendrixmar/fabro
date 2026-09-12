@@ -183,7 +183,7 @@ finish before its files can be removed.
 
 Target selection depends on the environment:
 
-| Selection | Local environment | Docker/Daytona environment |
+| Selection | Local environment | Clone-based environment (Docker, Daytona, or plugin) |
 | --- | --- | --- |
 | Default cwd or `--target-path PATH` | Uses the live directory, including uncommitted files | Uses the enclosing Git repository and exact available commit; a non-Git directory selects an empty workspace |
 | `--target-git OWNER/REPO` | Rejected | Uses the selected repository and exact observed branch commit; cloning must be enabled |

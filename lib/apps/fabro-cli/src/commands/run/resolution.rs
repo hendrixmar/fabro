@@ -2,8 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, anyhow, bail};
 use fabro_manifest::{CollectedWorkflowClosure, ResolvedLocalWorkflowPackage};
-use fabro_types::settings::run::EnvironmentProvider;
-use fabro_types::{DirtyStatus, RunTarget};
+use fabro_types::{DirtyStatus, RunTarget, SandboxProviderKind};
 use tokio::task;
 
 use super::remote_workflow::{Interruption, NativeGit};
@@ -70,7 +69,7 @@ pub(super) async fn workflow(
 
 pub(super) async fn target(
     selection: &TargetSelection,
-    provider: EnvironmentProvider,
+    provider: &SandboxProviderKind,
     cwd: &Path,
     interruption: &Interruption,
 ) -> anyhow::Result<(RunTarget, bool)> {
@@ -80,8 +79,8 @@ pub(super) async fn target(
             .canonicalize()
             .context("failed to canonicalize target directory")?,
         TargetSelection::Git { repository, branch } => {
-            if !provider.is_clone_based() {
-                bail!("Git targets require a clone-enabled Docker or Daytona environment");
+            if !provider.clones_workspace() {
+                bail!("Git targets require a clone-enabled environment");
             }
             let git = NativeGit::new();
             let (repository, branch) = (repository.clone(), branch.clone());
@@ -99,7 +98,8 @@ pub(super) async fn target(
     }
     // The existing observer can push/query Git synchronously. Preserve its
     // behavior without blocking a Tokio worker or promising a new timeout.
-    task::spawn_blocking(move || run_target_for_environment(provider, &path))
+    let provider = provider.clone();
+    task::spawn_blocking(move || run_target_for_environment(&provider, &path))
         .await
         .context("target observation task failed")?
 }
@@ -108,10 +108,10 @@ pub(super) async fn target(
 /// provider. Returns the target plus whether a clone-based observation found a
 /// dirty Git worktree, so the caller can warn about it.
 fn run_target_for_environment(
-    provider: EnvironmentProvider,
+    provider: &SandboxProviderKind,
     canonical_cwd: &Path,
 ) -> anyhow::Result<(RunTarget, bool)> {
-    if !provider.is_clone_based() {
+    if !provider.clones_workspace() {
         let path = canonical_cwd.to_str().ok_or_else(|| {
             anyhow!(
                 "target directory is not valid UTF-8: {}",
@@ -205,7 +205,7 @@ mod tests {
         let selected = TargetSelection::Path("target".into());
         let interruption = Interruption::new(false);
         assert_eq!(
-            target(&selected, EnvironmentProvider::Local, &root, &interruption)
+            target(&selected, &SandboxProviderKind::LOCAL, &root, &interruption)
                 .await
                 .unwrap()
                 .0,
@@ -213,9 +213,13 @@ mod tests {
                 path: root.join("target").to_str().unwrap().into(),
             }
         );
-        for provider in [EnvironmentProvider::Docker, EnvironmentProvider::Daytona] {
+        for provider in [
+            SandboxProviderKind::DOCKER,
+            SandboxProviderKind::DAYTONA,
+            SandboxProviderKind::try_new("host").unwrap(),
+        ] {
             assert_eq!(
-                target(&selected, provider, &root, &interruption)
+                target(&selected, &provider, &root, &interruption)
                     .await
                     .unwrap()
                     .0,
@@ -225,7 +229,7 @@ mod tests {
         assert_eq!(
             target(
                 &TargetSelection::Path(".".into()),
-                EnvironmentProvider::Local,
+                &SandboxProviderKind::LOCAL,
                 &root,
                 &interruption
             )
@@ -242,20 +246,20 @@ mod tests {
                     repository: "acme/app".parse().unwrap(),
                     branch:     None,
                 },
-                EnvironmentProvider::Local,
+                &SandboxProviderKind::LOCAL,
                 &root,
                 &interruption
             )
             .await
             .unwrap_err()
             .to_string()
-            .contains("Docker or Daytona")
+            .contains("clone-enabled environment")
         );
         for path in ["missing", ".fabro/workflows/review/workflow.toml"] {
             assert!(
                 target(
                     &TargetSelection::Path(path.into()),
-                    EnvironmentProvider::Local,
+                    &SandboxProviderKind::LOCAL,
                     &root,
                     &interruption
                 )

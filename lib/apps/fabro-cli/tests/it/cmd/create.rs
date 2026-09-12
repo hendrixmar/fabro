@@ -1627,6 +1627,7 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
     let server = MockServer::start();
     let local_env = mock_environment(&server, "local", "local");
     let docker_env = mock_environment(&server, "docker", "docker");
+    let plugin_env = mock_environment(&server, "plugin", "host");
     let versions = mock_workflow_version_registrations(&server);
     let requests = Arc::new(Mutex::new(Vec::new()));
     let create = mock_intent_create(&server, &unique_run_id(), Arc::clone(&requests));
@@ -1665,7 +1666,7 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
     .root_id();
     assert_ne!(local_id, remote_id);
     for source_kind in ["name", "file", "git"] {
-        for target_kind in ["inferred", "path", "git"] {
+        for target_kind in ["inferred", "path", "git", "git-plugin"] {
             let mut command = context.create_cmd();
             command
                 .current_dir(&caller)
@@ -1695,14 +1696,18 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
                 "path" => {
                     command.args(["--target-path", "../target", "--environment", "local"]);
                 }
-                "git" => {
+                "git" | "git-plugin" => {
                     command.args([
                         "--target-git",
                         "acme/app",
                         "--target-branch",
                         "release",
                         "--environment",
-                        "docker",
+                        if target_kind == "git-plugin" {
+                            "plugin"
+                        } else {
+                            "docker"
+                        },
                     ]);
                 }
                 _ => {
@@ -1729,7 +1734,7 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
             assert_eq!(intent["goal"], "Caller goal");
             assert_eq!(intent["target"], match target_kind {
                 "path" => json!({"kind":"folder","path":target.canonicalize().unwrap()}),
-                "git" =>
+                "git" | "git-plugin" =>
                     json!({"kind":"git","repo":"acme/app","branch":"release","sha":target_sha}),
                 _ => json!({"kind":"none"}),
             });
@@ -1737,8 +1742,9 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
     }
     local_env.assert_calls(3);
     docker_env.assert_calls(6);
-    versions.assert_calls(9);
-    create.assert_calls(9);
+    plugin_env.assert_calls(3);
+    versions.assert_calls(12);
+    create.assert_calls(12);
 }
 
 #[test]
