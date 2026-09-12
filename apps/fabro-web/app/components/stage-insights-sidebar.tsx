@@ -7,6 +7,7 @@ import {
 import {
   ArrowPathIcon,
   CheckCircleIcon,
+  ExclamationTriangleIcon,
   XCircleIcon,
 } from "@heroicons/react/24/solid";
 import {
@@ -554,32 +555,55 @@ function McpSection({ servers }: { servers: McpServerProjection[] }) {
     <ul className="space-y-1">
       {servers.map((server) => {
         // Dim unused servers so the eye lands on the invoked ones first;
-        // failed servers stay coral regardless.
+        // failed and disconnected servers keep their tone regardless.
         const nameClass = server.status.kind === "ready" && !server.invoked
           ? "min-w-0 flex-1 truncate text-xs text-fg-muted"
           : "min-w-0 flex-1 truncate text-xs text-fg-2";
         return (
           <li key={server.server_name} className="flex items-center gap-1.5">
-            {server.status.kind === "ready" ? (
-              <CheckCircleIcon className="size-3.5 shrink-0 text-mint" aria-label="Ready" />
-            ) : (
-              <XCircleIcon className="size-3.5 shrink-0 text-coral" aria-label="Failed" />
-            )}
+            <McpStatusIcon status={server.status} />
             <span className={nameClass}>{server.server_name}</span>
-            {server.status.kind === "ready" ? (
-              <span className="font-mono text-[10px] tabular-nums text-fg-muted">
-                {server.invoked
-                  ? "used"
-                  : `${server.tool_count} ${server.tool_count === 1 ? "tool" : "tools"}`}
-              </span>
-            ) : (
-              <span className="text-[10px] uppercase tracking-wider text-coral">Failed</span>
-            )}
+            <McpStatusBadge server={server} />
           </li>
         );
       })}
     </ul>
   );
+}
+
+function McpStatusIcon({ status }: { status: McpServerProjection["status"] }) {
+  switch (status.kind) {
+    case "ready":
+      return <CheckCircleIcon className="size-3.5 shrink-0 text-mint" aria-label="Ready" />;
+    case "disconnected":
+      return (
+        <ExclamationTriangleIcon
+          className="size-3.5 shrink-0 text-amber"
+          aria-label="Disconnected"
+        />
+      );
+    case "failed":
+      return <XCircleIcon className="size-3.5 shrink-0 text-coral" aria-label="Failed" />;
+  }
+}
+
+function McpStatusBadge({ server }: { server: McpServerProjection }) {
+  switch (server.status.kind) {
+    case "ready":
+      return (
+        <span className="font-mono text-[10px] tabular-nums text-fg-muted">
+          {server.invoked
+            ? "used"
+            : `${server.tool_count} ${server.tool_count === 1 ? "tool" : "tools"}`}
+        </span>
+      );
+    case "disconnected":
+      return (
+        <span className="text-[10px] uppercase tracking-wider text-amber">Disconnected</span>
+      );
+    case "failed":
+      return <span className="text-[10px] uppercase tracking-wider text-coral">Failed</span>;
+  }
 }
 
 // ---------- helpers ----------
