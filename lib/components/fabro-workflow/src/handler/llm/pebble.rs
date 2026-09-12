@@ -167,7 +167,9 @@ fn classify_agent_error(error: pebble_coding_agent::Error) -> AgentErrorDisposit
 /// an MCP server's outcome or disconnect are facts the run already has
 /// events for, so those are mirrored onto the run's own `agent.failover`,
 /// `agent.mcp.ready`, `agent.mcp.failed`, and `agent.mcp.disconnected`
-/// events instead of being stored twice.
+/// events instead of being stored twice. A failover that stops short, with
+/// the chain exhausted or the error ineligible, has no event of fabro's own
+/// and is stored as pebble's `agent.route.failover.stopped`.
 struct WorkflowEventSink {
     emitter: Arc<Emitter>,
     node_id: String,
@@ -184,16 +186,31 @@ impl EventSink for WorkflowEventSink {
         // watchdog.
         self.emitter.touch();
         match &event.event {
+            // The failed route's accounting (`usage`, `cost_usd_micros`,
+            // `inference_ms`, `tool_ms`) is not mirrored: the stage's totals
+            // already include it through the prompt report, and no run event
+            // of fabro's own carries per-route usage yet.
             CodingEvent::RouteFailover {
                 from,
                 to,
                 attempt,
                 error,
+                usage: _,
+                cost_usd_micros: _,
+                inference_ms: _,
+                tool_ms: _,
+                continuation,
             } => {
                 self.emitter.emit_scoped(
                     &Event::Failover {
                         stage: self.node_id.clone(),
-                        props: self.plan.failover_props(from, to, *attempt, &error.message),
+                        props: self.plan.failover_props(
+                            from,
+                            to,
+                            *attempt,
+                            &error.message,
+                            Some(*continuation),
+                        ),
                     },
                     &self.scope,
                 );

@@ -1268,6 +1268,44 @@ mod tests {
         assert_eq!(props.attempt, None);
         assert_eq!(props.requested_reasoning_effort, None);
         assert_eq!(props.effective_reasoning_effort, None);
+        assert_eq!(props.continuation, None);
+    }
+
+    #[test]
+    fn failover_event_round_trips_its_continuation() {
+        let body = EventBody::Failover(FailoverProps {
+            original_provider: Some("anthropic".to_string()),
+            original_model: Some("claude-fable-5".to_string()),
+            attempt: Some(1),
+            from_provider: "anthropic".to_string(),
+            from_model: "claude-fable-5".to_string(),
+            to_provider: "openai".to_string(),
+            to_model: "gpt-5.6-sol".to_string(),
+            requested_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            error: "overloaded".to_string(),
+            continuation: Some("continue_turn".to_string()),
+        });
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(value["event"], "agent.failover");
+        assert_eq!(value["properties"]["continuation"], "continue_turn");
+        let parsed: EventBody = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, body);
+
+        // A one-shot stage, or an event written before pebble reported the
+        // continuation, omits the field rather than writing `null`.
+        let EventBody::Failover(mut props) = body else {
+            unreachable!()
+        };
+        props.continuation = None;
+        let value = serde_json::to_value(EventBody::Failover(props)).unwrap();
+        assert!(
+            value["properties"]
+                .as_object()
+                .unwrap()
+                .get("continuation")
+                .is_none()
+        );
     }
 
     #[test]

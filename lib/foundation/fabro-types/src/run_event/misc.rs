@@ -268,6 +268,15 @@ pub struct FailoverProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_reasoning_effort: Option<ReasoningEffort>,
     pub error: String,
+    /// How the new route carried the prompt on, as pebble reported it:
+    /// `replay_prompt` when nothing the prompt committed was in the
+    /// conversation and the new route was asked the prompt again, or
+    /// `continue_turn` when the conversation held assistant output or tool
+    /// results and the new route continued from there. Absent on events
+    /// written before pebble reported it, and on one-shot prompt stages,
+    /// which walk the plan themselves and always re-send the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
