@@ -450,8 +450,17 @@ pub struct McpServerProjection {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpServerStatus {
-    Ready { tools: Vec<AgentMcpToolSummary> },
-    Failed { error: String },
+    Ready {
+        tools: Vec<AgentMcpToolSummary>,
+    },
+    Failed {
+        error: String,
+    },
+    /// The server was ready and then its connection closed during the
+    /// stage; its tools fail until the session ends.
+    Disconnected {
+        error: String,
+    },
 }
 
 /// Convert a 1-based event sequence number into the `NonZeroU32` form used for

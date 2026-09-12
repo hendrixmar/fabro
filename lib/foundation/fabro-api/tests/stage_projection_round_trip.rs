@@ -528,6 +528,31 @@ fn nested_agent_state_types_match_openapi_json_shape() {
     let api_mcp: ApiMcpServerProjection = serde_json::from_value(mcp_json).unwrap();
     assert_eq!(api_mcp, mcp_server);
     assert_eq!(mcp_server.tool_count, 1);
+
+    let disconnected = McpServerProjection {
+        server_name: "filesystem".to_string(),
+        tool_count:  1,
+        status:      McpServerStatus::Disconnected {
+            error: "transport closed".to_string(),
+        },
+        invoked:     true,
+    };
+    let disconnected_json = serde_json::to_value(&disconnected).unwrap();
+    assert_eq!(
+        disconnected_json,
+        json!({
+            "server_name": "filesystem",
+            "tool_count": 1,
+            "status": {
+                "kind": "disconnected",
+                "error": "transport closed"
+            },
+            "invoked": true,
+        })
+    );
+    let api_disconnected: ApiMcpServerProjection =
+        serde_json::from_value(disconnected_json).unwrap();
+    assert_eq!(api_disconnected, disconnected);
 }
 
 #[test]

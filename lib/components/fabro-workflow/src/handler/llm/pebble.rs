@@ -164,9 +164,10 @@ fn classify_agent_error(error: pebble_coding_agent::Error) -> AgentErrorDisposit
 
 /// Pebble's durable event sink for one stage: every agent event becomes a
 /// run event in the run's log before the agent goes on. A route failover and
-/// an MCP server's outcome are facts the run already has events for, so
-/// those are mirrored onto the run's own `agent.failover`, `agent.mcp.ready`,
-/// and `agent.mcp.failed` events instead of being stored twice.
+/// an MCP server's outcome or disconnect are facts the run already has
+/// events for, so those are mirrored onto the run's own `agent.failover`,
+/// `agent.mcp.ready`, `agent.mcp.failed`, and `agent.mcp.disconnected`
+/// events instead of being stored twice.
 struct WorkflowEventSink {
     emitter: Arc<Emitter>,
     node_id: String,
@@ -198,7 +199,11 @@ impl EventSink for WorkflowEventSink {
                 );
                 return Ok(());
             }
-            CodingEvent::McpServerReady { server, tools, .. } => {
+            CodingEvent::McpServerReady {
+                server,
+                tools,
+                startup_ms,
+            } => {
                 self.emitter.emit_scoped(
                     &Event::AgentMcpReady {
                         node_id:     self.node_id.clone(),
@@ -212,14 +217,32 @@ impl EventSink for WorkflowEventSink {
                                 original_name: tool.original_name.clone(),
                             })
                             .collect(),
+                        startup_ms:  *startup_ms,
                     },
                     &self.scope,
                 );
                 return Ok(());
             }
-            CodingEvent::McpServerFailed { server, error, .. } => {
+            CodingEvent::McpServerFailed {
+                server,
+                error,
+                startup_ms,
+            } => {
                 self.emitter.emit_scoped(
                     &Event::AgentMcpFailed {
+                        node_id:     self.node_id.clone(),
+                        visit:       self.scope.visit,
+                        server_name: server.clone(),
+                        error:       error.clone(),
+                        startup_ms:  *startup_ms,
+                    },
+                    &self.scope,
+                );
+                return Ok(());
+            }
+            CodingEvent::McpServerDisconnected { server, error } => {
+                self.emitter.emit_scoped(
+                    &Event::AgentMcpDisconnected {
                         node_id:     self.node_id.clone(),
                         visit:       self.scope.visit,
                         server_name: server.clone(),

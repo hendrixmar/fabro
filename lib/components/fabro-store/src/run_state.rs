@@ -729,6 +729,13 @@ impl RunProjectionReducer for RunProjection {
                     invoked:     false,
                 });
             }
+            EventBody::AgentMcpDisconnected(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                mark_mcp_server_disconnected(stage, &props.server_name, &props.error);
+            }
             _ => {}
         }
 
@@ -1107,6 +1114,30 @@ fn upsert_mcp_server(stage: &mut StageProjection, mut server: McpServerProjectio
         *existing = server;
     } else {
         stage.mcp_servers.push(server);
+    }
+}
+
+/// Move a server the stage saw come up to `Disconnected`. Its tool count and
+/// sticky `invoked` flag stay: the tools existed and may have been used, they
+/// only fail from here on. A disconnect for a server the stage never saw come
+/// up is still recorded, without tools.
+fn mark_mcp_server_disconnected(stage: &mut StageProjection, server_name: &str, error: &str) {
+    let status = McpServerStatus::Disconnected {
+        error: error.to_string(),
+    };
+    if let Some(existing) = stage
+        .mcp_servers
+        .iter_mut()
+        .find(|existing| existing.server_name == server_name)
+    {
+        existing.status = status;
+    } else {
+        stage.mcp_servers.push(McpServerProjection {
+            server_name: server_name.to_string(),
+            tool_count: 0,
+            status,
+            invoked: false,
+        });
     }
 }
 
@@ -1796,12 +1827,13 @@ mod tests {
     use fabro_types::run_event::run::RunFailedProps;
     use fabro_types::run_event::{
         AgentAcpCancelledProps, AgentAcpCompletedProps, AgentAcpStartedProps,
-        AgentAcpTimedOutProps, AgentEventProps, AgentMcpFailedProps, AgentMcpReadyProps,
-        AgentMcpToolSummary, AgentSessionActivatedProps, AgentSessionDeactivatedProps,
-        AgentToolsAvailableProps, CheckpointCompletedProps, InterviewCompletedProps,
-        InterviewOption, InterviewStartedProps, ParallelBranchCompletedProps,
-        ParallelBranchStartedProps, RunCompletedProps, RunControlEffectProps, StageCompletedProps,
-        StageFailedProps, StagePromptProps, StageRetryingProps, StageStartedProps,
+        AgentAcpTimedOutProps, AgentEventProps, AgentMcpDisconnectedProps, AgentMcpFailedProps,
+        AgentMcpReadyProps, AgentMcpToolSummary, AgentSessionActivatedProps,
+        AgentSessionDeactivatedProps, AgentToolsAvailableProps, CheckpointCompletedProps,
+        InterviewCompletedProps, InterviewOption, InterviewStartedProps,
+        ParallelBranchCompletedProps, ParallelBranchStartedProps, RunCompletedProps,
+        RunControlEffectProps, StageCompletedProps, StageFailedProps, StagePromptProps,
+        StageRetryingProps, StageStartedProps,
     };
     use fabro_types::settings::run::DockerfileSource;
     use fabro_types::{
@@ -7324,6 +7356,7 @@ mod tests {
                                 original_name: "write_file".to_string(),
                             },
                         ],
+                        startup_ms:  0,
                         visit:       1,
                     }),
                     stage_id.clone(),
@@ -7335,6 +7368,7 @@ mod tests {
                     EventBody::AgentMcpFailed(AgentMcpFailedProps {
                         server_name: "github".to_string(),
                         error:       "missing token".to_string(),
+                        startup_ms:  0,
                         visit:       1,
                     }),
                     stage_id.clone(),
@@ -7350,6 +7384,7 @@ mod tests {
                             name:          "read_file".to_string(),
                             original_name: "read_file".to_string(),
                         }],
+                        startup_ms:  0,
                         visit:       1,
                     }),
                     stage_id.clone(),
@@ -7376,6 +7411,87 @@ mod tests {
         }
 
         #[test]
+        fn mcp_server_disconnect_keeps_tool_count_and_invoked() {
+            let mut state = initialized_projection();
+            let stage_id = stage_id();
+
+            state
+                .apply_event(&test_stage_event(
+                    1,
+                    EventBody::AgentMcpReady(AgentMcpReadyProps {
+                        server_name: "github".to_string(),
+                        tool_count:  1,
+                        tools:       vec![AgentMcpToolSummary {
+                            name:          "mcp__github__list_issues".to_string(),
+                            original_name: "list_issues".to_string(),
+                        }],
+                        startup_ms:  842,
+                        visit:       1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            state
+                .apply_event(&test_stage_event(
+                    2,
+                    agent_body(CodingEvent::ToolCallStarted {
+                        tool_name:    "mcp__github__list_issues".to_string(),
+                        tool_call_id: "call_gh".to_string(),
+                        arguments:    serde_json::json!({}),
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            state
+                .apply_event(&test_stage_event(
+                    3,
+                    EventBody::AgentMcpDisconnected(AgentMcpDisconnectedProps {
+                        server_name: "github".to_string(),
+                        error:       "transport closed".to_string(),
+                        visit:       1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+
+            let stage = state.stage(&stage_id).unwrap();
+            assert_eq!(stage.mcp_servers.len(), 1);
+            let github = &stage.mcp_servers[0];
+            assert_eq!(github.server_name, "github");
+            assert_eq!(github.status, McpServerStatus::Disconnected {
+                error: "transport closed".to_string(),
+            });
+            assert_eq!(github.tool_count, 1, "the tools existed; they now fail");
+            assert!(github.invoked, "the server was used before it dropped");
+        }
+
+        #[test]
+        fn mcp_server_disconnect_without_a_ready_is_recorded_without_tools() {
+            let mut state = initialized_projection();
+            let stage_id = stage_id();
+
+            state
+                .apply_event(&test_stage_event(
+                    1,
+                    EventBody::AgentMcpDisconnected(AgentMcpDisconnectedProps {
+                        server_name: "github".to_string(),
+                        error:       "transport closed".to_string(),
+                        visit:       1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+
+            let stage = state.stage(&stage_id).unwrap();
+            assert_eq!(stage.mcp_servers.len(), 1);
+            assert_eq!(stage.mcp_servers[0].tool_count, 0);
+            assert!(!stage.mcp_servers[0].invoked);
+            assert_eq!(stage.mcp_servers[0].status, McpServerStatus::Disconnected {
+                error: "transport closed".to_string(),
+            });
+        }
+
+        #[test]
         fn agent_tool_started_marks_matching_mcp_server_as_invoked() {
             let mut state = initialized_projection();
             let stage_id = stage_id();
@@ -7390,6 +7506,7 @@ mod tests {
                             name:          "read_file".to_string(),
                             original_name: "read_file".to_string(),
                         }],
+                        startup_ms:  0,
                         visit:       1,
                     }),
                     stage_id.clone(),
@@ -7402,6 +7519,7 @@ mod tests {
                         server_name: "other".to_string(),
                         tool_count:  0,
                         tools:       vec![],
+                        startup_ms:  0,
                         visit:       1,
                     }),
                     stage_id.clone(),
@@ -7462,6 +7580,7 @@ mod tests {
                             name:          "read_file".to_string(),
                             original_name: "read_file".to_string(),
                         }],
+                        startup_ms:  0,
                         visit:       1,
                     }),
                     stage_id.clone(),
@@ -7496,6 +7615,7 @@ mod tests {
                                 original_name: "stat".to_string(),
                             },
                         ],
+                        startup_ms:  0,
                         visit:       1,
                     }),
                     stage_id.clone(),
@@ -7851,7 +7971,7 @@ mod tests {
     /// other for a retained session that spans two stages, so a stage's live
     /// account is the prompt delta pebble reports and the two never drift.
     mod session_projection_parity {
-        use pebble_coding_agent::events::InputSource;
+        use pebble_coding_agent::events::{InputSource, McpToolSummary};
         use pebble_coding_agent::projection::{
             SessionActivity, SessionProjection, SubagentStatus as PebbleSubagentStatus,
         };
@@ -8065,6 +8185,92 @@ mod tests {
             }
 
             assert_eq!(resumed, replayed);
+        }
+
+        /// Pebble folds its own `McpServer*` events; fabro folds the
+        /// `agent.mcp.*` events the workflow sink mirrors them onto, since
+        /// the raw pebble event is not stored. The mirrored events are built
+        /// here the way the sink builds them.
+        #[test]
+        fn mcp_servers_agree_across_the_two_folds() {
+            let code = StageId::new("code", 1);
+            let tools = vec![McpToolSummary {
+                name:          "mcp__github__list_issues".to_string(),
+                original_name: "list_issues".to_string(),
+            }];
+            let ready = root(CodingEvent::McpServerReady {
+                server:     "github".to_string(),
+                tools:      tools.clone(),
+                startup_ms: 842,
+            });
+            let call = root(CodingEvent::ToolCallStarted {
+                tool_name:    "mcp__github__list_issues".to_string(),
+                tool_call_id: "call_1".to_string(),
+                arguments:    json!({}),
+            });
+            // The child's call is the one that sees the connection close.
+            let disconnected = child(CodingEvent::McpServerDisconnected {
+                server: "github".to_string(),
+                error:  "transport closed".to_string(),
+            });
+
+            let mut projection = SessionProjection::new();
+            projection.apply(&ready);
+            projection.apply(&call);
+            // A projection stored between the two carries the disconnect on
+            // resume like the replayed one.
+            let stored_bytes = serde_json::to_vec(&projection).unwrap();
+            projection.apply(&disconnected);
+            let mut resumed: SessionProjection = serde_json::from_slice(&stored_bytes).unwrap();
+            resumed.apply(&disconnected);
+            assert_eq!(resumed, projection);
+
+            let mut run = initialized_projection();
+            run.apply_event(&test_stage_event(
+                1,
+                EventBody::AgentMcpReady(AgentMcpReadyProps {
+                    server_name: "github".to_string(),
+                    tool_count:  tools.len(),
+                    tools:       tools
+                        .iter()
+                        .map(|tool| AgentMcpToolSummary {
+                            name:          tool.name.clone(),
+                            original_name: tool.original_name.clone(),
+                        })
+                        .collect(),
+                    startup_ms:  842,
+                    visit:       1,
+                }),
+                code.clone(),
+            ))
+            .unwrap();
+            run.apply_event(&stored(2, &code, call)).unwrap();
+            run.apply_event(&test_stage_event(
+                3,
+                EventBody::AgentMcpDisconnected(AgentMcpDisconnectedProps {
+                    server_name: "github".to_string(),
+                    error:       "transport closed".to_string(),
+                    visit:       1,
+                }),
+                code.clone(),
+            ))
+            .unwrap();
+
+            let stage = run.stage(&code).unwrap();
+            assert_eq!(stage.mcp_servers.len(), projection.mcp_servers.len());
+            let server = &stage.mcp_servers[0];
+            let pebble = &projection.mcp_servers["github"];
+            assert_eq!(server.server_name, "github");
+            assert_eq!(server.tool_count, pebble.tools.len());
+            assert_eq!(server.invoked, pebble.invoked);
+            assert!(server.invoked);
+            assert_eq!(pebble.error, None, "a disconnect is not a failed start");
+            assert_eq!(server.status, McpServerStatus::Disconnected {
+                error: pebble
+                    .disconnected
+                    .clone()
+                    .expect("pebble recorded the disconnect"),
+            });
         }
     }
 }

@@ -1421,6 +1421,7 @@ Emitted when a sub-agent is spawned.
         "original_name": "list_issues"
       }
     ],
+    "startup_ms": 842,
     "visit": 1
   }
 }
@@ -1431,6 +1432,7 @@ Emitted when a sub-agent is spawned.
 | `server_name` | string | MCP server name |
 | `tool_count` | number | Number of tools available |
 | `tools` | array | Names-only tool summaries for the ready server, sorted by qualified `name`. Each entry has `name` (Fabro-qualified `mcp__{server}__{tool}` identifier) and `original_name` (server-provided tool name). Descriptions and input schemas are intentionally omitted. The field is omitted from serialized JSON for legacy parity when empty. |
+| `startup_ms` | number | Whole milliseconds from the server's launch to its tools being listed. Events written before the field existed read as `0`. |
 | `visit` | number | Stage visit count when the server became ready |
 
 ### `agent.mcp.failed`
@@ -1443,7 +1445,9 @@ Emitted when a sub-agent is spawned.
   "session_id": "ses_abc",
   "properties": {
     "server_name": "filesystem",
-    "error": "Connection refused"
+    "error": "Connection refused",
+    "startup_ms": 4,
+    "visit": 1
   }
 }
 ```
@@ -1452,6 +1456,37 @@ Emitted when a sub-agent is spawned.
 |----------|------|-------------|
 | `server_name` | string | MCP server name |
 | `error` | string | Error message |
+| `startup_ms` | number | Whole milliseconds from the server's launch to the failure. Events written before the field existed read as `0`. |
+| `visit` | number | Stage visit count when the server failed |
+
+### `agent.mcp.disconnected`
+
+An MCP server that was ready lost its connection during the stage. Pebble
+publishes the disconnect once per server, from whichever session's tool call
+first observed the closed connection, so the event can originate in a
+sub-agent. Every later call to that server's tools fails until the session
+ends. The stage projection moves the server's status from `ready` to
+`disconnected`; its `tool_count` and `invoked` flag are kept.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.mcp.disconnected",
+  "node_id": "code", "node_label": "code",
+  "session_id": "ses_abc",
+  "properties": {
+    "server_name": "github",
+    "error": "transport closed",
+    "visit": 1
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `server_name` | string | MCP server name |
+| `error` | string | What closed the connection, as the client observed it |
+| `visit` | number | Stage visit count when the disconnect was observed |
 
 ### `agent.memory.loaded`
 

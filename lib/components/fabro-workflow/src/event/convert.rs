@@ -844,19 +844,33 @@ fn event_body_from_event(event: &Event) -> EventBody {
             server_name,
             tool_count,
             tools,
+            startup_ms,
             ..
         } => EventBody::AgentMcpReady(fabro_types::AgentMcpReadyProps {
             server_name: server_name.clone(),
             tool_count:  *tool_count,
             tools:       tools.clone(),
+            startup_ms:  *startup_ms,
             visit:       *visit,
         }),
         Event::AgentMcpFailed {
             visit,
             server_name,
             error,
+            startup_ms,
             ..
         } => EventBody::AgentMcpFailed(fabro_types::AgentMcpFailedProps {
+            server_name: server_name.clone(),
+            error:       error.clone(),
+            startup_ms:  *startup_ms,
+            visit:       *visit,
+        }),
+        Event::AgentMcpDisconnected {
+            visit,
+            server_name,
+            error,
+            ..
+        } => EventBody::AgentMcpDisconnected(fabro_types::AgentMcpDisconnectedProps {
             server_name: server_name.clone(),
             error:       error.clone(),
             visit:       *visit,

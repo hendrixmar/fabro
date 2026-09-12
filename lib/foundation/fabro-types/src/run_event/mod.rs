@@ -221,6 +221,8 @@ pub enum EventBody {
     AgentMcpReady(AgentMcpReadyProps),
     #[serde(rename = "agent.mcp.failed")]
     AgentMcpFailed(AgentMcpFailedProps),
+    #[serde(rename = "agent.mcp.disconnected")]
+    AgentMcpDisconnected(AgentMcpDisconnectedProps),
     #[serde(rename = "subgraph.started")]
     SubgraphStarted(SubgraphStartedProps),
     #[serde(rename = "subgraph.completed")]
@@ -508,6 +510,7 @@ impl EventBody {
             Self::AgentSteerDropped(_) => "agent.steer.dropped",
             Self::AgentMcpReady(_) => "agent.mcp.ready",
             Self::AgentMcpFailed(_) => "agent.mcp.failed",
+            Self::AgentMcpDisconnected(_) => "agent.mcp.disconnected",
             Self::SubgraphStarted(_) => "subgraph.started",
             Self::SubgraphCompleted(_) => "subgraph.completed",
             Self::SandboxInitializing(_) => "sandbox.initializing",
@@ -640,6 +643,7 @@ fn is_known_event_name(event: &str) -> bool {
                 | "agent.steer.dropped"
                 | "agent.mcp.ready"
                 | "agent.mcp.failed"
+                | "agent.mcp.disconnected"
                 | "subgraph.started"
                 | "subgraph.completed"
                 | "sandbox.initializing"
@@ -2258,6 +2262,7 @@ mod tests {
                 name:          "mcp__github__create_issue".to_string(),
                 original_name: "create_issue".to_string(),
             }],
+            startup_ms:  0,
             visit:       1,
         });
         let value = serde_json::to_value(&body).unwrap();
@@ -2273,11 +2278,70 @@ mod tests {
     }
 
     #[test]
+    fn agent_mcp_ready_and_failed_carry_startup_ms_and_default_it_when_absent() {
+        let ready = EventBody::AgentMcpReady(AgentMcpReadyProps {
+            server_name: "github".to_string(),
+            tool_count:  0,
+            tools:       Vec::new(),
+            startup_ms:  842,
+            visit:       1,
+        });
+        let value = serde_json::to_value(&ready).unwrap();
+        assert_eq!(value["properties"]["startup_ms"], 842);
+
+        let failed = EventBody::AgentMcpFailed(AgentMcpFailedProps {
+            server_name: "filesystem".to_string(),
+            error:       "could not launch `npx`".to_string(),
+            startup_ms:  4,
+            visit:       1,
+        });
+        let value = serde_json::to_value(&failed).unwrap();
+        assert_eq!(value["properties"]["startup_ms"], 4);
+
+        // Events written before pebble reported startup time.
+        let legacy: EventBody = serde_json::from_value(json!({
+            "event": "agent.mcp.failed",
+            "properties": {
+                "server_name": "filesystem",
+                "error": "Connection refused",
+                "visit": 1
+            }
+        }))
+        .unwrap();
+        match legacy {
+            EventBody::AgentMcpFailed(props) => assert_eq!(props.startup_ms, 0),
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_mcp_disconnected_round_trips() {
+        let body = EventBody::AgentMcpDisconnected(AgentMcpDisconnectedProps {
+            server_name: "github".to_string(),
+            error:       "transport closed".to_string(),
+            visit:       1,
+        });
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(value["event"], "agent.mcp.disconnected");
+        assert_eq!(
+            value["properties"],
+            json!({
+                "server_name": "github",
+                "error": "transport closed",
+                "visit": 1
+            })
+        );
+        let parsed: EventBody = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, body);
+    }
+
+    #[test]
     fn agent_mcp_ready_omits_tools_when_empty() {
         let body = EventBody::AgentMcpReady(AgentMcpReadyProps {
             server_name: "github".to_string(),
             tool_count:  0,
             tools:       Vec::new(),
+            startup_ms:  0,
             visit:       1,
         });
         let value = serde_json::to_value(&body).unwrap();
