@@ -215,6 +215,26 @@ describe("StageInsightsSidebar", () => {
     expect(dom).toContain("Failed");
   });
 
+  test("renders a disconnected mcp server as disconnected, still counted as used", () => {
+    const dom = render(
+      makeStage({
+        mcp_servers: [
+          {
+            server_name: "github",
+            tool_count:  4,
+            status:      { kind: "disconnected", error: "transport closed" },
+            invoked:     true,
+          },
+        ],
+      }),
+      null,
+    );
+    expect(dom).toContain("1/1");
+    expect(dom).toContain("github");
+    expect(dom).toContain("Disconnected");
+    expect(dom).not.toContain("Failed");
+  });
+
   test("shows skill activated/available ratio with source label", () => {
     const dom = render(
       makeStage({

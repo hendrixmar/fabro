@@ -11528,11 +11528,13 @@ components:
       oneOf:
         - $ref: "#/components/schemas/McpServerStatusReady"
         - $ref: "#/components/schemas/McpServerStatusFailed"
+        - $ref: "#/components/schemas/McpServerStatusDisconnected"
       discriminator:
         propertyName: kind
         mapping:
           ready: "#/components/schemas/McpServerStatusReady"
           failed: "#/components/schemas/McpServerStatusFailed"
+          disconnected: "#/components/schemas/McpServerStatusDisconnected"
 
     McpServerStatusReady:
       type: object
@@ -11559,6 +11561,20 @@ components:
           enum: [failed]
         error:
           type: string
+
+    McpServerStatusDisconnected:
+      description: The server was ready and then its connection closed during the stage; its tools fail until the session ends.
+      type: object
+      required:
+        - kind
+        - error
+      properties:
+        kind:
+          type: string
+          enum: [disconnected]
+        error:
+          type: string
+          description: What closed the connection, as the client observed it.
 
     AgentMcpToolSummary:
       description: Summary of one tool exposed by an MCP server.

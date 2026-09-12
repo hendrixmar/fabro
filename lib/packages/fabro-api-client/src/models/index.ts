@@ -187,6 +187,7 @@ export * from './mcp-server-list-response';
 export * from './mcp-server-projection';
 export * from './mcp-server-settings';
 export * from './mcp-server-status';
+export * from './mcp-server-status-disconnected';
 export * from './mcp-server-status-failed';
 export * from './mcp-server-status-ready';
 export * from './mcp-transport';

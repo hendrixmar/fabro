@@ -79,6 +79,7 @@ pub fn coding_event_name(event: &CodingEvent) -> &'static str {
         CodingEvent::RouteFailover { .. } => "agent.route.failover",
         CodingEvent::McpServerReady { .. } => "agent.mcp.server.ready",
         CodingEvent::McpServerFailed { .. } => "agent.mcp.server.failed",
+        CodingEvent::McpServerDisconnected { .. } => "agent.mcp.server.disconnected",
         CodingEvent::SteeringInjected { .. } => "agent.steering.injected",
         CodingEvent::RoundInterrupted { .. } => "agent.round.interrupted",
         CodingEvent::CompactionStarted { .. } => "agent.compaction.started",
@@ -126,6 +127,7 @@ pub const CODING_EVENT_NAMES: &[&str] = &[
     "agent.route.failover",
     "agent.mcp.server.ready",
     "agent.mcp.server.failed",
+    "agent.mcp.server.disconnected",
     "agent.steering.injected",
     "agent.round.interrupted",
     "agent.compaction.started",
@@ -238,6 +240,10 @@ pub struct AgentMcpReadyProps {
     pub tool_count:  usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools:       Vec<AgentMcpToolSummary>,
+    /// Whole milliseconds from the server's launch to its tools being
+    /// listed. Events written before the field existed read as `0`.
+    #[serde(default)]
+    pub startup_ms:  u64,
     pub visit:       u32,
 }
 
@@ -250,6 +256,22 @@ pub struct AgentMcpToolSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentMcpFailedProps {
     pub server_name: String,
+    pub error:       String,
+    /// Whole milliseconds from the server's launch to the failure. Events
+    /// written before the field existed read as `0`.
+    #[serde(default)]
+    pub startup_ms:  u64,
+    pub visit:       u32,
+}
+
+/// An MCP server that was ready lost its connection during the stage; every
+/// later call to its tools fails until the session ends. Pebble reports the
+/// disconnect once per server, from whichever session's tool call first
+/// observed the closed connection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentMcpDisconnectedProps {
+    pub server_name: String,
+    /// What closed the connection, as the client observed it.
     pub error:       String,
     pub visit:       u32,
 }
@@ -313,6 +335,10 @@ mod tests {
             CodingEvent::SessionEnded,
             CodingEvent::ProcessingEnd,
             CodingEvent::LoopDetected,
+            CodingEvent::McpServerDisconnected {
+                server: "github".to_string(),
+                error:  "transport closed".to_string(),
+            },
             CodingEvent::AssistantMessage {
                 text:            String::new(),
                 model:           "gpt-5.4".to_string(),

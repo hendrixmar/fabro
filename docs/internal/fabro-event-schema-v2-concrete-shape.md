@@ -386,6 +386,7 @@ V2 keeps the current durable family surface broadly intact.
 - `agent.sub.closed`
 - `agent.mcp.ready`
 - `agent.mcp.failed`
+- `agent.mcp.disconnected`
 - `agent.failover`
 
 ### Git
