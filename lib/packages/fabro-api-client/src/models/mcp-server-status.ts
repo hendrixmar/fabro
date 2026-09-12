@@ -18,6 +18,9 @@
 import type { AgentMcpToolSummary } from './agent-mcp-tool-summary';
 // May contain unused imports in some cases
 // @ts-ignore
+import type { McpServerStatusDisconnected } from './mcp-server-status-disconnected';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { McpServerStatusFailed } from './mcp-server-status-failed';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -27,4 +30,4 @@ import type { McpServerStatusReady } from './mcp-server-status-ready';
  * @type McpServerStatus
  * Projected MCP server readiness status.
  */
-export type McpServerStatus = { kind: 'failed' } & McpServerStatusFailed | { kind: 'ready' } & McpServerStatusReady;
+export type McpServerStatus = { kind: 'disconnected' } & McpServerStatusDisconnected | { kind: 'failed' } & McpServerStatusFailed | { kind: 'ready' } & McpServerStatusReady;

@@ -215,6 +215,7 @@ models/mcp-server-list-meta.ts
 models/mcp-server-list-response.ts
 models/mcp-server-projection.ts
 models/mcp-server-settings.ts
+models/mcp-server-status-disconnected.ts
 models/mcp-server-status-failed.ts
 models/mcp-server-status-ready.ts
 models/mcp-server-status.ts
