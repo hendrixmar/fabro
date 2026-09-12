@@ -88,12 +88,50 @@ pub(super) fn validate_remote_selector(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Explicit local paths escape the shorthand grammar, including colons in
+/// file names. A repository without `:WORKFLOW` retains local lookup behavior.
+pub(super) fn workflow_shorthand(path: &Path) -> Option<(&str, &str)> {
+    let value = path.to_str()?;
+    if path.is_absolute() || value.starts_with("./") || value.starts_with("../") {
+        return None;
+    }
+    value.split_once(':')
+}
+
+fn repository_revision(value: &str) -> anyhow::Result<(GitHubRepositorySlug, Option<&str>)> {
+    let (repository, revision) = value
+        .split_once('@')
+        .map_or((value, None), |(repository, revision)| {
+            (repository, Some(revision))
+        });
+    let repository = repository
+        .parse()
+        .context("repository must be a GitHub OWNER/REPO")?;
+    if revision == Some("") {
+        bail!("a revision or branch is required after '@'");
+    }
+    Ok((repository, revision))
+}
+
 pub(super) fn parse(args: &RunArgs) -> anyhow::Result<(WorkflowSelection, TargetSelection)> {
     // Flag co-occurrence rules (`requires`/`conflicts_with`) are enforced by clap.
     let workflow = args.workflow.as_ref().context("workflow is required")?;
-    let workflow = match &args.workflow_git {
-        None => WorkflowSelection::Local(workflow.clone()),
-        Some(repository) => {
+    let workflow = match (&args.workflow_repo, workflow_shorthand(workflow)) {
+        (_, Some(_)) if args.workflow_repo.is_some() || args.workflow_ref.is_some() => {
+            bail!("workflow shorthand cannot be combined with --workflow-repo or --workflow-ref");
+        }
+        (None, Some((source, selector))) => {
+            let (repository, revision) = repository_revision(source)?;
+            let selector = PathBuf::from(selector);
+            validate_remote_selector(&selector)?;
+            WorkflowSelection::Git {
+                repository,
+                selector,
+                revision: RemoteWorkflowRevision::parse(revision)?,
+            }
+        }
+        (None, None) => WorkflowSelection::Local(workflow.clone()),
+        (Some(repository), _) => {
             validate_remote_selector(workflow)?;
             WorkflowSelection::Git {
                 repository: repository.clone(),
@@ -102,26 +140,30 @@ pub(super) fn parse(args: &RunArgs) -> anyhow::Result<(WorkflowSelection, Target
             }
         }
     };
-    let target = match (&args.target_path, &args.target_git) {
-        (Some(path), _) => TargetSelection::Path(path.clone()),
-        (_, Some(repository)) => {
-            if args
-                .target_branch
-                .as_deref()
-                .is_some_and(|branch| !repository::is_valid_git_branch_name(branch))
-            {
-                bail!(
-                    "target branch must be a working branch name, not a tag, SHA, or qualified ref"
-                );
-            }
-            TargetSelection::Git {
-                repository: repository.clone(),
-                branch:     args.target_branch.clone(),
-            }
+    let target = if let Some(value) = &args.target_repo_selector {
+        let (repository, branch) = repository_revision(value)?;
+        git_target(repository, branch)?
+    } else {
+        match (&args.target_from, &args.target_repo) {
+            (Some(path), _) => TargetSelection::Path(path.clone()),
+            (_, Some(repository)) => git_target(repository.clone(), args.target_branch.as_deref())?,
+            _ => TargetSelection::Path(PathBuf::from(".")),
         }
-        _ => TargetSelection::Path(PathBuf::from(".")),
     };
     Ok((workflow, target))
+}
+
+fn git_target(
+    repository: GitHubRepositorySlug,
+    branch: Option<&str>,
+) -> anyhow::Result<TargetSelection> {
+    if branch.is_some_and(|branch| !repository::is_valid_git_branch_name(branch)) {
+        bail!("target branch must be a working branch name, not a tag, SHA, or qualified ref");
+    }
+    Ok(TargetSelection::Git {
+        repository,
+        branch: branch.map(str::to_owned),
+    })
 }
 
 #[cfg(test)]
@@ -203,17 +245,129 @@ mod adapter_tests {
     use crate::args::{Cli, Commands, RunCommands};
 
     #[test]
+    fn shorthand_matches_explicit_selections_for_both_commands() {
+        for command in ["run", "create"] {
+            for (suffix, reference) in [
+                ("", None),
+                ("@v1.2", Some("v1.2")),
+                ("@release/v2", Some("release/v2")),
+                ("@refs/tags/v1", Some("refs/tags/v1")),
+                (
+                    "@abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd",
+                    Some("abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd"),
+                ),
+            ] {
+                for selector in ["review", "./reviews/security.toml"] {
+                    for branch in [None, Some("release/v2")] {
+                        let workflow = format!("acme/workflows{suffix}:{selector}");
+                        let target = branch.map_or_else(
+                            || "acme/app".to_owned(),
+                            |branch| format!("acme/app@{branch}"),
+                        );
+                        let short = ["fabro", command, &workflow, "--target", &target];
+                        let mut explicit = vec![
+                            "fabro",
+                            command,
+                            selector,
+                            "--workflow-repo",
+                            "acme/workflows",
+                            "--target-repo",
+                            "acme/app",
+                        ];
+                        if let Some(reference) = reference {
+                            explicit.extend(["--workflow-ref", reference]);
+                        }
+                        if let Some(branch) = branch {
+                            explicit.extend(["--target-branch", branch]);
+                        }
+                        let selections = |argv: &[&str]| {
+                            let cli = Cli::try_parse_from(argv).unwrap();
+                            let Commands::RunCmd(
+                                RunCommands::Run(args) | RunCommands::Create(args),
+                            ) = *cli.command.unwrap()
+                            else {
+                                panic!("expected run args")
+                            };
+                            parse(&args).unwrap()
+                        };
+                        assert_eq!(selections(&short), selections(&explicit));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shorthand_preserves_local_paths_and_requires_remote_workflow_selector() {
+        for value in [
+            "review",
+            "dir/review.toml",
+            "acme/workflows",
+            "acme/workflows@v1",
+            "./acme/workflows:review",
+            "../acme/workflows:review",
+            "/tmp/workflows:review",
+        ] {
+            let args = parse_run_args([value]).unwrap();
+            assert_eq!(
+                parse(&args).unwrap(),
+                (
+                    WorkflowSelection::Local(value.into()),
+                    TargetSelection::Path(".".into())
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn shorthand_rejects_malformed_or_conflicting_selections_before_acquisition() {
+        for flags in [
+            vec!["acme/workflows:"],
+            vec!["acme/workflows@:review"],
+            vec!["acme/workflows@HEAD~1:review"],
+            vec!["acme/workflows:../review.toml"],
+            vec!["acme/workflows:/review.toml"],
+            vec!["acme/workflows/extra:review"],
+            vec!["https://github.com/acme/workflows:review"],
+            vec!["acme/workflows:review", "--workflow-repo", "acme/other"],
+            vec!["acme/workflows:review", "--workflow-ref", "v1"],
+            vec!["review", "--target", "acme/app@"],
+            vec!["review", "--target", "acme/app@refs/tags/v1"],
+            vec![
+                "review",
+                "--target",
+                "acme/app@abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd",
+            ],
+            vec!["review", "--target", "acme/app@main..next"],
+            vec!["review", "--target", "acme/app/extra"],
+            vec!["review", "--target", "acme/app", "--target-from", "."],
+            vec![
+                "review",
+                "--target",
+                "acme/app",
+                "--target-repo",
+                "acme/app",
+            ],
+            vec!["review", "--target", "acme/app", "--target-branch", "main"],
+        ] {
+            if let Ok(args) = parse_run_args(flags.iter().copied()) {
+                assert!(parse(&args).is_err(), "{flags:?}");
+            }
+        }
+    }
+
+    #[test]
     fn run_selection_both_commands_share_the_adapter() {
         for command in ["run", "create"] {
             let cli = Cli::try_parse_from([
                 "fabro",
                 command,
                 "review",
-                "--workflow-git",
+                "--workflow-repo",
                 "acme/workflows",
                 "--workflow-ref",
                 "v1",
-                "--target-git",
+                "--target-repo",
                 "acme/app",
                 "--target-branch",
                 "release",
@@ -251,33 +405,33 @@ mod adapter_tests {
         for flags in [
             [
                 "review",
-                "--workflow-git",
+                "--workflow-repo",
                 "https://github.com/acme/workflows",
             ],
-            ["review", "--target-git", "acme/app/extra"],
+            ["review", "--target-repo", "acme/app/extra"],
         ] {
             assert!(parse_run_args(flags).is_err());
         }
         for flags in [
-            vec!["../review.toml", "--workflow-git", "acme/workflows"],
-            vec!["/tmp/review.toml", "--workflow-git", "acme/workflows"],
+            vec!["../review.toml", "--workflow-repo", "acme/workflows"],
+            vec!["/tmp/review.toml", "--workflow-repo", "acme/workflows"],
             vec![
                 "review",
-                "--workflow-git",
+                "--workflow-repo",
                 "acme/workflows",
                 "--workflow-ref",
                 "HEAD~1",
             ],
             vec![
                 "review",
-                "--target-git",
+                "--target-repo",
                 "acme/app",
                 "--target-branch",
                 "refs/tags/v1",
             ],
             vec![
                 "review",
-                "--target-git",
+                "--target-repo",
                 "acme/app",
                 "--target-branch",
                 "1234567890123456789012345678901234567890",

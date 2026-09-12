@@ -342,7 +342,7 @@ fabro create [OPTIONS] <WORKFLOW>
 
 | Name | Description |
 | --- | --- |
-| `WORKFLOW` | Workflow name or path (repository-relative with --workflow-git) |
+| `WORKFLOW` | Workflow name, path, or OWNER/REPO[@REF]:WORKFLOW |
 
 #### Options
 
@@ -361,12 +361,13 @@ fabro create [OPTIONS] <WORKFLOW>
 | `--provider <provider>` | Override default LLM provider |
 | `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
 | `--target-branch <branch>` | Target working branch (default: remote default branch), pinned to its observed commit |
-| `--target-git <owner/repo>` | Target GitHub OWNER/REPO; the execution sandbox still needs its own clone credentials |
-| `--target-path <path>` | Observe this target directory instead of cwd; Folder targets require server filesystem access |
+| `--target-from <path>` | Observe this target directory instead of cwd; Folder targets require server filesystem access |
+| `--target-repo <owner/repo>` | Target GitHub OWNER/REPO; the execution sandbox still needs its own clone credentials |
+| `--target <owner/repo[@branch]>` | Target GitHub repository and optional working branch |
 | `-I, --input <key=value>` | Override a workflow input value (repeatable, format: KEY=VALUE) |
 | `-v, --verbose` | Enable verbose output |
-| `--workflow-git <owner/repo>` | Acquire workflow source locally from a GitHub OWNER/REPO using native Git credentials |
 | `--workflow-ref <ref>` | Workflow branch, tag, HEAD (default), or full commit SHA; qualify ambiguous names |
+| `--workflow-repo <owner/repo>` | Acquire workflow source locally from a GitHub OWNER/REPO using native Git credentials |
 
 ### `fabro deny`
 
@@ -1076,7 +1077,7 @@ fabro run [OPTIONS] <WORKFLOW>
 
 | Name | Description |
 | --- | --- |
-| `WORKFLOW` | Workflow name or path (repository-relative with --workflow-git) |
+| `WORKFLOW` | Workflow name, path, or OWNER/REPO[@REF]:WORKFLOW |
 
 #### Options
 
@@ -1095,12 +1096,13 @@ fabro run [OPTIONS] <WORKFLOW>
 | `--provider <provider>` | Override default LLM provider |
 | `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
 | `--target-branch <branch>` | Target working branch (default: remote default branch), pinned to its observed commit |
-| `--target-git <owner/repo>` | Target GitHub OWNER/REPO; the execution sandbox still needs its own clone credentials |
-| `--target-path <path>` | Observe this target directory instead of cwd; Folder targets require server filesystem access |
+| `--target-from <path>` | Observe this target directory instead of cwd; Folder targets require server filesystem access |
+| `--target-repo <owner/repo>` | Target GitHub OWNER/REPO; the execution sandbox still needs its own clone credentials |
+| `--target <owner/repo[@branch]>` | Target GitHub repository and optional working branch |
 | `-I, --input <key=value>` | Override a workflow input value (repeatable, format: KEY=VALUE) |
 | `-v, --verbose` | Enable verbose output |
-| `--workflow-git <owner/repo>` | Acquire workflow source locally from a GitHub OWNER/REPO using native Git credentials |
 | `--workflow-ref <ref>` | Workflow branch, tag, HEAD (default), or full commit SHA; qualify ambiguous names |
+| `--workflow-repo <owner/repo>` | Acquire workflow source locally from a GitHub OWNER/REPO using native Git credentials |
 
 ### `fabro sandbox`
 

@@ -74,33 +74,34 @@ fn help() {
     Usage: fabro create [OPTIONS] <WORKFLOW>
 
     Arguments:
-      <WORKFLOW>  Workflow name or path (repository-relative with --workflow-git)
+      <WORKFLOW>  Workflow name, path, or OWNER/REPO[@REF]:WORKFLOW
 
     Options:
-          --json                       Output as JSON [env: FABRO_JSON=]
-          --server <SERVER>            Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
-          --debug                      Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
-      -I, --input <KEY=VALUE>          Override a workflow input value (repeatable, format: KEY=VALUE)
-          --no-upgrade-check           Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
-          --workflow-git <OWNER/REPO>  Acquire workflow source locally from a GitHub OWNER/REPO using native Git credentials
-          --quiet                      Suppress non-essential output [env: FABRO_QUIET=]
-          --workflow-ref <REF>         Workflow branch, tag, HEAD (default), or full commit SHA; qualify ambiguous names
-          --target-path <PATH>         Observe this target directory instead of cwd; Folder targets require server filesystem access
-          --target-git <OWNER/REPO>    Target GitHub OWNER/REPO; the execution sandbox still needs its own clone credentials
-          --target-branch <BRANCH>     Target working branch (default: remote default branch), pinned to its observed commit
-          --dry-run                    Simulate execution; workflow source may still be fetched and uploaded
-          --auto-approve               Auto-approve all human gates
-          --goal <GOAL>                Override the workflow goal (available as {{ goal }} in prompts)
-          --goal-file <GOAL_FILE>      Read a per-run goal value from a local file
-          --model <MODEL>              Override default LLM model
-          --provider <PROVIDER>        Override default LLM provider
-      -v, --verbose                    Enable verbose output
-          --environment <ENVIRONMENT>  Named environment for agent tools
-          --label <KEY=VALUE>          Attach a label to this run (repeatable, format: KEY=VALUE)
-          --parent <RUN>               Link this run to an existing orchestration parent run
-          --preserve-sandbox           Keep the sandbox alive after the run finishes (for debugging)
-      -d, --detach                     Run the workflow in the background and print the run ID
-      -h, --help                       Print help
+          --json                          Output as JSON [env: FABRO_JSON=]
+          --server <SERVER>               Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
+          --debug                         Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
+      -I, --input <KEY=VALUE>             Override a workflow input value (repeatable, format: KEY=VALUE)
+          --no-upgrade-check              Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
+          --workflow-repo <OWNER/REPO>    Acquire workflow source locally from a GitHub OWNER/REPO using native Git credentials
+          --quiet                         Suppress non-essential output [env: FABRO_QUIET=]
+          --workflow-ref <REF>            Workflow branch, tag, HEAD (default), or full commit SHA; qualify ambiguous names
+          --target-from <PATH>            Observe this target directory instead of cwd; Folder targets require server filesystem access
+          --target <OWNER/REPO[@BRANCH]>  Target GitHub repository and optional working branch
+          --target-repo <OWNER/REPO>      Target GitHub OWNER/REPO; the execution sandbox still needs its own clone credentials
+          --target-branch <BRANCH>        Target working branch (default: remote default branch), pinned to its observed commit
+          --dry-run                       Simulate execution; workflow source may still be fetched and uploaded
+          --auto-approve                  Auto-approve all human gates
+          --goal <GOAL>                   Override the workflow goal (available as {{ goal }} in prompts)
+          --goal-file <GOAL_FILE>         Read a per-run goal value from a local file
+          --model <MODEL>                 Override default LLM model
+          --provider <PROVIDER>           Override default LLM provider
+      -v, --verbose                       Enable verbose output
+          --environment <ENVIRONMENT>     Named environment for agent tools
+          --label <KEY=VALUE>             Attach a label to this run (repeatable, format: KEY=VALUE)
+          --parent <RUN>                  Link this run to an existing orchestration parent run
+          --preserve-sandbox              Keep the sandbox alive after the run finishes (for debugging)
+      -d, --detach                        Run the workflow in the background and print the run ID
+      -h, --help                          Print help
     ----- stderr -----
     ");
 }
@@ -729,7 +730,7 @@ fn create_preserves_configured_repository_inference_but_explicit_target_path_win
             "--server",
             &server_url,
             workflow.to_str().unwrap(),
-            "--target-path",
+            "--target-from",
             ".",
         ])
         .output()
@@ -749,9 +750,36 @@ fn create_preserves_configured_repository_inference_but_explicit_target_path_win
             .to_string(),
         sha
     );
-    environment.assert_calls(2);
-    versions.assert_calls(1);
-    create.assert_calls(1);
+    let config = root.path().join("gitconfig");
+    std::fs::write(
+        &config,
+        format!(
+            "[url \"file://{}\"]\n insteadOf = https://github.com/acme/actual\n",
+            origin.display()
+        ),
+    )
+    .unwrap();
+    let shorthand = context
+        .create_cmd()
+        .current_dir(&checkout)
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "0")
+        .args([
+            "--server",
+            &server_url,
+            workflow.to_str().unwrap(),
+            "--target",
+            "acme/actual@topic",
+        ])
+        .output()
+        .unwrap();
+    assert!(shorthand.status.success(), "{}", output_stderr(&shorthand));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0]["target"], requests[1]["target"]);
+    environment.assert_calls(3);
+    versions.assert_calls(2);
+    create.assert_calls(2);
 }
 
 #[test]
@@ -1744,8 +1772,8 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
     .closure()
     .root_id();
     assert_ne!(local_id, remote_id);
-    for source_kind in ["name", "file", "git"] {
-        for target_kind in ["inferred", "path", "git", "git-plugin"] {
+    for source_kind in ["name", "file", "git", "shorthand"] {
+        for target_kind in ["inferred", "path", "git", "git-plugin", "shorthand"] {
             let mut command = context.create_cmd();
             command
                 .current_dir(&caller)
@@ -1758,26 +1786,31 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
                 "--goal-file",
                 "goal.txt",
             ]);
-            command.arg(if source_kind == "file" {
+            command.arg(if source_kind == "shorthand" {
+                "acme/workflows@trunk:review"
+            } else if source_kind == "file" {
                 ".fabro/workflows/review/workflow.toml"
             } else {
                 "review"
             });
             if source_kind == "git" {
                 command.args([
-                    "--workflow-git",
+                    "--workflow-repo",
                     "acme/workflows",
                     "--workflow-ref",
                     "trunk",
                 ]);
             }
             match target_kind {
+                "shorthand" => {
+                    command.args(["--target", "acme/app@release", "--environment", "docker"]);
+                }
                 "path" => {
-                    command.args(["--target-path", "../target", "--environment", "local"]);
+                    command.args(["--target-from", "../target", "--environment", "local"]);
                 }
                 "git" | "git-plugin" => {
                     command.args([
-                        "--target-git",
+                        "--target-repo",
                         "acme/app",
                         "--target-branch",
                         "release",
@@ -1804,7 +1837,7 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
             assert_eq!(
                 intent["workflow_version_id"],
                 match source_kind {
-                    "git" => remote_id,
+                    "git" | "shorthand" => remote_id,
                     "file" => file_id,
                     _ => local_id,
                 }
@@ -1813,17 +1846,17 @@ fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_inde
             assert_eq!(intent["goal"], "Caller goal");
             assert_eq!(intent["target"], match target_kind {
                 "path" => json!({"kind":"folder","path":target.canonicalize().unwrap()}),
-                "git" | "git-plugin" =>
+                "git" | "git-plugin" | "shorthand" =>
                     json!({"kind":"git","repo":"acme/app","branch":"release","sha":target_sha}),
                 _ => json!({"kind":"none"}),
             });
         }
     }
-    local_env.assert_calls(3);
-    docker_env.assert_calls(6);
-    plugin_env.assert_calls(3);
-    versions.assert_calls(12);
-    create.assert_calls(12);
+    local_env.assert_calls(4);
+    docker_env.assert_calls(12);
+    plugin_env.assert_calls(4);
+    versions.assert_calls(20);
+    create.assert_calls(20);
 }
 
 #[test]
@@ -1866,7 +1899,7 @@ fn create_leaves_remote_workflow_run_submitted_without_starting() {
         .env("GIT_TRACE", &trace)
         .args([
             "review",
-            "--workflow-git",
+            "--workflow-repo",
             "acme/workflows",
             "--server",
             &format!("{}/api/v1", server.base_url()),
@@ -1945,7 +1978,7 @@ fn remote_workflow_explicit_acquisition_failure_has_no_fallback_or_server_mutati
             .env("GIT_CONFIG_COUNT", "0")
             .args([
                 "review",
-                "--workflow-git",
+                "--workflow-repo",
                 "acme/workflows",
                 "--workflow-ref",
                 reference,

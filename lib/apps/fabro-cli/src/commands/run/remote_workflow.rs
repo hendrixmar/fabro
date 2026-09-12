@@ -461,7 +461,15 @@ impl Interruption {
     }
 
     pub(crate) fn for_run_args(args: &RunArgs) -> Self {
-        Self::new(args.workflow_git.is_some() || args.target_git.is_some())
+        Self::new(
+            args.workflow_repo.is_some()
+                || args.target_repo.is_some()
+                || args.target_repo_selector.is_some()
+                || args
+                    .workflow
+                    .as_deref()
+                    .is_some_and(|path| super::selection::workflow_shorthand(path).is_some()),
+        )
     }
 
     /// Run `work` to completion, or until Ctrl-C cancels it and every owned
@@ -521,6 +529,19 @@ mod tests {
 
     use super::super::test_support::{commit_all, write_workflow};
     use super::*;
+
+    #[test]
+    fn shorthand_acquisition_owns_interruption_but_local_paths_do_not() {
+        for (flags, listens) in [
+            (vec!["acme/workflows:review"], true),
+            (vec!["review", "--target", "acme/app@main"], true),
+            (vec!["./acme/workflows:review"], false),
+            (vec!["review", "--target-from", "."], false),
+        ] {
+            let args = super::super::test_support::parse_run_args(flags).unwrap();
+            assert_eq!(Interruption::for_run_args(&args).listens, listens);
+        }
+    }
 
     struct Fixture {
         root: tempfile::TempDir,

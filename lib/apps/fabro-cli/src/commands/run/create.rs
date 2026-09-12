@@ -100,7 +100,9 @@ pub(crate) async fn create_run(
     // path. Explicit targets select their own repository independently.
     let configured_repo_origin_url = match &package {
         ResolvedWorkflow::Local(package)
-            if args.target_path.is_none() && args.target_git.is_none() =>
+            if args.target_from.is_none()
+                && args.target_repo.is_none()
+                && args.target_repo_selector.is_none() =>
         {
             fabro_manifest::configured_repo_origin_url_for_location(package.workflow_location())?
         }
