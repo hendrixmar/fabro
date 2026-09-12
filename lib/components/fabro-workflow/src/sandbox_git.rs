@@ -64,7 +64,6 @@ pub async fn git_checkpoint(
     node_id: &str,
     status: &str,
     completed_count: usize,
-    shadow_sha: Option<String>,
     checkpoint: &RunCheckpointSettings,
     author: &GitAuthor,
 ) -> std::result::Result<String, GitCommandError> {
@@ -89,7 +88,7 @@ pub async fn git_checkpoint(
 
     let subject = format!("fabro({run_id}): {node_id} ({status})");
     let completed_str = completed_count.to_string();
-    let mut trailers = vec![
+    let trailers = vec![
         Trailer {
             key:   "Fabro-Run",
             value: run_id,
@@ -99,13 +98,6 @@ pub async fn git_checkpoint(
             value: &completed_str,
         },
     ];
-    let shadow_sha_ref = shadow_sha.as_deref().unwrap_or("");
-    if shadow_sha.is_some() {
-        trailers.push(Trailer {
-            key:   "Fabro-Checkpoint",
-            value: shadow_sha_ref,
-        });
-    }
     let mut message = trailerlink::format_message(&subject, "", &trailers);
     author.append_footer(&mut message);
 
@@ -129,7 +121,6 @@ pub(crate) async fn checked_git_checkpoint(
     node_id: &str,
     status: &str,
     completed_count: usize,
-    shadow_sha: Option<String>,
     checkpoint: &RunCheckpointSettings,
     author: &GitAuthor,
 ) -> std::result::Result<String, SharedError> {
@@ -142,7 +133,6 @@ pub(crate) async fn checked_git_checkpoint(
         node_id,
         status,
         completed_count,
-        shadow_sha,
         checkpoint,
         author,
     )
@@ -560,7 +550,6 @@ mod tests {
             "work",
             "success",
             1,
-            None,
             &RunCheckpointSettings::default(),
             &crate::git::GitAuthor::default(),
         )
@@ -592,7 +581,6 @@ mod tests {
             "work",
             "success",
             1,
-            None,
             &RunCheckpointSettings::default(),
             &crate::git::GitAuthor::default(),
         )
@@ -622,7 +610,6 @@ mod tests {
             "work",
             "success",
             1,
-            None,
             &RunCheckpointSettings::default(),
             &crate::git::GitAuthor::default(),
         )
@@ -642,7 +629,6 @@ mod tests {
             "work",
             "success",
             1,
-            None,
             &RunCheckpointSettings::default(),
             &crate::git::GitAuthor::default(),
         )
@@ -672,7 +658,6 @@ mod tests {
             "work",
             "success",
             1,
-            Some("feedface".to_owned()),
             &checkpoint,
             &author,
         )
@@ -698,7 +683,8 @@ mod tests {
         assert!(commit.contains("'--allow-empty'"), "{commit}");
         assert!(
             commit.contains("fabro(run1): work (success)")
-                && commit.contains("Fabro-Checkpoint: feedface"),
+                && commit.contains("Fabro-Run: run1")
+                && !commit.contains("Fabro-Checkpoint"),
             "{commit}"
         );
         assert!(
@@ -804,7 +790,6 @@ mod tests {
             "work",
             "success",
             1,
-            None,
             &RunCheckpointSettings::default(),
             &author,
         )

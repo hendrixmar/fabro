@@ -36,7 +36,6 @@ pub struct RunNamespace {
     pub checkpoint:    RunCheckpointSettings,
     pub clone:         RunCloneSettings,
     pub run_branch:    RunBranchSettings,
-    pub meta_branch:   RunMetaBranchSettings,
     pub environment:   RunEnvironmentSettings,
     pub notifications: HashMap<String, NotificationRouteSettings>,
     pub interviews:    RunInterviewsSettings,
@@ -66,7 +65,6 @@ impl Default for RunNamespace {
             checkpoint:    RunCheckpointSettings::default(),
             clone:         RunCloneSettings::default(),
             run_branch:    RunBranchSettings::default(),
-            meta_branch:   RunMetaBranchSettings::default(),
             environment:   RunEnvironmentSettings::default(),
             notifications: HashMap::new(),
             interviews:    RunInterviewsSettings::default(),
@@ -1107,21 +1105,6 @@ pub struct RunBranchSettings {
 }
 
 impl Default for RunBranchSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            push:    true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunMetaBranchSettings {
-    pub enabled: bool,
-    pub push:    bool,
-}
-
-impl Default for RunMetaBranchSettings {
     fn default() -> Self {
         Self {
             enabled: true,

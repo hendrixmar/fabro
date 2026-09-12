@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use fabro_github::GitHubCredentials;
-use fabro_github::token_source::{InstallationTokenSource, TokenSnapshot};
+use fabro_github::token_source::TokenSnapshot;
 use fabro_types::SandboxProviderKind;
 use fabro_util::workspace_glob::WorkspaceGlob;
 use sandbox_driver::{
@@ -981,10 +981,6 @@ impl RunSandbox {
         };
         RepoCredentials::install(&self.git()?, checkout, &token).await?;
         Ok(Some(token.snapshot))
-    }
-
-    pub fn push_token_source(&self) -> Option<Arc<InstallationTokenSource>> {
-        self.workspace.credentials.source().cloned()
     }
 
     /// The local command that opens a shell in the sandbox, from the

@@ -69,10 +69,6 @@ impl RepoCredentials {
         Self::new(None)
     }
 
-    pub(crate) fn source(&self) -> Option<&Arc<InstallationTokenSource>> {
-        self.source.as_ref()
-    }
-
     pub(crate) fn managed(&self) -> bool {
         self.source.is_some()
     }
