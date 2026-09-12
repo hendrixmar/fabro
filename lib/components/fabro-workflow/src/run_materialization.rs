@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 
 use fabro_graphviz::graph::Graph;
-use fabro_model::{Catalog, ModelSelectionError, ProviderId};
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::{ModelSelectionError, selection};
 use fabro_types::WorkflowSettings;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
+use lithos_llm::catalog::ProviderId;
 
 use crate::error::Error;
 
@@ -61,7 +63,7 @@ fn materialize_run_with_eligible_providers(
     )?;
 
     settings.run.model.name = Some(resolved_model);
-    settings.run.model.provider = Some(resolved_provider.into_inner());
+    settings.run.model.provider = Some(resolved_provider.into_string());
 
     let goal = graph.goal().to_string();
     settings.run.goal = if goal.is_empty() {
@@ -93,9 +95,14 @@ pub(crate) fn resolve_run_model(
         .filter(|provider| !provider.is_empty())
         .map(ProviderId::new);
     let selected = if catalog_fallback {
-        catalog.resolve_selection_with_catalog_fallback(model, provider.as_ref(), eligible)?
+        selection::resolve_selection_with_catalog_fallback(
+            catalog,
+            model,
+            provider.as_ref(),
+            eligible,
+        )?
     } else {
-        catalog.resolve_selection(model, provider.as_ref(), eligible)?
+        selection::resolve_selection(catalog, model, provider.as_ref(), eligible)?
     };
     Ok((selected.model, selected.provider))
 }

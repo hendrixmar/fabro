@@ -14,22 +14,27 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 fabro-api = { path = "../../foundation/fabro-api" }
 fabro-config = { path = "../../foundation/fabro-config" }
 fabro-github = { path = "../fabro-github" }
 fabro-graphviz = { path = "../fabro-graphviz" }
 fabro-template = { path = "../../foundation/fabro-template" }
+fabro-tool = { path = "../fabro-tool" }
 fabro-types = { path = "../../foundation/fabro-types" }
+fabro-util = { path = "../../foundation/fabro-util" }
 fabro-workflow = { path = "../fabro-workflow" }
 fabro-workflow-version = { path = "../fabro-workflow-version" }
 git2.workspace = true
+tempfile = "3"
 thiserror.workspace = true
+tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 fabro-test.workspace = true
-fabro-util = { path = "../../foundation/fabro-util" }
+tracing-subscriber.workspace = true
 insta.workspace = true
 serde_json.workspace = true
-tempfile = "3"
 temp-env = "0.3"

@@ -15,16 +15,13 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { SessionMessage } from './session-message';
-// May contain unused imports in some cases
-// @ts-ignore
 import type { SessionStatus } from './session-status';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { SessionTurn } from './session-turn';
 
 /**
- * Session metadata plus durable transcript projection.
+ * Session metadata plus the highest run event sequence the session\'s event stream has reached. The conversation itself is held by the server\'s durable session record and is not returned over the API.
  */
 export interface SessionDetail {
     /**
@@ -45,6 +42,5 @@ export interface SessionDetail {
     'active_turn': SessionTurn | null;
     'created_at': string;
     'updated_at': string;
-    'messages': Array<SessionMessage>;
     'last_seq': number;
 }

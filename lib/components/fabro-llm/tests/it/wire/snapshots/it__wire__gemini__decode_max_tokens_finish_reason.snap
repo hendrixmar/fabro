@@ -1,5 +1,0 @@
----
-source: lib/components/fabro-llm/tests/it/wire/gemini.rs
-expression: rendered
----
-"length"

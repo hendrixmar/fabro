@@ -15,6 +15,7 @@ pub use reqwest::{
 };
 
 pub type HttpClient = reqwest::Client;
+pub type HttpError = reqwest::Error;
 pub type BlockingHttpClient = reqwest::blocking::Client;
 pub type BlockingRequestBuilder = reqwest::blocking::RequestBuilder;
 pub type BlockingResponse = reqwest::blocking::Response;

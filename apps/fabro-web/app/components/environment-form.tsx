@@ -3,7 +3,6 @@ import { ChevronRightIcon } from "@heroicons/react/20/solid";
 import {
   EnvironmentApiDockerfileSourceInlineTypeEnum,
   EnvironmentNetworkMode,
-  EnvironmentProvider,
 } from "@qltysh/fabro-api-client";
 import type {
   CreateEnvironmentRequest,
@@ -15,6 +14,7 @@ import type {
   ReplaceEnvironmentRequest,
 } from "@qltysh/fabro-api-client";
 
+import { DOCKER_PROVIDER, isCloneBasedProvider } from "../lib/environment-providers";
 import { Label, Panel, Row } from "./settings-panel";
 import { INPUT_CLASS } from "./ui";
 import {
@@ -25,11 +25,15 @@ import {
 } from "./key-value-editor";
 
 // Parse the `provider` query param used by the create flow into a creatable
-// provider, defaulting to Docker for anything unexpected.
-export function parseCreatableProvider(value: string | null): EnvironmentProvider {
-  return value === EnvironmentProvider.DAYTONA
-    ? EnvironmentProvider.DAYTONA
-    : EnvironmentProvider.DOCKER;
+// provider, defaulting to Docker for anything that cannot back a managed
+// environment. Kind names are validated server-side on create.
+const PROVIDER_KIND_PATTERN = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
+
+export function parseCreatableProvider(value: string | null): string {
+  if (value && PROVIDER_KIND_PATTERN.test(value) && isCloneBasedProvider(value)) {
+    return value;
+  }
+  return DOCKER_PROVIDER;
 }
 
 // Environment ids are server-managed file names: lowercase, digits, hyphens.
@@ -49,7 +53,7 @@ type ImageSource = "image" | "dockerfile";
 
 export interface EnvironmentFormValues {
   id: string;
-  provider: EnvironmentProvider;
+  provider: string;
   imageSource: ImageSource;
   dockerRef: string;
   dockerfile: string;
@@ -69,7 +73,7 @@ export interface EnvironmentFormValues {
 
 export const EMPTY_ENVIRONMENT_FORM: EnvironmentFormValues = {
   id:             "",
-  provider:       EnvironmentProvider.DOCKER,
+  provider:       DOCKER_PROVIDER,
   imageSource:    "image",
   dockerRef:      "",
   dockerfile:     "",

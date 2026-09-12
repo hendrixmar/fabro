@@ -24,20 +24,19 @@ use fabro_install::{
     write_github_app_settings, write_object_store_settings, write_sandbox_settings,
     write_token_settings,
 };
-use fabro_llm::client::Client as LlmClient;
-use fabro_llm::generate::{GenerateParams, generate};
-use fabro_model::catalog::CatalogProvider;
-use fabro_model::{Catalog, ProviderId};
+use fabro_llm::lithos_catalog::{Catalog, CatalogProvider};
+use fabro_llm::probe::{self, ApiKeyProbeError, ModelTestStatus};
 use fabro_sandbox::daytona;
+use fabro_sandbox::driver::DaytonaCredentials;
 use fabro_static::EnvVars;
 use fabro_store::ArtifactStore;
-use fabro_types::ServerSettings;
-use fabro_types::settings::run::EnvironmentProvider;
 use fabro_types::settings::server::ObjectStoreSettings;
 use fabro_types::settings::{is_wildcard_host, validate_public_url_with_label};
+use fabro_types::{SandboxProviderKind, ServerSettings};
 use fabro_util::version::FABRO_VERSION;
 use fabro_util::{Home, session_secret};
 use fabro_vault::SecretType as VaultSecretType;
+use lithos_llm::catalog::ProviderId;
 use object_store::aws::resolve_bucket_region;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{ClientOptions, RetryConfig};
@@ -97,9 +96,8 @@ const REDACTED_SECRET_VALUE: &str = "[REDACTED]";
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(20);
 const VALIDATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-static INSTALL_CATALOG: LazyLock<Arc<Catalog>> = LazyLock::new(|| {
-    Arc::new(Catalog::from_builtin().expect("embedded install model catalog should be valid"))
-});
+static INSTALL_CATALOG: LazyLock<Arc<Catalog>> =
+    LazyLock::new(|| Arc::new(fabro_llm::default_catalog()));
 
 impl InstallAppState {
     #[must_use]
@@ -466,10 +464,10 @@ impl InstallSandboxState {
         }
     }
 
-    fn to_environment_provider(&self) -> EnvironmentProvider {
+    fn to_environment_provider(&self) -> SandboxProviderKind {
         match &self.provider {
-            InstallSandboxProviderState::Docker => EnvironmentProvider::Docker,
-            InstallSandboxProviderState::Daytona { .. } => EnvironmentProvider::Daytona,
+            InstallSandboxProviderState::Docker => SandboxProviderKind::DOCKER,
+            InstallSandboxProviderState::Daytona { .. } => SandboxProviderKind::DAYTONA,
         }
     }
 }
@@ -849,23 +847,21 @@ async fn put_install_llm(
 
 fn install_catalog_provider(provider: &ProviderId) -> Result<&'static CatalogProvider, String> {
     let catalog_provider = INSTALL_CATALOG
-        .provider(provider)
+        .enabled_provider(provider.as_str())
         .ok_or_else(|| format!("provider '{provider}' is not configured in the model catalog"))?;
-    if catalog_provider.auth.is_some() {
+    if fabro_auth::accepts_api_key(catalog_provider) {
         Ok(catalog_provider)
     } else {
         Err(format!(
             "provider '{}' does not define an API-key credential path",
-            catalog_provider.id
+            catalog_provider.id()
         ))
     }
 }
 
 fn provider_secret_name(provider: &ProviderId) -> Result<String, String> {
-    install_catalog_provider(provider)?;
-    INSTALL_CATALOG
-        .provider_vault_secret_name(provider)
-        .map(str::to_string)
+    let catalog_provider = install_catalog_provider(provider)?;
+    fabro_auth::expected_secret_name(catalog_provider)
         .ok_or_else(|| format!("provider '{provider}' does not define a vault credential path"))
 }
 
@@ -1009,14 +1005,13 @@ async fn check_install_daytona_api_key(
     state: &InstallAppState,
     api_key: String,
 ) -> anyhow::Result<daytona::DaytonaKeyCheck> {
-    let base_url = state
-        .upstreams
-        .daytona_api_base_url
-        .as_deref()
-        .unwrap_or(daytona::DEFAULT_DAYTONA_API_URL);
-    let organization_id = state.upstreams.daytona_organization_id.as_deref();
-    let http_client = fabro_http::http_client().context("failed to build HTTP client")?;
-    daytona::check_daytona_api_key_with(base_url, organization_id, api_key, http_client).await
+    let credentials = DaytonaCredentials::new(api_key)
+        .with_api_url(state.upstreams.daytona_api_base_url.clone())
+        .with_organization_id(state.upstreams.daytona_organization_id.clone())
+        .with_http_client(Some(
+            fabro_http::http_client().context("failed to build HTTP client")?,
+        ));
+    daytona::check_daytona_api_key(&credentials, daytona::DAYTONA_CREDENTIAL_PROBE_TIMEOUT).await
 }
 
 async fn put_install_sandbox(
@@ -2137,69 +2132,72 @@ async fn validate_llm_provider(
     state: &InstallAppState,
     input: &InstallLlmTestInput,
 ) -> anyhow::Result<()> {
-    let catalog = Arc::clone(&INSTALL_CATALOG);
-    let provider = catalog.provider(&input.provider).with_context(|| {
-        format!(
-            "provider '{}' is not configured in the model catalog",
-            input.provider
-        )
-    })?;
-    ensure_install_api_key_provider(provider)?;
-
-    let mut credential = fabro_auth::ApiCredential::from_api_key(
-        input.provider.clone(),
+    let provider = install_catalog_provider(&input.provider).map_err(anyhow::Error::msg)?;
+    let catalog = install_catalog_with_base_url(state, provider)?;
+    let outcome = probe::probe_provider_with_api_key(
+        catalog,
+        provider.id(),
         input.api_key.clone(),
-        catalog.as_ref(),
-    )?;
-    if let Some(base_url) = provider_base_url_override(state, provider) {
-        credential.base_url = Some(base_url);
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|err| match err {
+        ApiKeyProbeError::Setup(err) => {
+            anyhow::Error::new(err).context("failed to create LLM client for install validation")
+        }
+        other => anyhow::Error::msg(other.to_string()),
+    })?;
+    match outcome.status {
+        ModelTestStatus::Ok => Ok(()),
+        ModelTestStatus::Error => Err(anyhow::anyhow!(
+            "LLM provider validation request failed: {}",
+            outcome
+                .error_message
+                .unwrap_or_else(|| "unknown error".to_string())
+        )),
     }
-
-    let client = LlmClient::from_credentials(vec![credential], Arc::clone(&catalog))
-        .await
-        .context("failed to create LLM client for install validation")?;
-    let probe_model = catalog
-        .probe_for_provider(&input.provider)
-        .with_context(|| {
-            format!(
-                "provider '{}' does not define a probe model",
-                input.provider
-            )
-        })?
-        .id
-        .clone();
-    let params = GenerateParams::new(probe_model.to_string(), Arc::new(client))
-        .provider(input.provider.to_string())
-        .prompt("Say OK")
-        .max_tokens(16);
-
-    timeout(Duration::from_secs(30), generate(params))
-        .await
-        .context("LLM provider validation timed out")?
-        .map(|_| ())
-        .context("LLM provider validation request failed")
 }
 
-fn ensure_install_api_key_provider(provider: &CatalogProvider) -> anyhow::Result<()> {
-    if provider.auth.is_none() {
-        bail!(
-            "provider '{}' does not define an API-key credential path",
-            provider.id
-        )
-    }
-    Ok(())
-}
-
-fn provider_base_url_override(
+/// The install catalog with the provider's base URL replaced by the state
+/// override, when the install flow points a provider at a test upstream.
+fn install_catalog_with_base_url(
     state: &InstallAppState,
     provider: &CatalogProvider,
-) -> Option<String> {
+) -> anyhow::Result<Catalog> {
+    let Some(base_url) = state.upstreams.provider_base_urls.get(provider.id()) else {
+        return Ok(Catalog::clone(&INSTALL_CATALOG));
+    };
+    let overlay = fabro_config::LlmLayer(
+        toml::from_str(&format!(
+            "[providers.{}]\nbase_url = {}\n",
+            toml_key(provider.id().as_str()),
+            toml::Value::String(base_url.clone())
+        ))
+        .context("install provider base URL overlay should parse")?,
+    );
+    fabro_llm::build_catalog(&overlay, &|_| None)
+        .context("install catalog with provider base URL override should build")
+}
+
+fn toml_key(key: &str) -> String {
+    if key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        key.to_string()
+    } else {
+        format!("{key:?}")
+    }
+}
+
+#[cfg(test)]
+fn provider_base_url_override(state: &InstallAppState, provider: &CatalogProvider) -> String {
     state
         .upstreams
         .provider_base_urls
-        .get(&provider.id)
+        .get(provider.id())
         .cloned()
-        .or_else(|| provider.base_url.clone())
+        .unwrap_or_else(|| provider.base_url().to_string())
 }
 
 async fn validate_github_token(state: &InstallAppState, token: &str) -> anyhow::Result<String> {
@@ -2343,7 +2341,6 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use fabro_config::{Storage, envfile};
     use fabro_install::{OBJECT_STORE_ACCESS_KEY_ID_ENV, OBJECT_STORE_SECRET_ACCESS_KEY_ENV};
-    use fabro_model::{Catalog, ProviderId};
     use fabro_static::EnvVars;
     use fabro_vault::SecretType as VaultSecretType;
     use object_store::Error as ObjectStoreError;
@@ -2356,9 +2353,9 @@ mod tests {
         InstallObjectStoreState, InstallSandboxProviderState, InstallSandboxState,
         InstallTokenQuery, LlmProvidersInput, PendingInstall, ServerConfigInput, ServerSecrets,
         build_github_app_manifest, classify_object_store_validation_error, detect_canonical_url,
-        install_object_store_lookup, lock_unpoisoned, post_install_finish,
-        provider_base_url_override, resolve_install_object_store_state, token_is_valid,
-        write_artifact_store_metadata,
+        install_catalog_provider, install_object_store_lookup, lock_unpoisoned,
+        post_install_finish, provider_base_url_override, resolve_install_object_store_state,
+        token_is_valid, write_artifact_store_metadata,
     };
 
     #[test]
@@ -2570,25 +2567,25 @@ mod tests {
     #[test]
     fn install_provider_base_url_falls_back_to_catalog_base_url() {
         let state = InstallAppState::for_test("expected");
-        let catalog = Catalog::builtin();
-        let provider = catalog.provider(&ProviderId::openai()).unwrap();
+        let provider = install_catalog_provider(&lithos_llm::catalog::builtin::openai()).unwrap();
 
         assert_eq!(
-            provider_base_url_override(&state, provider).as_deref(),
-            Some("https://api.openai.com/v1")
+            provider_base_url_override(&state, provider),
+            "https://api.openai.com"
         );
     }
 
     #[test]
     fn install_provider_base_url_prefers_state_override() {
-        let state = InstallAppState::for_test("expected")
-            .with_provider_base_url(ProviderId::openai(), "https://proxy.example.com/v1");
-        let catalog = Catalog::builtin();
-        let provider = catalog.provider(&ProviderId::openai()).unwrap();
+        let state = InstallAppState::for_test("expected").with_provider_base_url(
+            lithos_llm::catalog::builtin::openai(),
+            "https://proxy.example.com/v1",
+        );
+        let provider = install_catalog_provider(&lithos_llm::catalog::builtin::openai()).unwrap();
 
         assert_eq!(
-            provider_base_url_override(&state, provider).as_deref(),
-            Some("https://proxy.example.com/v1")
+            provider_base_url_override(&state, provider),
+            "https://proxy.example.com/v1"
         );
     }
 

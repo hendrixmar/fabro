@@ -106,7 +106,9 @@ fn list_with_filters_renders_server_models_table() {
                             "features": {
                                 "tools": true,
                                 "vision": false,
-                                "reasoning": false
+                                "reasoning": false,
+                                "prompt_cache": false,
+                                "sampling": true
                             },
                             "controls": {
                                 "reasoning_effort": []
@@ -135,7 +137,9 @@ fn list_with_filters_renders_server_models_table() {
                             "features": {
                                 "tools": false,
                                 "vision": true,
-                                "reasoning": true
+                                "reasoning": true,
+                                "prompt_cache": false,
+                                "sampling": true
                             },
                             "controls": {
                                 "reasoning_effort": []
@@ -210,7 +214,9 @@ fn list_uses_configured_server_target_without_server_flag() {
                         "features": {
                             "tools": true,
                             "vision": false,
-                            "reasoning": false
+                            "reasoning": false,
+                            "prompt_cache": false,
+                            "sampling": true
                         },
                         "controls": {
                             "reasoning_effort": []
@@ -267,7 +273,9 @@ fn list_uses_fabro_config_for_machine_settings() {
                         "features": {
                             "tools": true,
                             "vision": false,
-                            "reasoning": false
+                            "reasoning": false,
+                            "prompt_cache": false,
+                            "sampling": true
                         },
                         "controls": {
                             "reasoning_effort": []

@@ -1,6 +1,6 @@
 use fabro_graphviz::graph::Graph;
 use fabro_graphviz::stylesheet::{Selector, parse_stylesheet};
-use fabro_model::Catalog;
+use fabro_llm::lithos_catalog::Catalog;
 
 use super::model_support::{check_model_known, check_provider_known};
 use crate::{Diagnostic, LintRule};
@@ -77,7 +77,7 @@ impl LintRule for Rule<'_> {
 #[cfg(test)]
 mod tests {
     use fabro_graphviz::graph::AttrValue;
-    use fabro_model::Catalog;
+    use fabro_llm::test_support::test_catalog;
 
     use super::Rule;
     use crate::rules::test_support::minimal_graph;
@@ -88,11 +88,10 @@ mod tests {
         let mut g = minimal_graph();
         g.attrs.insert(
             "model_stylesheet".to_string(),
-            AttrValue::String("* { model: claude-sonnet-4-5; provider: anthropic; }".to_string()),
+            AttrValue::String("* { model: claude-sonnet-4.5; provider: anthropic; }".to_string()),
         );
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert!(d.is_empty());
     }
@@ -104,9 +103,8 @@ mod tests {
             "model_stylesheet".to_string(),
             AttrValue::String("#opus { model: claude-opus-4-5; }".to_string()),
         );
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Severity::Warning);
@@ -119,15 +117,14 @@ mod tests {
         let mut g = minimal_graph();
         g.attrs.insert(
             "model_stylesheet".to_string(),
-            AttrValue::String("* { provider: google; }".to_string()),
+            AttrValue::String("* { provider: nonexistent-provider; }".to_string()),
         );
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Severity::Warning);
-        assert!(d[0].message.contains("google"));
+        assert!(d[0].message.contains("nonexistent-provider"));
     }
 
     #[test]
@@ -137,9 +134,8 @@ mod tests {
             "model_stylesheet".to_string(),
             AttrValue::String("* { model: opus; }".to_string()),
         );
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert!(d.is_empty());
     }
@@ -147,9 +143,8 @@ mod tests {
     #[test]
     fn stylesheet_model_known_rule_no_stylesheet() {
         let g = minimal_graph();
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert!(d.is_empty());
     }

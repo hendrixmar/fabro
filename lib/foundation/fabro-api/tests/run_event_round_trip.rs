@@ -329,10 +329,21 @@ fn run_event_round_trips_agent_tool_started() {
             "model": "claude-sonnet"
         },
         "properties": {
-            "tool_name": "Bash",
-            "tool_call_id": "call_1",
-            "arguments": { "cmd": "cargo test" },
-            "visit": 2
+            "stage": "code",
+            "visit": 2,
+            "seq": 12,
+            "stream_id": "ses_parent",
+            "event": {
+                "ToolCallStarted": {
+                    "tool_name": "Bash",
+                    "tool_call_id": "call_1",
+                    "arguments": { "cmd": "cargo test" }
+                }
+            },
+            "timestamp": "2026-04-29T12:02:00.000Z",
+            "session_id": "ses_child",
+            "parent_session_id": "ses_parent",
+            "tool_call_id": "call_1"
         }
     });
 

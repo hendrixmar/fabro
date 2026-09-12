@@ -15,19 +15,11 @@
 
 
 /**
- * Resource configuration for a sandbox. Fields are nullable when the provider does not surface a value or no limit is configured.
+ * Compute resources of a sandbox, in the units the field names give. A field is null when the provider does not report a value or applies its default.
  */
 export interface SandboxResources {
-    /**
-     * Configured CPU cores. Null when unavailable.
-     */
-    'cpu_cores'?: number;
-    /**
-     * Memory limit in bytes. Null when unavailable or unlimited.
-     */
-    'memory_bytes'?: number;
-    /**
-     * Disk size in bytes. Null when unavailable.
-     */
-    'disk_bytes'?: number;
+    'cpu_cores'?: number | null;
+    'memory_mb'?: number | null;
+    'disk_mb'?: number | null;
+    'gpus'?: number | null;
 }

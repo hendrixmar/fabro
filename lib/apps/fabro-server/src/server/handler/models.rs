@@ -1,18 +1,21 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
-use fabro_auth::ApiCredential;
-use fabro_llm::client::Client as LlmClient;
-use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe};
-use fabro_model::{ModelSelectionError, ReasoningEffort};
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::probe::{self, ApiKeyProbeError, ModelTestStatus};
+use fabro_llm::{ModelSelectionError, api, selection};
 use fabro_redact::redact_string;
+use lithos_llm::types::ReasoningEffort;
 
 use super::super::{
-    ApiError, AppState, FromStr, HashSet, IntoResponse, Json, MAX_PAGE_OFFSET, ModelTestMode, Path,
+    ApiError, AppState, FromStr, IntoResponse, Json, MAX_PAGE_OFFSET, ModelTestMode, Path,
     ProviderCredentialTestRequest, ProviderCredentialTestResponse, ProviderId, ProviderList, Query,
-    RequiredUser, Response, Router, State, StatusCode, auth_issue_message, default_page_limit,
-    error, get, post, run_model_test,
+    RequiredUser, Response, Router, State, StatusCode, default_page_limit, error, get, post,
 };
 use crate::diagnostics;
+
+const CREDENTIAL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -53,18 +56,28 @@ async fn list_models(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ModelListParams>,
 ) -> Response {
-    let provider_id = params.provider.as_deref().map(ProviderId::from);
+    let catalog = state.catalog();
+    // An unknown provider filter matches nothing rather than erroring.
+    let provider_id = params.provider.as_deref().map(|selector| {
+        catalog.enabled_provider(selector).map_or_else(
+            || ProviderId::new(selector),
+            |provider| provider.id().clone(),
+        )
+    });
 
     let query = params.query.as_ref().map(|value| value.to_lowercase());
     let limit = params.limit.clamp(1, 100) as usize;
     let offset = params.offset.min(MAX_PAGE_OFFSET) as usize;
-    let catalog = state.catalog();
     let configured: HashSet<ProviderId> =
         state.ready_llm_provider_ids().await.into_iter().collect();
 
-    let mut data = catalog
-        .list(provider_id.as_ref())
+    let mut data = api::models(&catalog, &configured)
         .into_iter()
+        .filter(|model| {
+            provider_id
+                .as_ref()
+                .is_none_or(|provider| &model.provider == provider)
+        })
         .filter(|model| match &query {
             Some(query) => {
                 model.id.as_str().to_lowercase().contains(query)
@@ -78,11 +91,6 @@ async fn list_models(
         })
         .skip(offset)
         .take(limit + 1)
-        .cloned()
-        .map(|mut model| {
-            model.configured = configured.contains(&model.provider);
-            model
-        })
         .collect::<Vec<_>>();
 
     let has_more = data.len() > limit;
@@ -105,7 +113,7 @@ async fn list_providers(_auth: RequiredUser, State(state): State<Arc<AppState>>)
         .await
         .into_iter()
         .collect();
-    let data = catalog.provider_summaries(&configured);
+    let data = api::providers(&catalog, &configured);
 
     (StatusCode::OK, Json(ProviderList { data })).into_response()
 }
@@ -122,30 +130,24 @@ async fn test_provider_credentials(
 
     let requested_provider = ProviderId::new(provider);
     let catalog = state.catalog();
-    let Some(catalog_provider) = catalog.provider(&requested_provider) else {
-        return ApiError::not_found(format!("Provider not found: {requested_provider}"))
-            .into_response();
-    };
-    if catalog_provider.auth.is_none() {
-        return ApiError::bad_request(format!(
-            "provider '{}' does not define an API-key credential path",
-            catalog_provider.id,
-        ))
-        .into_response();
-    }
-    let provider_id = catalog_provider.id.clone();
-
-    let credential =
-        match ApiCredential::from_api_key(provider_id.clone(), body.api_key, catalog.as_ref()) {
-            Ok(credential) => credential,
-            Err(err) => {
-                return ApiError::bad_request(err.to_string()).into_response();
-            }
-        };
-    let client = match LlmClient::from_credentials(vec![credential], Arc::clone(&catalog)).await {
-        Ok(client) => Arc::new(client),
-        Err(err) => {
-            error!(provider = %provider_id, error = ?err, "Failed to create LLM client for provider credential validation");
+    let outcome = match probe::probe_provider_with_api_key(
+        Catalog::clone(&catalog),
+        &requested_provider,
+        body.api_key,
+        CREDENTIAL_TEST_TIMEOUT,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(ApiKeyProbeError::UnknownProvider(_)) => {
+            return ApiError::not_found(format!("Provider not found: {requested_provider}"))
+                .into_response();
+        }
+        Err(err @ (ApiKeyProbeError::NoApiKeyPath(_) | ApiKeyProbeError::NoProbeModel(_))) => {
+            return ApiError::bad_request(err.to_string()).into_response();
+        }
+        Err(ApiKeyProbeError::Setup(err)) => {
+            error!(provider = %requested_provider, error = ?err, "Failed to create LLM client for provider credential validation");
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to create LLM client: {err}"),
@@ -153,14 +155,6 @@ async fn test_provider_credentials(
             .into_response();
         }
     };
-    let Some(model) = catalog.probe_for_provider(&provider_id) else {
-        return ApiError::bad_request(format!(
-            "provider '{provider_id}' does not define a probe model"
-        ))
-        .into_response();
-    };
-
-    let outcome = run_basic_model_probe(model.id.as_str(), &provider_id, client).await;
     match outcome.status {
         ModelTestStatus::Ok => (
             StatusCode::OK,
@@ -210,12 +204,18 @@ async fn test_model(
         Ok(mode) => mode.unwrap_or(ModelTestMode::Basic),
         Err(error) => return error.into_response(),
     };
-    let reasoning_effort = match parse_query_enum::<ReasoningEffort>(
-        params.reasoning_effort.as_deref(),
-        "reasoning effort",
-    ) {
-        Ok(reasoning_effort) => reasoning_effort,
-        Err(error) => return error.into_response(),
+    let reasoning_effort = match params.reasoning_effort.as_deref() {
+        Some(value) => match value.parse::<ReasoningEffort>() {
+            Ok(effort) => Some(effort),
+            Err(_) => {
+                return ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid reasoning effort: {value}"),
+                )
+                .into_response();
+            }
+        },
+        None => None,
     };
     let llm_result = match state.resolve_llm_client().await {
         Ok(result) => result,
@@ -235,38 +235,60 @@ async fn test_model(
         .collect::<HashSet<_>>();
     let explicit_provider = params.provider.map(ProviderId::new);
     let info = if let Some(provider) = explicit_provider.as_ref() {
-        match catalog.resolve_on_provider(provider, &id) {
+        match selection::resolve_on_provider(&catalog, provider, &id) {
             Ok(info) => info,
             Err(error) => return model_selection_response(&error),
         }
     } else {
-        match catalog.select(&id, None, &eligible) {
+        match selection::select(&catalog, &id, None, &eligible) {
             Ok(info) => info,
             Err(error) => return model_selection_response(&error),
         }
     };
+    let provider_id = info.provider.id().clone();
+    let model_id = info.model.id().clone();
     if let Some((_, issue)) = llm_result
         .auth_issues
         .iter()
-        .find(|(provider, _)| provider == &info.provider)
+        .find(|(provider, _)| provider == &provider_id)
     {
-        return ApiError::bad_request(auth_issue_message(&info.provider, issue)).into_response();
+        return ApiError::bad_request(issue.to_string()).into_response();
     }
-    let provider_name = info.provider.as_str();
-    if !llm_result.client.has_provider(provider_name) {
+    if !llm_result.has_provider(&provider_id) {
         return Json(serde_json::json!({
-            "model_id": info.id,
-            "provider": info.provider,
+            "model_id": model_id,
+            "provider": provider_id,
             "status": "skip",
         }))
         .into_response();
     }
-    let client = Arc::new(llm_result.client);
+    if let Some(effort) = reasoning_effort {
+        let capabilities = info.model.capabilities();
+        if !capabilities.reasoning_effort(effort).is_supported() {
+            let allowed = ReasoningEffort::ALL
+                .into_iter()
+                .filter(|candidate| capabilities.reasoning_effort(*candidate).is_supported())
+                .map(ReasoningEffort::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return ApiError::bad_request(format!(
+                "model '{model_id}' does not support reasoning_effort '{effort}'; allowed values: {allowed}"
+            ))
+            .into_response();
+        }
+    }
 
-    let outcome = run_model_test(info, mode, reasoning_effort, client).await;
+    let outcome = probe::run_model_test(
+        &llm_result.client,
+        &format!("{provider_id}/{model_id}"),
+        mode,
+        reasoning_effort,
+        None,
+    )
+    .await;
     Json(serde_json::json!({
-        "model_id": info.id,
-        "provider": info.provider,
+        "model_id": model_id,
+        "provider": provider_id,
         "status": <&'static str>::from(outcome.status),
         "error_message": outcome.error_message,
     }))

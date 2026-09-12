@@ -1,10 +1,8 @@
 use std::fmt::Write as _;
 
-#[cfg(feature = "docker")]
-use bollard::errors::Error as BollardError;
 use fabro_util::error::{collect_causes, render_with_causes};
 
-use crate::ExecResult;
+use crate::sandbox::{DEFAULT_EXEC_OUTPUT_TAIL_BYTES, redacted_output_tail};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -25,39 +23,12 @@ pub enum Error {
         source:  anyhow::Error,
     },
 
-    #[cfg(feature = "docker")]
-    #[error("Failed to connect to Docker daemon")]
-    DockerConnect {
-        #[source]
-        source: BollardError,
-    },
-
-    #[cfg(feature = "docker")]
-    #[error("Failed to inspect Docker image {image}")]
-    DockerImageInspect {
-        image:  String,
-        #[source]
-        source: BollardError,
-    },
-
-    #[cfg(feature = "docker")]
-    #[error("Failed to pull Docker image {image}")]
-    DockerImagePull {
-        image:  String,
-        #[source]
-        source: BollardError,
-    },
-
-    #[error(
-        "{label} failed (exit {exit}, termination={termination}, duration_ms={duration_ms}) - hint: {hint}",
-        exit = format_exit_code(result.exit_code),
-        termination = result.termination,
-        duration_ms = result.duration_ms,
-        hint = classify_exec_failure(&result.stderr)
-            .or_else(|| classify_exec_failure(&result.stdout))
-            .unwrap_or("unclassified")
-    )]
-    Exec { label: String, result: ExecResult },
+    /// A sandbox-driver failure: provider, transport, or an operation whose
+    /// outcome is unknown. The driver's own variants stay reachable through
+    /// [`Error::driver`] so callers can act on `Exec`, `Git`, and `NotFound`
+    /// without string matching.
+    #[error(transparent)]
+    Driver(Box<sandbox_driver::Error>),
 }
 
 impl Error {
@@ -82,40 +53,28 @@ impl Error {
         }
     }
 
-    pub fn exec(label: impl Into<String>, result: ExecResult) -> Self {
-        Self::Exec {
-            label: label.into(),
-            result,
-        }
-    }
-
     pub fn default_redacted_output_tail(&self) -> Option<fabro_types::ExecOutputTail> {
         default_redacted_output_tail(self)
     }
 
-    #[cfg(feature = "docker")]
-    pub fn docker_connect(source: BollardError) -> Self {
-        Self::DockerConnect { source }
-    }
-
-    #[cfg(feature = "docker")]
-    pub fn docker_image_inspect(image: impl Into<String>, source: BollardError) -> Self {
-        Self::DockerImageInspect {
-            image: image.into(),
-            source,
-        }
-    }
-
-    #[cfg(feature = "docker")]
-    pub fn docker_image_pull(image: impl Into<String>, source: BollardError) -> Self {
-        Self::DockerImagePull {
-            image: image.into(),
-            source,
-        }
-    }
-
     pub fn causes(&self) -> Vec<String> {
         collect_causes(self)
+    }
+
+    /// The underlying sandbox-driver error, when this error carries one
+    /// anywhere in its chain.
+    pub fn driver(&self) -> Option<&sandbox_driver::Error> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(err) = current {
+            if let Some(Self::Driver(driver)) = err.downcast_ref::<Self>() {
+                return Some(driver.as_ref());
+            }
+            if let Some(driver) = err.downcast_ref::<sandbox_driver::Error>() {
+                return Some(driver);
+            }
+            current = err.source();
+        }
+        None
     }
 
     pub fn display_with_causes(&self) -> String {
@@ -123,54 +82,10 @@ impl Error {
     }
 }
 
-impl From<String> for Error {
-    fn from(value: String) -> Self {
-        Self::Message(value)
+impl From<sandbox_driver::Error> for Error {
+    fn from(value: sandbox_driver::Error) -> Self {
+        Self::Driver(Box::new(value))
     }
-}
-
-impl From<&str> for Error {
-    fn from(value: &str) -> Self {
-        Self::Message(value.to_string())
-    }
-}
-
-pub(crate) fn classify_exec_failure(stderr: &str) -> Option<&'static str> {
-    let lower = stderr.to_ascii_lowercase();
-    if lower.contains("could not read username") || lower.contains("terminal prompts disabled") {
-        Some(
-            "no credentials in origin URL - check that the sandbox forwarded \
-             GITHUB_APP_PRIVATE_KEY (or GITHUB_TOKEN) and that refresh_push_credentials succeeded",
-        )
-    } else if lower.contains("permission to") && lower.contains("denied") {
-        Some(
-            "github denied the push - installation token lacks contents:write \
-             on this repo, or a branch protection / push ruleset is rejecting the ref",
-        )
-    } else if lower.contains("protected branch")
-        || lower.contains("ruleset")
-        || lower.contains("rejected")
-    {
-        Some("github rejected the ref - likely a branch protection rule or push ruleset")
-    } else if lower.contains("authentication failed") || lower.contains("invalid username") {
-        Some("github authentication failed - installation token may be expired or wrong scope")
-    } else if lower.contains("could not resolve host") || lower.contains("network is unreachable") {
-        Some("network failure inside sandbox - check DNS / egress from the run container")
-    } else if lower.contains("repository not found") {
-        Some("github 404 - repository is unavailable to the current credentials")
-    } else if lower.contains("no such remote") && lower.contains("origin") {
-        Some("origin remote missing - push credentials could not be installed")
-    } else if lower.contains("not a git repository")
-        || lower.contains("does not appear to be a git repository")
-    {
-        Some("git repository unavailable in sandbox working directory")
-    } else {
-        None
-    }
-}
-
-fn format_exit_code(exit_code: Option<i32>) -> String {
-    exit_code.map_or_else(|| "none".to_string(), |code| code.to_string())
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -180,12 +95,34 @@ pub fn default_redacted_output_tail(
 ) -> Option<fabro_types::ExecOutputTail> {
     let mut current = Some(err);
     while let Some(err) = current {
-        if let Some(Error::Exec { result, .. }) = err.downcast_ref::<Error>() {
-            return result.default_redacted_output_tail();
+        if let Some(Error::Driver(driver)) = err.downcast_ref::<Error>() {
+            if let Some(tail) = driver_output_tail(driver) {
+                return Some(tail);
+            }
+        }
+        if let Some(driver) = err.downcast_ref::<sandbox_driver::Error>() {
+            if let Some(tail) = driver_output_tail(driver) {
+                return Some(tail);
+            }
         }
         current = err.source();
     }
     None
+}
+
+/// The output a driver failure carries: a command that ran and failed, or
+/// a git operation whose command output the driver kept as evidence.
+fn driver_output_tail(error: &sandbox_driver::Error) -> Option<fabro_types::ExecOutputTail> {
+    let failure = match error {
+        sandbox_driver::Error::Exec(failure) => failure,
+        sandbox_driver::Error::Git(git) => git.output()?,
+        _ => return None,
+    };
+    redacted_output_tail(
+        &String::from_utf8_lossy(failure.stdout()),
+        &String::from_utf8_lossy(failure.stderr()),
+        DEFAULT_EXEC_OUTPUT_TAIL_BYTES,
+    )
 }
 
 pub fn display_for_log(err: &(dyn std::error::Error + 'static)) -> String {
@@ -218,64 +155,69 @@ fn append_tail_for_log(rendered: &mut String, stream: &str, tail: Option<&str>, 
 
 #[cfg(test)]
 mod tests {
-    use fabro_types::CommandTermination;
+    use std::time::Duration;
+
+    use sandbox_driver::{ExecResult, Termination};
 
     use super::*;
+    use crate::exec::ExecResultExt;
+
+    const SECRET: &str = "ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA";
+
+    fn failed_push(stdout: &str, stderr: &str) -> Error {
+        let mut result =
+            ExecResult::new(Termination::Exited, Some(128), Duration::from_millis(210));
+        result.stdout = stdout.as_bytes().to_vec();
+        result.stderr = stderr.as_bytes().to_vec();
+        result.into_exec_error("git push origin refs/heads/run")
+    }
+
+    fn leaky_stderr() -> String {
+        format!(
+            "fatal: unable to access 'https://x-access-token:{SECRET}@github.com/owner/repo/':\n\
+             remote: Permission to owner/repo.git denied\n\
+             identity ~/.ssh/id_rsa_work"
+        )
+    }
 
     #[test]
     fn exec_display_is_log_safe() {
-        let stderr = "fatal: unable to access \
-                      'https://x-access-token:ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA@github.com/owner/repo/':\n\
-                      remote: Permission to owner/repo.git denied\n\
-                      identity ~/.ssh/id_rsa_work";
-        let error = Error::exec("git push origin refs/heads/run", crate::ExecResult {
-            stdout:      String::new(),
-            stderr:      stderr.to_string(),
-            exit_code:   Some(128),
-            termination: CommandTermination::Exited,
-            duration_ms: 210,
-        });
+        let error = failed_push("", &leaky_stderr());
         let rendered = error.to_string();
 
         assert_exec_rendering_is_safe(&rendered);
         assert!(rendered.contains("git push origin refs/heads/run"));
-        assert!(rendered.contains("exit 128"));
-        assert!(rendered.contains("termination=exited"));
-        assert!(rendered.contains("duration_ms=210"));
-        assert!(rendered.contains("hint:"));
+        assert!(rendered.contains("128"));
+        assert!(rendered.contains("210 ms"));
     }
 
     #[test]
     fn display_with_causes_does_not_reintroduce_raw_exec_output() {
-        let stderr = "fatal: unable to access \
-                      'https://x-access-token:ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA@github.com/owner/repo/':\n\
-                      remote: Permission to owner/repo.git denied\n\
-                      identity ~/.ssh/id_rsa_work";
-        let exec_error = Error::exec("git push origin refs/heads/run", crate::ExecResult {
-            stdout:      "stdout secret ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA".to_string(),
-            stderr:      stderr.to_string(),
-            exit_code:   Some(128),
-            termination: CommandTermination::Exited,
-            duration_ms: 210,
-        });
+        let exec_error = failed_push(&format!("stdout secret {SECRET}"), &leaky_stderr());
         let error = Error::context("metadata push failed", exec_error);
         let rendered = error.display_with_causes();
 
         assert_exec_rendering_is_safe(&rendered);
         assert!(rendered.contains("metadata push failed"));
         assert!(rendered.contains("git push origin refs/heads/run"));
-        assert!(rendered.contains("hint:"));
+    }
+
+    #[test]
+    fn the_driver_error_is_reachable_through_the_context_chain() {
+        let error = Error::context("metadata push failed", failed_push("", "boom"));
+
+        let Some(sandbox_driver::Error::Exec(failure)) = error.driver() else {
+            panic!("expected an exec failure, got {error:?}");
+        };
+        assert_eq!(failure.label(), "git push origin refs/heads/run");
+        assert_eq!(failure.exit_code(), Some(128));
+        assert_eq!(failure.termination(), Termination::Exited);
+        assert!(Error::message("plain").driver().is_none());
     }
 
     #[test]
     fn display_for_log_walks_context_chain_and_emits_tail() {
-        let exec_error = Error::exec("git push origin refs/heads/run", crate::ExecResult {
-            stdout:      "last stdout line".to_string(),
-            stderr:      "last stderr line".to_string(),
-            exit_code:   Some(128),
-            termination: CommandTermination::Exited,
-            duration_ms: 210,
-        });
+        let exec_error = failed_push("last stdout line", "last stderr line");
         let error = Error::context("metadata push failed", exec_error);
 
         let rendered = display_for_log(&error);
@@ -290,18 +232,15 @@ mod tests {
 
     #[test]
     fn display_for_log_redacts_secrets() {
-        let error = Error::exec("git push origin refs/heads/run", crate::ExecResult {
-            stdout:      "stdout secret ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA".to_string(),
-            stderr:      "stderr secret ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA".to_string(),
-            exit_code:   Some(128),
-            termination: CommandTermination::Exited,
-            duration_ms: 210,
-        });
+        let error = failed_push(
+            &format!("stdout secret {SECRET}"),
+            &format!("stderr secret {SECRET}"),
+        );
 
         let rendered = display_for_log(&error);
 
         assert!(
-            !rendered.contains("ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA"),
+            !rendered.contains(SECRET),
             "log rendering leaked raw secret: {rendered}"
         );
         assert!(rendered.contains("REDACTED"));
@@ -323,7 +262,7 @@ mod tests {
             "fatal:",
             "remote:",
             "x-access-token",
-            "ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA",
+            SECRET,
             "~/.ssh",
             "id_rsa_work",
         ] {
@@ -336,14 +275,7 @@ mod tests {
 
     #[test]
     fn exec_error_exposes_default_redacted_output_tail() {
-        let stderr = "stderr secret ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA";
-        let error = Error::exec("git push origin refs/heads/run", crate::ExecResult {
-            stdout:      "last stdout line".to_string(),
-            stderr:      stderr.to_string(),
-            exit_code:   Some(128),
-            termination: CommandTermination::Exited,
-            duration_ms: 210,
-        });
+        let error = failed_push("last stdout line", &format!("stderr secret {SECRET}"));
 
         let tail = error.default_redacted_output_tail().expect("tail present");
         assert_eq!(tail.stdout.as_deref(), Some("last stdout line"));
@@ -357,56 +289,12 @@ mod tests {
 
     #[test]
     fn free_tail_helper_walks_context_chain() {
-        let exec_error = Error::exec("git push origin refs/heads/run", crate::ExecResult {
-            stdout:      "last stdout line".to_string(),
-            stderr:      "last stderr line".to_string(),
-            exit_code:   Some(128),
-            termination: CommandTermination::Exited,
-            duration_ms: 210,
-        });
+        let exec_error = failed_push("last stdout line", "last stderr line");
         let error = Error::context("metadata push failed", exec_error);
 
         let tail = default_redacted_output_tail(&error).expect("tail present");
 
         assert_eq!(tail.stdout.as_deref(), Some("last stdout line"));
         assert_eq!(tail.stderr.as_deref(), Some("last stderr line"));
-    }
-
-    #[test]
-    fn classify_exec_failure_documents_known_branches() {
-        let cases = [
-            (
-                "fatal: could not read Username for 'https://github.com'",
-                "no credentials in origin URL",
-            ),
-            (
-                "remote: Permission to owner/repo.git denied to fabro-app[bot].",
-                "github denied the push",
-            ),
-            (
-                "remote: error: GH013: Repository rule violations found due to ruleset",
-                "github rejected the ref",
-            ),
-            (
-                "fatal: Authentication failed for 'https://github.com/owner/repo'",
-                "github authentication failed",
-            ),
-            (
-                "fatal: could not resolve host: github.com",
-                "network failure",
-            ),
-            ("remote: Repository not found.", "github 404"),
-            ("error: No such remote 'origin'", "origin remote missing"),
-            ("fatal: not a git repository", "git repository unavailable"),
-        ];
-
-        for (stderr, expected) in cases {
-            let hint = classify_exec_failure(stderr).expect(stderr);
-            assert!(
-                hint.contains(expected),
-                "expected {hint:?} to contain {expected:?}"
-            );
-        }
-        assert_eq!(classify_exec_failure("weird new git error"), None);
     }
 }

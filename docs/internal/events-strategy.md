@@ -125,7 +125,17 @@ Never build the same `RunEvent` twice if multiple sinks receive it.
 
 ### 1. Add the typed event
 
-Add a variant to `Event`, `AgentEvent`, or `SandboxEvent` as appropriate.
+Add a variant to `Event`, `AgentEvent`, or `SandboxLifecycle` as appropriate. Sandbox
+facts come from two places: the pipeline emits `Initializing`, `Ready`, and
+`InitializeFailed` around bringing the sandbox up, and the sandbox driver's own events
+(operations and their outcome, progress inside a create such as an image pull, snapshot
+builds, state observations, notices) are stored whole as `Event::SandboxDriver` by the
+`DriverEventRecorder` in the `fabro-workflow::event` module. Their names derive from the
+event (`fabro_types::sandbox_driver_event_name`): `<subject>.<action>.<phase>` such as
+`sandbox.stop.completed` or `snapshot.create.started`, `<subject>.state`, and
+`<subject>.notice`; their `properties` are the driver's event as the driver serializes
+it, so the driver's `Event` is part of fabro's stored format. Fabro-sandbox emits no
+events of its own.
 
 ### 2. Add tracing
 

@@ -18,9 +18,6 @@
 import type { AgentControlState } from './agent-control-state';
 // May contain unused imports in some cases
 // @ts-ignore
-import type { AgentToolSummary } from './agent-tool-summary';
-// May contain unused imports in some cases
-// @ts-ignore
 import type { BilledTokenCounts } from './billed-token-counts';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -28,6 +25,9 @@ import type { BillingModelRef } from './billing-model-ref';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { CommandTermination } from './command-termination';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ContextWindowSnapshot } from './context-window-snapshot';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { McpServerProjection } from './mcp-server-projection';
@@ -43,9 +43,6 @@ import type { SkillsProjection } from './skills-projection';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { StageCompletion } from './stage-completion';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { StageContextWindowProjection } from './stage-context-window-projection';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { StageInferenceProjection } from './stage-inference-projection';
@@ -67,6 +64,9 @@ import type { SubAgentProjection } from './sub-agent-projection';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { TodoListProjection } from './todo-list-projection';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ToolSummary } from './tool-summary';
 
 /**
  * Observable projection data for one workflow stage execution.
@@ -127,12 +127,12 @@ export interface StageProjection {
     /**
      * Effective model-callable tools exposed to this agent stage session. Tool parameter schemas are intentionally omitted from this projection.
      */
-    'agent_tools'?: Array<AgentToolSummary>;
+    'agent_tools'?: Array<ToolSummary>;
     /**
      * MCP servers observed by this stage.
      */
     'mcp_servers'?: Array<McpServerProjection>;
-    'context_window'?: StageContextWindowProjection | null;
+    'context_window'?: ContextWindowSnapshot | null;
     'inference'?: StageInferenceProjection | null;
     /**
      * Start of an external ACP agent process, if one is running. ACP agents do not expose Fabro\'s internal LLM brackets, so the process lifetime supplies their live inference estimate.

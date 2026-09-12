@@ -15,12 +15,13 @@
 
 
 /**
- * A content part within a message, discriminated by `kind`.
+ * A lithos `ContentPart`, discriminated by `type`: `text` ({text}), `image`, `audio`, `document` ({source, ...}), `reasoning` ({text, signature, redacted}), `tool_call` ({id, name, input}), `tool_result` ({tool_call_id, content, is_error}), `json` ({value}), and `opaque` ({kind, data}).
  */
 export interface CompletionContentPart {
+    [key: string]: any;
+
     /**
-     * Content part type: text, image, tool_call, tool_result, thinking, etc.
+     * Content part type.
      */
-    'kind': string;
-    'data'?: any;
+    'type': string;
 }

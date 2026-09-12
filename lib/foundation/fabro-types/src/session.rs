@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
-use fabro_model::ProviderId;
+use lithos_llm::catalog::ProviderId;
+pub use pebble_coding_agent::events::PermissionLevel;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -8,29 +9,6 @@ use crate::id::ulid_id;
 
 ulid_id!(SessionId);
 ulid_id!(TurnId);
-
-/// Agent tool permission level applied to a session.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    Display,
-    EnumString,
-    IntoStaticStr,
-)]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
-#[serde(rename_all = "kebab-case")]
-#[strum(serialize_all = "kebab-case")]
-pub enum PermissionLevel {
-    ReadOnly,
-    ReadWrite,
-    Full,
-}
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display, EnumString, IntoStaticStr,
@@ -57,7 +35,8 @@ pub struct SessionTurn {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionRecord {
+/// Ask Fabro session metadata derived from the owning run event stream.
+pub struct RunSessionMetadata {
     pub id:          SessionId,
     pub run_id:      RunId,
     pub title:       Option<String>,
@@ -71,7 +50,7 @@ pub struct SessionRecord {
     pub updated_at:  DateTime<Utc>,
 }
 
-impl SessionRecord {
+impl RunSessionMetadata {
     pub fn new(id: SessionId, run_id: RunId, now: DateTime<Utc>) -> Self {
         Self {
             id,
@@ -102,8 +81,8 @@ pub struct SessionSummary {
     pub updated_at:  DateTime<Utc>,
 }
 
-impl From<&SessionRecord> for SessionSummary {
-    fn from(record: &SessionRecord) -> Self {
+impl From<&RunSessionMetadata> for SessionSummary {
+    fn from(record: &RunSessionMetadata) -> Self {
         Self {
             id:          record.id,
             run_id:      record.run_id,
@@ -118,71 +97,20 @@ impl From<&SessionRecord> for SessionSummary {
     }
 }
 
+/// Session metadata plus the event-log position the projection was read at.
+///
+/// The transcript itself is not part of the API: pebble's session record
+/// holds the durable history and the `run.session.*` events stream it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionDetail {
     #[serde(flatten)]
-    pub record:   SessionRecord,
-    #[serde(default)]
-    pub messages: Vec<SessionMessage>,
+    pub record:   RunSessionMetadata,
     pub last_seq: u32,
 }
 
 impl SessionDetail {
-    pub fn new(record: SessionRecord, messages: Vec<SessionMessage>, last_seq: u32) -> Self {
-        Self {
-            record,
-            messages,
-            last_seq,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SessionMessage {
-    User {
-        content:   String,
-        timestamp: DateTime<Utc>,
-    },
-    Assistant {
-        content:        String,
-        #[serde(default)]
-        tool_calls:     Vec<serde_json::Value>,
-        #[serde(default)]
-        provider_parts: Vec<serde_json::Value>,
-        #[serde(default)]
-        usage:          serde_json::Value,
-        response_id:    String,
-        timestamp:      DateTime<Utc>,
-    },
-    ToolResults {
-        #[serde(default)]
-        results:   Vec<serde_json::Value>,
-        timestamp: DateTime<Utc>,
-    },
-    System {
-        content:   String,
-        timestamp: DateTime<Utc>,
-    },
-    Steering {
-        content:   String,
-        timestamp: DateTime<Utc>,
-    },
-}
-
-impl SessionMessage {
-    pub fn user(content: impl Into<String>, timestamp: DateTime<Utc>) -> Self {
-        Self::User {
-            content: content.into(),
-            timestamp,
-        }
-    }
-
-    pub fn system(content: impl Into<String>, timestamp: DateTime<Utc>) -> Self {
-        Self::System {
-            content: content.into(),
-            timestamp,
-        }
+    pub fn new(record: RunSessionMetadata, last_seq: u32) -> Self {
+        Self { record, last_seq }
     }
 }
 
@@ -191,7 +119,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
 
-    use super::{SessionId, SessionRecord, SessionStatus};
+    use super::{RunSessionMetadata, SessionId, SessionStatus};
     use crate::fixtures;
 
     #[test]
@@ -202,7 +130,7 @@ mod tests {
 
     #[test]
     fn session_record_deserializes_legacy_json_without_provider() {
-        let mut value = serde_json::to_value(SessionRecord::new(
+        let mut value = serde_json::to_value(RunSessionMetadata::new(
             SessionId::new(),
             fixtures::RUN_1,
             Utc::now(),
@@ -213,7 +141,7 @@ mod tests {
             .expect("session record should serialize as an object")
             .remove("provider");
 
-        let record: SessionRecord = serde_json::from_value(value).unwrap();
+        let record: RunSessionMetadata = serde_json::from_value(value).unwrap();
 
         assert_eq!(record.provider, None);
     }

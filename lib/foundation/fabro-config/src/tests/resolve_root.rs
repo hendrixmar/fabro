@@ -58,7 +58,7 @@ id = "bad"
             workflow_source,
             r#"
 [environments.bad]
-provider = "not-a-provider"
+provider = "Not A Provider"
 "#
             .parse::<SettingsLayer>()
             .expect("bad environment catalog should parse")
@@ -173,7 +173,7 @@ id = "bad"
 "#,
         r#"
 [environments.bad]
-provider = "not-a-provider"
+provider = "Not A Provider"
 "#
         .parse::<SettingsLayer>()
         .expect("bad environment catalog should parse")
@@ -208,7 +208,7 @@ command = ["echo", "hi"]
 "#,
         r#"
 [environments.bad]
-provider = "not-a-provider"
+provider = "Not A Provider"
 "#
         .parse::<SettingsLayer>()
         .expect("bad environment catalog should parse")

@@ -15,17 +15,15 @@ use dialoguer::console::Term;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Password};
 use fabro_auth::{
-    ApiCredential, AuthContextRequest, AuthContextResponse, AuthMethod, LoginResult,
-    codex_oauth_config, strategy_for,
+    AuthContextRequest, AuthContextResponse, AuthMethod, LoginResult, codex_oauth_config,
+    strategy_for,
 };
-use fabro_llm::client::Client as LlmClient;
-use fabro_llm::generate::{GenerateParams, generate};
-use fabro_model::catalog::CatalogProvider;
-use fabro_model::{Catalog, ProviderId};
+use fabro_llm::lithos_catalog::{Catalog, CatalogProvider};
+use fabro_llm::probe::{self, ApiKeyProbeError, ModelTestStatus};
 use fabro_util::printer::Printer;
 use fabro_util::terminal::Styles;
+use lithos_llm::catalog::{ProviderId, builtin};
 use tokio::task::spawn_blocking;
-use tokio::time::timeout;
 
 // ---------------------------------------------------------------------------
 // Interactive prompts
@@ -55,16 +53,14 @@ pub(crate) enum ApiKeySource {
 // API key validation
 // ---------------------------------------------------------------------------
 
-fn default_catalog_for_provider_auth() -> Result<Arc<Catalog>> {
-    Ok(Arc::new(
-        Catalog::from_builtin().context("failed to build provider auth catalog")?,
-    ))
+fn default_catalog_for_provider_auth() -> Arc<Catalog> {
+    Arc::new(fabro_llm::default_catalog())
 }
 
 pub(crate) fn provider_display_name(provider: &ProviderId, catalog: &Catalog) -> String {
-    catalog.provider(provider).map_or_else(
-        || provider.display_name(),
-        |provider| provider.display_name.clone(),
+    catalog.enabled_provider(provider.as_str()).map_or_else(
+        || provider.to_string(),
+        |provider| provider.display_name().to_string(),
     )
 }
 
@@ -72,15 +68,15 @@ fn api_key_catalog_provider<'a>(
     provider: &ProviderId,
     catalog: &'a Catalog,
 ) -> Result<&'a CatalogProvider> {
-    let catalog_provider = catalog
-        .provider(provider)
+    let provider = catalog
+        .enabled_provider(provider.as_str())
         .with_context(|| format!("provider '{provider}' is not configured in the model catalog"))?;
     anyhow::ensure!(
-        catalog_provider.auth.is_some(),
+        fabro_auth::accepts_api_key(provider),
         "provider '{}' does not define an API-key credential path",
-        catalog_provider.id
+        provider.id()
     );
-    Ok(catalog_provider)
+    Ok(provider)
 }
 
 pub(crate) async fn validate_api_key(
@@ -89,33 +85,28 @@ pub(crate) async fn validate_api_key(
     catalog: Arc<Catalog>,
 ) -> Result<()> {
     api_key_catalog_provider(provider, catalog.as_ref())?;
-    let client = LlmClient::from_credentials(
-        vec![ApiCredential::from_api_key(
-            provider.clone(),
-            api_key.to_string(),
-            catalog.as_ref(),
-        )?],
-        Arc::clone(&catalog),
+    let outcome = probe::probe_provider_with_api_key(
+        Catalog::clone(&catalog),
+        provider,
+        api_key.to_string(),
+        std::time::Duration::from_secs(30),
     )
     .await
-    .context("failed to create LLM client")?;
-
-    let probe_model = catalog.probe_for_provider(provider).map_or_else(
-        || format!("unknown-{provider}"),
-        |model| model.id.to_string(),
-    );
-
-    let params = GenerateParams::new(probe_model, Arc::new(client))
-        .provider(provider.to_string())
-        .prompt("Say OK")
-        .max_tokens(16);
-
-    let response = timeout(std::time::Duration::from_secs(30), generate(params))
-        .await
-        .context("API key validation timed out")?;
-    response
-        .map(|_| ())
-        .context("API key validation request failed")
+    .map_err(|err| match err {
+        ApiKeyProbeError::Setup(err) => {
+            anyhow::Error::new(err).context("failed to create LLM client")
+        }
+        other => anyhow::Error::msg(other.to_string()),
+    })?;
+    match outcome.status {
+        ModelTestStatus::Ok => Ok(()),
+        ModelTestStatus::Error => Err(anyhow::anyhow!(
+            "API key validation request failed: {}",
+            outcome
+                .error_message
+                .unwrap_or_else(|| "unknown error".to_string())
+        )),
+    }
 }
 
 fn normalize_api_key_input(raw: &str) -> Result<String> {
@@ -193,7 +184,7 @@ async fn read_and_validate_api_key(
 }
 
 pub(crate) async fn pick_auth_method(provider: &ProviderId) -> Result<AuthMethod> {
-    if provider != &ProviderId::openai() {
+    if provider != &builtin::openai() {
         return Ok(AuthMethod::ApiKey);
     }
 
@@ -212,7 +203,7 @@ pub(crate) async fn authenticate_provider(
     s: &Styles,
     printer: Printer,
 ) -> Result<LoginResult> {
-    authenticate_provider_with_catalog(provider, s, printer, default_catalog_for_provider_auth()?)
+    authenticate_provider_with_catalog(provider, s, printer, default_catalog_for_provider_auth())
         .await
 }
 
@@ -238,7 +229,7 @@ pub(crate) async fn authenticate_provider_with_api_key_source(
         source,
         s,
         printer,
-        default_catalog_for_provider_auth()?,
+        default_catalog_for_provider_auth(),
     )
     .await
 }
@@ -269,7 +260,7 @@ pub(crate) async fn authenticate_provider_with_method(
         method,
         s,
         printer,
-        default_catalog_for_provider_auth()?,
+        default_catalog_for_provider_auth(),
     )
     .await
 }
@@ -381,29 +372,29 @@ mod tests {
 
     #[test]
     fn builtin_api_key_providers_have_key_urls() {
-        let catalog = Catalog::builtin();
+        let catalog = fabro_llm::default_catalog();
         for provider in [
-            ProviderId::anthropic(),
-            ProviderId::openai(),
-            ProviderId::gemini(),
+            builtin::anthropic(),
+            builtin::openai(),
+            builtin::gemini(),
             ProviderId::new("moonshot"),
             ProviderId::new("zai"),
             ProviderId::new("minimax"),
             ProviderId::new("inception"),
         ] {
-            let provider = api_key_catalog_provider(&provider, catalog).unwrap();
-            let url = provider.api_key_url.as_deref().unwrap_or_default();
-            assert!(!url.is_empty(), "{} has empty URL", provider.id);
-            assert!(url.starts_with("https://"), "{} URL: {url}", provider.id);
+            let provider = api_key_catalog_provider(&provider, &catalog).unwrap();
+            let url = provider.api_key_url().unwrap_or_default();
+            assert!(!url.is_empty(), "{} has empty URL", provider.id());
+            assert!(url.starts_with("https://"), "{} URL: {url}", provider.id());
         }
     }
 
     #[test]
     fn api_key_catalog_provider_rejects_unconfigured_provider() {
-        let catalog = Catalog::builtin();
+        let catalog = fabro_llm::default_catalog();
         let provider = ProviderId::new("bogus");
 
-        let err = api_key_catalog_provider(&provider, catalog).unwrap_err();
+        let err = api_key_catalog_provider(&provider, &catalog).unwrap_err();
 
         assert!(
             err.to_string()
@@ -417,9 +408,9 @@ mod tests {
     #[fabro_macros::e2e_test(live("ANTHROPIC_API_KEY"))]
     async fn validate_api_key_rejects_invalid_key() {
         let result = validate_api_key(
-            &ProviderId::anthropic(),
+            &builtin::anthropic(),
             "sk-invalid-key-12345",
-            default_catalog_for_provider_auth().unwrap(),
+            default_catalog_for_provider_auth(),
         )
         .await;
         assert!(result.is_err(), "expected invalid key to be rejected");

@@ -181,9 +181,10 @@ The GitHub OAuth client ID still lives under `[server.integrations.github].clien
 
 ### `[server.sandbox.providers]` section
 
-Controls which sandbox providers the server may launch. Missing provider entries default to
-`enabled = true` for backward compatibility. Disabling a provider rejects new runs whose effective
-provider is disabled; dry-run Docker/Daytona runs use the local provider and are governed by
+Controls which sandbox providers the server may launch, keyed by provider kind. The bundled
+providers `local`, `docker`, and `daytona` run inside the server and default to `enabled = true`
+when their entry is missing. Disabling a provider rejects new runs whose effective provider is
+disabled; dry-run Docker/Daytona runs use the local provider and are governed by
 `server.sandbox.providers.local.enabled`.
 
 ```toml title="settings.toml"
@@ -196,6 +197,34 @@ enabled = true
 [server.sandbox.providers.daytona]
 enabled = true
 ```
+
+Any other key names a [sandbox-driver](https://github.com/lithoscomputer/sandbox-driver) plugin:
+an executable that speaks the sandbox-driver JSON-RPC protocol on stdin and stdout. The kind must
+be lowercase ASCII letters, digits, and interior hyphens. The plugin starts with a scrubbed
+environment: only `env` and the ambient variables listed in `inherit_env` reach it. Bundled
+providers reject these plugin keys.
+
+```toml title="settings.toml"
+[server.sandbox.providers.e2b]
+enabled = true
+path = "/opt/fabro/plugins/fabro-sandbox-e2b"   # default: `fabro-sandbox-<kind>` on PATH
+sha256 = "0123…cdef"                            # pin the executable; `dev = true` skips it
+args = []
+inherit_env = ["PATH"]
+
+[server.sandbox.providers.e2b.env]
+E2B_API_URL = "https://api.e2b.example"
+```
+
+| Key | Description | Default |
+|---|---|---|
+| `enabled` | Whether runs may select this provider | `true` |
+| `path` | Plugin executable path | `fabro-sandbox-<kind>` on `PATH` |
+| `sha256` | Pinned SHA-256 of the executable, hex | none |
+| `dev` | Allow launching without a checksum | `false` |
+| `args` | Arguments passed to the executable | `[]` |
+| `env` | Complete environment for the plugin, apart from `inherit_env` | `{}` |
+| `inherit_env` | Ambient variables forwarded from the server process | `[]` |
 
 ### `[server.slatedb]` section
 
@@ -301,12 +330,22 @@ The CLI has its own `[cli.logging]` section.
 
 ### `[run.git.author]` section
 
-Customize the git author identity used for checkpoint commits. When not set, defaults to `fabro` / `fabro@local`.
+Override the Git author and committer identity for every commit a run creates: Fabro's own checkpoint and metadata commits, and any `git commit` a prepare step, command stage, or agent tool runs inside the sandbox. Fabro resolves one identity per run and injects it as `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` into every workflow command, so the primary checkout, additional clones, and repositories a workflow clones itself all commit as the same identity. It does not write to any Git configuration file.
+
+When a field is not set, Fabro derives it from the run's GitHub credential:
+
+| Credential | Name | Email |
+|---|---|---|
+| GitHub App (`strategy = "app"`) | `<slug>[bot]` | `<id>+<slug>[bot]@users.noreply.github.com` |
+| Token (`strategy = "token"`) | the token's user login | `<id>+<login>@users.noreply.github.com` |
+| None | `Fabro` | `noreply@fabro.sh` |
+
+Setting both `name` and `email` skips the credential lookup. Setting one field overlays it on the derived identity. A lookup failure for the selected credential fails the run at setup; Fabro never silently switches to another author. The resolved identity is recorded in the run's event stream as `git.identity.resolved` and in the run state as `git_identity`.
 
 | Key | Description | Default |
 |---|---|---|
-| `name` | Git author name | `"fabro"` |
-| `email` | Git author email | `"fabro@local"` |
+| `name` | Git author and committer name | derived from the run's GitHub credential |
+| `email` | Git author and committer email | derived from the run's GitHub credential |
 
 ### `[server.integrations.github]` section
 
@@ -371,7 +410,7 @@ Fabro splits server-runtime secrets into two scopes:
 
 `server.env` is not used for Slack, Daytona, Brave Search, Venice Search, LLM provider keys, `GITHUB_TOKEN`, or GitHub App private key/client secret/webhook secret. Configure those optional integrations with `fabro secret set`, `fabro provider login`, or `fabro install`.
 
-During startup, Fabro temporarily migrates recognized legacy optional integration secrets from process env or `server.env` into the vault. When a matching `server.env` entry can be safely removed, Fabro writes a hidden backup beside `server.env` first. Process env values cannot be cleaned up automatically, so remove those from your deployment environment after the vault contains the secret.
+Startup does not import optional integration secrets from process env or `server.env`, or rewrite old `credential` / `environment` vault entries. Provision these secrets with the commands above before upgrading an installation that still uses those retired sources or formats.
 
 Fabro no longer auto-loads `.env` files. Provider API keys are required for the models you want to use; everything else is optional.
 

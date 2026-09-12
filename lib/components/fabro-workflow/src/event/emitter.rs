@@ -8,6 +8,7 @@ use tokio::time::Instant;
 
 use super::Event;
 use super::convert::to_run_event_at;
+use super::sink::{RunEventLogger, RunEventPersistenceError};
 use crate::millis_u64;
 use crate::stage_scope::StageScope;
 
@@ -18,6 +19,9 @@ type EventListener = Arc<dyn Fn(&RunEvent) + Send + Sync>;
 pub struct Emitter {
     run_id:           RunId,
     listeners:        std::sync::Mutex<Vec<EventListener>>,
+    /// The persistence path. Events reach it before any listener, and
+    /// [`Emitter::emit_durable`] waits for it.
+    persisters:       std::sync::Mutex<Vec<RunEventLogger>>,
     /// Monotonic origin that `last_activity_ms` is measured from.
     activity_origin:  Instant,
     /// Milliseconds after `activity_origin` of the last `emit()` or `touch()`.
@@ -51,6 +55,7 @@ impl Emitter {
         Self {
             run_id,
             listeners: std::sync::Mutex::new(Vec::new()),
+            persisters: std::sync::Mutex::new(Vec::new()),
             activity_origin: Instant::now(),
             last_activity_ms: AtomicU64::new(0),
         }
@@ -68,8 +73,44 @@ impl Emitter {
             .push(Arc::new(listener));
     }
 
+    pub(super) fn attach_persistence(&self, logger: RunEventLogger) {
+        self.persisters
+            .lock()
+            .expect("persisters lock poisoned")
+            .push(logger);
+    }
+
     pub fn emit(&self, event: &Event) {
         self.emit_with_scope(event, None);
+    }
+
+    /// Emits `event` and returns once every attached persistence path has
+    /// accepted it.
+    ///
+    /// Listeners see the event only after it is durable. With no persistence
+    /// attached the event is dispatched to listeners and the call succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the persistence failure that stopped the run event log.
+    pub async fn emit_durable(
+        &self,
+        event: &Event,
+        scope: Option<&StageScope>,
+    ) -> Result<(), RunEventPersistenceError> {
+        event.trace();
+        let stored = to_run_event_at(&self.run_id, event, Utc::now(), scope);
+        self.record_activity();
+        let persisters: Vec<RunEventLogger> = self
+            .persisters
+            .lock()
+            .expect("persisters lock poisoned")
+            .clone();
+        for persister in &persisters {
+            persister.write_acknowledged(&stored).await?;
+        }
+        self.dispatch_to_listeners(&stored);
+        Ok(())
     }
 
     pub fn emit_scoped(&self, event: &Event, scope: &StageScope) {
@@ -132,6 +173,18 @@ impl Emitter {
 
     pub(crate) fn dispatch_run_event(&self, event: &RunEvent) {
         self.record_activity();
+        let persisters: Vec<RunEventLogger> = self
+            .persisters
+            .lock()
+            .expect("persisters lock poisoned")
+            .clone();
+        for persister in &persisters {
+            persister.enqueue(event);
+        }
+        self.dispatch_to_listeners(event);
+    }
+
+    fn dispatch_to_listeners(&self, event: &RunEvent) {
         // Clone the listener list so we don't hold the lock during dispatch.
         // This prevents deadlocks if a listener calls emit() reentrantly.
         // Note: listeners added during this emit() won't receive the current event.

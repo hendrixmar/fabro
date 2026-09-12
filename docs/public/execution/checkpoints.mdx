@@ -40,6 +40,8 @@ The `git_commit_sha` in a `checkpoint.completed` event identifies the run branch
 
 Fabro disables Git commit and tag signing for checkpoint commits created inside a sandbox. Your personal or repository-level signing settings can stay enabled, but sandbox bookkeeping does not need access to your signing key.
 
+Checkpoint commits and any commit a workflow command or agent creates all carry the run's one resolved Git identity. Fabro derives it from the run's GitHub App bot account or token user, or from the generic `Fabro <noreply@fabro.sh>` identity when the run has no GitHub credential, and `[run.git.author]` overrides it. See [`[run.git.author]`](/administration/server-configuration#rungitauthor-section).
+
 ### Durable execution state
 
 Fabro derives run state from persisted events. The projection includes the run spec, start and status records, checkpoints, stage results, conclusion, and sandbox information. Artifact payloads live in CAS.

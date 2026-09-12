@@ -13,9 +13,12 @@
  */
 
 
+// May contain unused imports in some cases
+// @ts-ignore
+import type { CompletionToolDefinitionKind } from './completion-tool-definition-kind';
 
 /**
- * A tool available for the model to call.
+ * A lithos `ToolDefinition`. `kind` is `{type: function, input_schema}` for JSON-argument tools or `{type: custom, format}` for free-form input.
  */
 export interface CompletionToolDefinition {
     /**
@@ -26,5 +29,5 @@ export interface CompletionToolDefinition {
      * Human-readable tool description.
      */
     'description': string;
-    'parameters': any;
+    'kind': CompletionToolDefinitionKind;
 }

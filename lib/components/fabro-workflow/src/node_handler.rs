@@ -94,7 +94,7 @@ pub(crate) async fn execute_single_attempt(
     let wf_context = artifact::resolve_context_for_execution(
         context,
         &services.run.run_store,
-        &*services.run.sandbox,
+        &services.run.sandbox,
         run_dir,
     )
     .await

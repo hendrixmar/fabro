@@ -33,7 +33,7 @@ import type { WorkflowVersion } from '../models';
 export const WorkflowVersionsApiAxiosParamCreator = function (configuration?: Configuration) {
     return {
         /**
-         * Validates and stores an immutable workflow package in content-addressed storage. Repeating the same canonical content returns the same identifier.
+         * Validates and stores an immutable workflow package in content-addressed storage. Repeating the same canonical content returns the same identifier. Requires an authenticated user or a worker token with the `agent:run_tools` capability. Ordinary worker tokens cannot register versions. Registration creates no run and starts no execution.
          * @summary Create Workflow Version
          * @param {WorkflowVersion} workflowVersion
          * @param {*} [options] Override http request option.
@@ -83,7 +83,7 @@ export const WorkflowVersionsApiFp = function(configuration?: Configuration) {
     const localVarAxiosParamCreator = WorkflowVersionsApiAxiosParamCreator(configuration)
     return {
         /**
-         * Validates and stores an immutable workflow package in content-addressed storage. Repeating the same canonical content returns the same identifier.
+         * Validates and stores an immutable workflow package in content-addressed storage. Repeating the same canonical content returns the same identifier. Requires an authenticated user or a worker token with the `agent:run_tools` capability. Ordinary worker tokens cannot register versions. Registration creates no run and starts no execution.
          * @summary Create Workflow Version
          * @param {WorkflowVersion} workflowVersion
          * @param {*} [options] Override http request option.
@@ -105,7 +105,7 @@ export const WorkflowVersionsApiFactory = function (configuration?: Configuratio
     const localVarFp = WorkflowVersionsApiFp(configuration)
     return {
         /**
-         * Validates and stores an immutable workflow package in content-addressed storage. Repeating the same canonical content returns the same identifier.
+         * Validates and stores an immutable workflow package in content-addressed storage. Repeating the same canonical content returns the same identifier. Requires an authenticated user or a worker token with the `agent:run_tools` capability. Ordinary worker tokens cannot register versions. Registration creates no run and starts no execution.
          * @summary Create Workflow Version
          * @param {WorkflowVersion} workflowVersion
          * @param {*} [options] Override http request option.
@@ -122,7 +122,7 @@ export const WorkflowVersionsApiFactory = function (configuration?: Configuratio
  */
 export class WorkflowVersionsApi extends BaseAPI {
     /**
-     * Validates and stores an immutable workflow package in content-addressed storage. Repeating the same canonical content returns the same identifier.
+     * Validates and stores an immutable workflow package in content-addressed storage. Repeating the same canonical content returns the same identifier. Requires an authenticated user or a worker token with the `agent:run_tools` capability. Ordinary worker tokens cannot register versions. Registration creates no run and starts no execution.
      * @summary Create Workflow Version
      * @param {WorkflowVersion} workflowVersion
      * @param {*} [options] Override http request option.

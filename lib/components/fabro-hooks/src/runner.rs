@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use fabro_agent::Sandbox;
-use fabro_auth::CredentialSource;
 #[cfg(test)]
 use fabro_auth::test_support;
-use fabro_model::Catalog;
+use fabro_llm::credentials::CredentialProvider;
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_sandbox::RunSandbox;
 
 use crate::config::{HookDefinition, HookSettings};
 use crate::executor::{HookExecutor, HookExecutorImpl};
@@ -16,7 +16,7 @@ use crate::types::{HookContext, HookDecision, HookExecutionContext};
 pub struct HookRunner {
     config:            HookSettings,
     executor:          Arc<dyn HookExecutor>,
-    llm_source:        Arc<dyn CredentialSource>,
+    llm_source:        Arc<dyn CredentialProvider>,
     catalog:           Arc<Catalog>,
     /// Pre-compiled regexes keyed by matcher pattern string.
     compiled_matchers: HashMap<String, regex::Regex>,
@@ -26,7 +26,7 @@ impl HookRunner {
     #[must_use]
     pub fn new(
         config: HookSettings,
-        llm_source: Arc<dyn CredentialSource>,
+        llm_source: Arc<dyn CredentialProvider>,
         catalog: Arc<Catalog>,
     ) -> Self {
         let compiled_matchers = Self::compile_matchers(&config);
@@ -47,7 +47,7 @@ impl HookRunner {
             config,
             executor,
             llm_source: test_support::vault_only_credential_source(),
-            catalog: Arc::new(Catalog::from_builtin().expect("default catalog should build")),
+            catalog: Arc::new(fabro_llm::default_catalog()),
             compiled_matchers,
         }
     }
@@ -71,7 +71,7 @@ impl HookRunner {
     pub async fn run(
         &self,
         context: &HookContext,
-        sandbox: Arc<dyn Sandbox>,
+        sandbox: Arc<RunSandbox>,
         execution_context: HookExecutionContext,
     ) -> HookDecision {
         let matching = self.filter_hooks(context);
@@ -141,7 +141,7 @@ impl HookRunner {
         &self,
         hooks: &[&HookDefinition],
         context: &HookContext,
-        sandbox: Arc<dyn Sandbox>,
+        sandbox: Arc<RunSandbox>,
         execution_context: &HookExecutionContext,
     ) -> HookDecision {
         let mut merged = HookDecision::Proceed;
@@ -158,7 +158,7 @@ impl HookRunner {
                     context,
                     sandbox.clone(),
                     execution_context,
-                    self.llm_source.as_ref(),
+                    Arc::clone(&self.llm_source),
                     Arc::clone(&self.catalog),
                 )
                 .await;
@@ -197,7 +197,7 @@ impl HookRunner {
         &self,
         hooks: &[&HookDefinition],
         context: &HookContext,
-        sandbox: Arc<dyn Sandbox>,
+        sandbox: Arc<RunSandbox>,
         execution_context: &HookExecutionContext,
     ) -> HookDecision {
         for hook in hooks {
@@ -213,7 +213,7 @@ impl HookRunner {
                     context,
                     sandbox.clone(),
                     execution_context,
-                    self.llm_source.as_ref(),
+                    Arc::clone(&self.llm_source),
                     Arc::clone(&self.catalog),
                 )
                 .await;
@@ -254,9 +254,9 @@ mod tests {
             &self,
             definition: &HookDefinition,
             _context: &HookContext,
-            _sandbox: Arc<dyn Sandbox>,
+            _sandbox: Arc<RunSandbox>,
             _execution_context: &HookExecutionContext,
-            _llm_source: &dyn CredentialSource,
+            _llm_source: Arc<dyn CredentialProvider>,
             _catalog: Arc<Catalog>,
         ) -> HookResult {
             HookResult {
@@ -267,22 +267,24 @@ mod tests {
         }
     }
 
-    fn make_sandbox() -> Arc<dyn Sandbox> {
-        Arc::new(fabro_agent::LocalSandbox::new(
-            std::env::current_dir().unwrap(),
-        ))
+    async fn make_sandbox() -> Arc<RunSandbox> {
+        Arc::new(
+            fabro_sandbox::local_sandbox(std::env::current_dir().unwrap())
+                .await
+                .unwrap(),
+        )
     }
 
     fn make_context(event: HookEvent) -> HookContext {
         HookContext::new(event, fixtures::RUN_1, "test-wf".into())
     }
 
-    fn test_llm_source() -> Arc<dyn CredentialSource> {
+    fn test_llm_source() -> Arc<dyn CredentialProvider> {
         test_support::vault_only_credential_source()
     }
 
     fn test_catalog() -> Arc<Catalog> {
-        Arc::new(Catalog::from_builtin().expect("default catalog should build"))
+        Arc::new(fabro_llm::default_catalog())
     }
 
     fn make_hook(event: HookEvent, name: &str) -> HookDefinition {
@@ -302,7 +304,7 @@ mod tests {
     async fn no_hooks_returns_proceed() {
         let runner = HookRunner::new(HookSettings::default(), test_llm_source(), test_catalog());
         let ctx = make_context(HookEvent::RunStart);
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let decision = runner
             .run(&ctx, sandbox.clone(), HookExecutionContext::default())
             .await;
@@ -414,7 +416,7 @@ mod tests {
             }),
         );
         let ctx = make_context(HookEvent::RunStart);
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let decision = runner
             .run(&ctx, sandbox.clone(), HookExecutionContext::default())
             .await;
@@ -435,7 +437,7 @@ mod tests {
             }),
         );
         let ctx = make_context(HookEvent::StageStart);
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let decision = runner
             .run(&ctx, sandbox.clone(), HookExecutionContext::default())
             .await;
@@ -456,7 +458,7 @@ mod tests {
             }),
         );
         let ctx = make_context(HookEvent::StageComplete);
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let decision = runner
             .run(&ctx, sandbox.clone(), HookExecutionContext::default())
             .await;
@@ -475,7 +477,7 @@ mod tests {
         };
         let runner = HookRunner::new(config, test_llm_source(), test_catalog());
         let ctx = make_context(HookEvent::RunStart);
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let decision = runner
             .run(&ctx, sandbox.clone(), HookExecutionContext::default())
             .await;
@@ -493,7 +495,7 @@ mod tests {
         };
         let runner = HookRunner::new(config, test_llm_source(), test_catalog());
         let ctx = make_context(HookEvent::RunStart);
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let decision = runner
             .run(&ctx, sandbox.clone(), HookExecutionContext::default())
             .await;

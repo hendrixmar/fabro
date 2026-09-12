@@ -856,7 +856,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/SessionRecord"
+                $ref: "#/components/schemas/RunSessionMetadata"
         "400":
           description: Invalid input
           headers:
@@ -1086,6 +1086,9 @@ paths:
       description: >-
         Validates and stores an immutable workflow package in content-addressed
         storage. Repeating the same canonical content returns the same identifier.
+        Requires an authenticated user or a worker token with the `agent:run_tools`
+        capability. Ordinary worker tokens cannot register versions. Registration
+        creates no run and starts no execution.
       requestBody:
         required: true
         content:
@@ -3907,7 +3910,7 @@ paths:
       operationId: retrieveRunSandbox
       tags: [Human-in-the-Loop]
       summary: Retrieve Run Sandbox Details
-      description: Returns provider-neutral details about the sandbox owned by this run, including identity, normalized state, image/snapshot, resources, labels, and timestamps.
+      description: Returns the sandbox owned by this run as fabro's record of it plus the sandbox driver's status (identity, state, image or snapshot, resources, network policy, labels, and timestamps).
       parameters:
         - $ref: "#/components/parameters/RunId"
       responses:
@@ -5814,9 +5817,10 @@ paths:
       description: |
         Generate a text completion. Set `stream: true` for SSE streaming.
 
-        All SSE frames use `event: stream_event` with a JSON-serialized StreamEvent
-        payload. StreamEvent types: stream_start, text_start, text_delta, text_end,
-        tool_call_start, tool_call_delta, tool_call_end, finish, error.
+        All SSE frames use `event: stream_event` with a JSON-serialized lithos
+        `StreamEvent` payload, discriminated by `type`: started,
+        content_block_start, text_delta, reasoning_delta, tool_call_delta,
+        content_block_end, usage, rate_limits, ended, and error.
       requestBody:
         required: true
         content:
@@ -7243,7 +7247,7 @@ components:
           description: Stable revision used with `If-Match` for optimistic concurrency.
           example: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         provider:
-          $ref: "#/components/schemas/EnvironmentProvider"
+          $ref: "#/components/schemas/SandboxProviderKind"
         cwd:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
@@ -7282,7 +7286,7 @@ components:
           pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
           example: docker
         provider:
-          $ref: "#/components/schemas/EnvironmentProvider"
+          $ref: "#/components/schemas/SandboxProviderKind"
         cwd:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
@@ -7316,7 +7320,7 @@ components:
         - env
       properties:
         provider:
-          $ref: "#/components/schemas/EnvironmentProvider"
+          $ref: "#/components/schemas/SandboxProviderKind"
         cwd:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
@@ -8036,35 +8040,7 @@ components:
         input:
           type: string
 
-    SessionMessage:
-      description: Persisted full-fidelity session transcript message.
-      type: object
-      required:
-        - kind
-        - timestamp
-      properties:
-        kind:
-          type: string
-          enum: [user, assistant, tool_results, system, steering]
-        content:
-          type: string
-        timestamp:
-          type: string
-          format: date-time
-        tool_calls:
-          type: array
-          items: {}
-        provider_parts:
-          type: array
-          items: {}
-        usage: {}
-        response_id:
-          type: string
-        results:
-          type: array
-          items: {}
-
-    SessionRecord:
+    RunSessionMetadata:
       description: Ask Fabro session metadata derived from the owning run event stream.
       type: object
       required:
@@ -8141,7 +8117,10 @@ components:
           format: date-time
 
     SessionDetail:
-      description: Session metadata plus durable transcript projection.
+      description: >-
+        Session metadata plus the highest run event sequence the session's
+        event stream has reached. The conversation itself is held by the
+        server's durable session record and is not returned over the API.
       type: object
       required:
         - id
@@ -8150,7 +8129,6 @@ components:
         - active_turn
         - created_at
         - updated_at
-        - messages
         - last_seq
       properties:
         id:
@@ -8179,10 +8157,6 @@ components:
         updated_at:
           type: string
           format: date-time
-        messages:
-          type: array
-          items:
-            $ref: "#/components/schemas/SessionMessage"
         last_seq:
           type: integer
           minimum: 0
@@ -8430,6 +8404,7 @@ components:
         - id
         - display_name
         - adapter
+        - base_url
         - priority
         - model_count
         - configured
@@ -8442,12 +8417,12 @@ components:
           example: "Anthropic"
         adapter:
           type: string
-          enum: [anthropic, openai, gemini, openai_compatible]
-          description: Protocol adapter the provider speaks.
+          description: "lithos adapter id the provider speaks, such as `anthropic`, `openai`, `gemini`, or `openai-compatible`."
           example: "anthropic"
         base_url:
-          type: ["string", "null"]
-          description: Operator-set base URL override, if any.
+          type: string
+          description: Effective API base URL, including any operator override.
+          example: "https://api.anthropic.com"
         api_key_url:
           type: ["string", "null"]
           description: URL where an operator can obtain an API key for this provider.
@@ -8506,22 +8481,11 @@ components:
           description: Maximum output tokens, if known.
           example: 128000
 
-    ReasoningEffortFeature:
-      description: >-
-        Whether the model endpoint supports a native reasoning-effort
-        parameter. `levels` accepts discrete effort levels; `always_adaptive`
-        accepts effort levels with natively always-on adaptive thinking;
-        `none` has no native effort parameter.
-      type: string
-      enum:
-        - levels
-        - always_adaptive
-        - none
-
     ReasoningEffort:
       description: Native reasoning-effort level requested for an LLM call.
       type: string
       enum:
+        - minimal
         - low
         - medium
         - high
@@ -8529,38 +8493,28 @@ components:
         - max
 
     ModelFeatures:
-      description: Capability flags for a model.
+      description: "Capability flags for a model, from the lithos catalog."
       type: object
       required:
         - tools
         - vision
         - reasoning
-        - reasoning_effort
         - prompt_cache
-        - cache_control_breakpoints
-        - sampling_params
+        - sampling
       properties:
         tools:
           type: boolean
           description: Whether the model supports tool use.
         vision:
           type: boolean
-          description: Whether the model supports vision/image inputs.
+          description: Whether the model supports image inputs.
         reasoning:
           type: boolean
           description: Whether the model supports extended reasoning.
-        reasoning_effort:
-          $ref: "#/components/schemas/ReasoningEffortFeature"
         prompt_cache:
           type: boolean
           description: Whether the model endpoint supports prompt caching.
-        cache_control_breakpoints:
-          type: boolean
-          description: >-
-            Whether the endpoint only caches when the request marks the
-            cacheable prefix with Anthropic-style cache_control breakpoints
-            (e.g. Claude via OpenRouter).
-        sampling_params:
+        sampling:
           type: boolean
           description: Whether the model accepts classic sampling parameters (temperature, top_p).
 
@@ -8713,13 +8667,13 @@ components:
     # ── Completion Schemas ─────────────────────────────────────────────
 
     CompletionMessage:
-      description: A message in the conversation.
+      description: "A lithos `Message`. `content` parts are discriminated by `type`."
       type: object
       required: [role, content]
       properties:
         role:
           type: string
-          enum: [system, user, assistant, tool, developer]
+          enum: [system, developer, user, assistant, tool]
           description: The role of the message author.
         content:
           type: array
@@ -8734,20 +8688,27 @@ components:
           description: Tool call ID for tool result messages.
 
     CompletionContentPart:
-      description: A content part within a message, discriminated by `kind`.
+      description: >-
+        A lithos `ContentPart`, discriminated by `type`: `text` ({text}),
+        `image`, `audio`, `document` ({source, ...}), `reasoning` ({text,
+        signature, redacted}), `tool_call` ({id, name, input}), `tool_result`
+        ({tool_call_id, content, is_error}), `json` ({value}), and `opaque`
+        ({kind, data}).
       type: object
-      required: [kind]
+      required: [type]
       properties:
-        kind:
+        type:
           type: string
-          description: "Content part type: text, image, tool_call, tool_result, thinking, etc."
-        data:
-          description: Content data, structure depends on kind.
+          description: Content part type.
+      additionalProperties: true
 
     CompletionToolDefinition:
-      description: A tool available for the model to call.
+      description: >-
+        A lithos `ToolDefinition`. `kind` is `{type: function, input_schema}`
+        for JSON-argument tools or `{type: custom, format}` for free-form
+        input.
       type: object
-      required: [name, description, parameters]
+      required: [name, description, kind]
       properties:
         name:
           type: string
@@ -8755,23 +8716,50 @@ components:
         description:
           type: string
           description: Human-readable tool description.
-        parameters:
-          description: JSON Schema for the tool's parameters.
+        kind:
+          $ref: "#/components/schemas/CompletionToolDefinitionKind"
+
+    CompletionToolDefinitionKind:
+      description: >-
+        lithos `ToolDefinitionKind`: `{type: function, input_schema}` for
+        JSON-argument tools or `{type: custom, format}` for free-form input.
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [function, custom]
+      additionalProperties: true
+
+    CompletionResponseFormat:
+      description: >-
+        lithos `ResponseFormat`, discriminated by `type`: `text`,
+        `json_object`, or `json_schema` ({name, schema}).
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [text, json_object, json_schema]
+      additionalProperties: true
 
     CompletionToolChoice:
-      description: Controls how the model selects tools.
+      description: "A lithos `ToolChoice`, discriminated by `type`."
       type: object
-      required: [mode]
+      required: [type]
       properties:
-        mode:
+        type:
           type: string
-          enum: [auto, none, required, named]
+          enum: [auto, none, required, tool]
           description: Tool selection mode.
-        tool_name:
+        name:
           type: string
-          description: Required when mode is "named".
+          description: Required when type is `tool`.
 
     CreateCompletionRequest:
+      description: >-
+        A lithos `Request` plus `stream`. Field names match the lithos wire
+        form so a serialized lithos request can be posted as-is.
       type: object
       required: [messages]
       properties:
@@ -8782,7 +8770,13 @@ components:
             $ref: "#/components/schemas/CompletionMessage"
         model:
           type: string
-          description: Model ID or alias. Server picks a ready-provider default if omitted.
+          description: >-
+            Model selector: `provider/model`, a model id or alias, or a
+            provider id. The server picks a ready-provider default when
+            omitted.
+        provider:
+          type: string
+          description: Optional provider pin for a bare model selector.
         system:
           type: string
           description: System prompt (convenience; prepended as a system message).
@@ -8797,14 +8791,18 @@ components:
             $ref: "#/components/schemas/CompletionToolDefinition"
         tool_choice:
           $ref: "#/components/schemas/CompletionToolChoice"
+        response_format:
+          $ref: "#/components/schemas/CompletionResponseFormat"
         schema:
-          description: JSON Schema for structured output.
+          description: >-
+            JSON Schema for structured output. Forces a non-streaming
+            response whose `output` is the parsed object.
+        max_output_tokens:
+          type: integer
+          format: int64
         temperature:
           type: number
           format: double
-        max_tokens:
-          type: integer
-          format: int64
         top_p:
           type: number
           format: double
@@ -8816,81 +8814,129 @@ components:
         reasoning_effort:
           $ref: "#/components/schemas/ReasoningEffort"
           description: Reasoning effort level.
-        provider:
-          type: string
-          description: Optional provider pin.
+        speed:
+          $ref: "#/components/schemas/BillingSpeed"
+          description: Requested speed tier.
+        metadata:
+          type: object
+          description: Request tags forwarded to providers that accept them.
+          additionalProperties:
+            type: string
         provider_options:
-          description: Provider-specific options.
+          type: object
+          description: Raw provider options keyed by provider id.
+          additionalProperties: true
 
     CompletionUsage:
       description: >
-        Five disjoint token buckets for one completion. `input_tokens` excludes
-        cache reads and writes, while `output_tokens` excludes reasoning tokens
-        when the provider reports them separately.
+        lithos `TokenCounts`: five disjoint token buckets for one completion.
+        `input` excludes cache reads and writes, while `output` excludes
+        reasoning tokens when the provider reports them separately.
       type: object
-      required:
-        - input_tokens
-        - output_tokens
-        - reasoning_tokens
-        - cache_read_tokens
-        - cache_write_tokens
       properties:
-        input_tokens:
+        input:
           type: integer
           format: int64
-          description: Number of uncached input tokens consumed.
-        output_tokens:
+          default: 0
+          description: Uncached prompt tokens.
+        output:
           type: integer
           format: int64
-          description: Number of non-reasoning output tokens generated.
-        reasoning_tokens:
+          default: 0
+          description: Non-reasoning completion tokens.
+        reasoning:
           type: integer
           format: int64
-          description: Number of separately reported reasoning tokens.
-        cache_read_tokens:
+          default: 0
+          description: Separately reported reasoning tokens.
+        cache_read:
           type: integer
           format: int64
-          description: Number of input tokens served from a provider cache.
-        cache_write_tokens:
+          default: 0
+          description: Prompt tokens served from a provider cache.
+        cache_write:
           type: integer
           format: int64
-          description: Number of input tokens written to a provider cache.
+          default: 0
+          description: Prompt tokens written to a provider cache.
 
-    CompletionResponse:
+    ModelHandle:
+      description: A resolved provider and model identity.
       type: object
-      required: [id, model, provider, message, stop_reason, usage]
+      required: [provider, model]
       properties:
-        id:
-          type: string
-        model:
-          type: string
-          description: Canonical model ID selected for the request.
         provider:
           $ref: "#/components/schemas/ProviderId"
-        message:
-          $ref: "#/components/schemas/CompletionMessage"
-        stop_reason:
+        model:
           type: string
-          description: Why generation stopped (end_turn, max_tokens, tool_calls).
+          description: Canonical model id within the provider.
+
+    CompletionCost:
+      description: "lithos `Cost`: a USD amount in micros and where it came from."
+      type: object
+      required: [usd_micros, source]
+      properties:
+        usd_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        source:
+          $ref: "#/components/schemas/CostSource"
+
+    CompletionResponse:
+      description: >-
+        A lithos `Response`, returned verbatim. The server is the billing
+        authority: `cost` is the catalog estimate or the provider's own
+        figure. When the request carried `schema`, `output` holds the parsed
+        object.
+      type: object
+      required: [model, content, finish_reason, usage]
+      properties:
+        output:
+          description: Parsed structured output when `schema` was provided.
+        id:
+          type: ["string", "null"]
+        model:
+          $ref: "#/components/schemas/ModelHandle"
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/CompletionContentPart"
+        suppressed_tool_calls:
+          type: array
+          description: Tool calls withheld because the turn ended early.
+          items:
+            type: object
+            additionalProperties: true
+        finish_reason:
+          type: string
+          description: "Why generation stopped: stop, length, tool_call, content_filter, error, incomplete, or a provider-specific reason."
         usage:
           $ref: "#/components/schemas/CompletionUsage"
-        output:
-          description: Parsed structured output when schema was provided.
-        cost_usd:
-          type: number
-          format: double
-          description: >
-            USD cost of the completion when known: estimated from catalog
-            prices unless the provider returned authoritative billing data.
-        cost_source:
-          $ref: "#/components/schemas/CostSource"
+        cost:
+          $ref: "#/components/schemas/CompletionCost"
+        rate_limits:
+          type: object
+          additionalProperties: true
+        warnings:
+          type: array
+          items:
+            type: object
+            required: [code, message]
+            properties:
+              code:
+                type: string
+              message:
+                type: string
+        raw:
+          description: The provider's success payload, when available.
 
     CostSource:
       type: string
       description: >
-        Whether `cost_usd` came from provider billing data (authoritative)
-        or catalog price estimation (estimated).
-      enum: [authoritative, estimated]
+        Where a cost came from: `catalog` (estimated from catalog prices),
+        `provider` (the provider's own billing data), or `application`.
+      enum: [catalog, provider, application]
 
     PaginatedSavedQueryList:
       description: Paginated list of saved queries.
@@ -9513,6 +9559,35 @@ components:
           example: abc123def
         dirty:
           $ref: "#/components/schemas/DirtyStatus"
+
+    GitIdentitySource:
+      description: Where a run's Git author/committer identity came from.
+      type: string
+      enum:
+        - explicit
+        - github_app
+        - github_pat
+        - default
+
+    GitIdentity:
+      description: >
+        The Git author and committer identity a run resolved once and uses for
+        every commit it creates: engine checkpoints, metadata commits, and any
+        commit a workflow command or agent tool runs.
+      type: object
+      required:
+        - name
+        - email
+        - source
+      properties:
+        name:
+          type: string
+          example: "fabro-sh[bot]"
+        email:
+          type: string
+          example: "123456+fabro-sh[bot]@users.noreply.github.com"
+        source:
+          $ref: "#/components/schemas/GitIdentitySource"
 
     ManifestGoal:
       description: Resolved goal kind and content.
@@ -10372,44 +10447,46 @@ components:
           type: integer
           minimum: 1
 
-    AgentMessageProps:
-      description: Properties for the `agent.message` event.
+    AgentEventProps:
+      description: >-
+        Properties for every `agent.*` and `todo.*` event: the stage that owns
+        the session plus the coding agent's own event envelope. `event` is the
+        externally tagged coding event, `{"ToolCallStarted": {...}}` or a bare
+        `"SessionEnded"`. Variant names are permanent API; their payloads are
+        documented by the pebble coding agent.
       type: object
       required:
-        - text
-        - model
-        - billing
-        - tool_call_count
+        - stage
         - visit
+        - event
+        - timestamp
+        - session_id
       properties:
-        text:
+        stage:
           type: string
-        model:
-          $ref: "#/components/schemas/BillingModelRef"
-        billing:
-          $ref: "#/components/schemas/BilledTokenCounts"
-        tool_call_count:
-          type: integer
-          minimum: 0
+          description: Graph node id of the stage that owns the session.
         visit:
           type: integer
           minimum: 1
-        message:
-          oneOf:
-            - type: object
-              additionalProperties: true
-            - type: "null"
-          description: Canonical replay-authoritative transcript message, when present.
-        context_window:
-          oneOf:
-            - $ref: "#/components/schemas/StageContextWindowProjection"
-            - type: "null"
-          description: Latest content-free context-window projection for this agent stage.
-        reasoning:
-          oneOf:
-            - $ref: "#/components/schemas/ReasoningOutput"
-            - type: "null"
-          description: Readable reasoning the provider returned with this response, if any.
+        seq:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Position in the session's event stream.
+        stream_id:
+          type: string
+          description: The event stream this event belongs to.
+        event:
+          description: The externally tagged coding agent event.
+        timestamp:
+          type: string
+          format: date-time
+        session_id:
+          type: string
+        parent_session_id:
+          type: ["string", "null"]
+        tool_call_id:
+          type: ["string", "null"]
 
     ReasoningOutput:
       description: >-
@@ -10457,7 +10534,7 @@ components:
           type: array
           description: Effective model-callable tools exposed to the stage session.
           items:
-            $ref: "#/components/schemas/AgentToolSummary"
+            $ref: "#/components/schemas/ToolSummary"
         visit:
           type: integer
           minimum: 1
@@ -10757,7 +10834,7 @@ components:
           type: string
           format: date-time
 
-    StageContextWindowCategory:
+    ContextWindowCategory:
       description: Category of model-visible input/context tokens.
       type: string
       enum:
@@ -10769,7 +10846,7 @@ components:
         - conversation
         - other
 
-    StageContextWindowCountMethod:
+    ContextWindowCountMethod:
       description: Method used to produce the context-window token total and breakdown.
       type: string
       enum:
@@ -10777,7 +10854,7 @@ components:
         - response_usage_scaled_breakdown
         - local_estimate
 
-    StageContextWindowStaleness:
+    ContextWindowStaleness:
       description: Freshness of the returned context-window data.
       type: string
       enum:
@@ -10793,7 +10870,7 @@ components:
         - not_observed
         - provider_unconfigured
 
-    StageContextWindowWarning:
+    ContextWindowWarning:
       description: Content-free warning about context-window count quality or attribution.
       type: object
       required:
@@ -10809,7 +10886,7 @@ components:
           description: Human-readable warning that must not include prompt, memory, message, or tool-argument content.
           example: provider input token counting failed; returned local estimate
 
-    StageContextWindowBreakdownItem:
+    ContextWindowBreakdownItem:
       description: Token usage for one content category.
       type: object
       required:
@@ -10818,7 +10895,7 @@ components:
         - usage_percent
       properties:
         category:
-          $ref: "#/components/schemas/StageContextWindowCategory"
+          $ref: "#/components/schemas/ContextWindowCategory"
         tokens:
           type: integer
           format: uint64
@@ -10830,8 +10907,8 @@ components:
           minimum: 0
           example: 7.5
 
-    StageContextWindowProjection:
-      description: Durable content-free context-window snapshot projected onto an agent stage.
+    ContextWindowSnapshot:
+      description: Durable content-free context-window snapshot recorded by the coding agent.
       type: object
       required:
         - provider
@@ -10867,26 +10944,27 @@ components:
           minimum: 0
           example: 30.86
         count_method:
-          $ref: "#/components/schemas/StageContextWindowCountMethod"
+          $ref: "#/components/schemas/ContextWindowCountMethod"
         staleness:
-          $ref: "#/components/schemas/StageContextWindowStaleness"
+          $ref: "#/components/schemas/ContextWindowStaleness"
         generated_at:
           type: string
           format: date-time
           example: "2026-05-23T12:34:56Z"
         event_seq:
           type: ["integer", "null"]
-          format: uint32
-          minimum: 1
+          format: uint64
+          minimum: 0
+          description: Sequence of the agent event this snapshot was taken at, when known.
           example: 42
         breakdown:
           type: array
           items:
-            $ref: "#/components/schemas/StageContextWindowBreakdownItem"
+            $ref: "#/components/schemas/ContextWindowBreakdownItem"
         warnings:
           type: array
           items:
-            $ref: "#/components/schemas/StageContextWindowWarning"
+            $ref: "#/components/schemas/ContextWindowWarning"
 
     StageContextWindow:
       description: Best-effort context-window usage for one agent stage.
@@ -10941,10 +11019,10 @@ components:
           example: 30.86
         count_method:
           oneOf:
-            - $ref: "#/components/schemas/StageContextWindowCountMethod"
+            - $ref: "#/components/schemas/ContextWindowCountMethod"
             - type: "null"
         staleness:
-          $ref: "#/components/schemas/StageContextWindowStaleness"
+          $ref: "#/components/schemas/ContextWindowStaleness"
         generated_at:
           type: ["string", "null"]
           format: date-time
@@ -10957,11 +11035,11 @@ components:
         breakdown:
           type: array
           items:
-            $ref: "#/components/schemas/StageContextWindowBreakdownItem"
+            $ref: "#/components/schemas/ContextWindowBreakdownItem"
         warnings:
           type: array
           items:
-            $ref: "#/components/schemas/StageContextWindowWarning"
+            $ref: "#/components/schemas/ContextWindowWarning"
 
     ParallelBranchResult:
       description: The outcome and isolated context updates from one parallel branch.
@@ -11120,7 +11198,7 @@ components:
             Effective model-callable tools exposed to this agent stage session.
             Tool parameter schemas are intentionally omitted from this projection.
           items:
-            $ref: "#/components/schemas/AgentToolSummary"
+            $ref: "#/components/schemas/ToolSummary"
         mcp_servers:
           type: array
           description: MCP servers observed by this stage.
@@ -11128,7 +11206,7 @@ components:
             $ref: "#/components/schemas/McpServerProjection"
         context_window:
           oneOf:
-            - $ref: "#/components/schemas/StageContextWindowProjection"
+            - $ref: "#/components/schemas/ContextWindowSnapshot"
             - type: "null"
           description: Latest content-free context-window snapshot for this agent stage.
         inference:
@@ -11207,10 +11285,12 @@ components:
           format: date-time
           description: When the request was dispatched.
         requested_model:
-          $ref: "#/components/schemas/BillingModelRef"
+          type: string
           description: >
-            Provider and model the request was sent to. Failover can re-target,
-            so `StageProjection.model` stays authoritative for what answered.
+            The model the request was sent to, as the agent names it. Failover
+            can re-target, so `StageProjection.model` stays authoritative for
+            what answered.
+          example: claude-fable-5
         first_output_at:
           type: ["string", "null"]
           format: date-time
@@ -11326,13 +11406,13 @@ components:
         available:
           type: array
           items:
-            $ref: "#/components/schemas/AgentSkillSummary"
+            $ref: "#/components/schemas/SkillSummary"
         activated:
           type: array
           items:
             $ref: "#/components/schemas/ActivatedSkill"
 
-    AgentSkillSummary:
+    SkillSummary:
       description: Summary of an available agent skill.
       type: object
       required:
@@ -11354,14 +11434,14 @@ components:
         name:
           type: string
         source:
-          $ref: "#/components/schemas/AgentSkillActivationSource"
+          $ref: "#/components/schemas/SkillActivationSource"
 
-    AgentSkillActivationSource:
+    SkillActivationSource:
       description: Source that activated an agent skill.
       type: string
       enum: [slash, tool]
 
-    AgentToolSummary:
+    ToolSummary:
       description: Summary of one effective model-callable tool exposed to an agent stage.
       type: object
       required:
@@ -11378,27 +11458,31 @@ components:
           type: string
           description: Model-facing tool description.
         source:
-          $ref: "#/components/schemas/AgentToolSource"
+          $ref: "#/components/schemas/ToolSource"
         category:
-          $ref: "#/components/schemas/AgentToolCategory"
+          $ref: "#/components/schemas/ToolCategory"
         invoked:
           type: boolean
+          default: false
           description: True once this tool has been invoked during the stage.
 
-    AgentToolSource:
+    ToolSource:
       description: Origin of an effective agent tool.
       oneOf:
-        - $ref: "#/components/schemas/AgentToolSourceNative"
-        - $ref: "#/components/schemas/AgentToolSourceMcp"
-        - $ref: "#/components/schemas/AgentToolSourceSkill"
+        - $ref: "#/components/schemas/ToolSourceNative"
+        - $ref: "#/components/schemas/ToolSourceApplication"
+        - $ref: "#/components/schemas/ToolSourceMcp"
+        - $ref: "#/components/schemas/ToolSourceSkill"
       discriminator:
         propertyName: kind
         mapping:
-          native: "#/components/schemas/AgentToolSourceNative"
-          mcp: "#/components/schemas/AgentToolSourceMcp"
-          skill: "#/components/schemas/AgentToolSourceSkill"
+          native: "#/components/schemas/ToolSourceNative"
+          application: "#/components/schemas/ToolSourceApplication"
+          mcp: "#/components/schemas/ToolSourceMcp"
+          skill: "#/components/schemas/ToolSourceSkill"
 
-    AgentToolSourceNative:
+    ToolSourceNative:
+      description: A tool the coding agent itself implements.
       type: object
       required:
         - kind
@@ -11407,7 +11491,17 @@ components:
           type: string
           enum: [native]
 
-    AgentToolSourceMcp:
+    ToolSourceApplication:
+      description: A tool Fabro registers with the coding agent, such as the `fabro_run_*` tools.
+      type: object
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum: [application]
+
+    ToolSourceMcp:
       type: object
       required:
         - kind
@@ -11424,7 +11518,7 @@ components:
           type: string
           description: Tool name before MCP qualification.
 
-    AgentToolSourceSkill:
+    ToolSourceSkill:
       type: object
       required:
         - kind
@@ -11433,7 +11527,7 @@ components:
           type: string
           enum: [skill]
 
-    AgentToolCategory:
+    ToolCategory:
       description: Coarse tool category for display and grouping.
       type: string
       enum: [read, write, shell, subagent, other]
@@ -11463,11 +11557,13 @@ components:
       oneOf:
         - $ref: "#/components/schemas/McpServerStatusReady"
         - $ref: "#/components/schemas/McpServerStatusFailed"
+        - $ref: "#/components/schemas/McpServerStatusDisconnected"
       discriminator:
         propertyName: kind
         mapping:
           ready: "#/components/schemas/McpServerStatusReady"
           failed: "#/components/schemas/McpServerStatusFailed"
+          disconnected: "#/components/schemas/McpServerStatusDisconnected"
 
     McpServerStatusReady:
       type: object
@@ -11494,6 +11590,20 @@ components:
           enum: [failed]
         error:
           type: string
+
+    McpServerStatusDisconnected:
+      description: The server was ready and then its connection closed during the stage; its tools fail until the session ends.
+      type: object
+      required:
+        - kind
+        - error
+      properties:
+        kind:
+          type: string
+          enum: [disconnected]
+        error:
+          type: string
+          description: What closed the connection, as the client observed it.
 
     AgentMcpToolSummary:
       description: Summary of one tool exposed by an MCP server.
@@ -11874,6 +11984,13 @@ components:
         retried_from:
           type: ["string", "null"]
           description: Source run ID when this run was created by manual retry.
+        git_identity:
+          oneOf:
+            - $ref: "#/components/schemas/GitIdentity"
+            - type: "null"
+          description: >
+            The Git author/committer identity the run resolved for its
+            commits. Absent until the run's first initialization resolves it.
         pending_interviews:
           type: object
           additionalProperties:
@@ -12470,11 +12587,12 @@ components:
             - type: "null"
 
     BillingSpeed:
-      description: Optional provider-specific model speed tier used for cost estimates.
+      description: "lithos `Speed`: the requested latency or cost tier."
       type: string
       enum:
-        - standard
         - fast
+        - balanced
+        - economical
 
     CodeLocation:
       description: A file and line location in the codebase.
@@ -12875,12 +12993,13 @@ components:
           example: 180000
 
     SandboxProviderKind:
-      description: Sandbox provider discriminator.
+      description: |
+        Sandbox provider kind. `local`, `docker`, and `daytona` are bundled
+        with the server; any other value names a sandbox-driver plugin
+        configured under `server.sandbox.providers.<kind>`.
       type: string
-      enum:
-        - local
-        - docker
-        - daytona
+      pattern: "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"
+      example: docker
 
     RunSandboxKind:
       description: Lifecycle state for a run sandbox request.
@@ -13800,179 +13919,182 @@ components:
           example: docker exec -it fabro-run-01HY0000000000000000000000 sh -lc 'cd /workspace/fabro && exec sh -l'
 
     SandboxState:
-      description: Normalized sandbox lifecycle state used by the control plane and UI. The original provider-specific state string is preserved in `native_state`.
+      description: The sandbox driver's lifecycle state for a sandbox. The provider's own state string is preserved in `SandboxStatus.provider_state`. A reader must treat a value it does not know as `unknown`.
       type: string
       enum:
-        - unknown
-        - provisioning
+        - creating
         - starting
         - running
         - stopping
         - stopped
+        - pausing
         - paused
-        - deleting
-        - deleted
+        - resuming
+        - archiving
         - archived
         - restoring
         - resizing
+        - forking
+        - snapshotting
+        - deleting
+        - deleted
         - error
+        - unknown
+
+    SandboxKind:
+      description: The kind of isolation a sandbox was provisioned with, as observed by the driver. Not an isolation guarantee.
+      type: string
+      enum:
+        - container
+        - virtual_machine
+        - unknown
+
+    SandboxWorkspaceOwnership:
+      description: Who owns a local sandbox's workspace directory. `designated` is a caller-owned directory that deleting the sandbox never touches; `managed` is a directory the driver created and removes.
+      type: string
+      enum:
+        - designated
+        - managed
 
     SandboxResources:
-      description: Resource configuration for a sandbox. Fields are nullable when the provider does not surface a value or no limit is configured.
+      description: Compute resources of a sandbox, in the units the field names give. A field is null when the provider does not report a value or applies its default.
       type: object
       properties:
         cpu_cores:
-          type: number
-          format: double
-          description: Configured CPU cores. Null when unavailable.
-        memory_bytes:
-          type: integer
+          type: ["integer", "null"]
           format: int64
           minimum: 0
-          description: Memory limit in bytes. Null when unavailable or unlimited.
-        disk_bytes:
-          type: integer
+        memory_mb:
+          type: ["integer", "null"]
           format: int64
           minimum: 0
-          description: Disk size in bytes. Null when unavailable.
-
-    SandboxNetworkPolicyMode:
-      description: Provider-neutral public-network policy for one direction.
-      type: string
-      enum:
-        - unknown
-        - open
-        - blocked
-        - cidr_allow_list
-        - essentials_only
+        disk_mb:
+          type: ["integer", "null"]
+          format: int64
+          minimum: 0
+        gpus:
+          type: ["integer", "null"]
+          format: int64
+          minimum: 0
 
     SandboxNetworkPolicy:
-      description: Public-network policy for one direction.
+      description: The network policy in force for a sandbox. A policy without parameters is its name; an allow list carries its entries.
+      oneOf:
+        - type: string
+          enum:
+            - provider_default
+            - allow_all
+            - block
+        - type: object
+          required: [cidr_allow_list]
+          properties:
+            cidr_allow_list:
+              type: object
+              required: [cidrs]
+              properties:
+                cidrs:
+                  type: array
+                  items:
+                    type: string
+        - type: object
+          required: [domain_allow_list]
+          properties:
+            domain_allow_list:
+              type: object
+              required: [domains]
+              properties:
+                domains:
+                  type: array
+                  items:
+                    type: string
+
+    SandboxStatus:
+      description: What the sandbox driver reports about a sandbox. Only `id` and `state` are always present; every other field is null or empty when the provider does not report it.
       type: object
       required:
-        - mode
-        - cidrs
+        - id
+        - state
       properties:
-        mode:
-          $ref: "#/components/schemas/SandboxNetworkPolicyMode"
-        cidrs:
-          type: array
-          items:
+        id:
+          type: string
+          description: The provider's stable identifier for the sandbox.
+        name:
+          type: ["string", "null"]
+          description: The provider's display name, which is not the stable identifier.
+        state:
+          $ref: "#/components/schemas/SandboxState"
+        provider_state:
+          type: string
+          default: ""
+          description: The provider's own state string, for display and debugging.
+        error_reason:
+          type: ["string", "null"]
+        resources:
+          oneOf:
+            - $ref: "#/components/schemas/SandboxResources"
+            - type: "null"
+        sandbox_kind:
+          oneOf:
+            - $ref: "#/components/schemas/SandboxKind"
+            - type: "null"
+        region:
+          type: ["string", "null"]
+          description: The provider region or target the sandbox runs in.
+        labels:
+          type: object
+          additionalProperties:
             type: string
-          description: CIDR entries when `mode` is `cidr_allow_list`; empty for other modes.
-
-    SandboxNetwork:
-      description: Provider-neutral public-network policy for sandbox egress and ingress.
-      type: object
-      required:
-        - egress
-        - ingress
-      properties:
-        egress:
-          $ref: "#/components/schemas/SandboxNetworkPolicy"
-        ingress:
-          $ref: "#/components/schemas/SandboxNetworkPolicy"
-
-    SandboxTimestamps:
-      description: Lifecycle timestamps for a sandbox. Fields are nullable when the provider does not surface a value.
-      type: object
-      properties:
+          description: Provider-stored labels, including fabro's ownership labels.
+        image:
+          type: ["string", "null"]
+          description: The image the sandbox runs, when the provider knows it (a Docker container's image reference).
+        snapshot:
+          type: ["string", "null"]
+          description: The snapshot the sandbox was created from, when the provider knows it (a Daytona snapshot name).
+        network:
+          oneOf:
+            - $ref: "#/components/schemas/SandboxNetworkPolicy"
+            - type: "null"
+          description: The network policy in force, when the provider can read it back.
+        workspace_ownership:
+          oneOf:
+            - $ref: "#/components/schemas/SandboxWorkspaceOwnership"
+            - type: "null"
+          description: Local sandboxes only.
+        web_url:
+          type: ["string", "null"]
+          description: The provider's console page for the sandbox, when it has one.
         created_at:
-          type: string
+          type: ["string", "null"]
           format: date-time
-          description: When the sandbox was created.
-        last_activity_at:
-          type: string
+        updated_at:
+          type: ["string", "null"]
           format: date-time
-          description: Most recent activity timestamp reported by the provider.
+          description: The provider's most recent activity or update timestamp for the sandbox.
 
     SandboxDetails:
-      description: Provider-neutral details about the sandbox owned by a run.
+      description: The sandbox owned by a run, as fabro's record of it and the sandbox driver's status.
       type: object
       required:
         - sandbox
-        - state
-        - resources
-        - network
-        - labels
-        - timestamps
+        - status
       properties:
         sandbox:
           $ref: "#/components/schemas/RunSandboxInstance"
-        state:
-          $ref: "#/components/schemas/SandboxState"
-        native_state:
-          type: ["string", "null"]
-          description: Original provider state string before normalization. Display/debugging only; UI behavior keys off `state`.
-        region:
-          type: ["string", "null"]
-          description: Provider region or target. Null for local-style providers.
-        web_url:
-          type: ["string", "null"]
-          description: Provider dashboard URL for this sandbox when available.
-        resources:
-          $ref: "#/components/schemas/SandboxResources"
-        network:
-          $ref: "#/components/schemas/SandboxNetwork"
-        labels:
-          type: object
-          additionalProperties:
-            type: string
-          description: Provider-reported labels.
-        timestamps:
-          $ref: "#/components/schemas/SandboxTimestamps"
+        status:
+          $ref: "#/components/schemas/SandboxStatus"
 
     SandboxInfo:
-      description: Provider-backed inventory record for a Fabro-managed sandbox.
+      description: One sandbox of fabro's provider-backed inventory, as the provider fabro connected it through and the sandbox driver's status.
       type: object
       required:
         - provider
-        - id
-        - state
-        - resources
-        - network
-        - labels
-        - timestamps
+        - status
       properties:
         provider:
           $ref: "#/components/schemas/SandboxProviderKind"
-        id:
-          type: string
-          description: Provider-native sandbox id.
-        display_name:
-          type: ["string", "null"]
-          description: Provider display name when distinct from the native id.
-        state:
-          $ref: "#/components/schemas/SandboxState"
-        native_state:
-          type: ["string", "null"]
-          description: Original provider state string before normalization. Display/debugging only; UI behavior keys off `state`.
-        image:
-          type: ["string", "null"]
-          description: Provider image when surfaced by the sandbox provider.
-        snapshot:
-          type: ["string", "null"]
-          description: Provider snapshot when surfaced by the sandbox provider.
-        region:
-          type: ["string", "null"]
-          description: Provider region or target. Null for local-style providers.
-        web_url:
-          type: ["string", "null"]
-          description: Provider dashboard URL for this sandbox when available.
-        working_directory:
-          type: ["string", "null"]
-          description: Provider-reported or Fabro-default working directory when available.
-        resources:
-          $ref: "#/components/schemas/SandboxResources"
-        network:
-          $ref: "#/components/schemas/SandboxNetwork"
-        labels:
-          type: object
-          additionalProperties:
-            type: string
-          description: Provider-reported labels.
-        timestamps:
-          $ref: "#/components/schemas/SandboxTimestamps"
+        status:
+          $ref: "#/components/schemas/SandboxStatus"
 
     SandboxProviderLookupError:
       description: Provider error captured during fail-soft sandbox inventory lookup.
@@ -14041,7 +14163,7 @@ components:
             $ref: "#/components/schemas/SandboxFileEntry"
 
     SandboxService:
-      description: A listening TCP service discovered inside a run sandbox.
+      description: A TCP port a process inside a run sandbox listens on, as the sandbox driver reports it.
       type: object
       required:
         - port
@@ -14057,16 +14179,16 @@ components:
           example: 3000
         addresses:
           type: array
-          description: Local bind addresses discovered from `ss` or `/proc/net/tcp*`.
+          description: Local bind addresses the sandbox reports for the port.
           items:
             type: string
           example: ["127.0.0.1:3000", "[::]:3000"]
         processes:
           type: array
-          description: Visible process summaries when available. Empty when the sandbox only supports `/proc/net/tcp*` discovery.
+          description: The listening processes, when the sandbox can name them (`node`, or `pid=1234`). Empty when it cannot.
           items:
             type: string
-          example: ['users:(("node",pid=42,fd=23))']
+          example: ["node"]
         preview_supported:
           type: boolean
           description: Whether the provider supports an external preview URL for this port.
@@ -14077,30 +14199,11 @@ components:
       type: object
       required:
         - data
-        - meta
       properties:
         data:
           type: array
           items:
             $ref: "#/components/schemas/SandboxService"
-        meta:
-          $ref: "#/components/schemas/SandboxServiceListMeta"
-
-    SandboxServiceListMeta:
-      description: Metadata about sandbox service discovery.
-      type: object
-      required:
-        - source
-      properties:
-        source:
-          $ref: "#/components/schemas/SandboxServiceDiscoverySource"
-
-    SandboxServiceDiscoverySource:
-      description: Tool or kernel interface used to discover sandbox services.
-      type: string
-      enum:
-        - ss
-        - procfs
 
     VncPreviewResponse:
       description: Response containing a signed noVNC preview URL for a Daytona sandbox.
@@ -14381,15 +14484,13 @@ components:
           $ref: "#/components/schemas/ServerSandboxProvidersSettings"
 
     ServerSandboxProvidersSettings:
+      description: |
+        Sandbox provider policy keyed by provider kind. The bundled kinds
+        (`local`, `docker`, `daytona`) are always present; any other key names
+        a sandbox-driver plugin and carries its launch settings.
       type: object
-      required: [local, docker, daytona]
-      properties:
-        local:
-          $ref: "#/components/schemas/ServerSandboxProviderSettings"
-        docker:
-          $ref: "#/components/schemas/ServerSandboxProviderSettings"
-        daytona:
-          $ref: "#/components/schemas/ServerSandboxProviderSettings"
+      additionalProperties:
+        $ref: "#/components/schemas/ServerSandboxProviderSettings"
 
     ServerSandboxProviderSettings:
       type: object
@@ -14397,6 +14498,32 @@ components:
       properties:
         enabled:
           type: boolean
+        plugin:
+          $ref: "#/components/schemas/SandboxPluginSettings"
+
+    SandboxPluginSettings:
+      description: How the server launches a sandbox-driver plugin executable.
+      type: object
+      properties:
+        path:
+          type: string
+          description: Executable path. Absent means `fabro-sandbox-<kind>` on `PATH`.
+        sha256:
+          type: string
+          description: Pinned SHA-256 of the executable, hex.
+        dev:
+          type: boolean
+          description: Allow launching without a checksum.
+        args:
+          type: array
+          items:
+            type: string
+        env:
+          $ref: "#/components/schemas/StringMap"
+        inherit_env:
+          type: array
+          items:
+            type: string
 
     ServerStorageSettings:
       type: object
@@ -14875,9 +15002,10 @@ components:
           type: boolean
           default: false
           description: |
-            When true, Fabro-managed run-branch checkpoint commits bypass
-            local Git commit hooks. Does not affect Fabro `[[run.hooks]]`
-            or metadata-branch snapshots. Defaults to false.
+            Accepted for compatibility. Fabro-managed run-branch checkpoint
+            commits never run local Git commit hooks: the sandbox driver
+            disables repository hooks on every git command it runs. Does not
+            affect Fabro `[[run.hooks]]`. Defaults to false.
 
     RunCloneSettings:
       type: object
@@ -14908,7 +15036,7 @@ components:
         id:
           type: string
         provider:
-          $ref: "#/components/schemas/EnvironmentProvider"
+          $ref: "#/components/schemas/SandboxProviderKind"
         cwd:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
@@ -14933,7 +15061,7 @@ components:
       required: [provider, image, resources, network, lifecycle, labels, env]
       properties:
         provider:
-          $ref: "#/components/schemas/EnvironmentProvider"
+          $ref: "#/components/schemas/SandboxProviderKind"
         cwd:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
@@ -14952,11 +15080,6 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/InterpString"
-
-    EnvironmentProvider:
-      description: Desired environment provider.
-      type: string
-      enum: [local, docker, daytona]
 
     EnvironmentImageSettings:
       type: object

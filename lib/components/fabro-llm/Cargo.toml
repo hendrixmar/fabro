@@ -4,56 +4,43 @@ edition.workspace = true
 version.workspace = true
 publish = false
 license.workspace = true
-description = "A unified client library for multiple LLM providers"
-repository = "https://github.com/brynary/arc"
-readme = "README.md"
-keywords = ["llm", "ai", "openai", "anthropic"]
-categories = ["api-bindings"]
+description = "Fabro's integration layer over the lithos-llm catalog and client"
 
 [lib]
 doctest = false
+
+[features]
+default = []
+test-support = ["fabro-auth/test-support"]
 
 [lints]
 workspace = true
 
 [dependencies]
 anyhow.workspace = true
-thiserror.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-strum.workspace = true
-tokio.workspace = true
-uuid.workspace = true
-rand.workspace = true
-futures.workspace = true
-tokio-stream.workspace = true
 async-trait.workspace = true
-base64.workspace = true
 bytes.workspace = true
-tokio-util.workspace = true
-tracing.workspace = true
-aws-config.workspace = true
-aws-credential-types.workspace = true
-aws-sigv4.workspace = true
-aws-smithy-eventstream.workspace = true
-aws-smithy-runtime-api.workspace = true
-aws-smithy-types.workspace = true
-fabro-http.workspace = true
 fabro-auth = { path = "../../foundation/fabro-auth" }
-fabro-model = { path = "../../foundation/fabro-model" }
+fabro-config = { path = "../../foundation/fabro-config" }
+fabro-http.workspace = true
 fabro-redact.workspace = true
 fabro-static.workspace = true
 fabro-types = { path = "../../foundation/fabro-types" }
-fabro-util = { path = "../../foundation/fabro-util" }
+futures.workspace = true
+lithos-llm = { workspace = true, features = ["builtin-catalog", "openai", "anthropic", "gemini", "openai-compatible", "bedrock", "bedrock-aws", "local-files"] }
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-http = "1"
-insta = { workspace = true }
-tokio = { workspace = true, features = ["test-util", "macros"] }
-httpmock = "0.8"
-serde_json.workspace = true
-toml.workspace = true
+fabro-auth = { path = "../../foundation/fabro-auth", features = ["test-support"] }
+fabro-llm = { path = ".", features = ["test-support"] }
 fabro-macros = { path = "../../foundation/fabro-macros" }
 fabro-test = { workspace = true }
-tracing-subscriber.workspace = true
+httpmock = "0.8"
+tokio = { workspace = true, features = ["test-util", "macros"] }

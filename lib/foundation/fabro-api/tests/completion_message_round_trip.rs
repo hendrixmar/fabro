@@ -1,13 +1,13 @@
 //! Proves the `CompletionMessage` / `CompletionMessageRole` /
-//! `CompletionContentPart` OpenAPI schemas are served by the canonical
-//! `fabro_types::{Message, Role, ContentPart}` via build.rs
-//! `with_replacement`, and that the canonical serde output matches the
-//! wire shape the spec describes.
+//! `CompletionContentPart` OpenAPI schemas are served by the lithos
+//! `Message`, `Role`, and `ContentPart` types re-exported from `fabro_types`
+//! via build.rs `with_replacement`, and that the lithos serde output matches
+//! the wire shape the spec describes.
 
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::{ContentPart as ApiContentPart, Message as ApiMessage, Role as ApiRole};
-use fabro_types::{ContentPart, Message, Role, ToolCall, ToolResult};
+use lithos_llm::types::{ContentPart, Message, Role, ToolCall, ToolResult};
 use serde_json::json;
 
 #[test]
@@ -21,10 +21,10 @@ fn completion_message_reuses_domain_types() {
 fn role_json_matches_openapi_enum() {
     for (role, wire) in [
         (Role::System, "system"),
+        (Role::Developer, "developer"),
         (Role::User, "user"),
         (Role::Assistant, "assistant"),
         (Role::Tool, "tool"),
-        (Role::Developer, "developer"),
     ] {
         assert_eq!(serde_json::to_value(role).unwrap(), json!(wire));
         assert_eq!(
@@ -39,27 +39,32 @@ fn role_json_matches_openapi_enum() {
 fn message_json_matches_openapi_shape() {
     // Optional fields are omitted, not serialized as null.
     assert_eq!(
-        serde_json::to_value(Message::user("hello")).unwrap(),
+        serde_json::to_value(Message::text(Role::User, "hello")).unwrap(),
         json!({
             "role": "user",
-            "content": [{"kind": "text", "data": "hello"}]
+            "content": [{"type": "text", "text": "hello"}]
         })
     );
 
-    // Populated optionals appear under the spec's property names.
-    let mut message = Message::tool_result("call_1", json!("ok"), false);
-    message.name = Some("checker".to_string());
+    let message = Message::new(Role::Tool, vec![ContentPart::ToolResult(ToolResult {
+        tool_call_id: "call_1".to_string(),
+        name:         None,
+        content:      vec![ContentPart::Text {
+            text: "ok".to_string(),
+        }],
+        is_error:     false,
+    })])
+    .with_name("checker")
+    .with_tool_call_id("call_1");
     assert_eq!(
         serde_json::to_value(message).unwrap(),
         json!({
             "role": "tool",
             "content": [{
-                "kind": "tool_result",
-                "data": {
-                    "tool_call_id": "call_1",
-                    "content": "ok",
-                    "is_error": false
-                }
+                "type": "tool_result",
+                "tool_call_id": "call_1",
+                "content": [{"type": "text", "text": "ok"}],
+                "is_error": false
             }],
             "name": "checker",
             "tool_call_id": "call_1"
@@ -68,77 +73,27 @@ fn message_json_matches_openapi_shape() {
 }
 
 #[test]
-fn message_accepts_explicit_nulls_for_optionals() {
-    // The previously generated API type serialized absent optionals as
-    // explicit nulls; inbound payloads in that older shape must keep
-    // parsing.
-    let message: Message = serde_json::from_value(json!({
-        "role": "assistant",
-        "content": [{"kind": "text", "data": "hi"}],
-        "name": null,
-        "tool_call_id": null
-    }))
-    .unwrap();
-    assert_eq!(message.role, Role::Assistant);
-    assert_eq!(message.name, None);
-    assert_eq!(message.tool_call_id, None);
+fn tool_call_part_json_matches_lithos_shape() {
+    let part = ContentPart::ToolCall(ToolCall::function(
+        "call_1",
+        "write_workflow_file",
+        json!({"file_name": "workflow.fabro"}),
+    ));
+    let json = serde_json::to_value(&part).unwrap();
+    assert_eq!(json["type"], "tool_call");
+    assert_eq!(json["id"], "call_1");
+    assert_eq!(json["name"], "write_workflow_file");
+    let round_trip: ContentPart = serde_json::from_value(json).unwrap();
+    assert_eq!(round_trip, part);
 }
 
 #[test]
-fn content_part_json_matches_openapi_envelope() {
-    // The spec describes a `{kind, data}` envelope; every variant must
-    // serialize into it.
-    assert_eq!(
-        serde_json::to_value(ContentPart::text("hi")).unwrap(),
-        json!({"kind": "text", "data": "hi"})
-    );
-
-    assert_eq!(
-        serde_json::to_value(ContentPart::ToolCall(ToolCall::new(
-            "call_1",
-            "write_workflow_file",
-            json!({"file_name": "workflow.fabro"}),
-        )))
-        .unwrap(),
-        json!({
-            "kind": "tool_call",
-            "data": {
-                "id": "call_1",
-                "name": "write_workflow_file",
-                "type": "function",
-                "arguments": {"file_name": "workflow.fabro"},
-                "raw_arguments": null
-            }
-        })
-    );
-
-    assert_eq!(
-        serde_json::to_value(ContentPart::ToolResult(ToolResult::success(
-            "call_1",
-            json!("done"),
-        )))
-        .unwrap(),
-        json!({
-            "kind": "tool_result",
-            "data": {
-                "tool_call_id": "call_1",
-                "content": "done",
-                "is_error": false
-            }
-        })
-    );
-}
-
-#[test]
-fn content_part_preserves_unknown_kinds() {
-    // The spec leaves `kind` open-ended; unknown kinds must round-trip
-    // (previously the handler conversion silently dropped them).
-    let wire = json!({"kind": "mystery", "data": {"x": 1}});
+fn content_part_preserves_unknown_types() {
+    // The spec leaves `type` open-ended; unknown types must round-trip so a
+    // newer writer's parts survive an older reader.
+    let wire = json!({"type": "mystery", "x": 1});
     let part: ContentPart = serde_json::from_value(wire.clone()).unwrap();
-    assert_eq!(part, ContentPart::Other {
-        kind: "mystery".to_string(),
-        data: json!({"x": 1}),
-    });
+    assert!(matches!(part, ContentPart::Unknown(_)));
     assert_eq!(serde_json::to_value(part).unwrap(), wire);
 }
 

@@ -35,7 +35,7 @@ function formatUsdMicrosOrDash(usdMicros?: number | null): string {
 
 function formatModelRef(model?: BillingModelRef | null): string | null {
   if (!model) return null;
-  const speed = model.speed && model.speed !== "standard" ? ` · ${model.speed}` : "";
+  const speed = model.speed ? ` · ${model.speed}` : "";
   return `${model.provider}:${model.model_id}${speed}`;
 }
 

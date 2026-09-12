@@ -35,6 +35,12 @@ pub const RUN_EVENTS_MIGRATION_SQL: &str = include_str!("../migrations/202608270
 pub const RUN_EVENT_SESSION_OWNER_MIGRATION_SQL: &str =
     include_str!("../migrations/2026083101_run_event_session_owner.sql");
 
+/// The Ask Fabro session record migration, exposed so fixtures in other
+/// crates can install the production schema without a filesystem path into
+/// this crate.
+pub const RUN_SESSION_RECORDS_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026091101_run_session_records.sql");
+
 /// The temporary run-history activation migration, exposed so fixtures in
 /// other crates can install the production compatibility schema.
 pub const RUN_HISTORY_ACTIVATION_MIGRATION_SQL: &str =

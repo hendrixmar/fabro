@@ -32,9 +32,9 @@ import type { PaginatedEventList } from '../models';
 // @ts-ignore
 import type { PaginatedSessionList } from '../models';
 // @ts-ignore
-import type { SessionDetail } from '../models';
+import type { RunSessionMetadata } from '../models';
 // @ts-ignore
-import type { SessionRecord } from '../models';
+import type { SessionDetail } from '../models';
 // @ts-ignore
 import type { SubmitTurnRequest } from '../models';
 /**
@@ -397,7 +397,7 @@ export const SessionsApiFp = function(configuration?: Configuration) {
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async createRunSession(id: string, createRunSessionRequest: CreateRunSessionRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<SessionRecord>> {
+        async createRunSession(id: string, createRunSessionRequest: CreateRunSessionRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<RunSessionMetadata>> {
             const localVarAxiosArgs = await localVarAxiosParamCreator.createRunSession(id, createRunSessionRequest, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['SessionsApi.createRunSession']?.[localVarOperationServerIndex]?.url;
@@ -503,7 +503,7 @@ export const SessionsApiFactory = function (configuration?: Configuration, baseP
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        createRunSession(id: string, createRunSessionRequest: CreateRunSessionRequest, options?: RawAxiosRequestConfig): AxiosPromise<SessionRecord> {
+        createRunSession(id: string, createRunSessionRequest: CreateRunSessionRequest, options?: RawAxiosRequestConfig): AxiosPromise<RunSessionMetadata> {
             return localVarFp.createRunSession(id, createRunSessionRequest, options).then((request) => request(axios, basePath));
         },
         /**

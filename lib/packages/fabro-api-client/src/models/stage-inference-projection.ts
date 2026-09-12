@@ -15,9 +15,6 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { BillingModelRef } from './billing-model-ref';
-// May contain unused imports in some cases
-// @ts-ignore
 import type { LlmOutputKind } from './llm-output-kind';
 
 /**
@@ -33,9 +30,9 @@ export interface StageInferenceProjection {
      */
     'started_at': string;
     /**
-     * Provider and model the request was sent to. Failover can re-target, so `StageProjection.model` stays authoritative for what answered.
+     * The model the request was sent to, as the agent names it. Failover can re-target, so `StageProjection.model` stays authoritative for what answered.
      */
-    'requested_model': BillingModelRef;
+    'requested_model': string;
     /**
      * When the provider produced its first output, if it has.
      */

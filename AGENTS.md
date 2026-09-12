@@ -32,17 +32,19 @@ macOS note: if `cargo nextest run` fails with `Too many open files (os error 24)
 - The packaged compose service mounts `/var/run/docker.sock` so the server can create sibling run containers on the host daemon. This is host-root-equivalent under Docker's security model; only use it in the trusted, single-tenant deployment model described by the sandbox code/docs.
 - Docker and Daytona are clone-based providers. When a run manifest has a GitHub origin, they clone it into the provider workspace. Present non-GitHub origins fail unless the provider has `skip_clone = true`; absent origins or `skip_clone = true` create an empty workspace without repository files. For an exact commit, the submitted branch names the working branch and the syntactically valid SHA is requested directly. No layer proves branch/SHA ancestry: a fetchable commit is checked out, an unavailable commit fails setup, and branch HEAD is never substituted.
 - The sandbox layer also accepts an optional exact commit for future admitted
-  runs. An exact commit always requires a non-empty branch. Docker initializes
-  an empty repository, shallow-fetches the SHA at the same depth as a branch
-  clone, and checks it out; Daytona uses its official SDK clone with both
-  `branch` and `commit_id`. Both providers then point the admitted branch at
-  the commit and verify HEAD, so the workspace still reports the admitted
-  branch name. Keep those provider transports distinct, never fall back to a
-  newer branch HEAD, and do not wire this capability directly from legacy
-  `GitContext.sha`. The sandbox layer does not verify that the commit is
-  reachable from the branch; admission owns that check. Current production
-  callers remain branch-only until the RunIntent admission cutover supplies a
-  validated branch/SHA pair.
+  runs. An exact commit always requires a non-empty branch. The sandbox driver
+  performs the pin the same way on every provider: it initializes an empty
+  repository, fetches the SHA directly at the requested depth, and attaches
+  the admitted branch to it, so the workspace reports the admitted branch
+  name. Daytona's native toolbox clone serves plain branch clones only; its
+  commit pin checks the branch head out first, so the driver does not use
+  it. A successful clone has the pin checked out; the driver's
+  conformance suite verifies that on every provider, and fabro does not
+  re-verify HEAD. Never fall back to a newer branch HEAD, and do not wire
+  this capability directly from legacy `GitContext.sha`. The sandbox layer
+  does not verify that the commit is reachable from the branch; admission
+  owns that check. Current production callers remain branch-only until the
+  RunIntent admission cutover supplies a validated branch/SHA pair.
 
 ### Release automation
 - `cargo dev release` — creates the next stable release tag. Use `cargo dev release --nightly` for a nightly prerelease. Use `--dry-run` to print planned commands without mutating git or running Cargo, `--skip-tests` only after running the release-mode smoke yourself, and `--release-date YYYY-MM-DD` or `FABRO_RELEASE_DATE` for deterministic version computation.
@@ -122,8 +124,7 @@ Fabro is an AI-powered workflow orchestration platform. Workflows are defined as
 ### Rust crates (`lib/apps/`, `lib/components/`, and `lib/foundation/`)
 - **fabro-cli** — CLI entry point. Commands: `run`, `exec`, `serve`, `validate`, `parse`, `cp`, `model`, `doctor`, `install`, `ps`, `system prune`
 - **fabro-workflow** — Core workflow engine. Parses Graphviz graphs, runs stages, manages checkpoints/resume, hooks, and human-in-the-loop interactions
-- **fabro-agent** — AI coding agent with tool use (Bash, Read, Write, Edit, Glob, Grep, WebFetch). `Sandbox` trait abstracts execution environments
-- **fabro-sandbox** — Local, Docker, and Daytona sandbox providers. Docker is the default runtime provider and creates clone-based `/workspace` containers through the operator's Docker daemon; Daytona uses the same GitHub-only clone-source contract. Docker daemon access is host-root-equivalent and assumes trusted callers/payloads.
+- **fabro-sandbox** — Local, Docker, and Daytona sandbox providers. `RunSandbox` is also the `Environment` pebble's coding agent runs its tools through; agent stages, Ask Fabro, hook evaluators, and `fabro exec` all run on the `pebble-coding-agent` crate (pinned by rev in the workspace `Cargo.toml`). `RunSandbox` is also the `Environment` pebble's coding agent runs its tools through; agent stages, Ask Fabro, hook evaluators, and `fabro exec` all run on the `pebble-coding-agent` crate (pinned by rev in the workspace `Cargo.toml`). Docker is the default runtime provider and creates clone-based `/workspace` containers through the operator's Docker daemon; Daytona uses the same GitHub-only clone-source contract. Docker daemon access is host-root-equivalent and assumes trusted callers/payloads.
 - **fabro-server** — Axum HTTP server. Routes for runs, sessions, models, completions, usage. SSE event streaming. Demo mode via header
 - **fabro-llm** — Unified LLM client with providers: Anthropic, OpenAI, Gemini, OpenAI-compatible, plus retry/middleware/streaming
 - **fabro-api** — Auto-generated Rust types and reqwest HTTP client from OpenAPI spec (build.rs + progenitor)
@@ -139,7 +140,7 @@ Fabro is an AI-powered workflow orchestration platform. Workflows are defined as
 - **lib/packages/fabro-api-client** — Auto-generated TypeScript Axios client from OpenAPI spec
 
 ### Key design patterns
-- **Sandbox trait** — Uniform interface for local, Docker, and Daytona execution environments. Clone-based providers use run-spec GitHub origin metadata rather than worker process cwd detection.
+- **RunSandbox** — One concrete sandbox type for local, Docker, and Daytona execution environments, over the `sandbox-driver` facets (exec, filesystem, search, git). There is no fabro-side sandbox trait; tests use `fabro_sandbox::test_support::MockSandbox` over the driver's scripted doubles. Clone-based providers use run-spec GitHub origin metadata rather than worker process cwd detection.
 - **Graphviz graph workflows** — Stages and transitions defined as Graphviz graph attributes
 - **OpenAPI-first** — `fabro-api.yaml` drives Rust type + client generation (progenitor) and TypeScript client generation (openapi-generator)
 - **Checkpoint/resume** — Workflows can be paused, checkpointed, and resumed

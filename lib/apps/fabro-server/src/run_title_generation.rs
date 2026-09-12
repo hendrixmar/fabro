@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use fabro_llm::client::Client;
-use fabro_llm::generate::{self, GenerateParams};
-use fabro_llm::types::TimeoutOptions;
-use fabro_model::ProviderId;
+use fabro_llm::{Client, Request};
 use fabro_template::{TemplateContext, TemplateError};
 use fabro_types::{Graph, MAX_RUN_TITLE_CHARS, RunId};
 use fabro_util::error;
+use lithos_llm::catalog::ProviderId;
 use serde::Serialize;
 use toml::Value as TomlValue;
 
@@ -44,27 +43,34 @@ pub(crate) async fn generate_title_or_current(input: GenerateTitleInput<'_>) -> 
             return current_title;
         }
     };
-    let params = GenerateParams::new(input.model_id, input.client)
-        .provider(input.provider_id.to_string())
-        .prompt(prompt)
-        .max_tokens(64)
-        .max_retries(0)
-        .timeout(TimeoutOptions {
-            total:    Some(10.0),
-            per_step: Some(5.0),
-        });
+    let request = match Request::builder()
+        .model(format!("{}/{}", input.provider_id, input.model_id))
+        .user(prompt)
+        .max_output_tokens(64)
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(request) => request,
+        Err(err) => {
+            tracing::warn!(run_id = %input.prompt.run_id, error = %err, "Run title request is invalid");
+            return current_title;
+        }
+    };
 
-    let result = match generate::generate_object(params, title_response_schema()).await {
-        Ok(result) => result,
+    let completion = match input
+        .client
+        .complete_object(request, "run_title", title_response_schema())
+        .await
+    {
+        Ok(completion) => completion,
         Err(err) => {
             tracing::warn!(run_id = %input.prompt.run_id, error = %err, "Run title generation failed");
             return current_title;
         }
     };
-    result
-        .output
-        .as_ref()
-        .and_then(|output| output.get("title"))
+    completion
+        .object
+        .get("title")
         .and_then(serde_json::Value::as_str)
         .and_then(normalize_generated_title)
         .unwrap_or(current_title)
@@ -183,19 +189,15 @@ fn truncate_section(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use fabro_graphviz::parser;
-    use fabro_llm::client::Client;
-    use fabro_llm::error::Error as LlmError;
-    use fabro_llm::provider::{ProviderAdapter, StreamEventStream};
-    use fabro_llm::token_count::InputTokenCount;
-    use fabro_llm::types::{FinishReason, Message, Request, Response, StreamEvent, TokenCounts};
-    use fabro_model::ProviderId;
+    use fabro_llm::adapter::{ProviderAdapter, ResolvedCall};
+    use fabro_llm::lithos_catalog::AdapterId;
+    use fabro_llm::{Error as LlmError, Response, ResponseStream};
     use fabro_types::RunId;
-    use futures_util::stream;
+    use lithos_llm::catalog::builtin;
     use toml::Value as TomlValue;
 
     use super::*;
@@ -319,9 +321,9 @@ mod tests {
 
         assert_eq!(title, "Generated title");
         let captured = captured.lock().unwrap();
-        assert_eq!(captured[0].model, "small-model");
-        assert_eq!(captured[0].provider.as_deref(), Some("openai"));
-        assert_eq!(captured[0].max_tokens, Some(64));
+        assert_eq!(captured[0].provider, "openai");
+        assert_eq!(captured[0].model, "gpt-5.4");
+        assert_eq!(captured[0].max_output_tokens, Some(64));
     }
 
     #[tokio::test]
@@ -333,16 +335,23 @@ mod tests {
         assert_eq!(invalid_shape, "Current");
     }
 
-    async fn title_with_mocked_response(response_text: &str) -> (String, Arc<Mutex<Vec<Request>>>) {
+    struct CapturedCall {
+        provider:          String,
+        model:             String,
+        max_output_tokens: Option<u32>,
+    }
+
+    async fn title_with_mocked_response(
+        response_text: &str,
+    ) -> (String, Arc<Mutex<Vec<CapturedCall>>>) {
         let captured = Arc::new(Mutex::new(Vec::new()));
-        let provider = Arc::new(CapturingProvider {
+        let provider: Arc<dyn ProviderAdapter> = Arc::new(CapturingProvider {
+            id:            AdapterId::new("capturing"),
             captured:      Arc::clone(&captured),
             response_text: response_text.to_string(),
         });
-        let client = Arc::new(Client::new(
-            HashMap::from([("openai".to_string(), provider as Arc<dyn ProviderAdapter>)]),
-            Some("openai".to_string()),
-            Vec::new(),
+        let client = Arc::new(fabro_llm::test_support::client_with_adapter(
+            "openai", provider,
         ));
         let run_id = RunId::new();
         let graph = title_test_graph();
@@ -350,8 +359,8 @@ mod tests {
         let inputs = HashMap::new();
         let title = generate_title_or_current(GenerateTitleInput {
             client,
-            model_id: "small-model".to_string(),
-            provider_id: ProviderId::openai(),
+            model_id: "gpt-5.4".to_string(),
+            provider_id: builtin::openai(),
             prompt: TitlePromptInput {
                 run_id:          &run_id,
                 current_title:   "Current",
@@ -365,48 +374,33 @@ mod tests {
     }
 
     struct CapturingProvider {
-        captured:      Arc<Mutex<Vec<Request>>>,
+        id:            AdapterId,
+        captured:      Arc<Mutex<Vec<CapturedCall>>>,
         response_text: String,
     }
 
     #[async_trait]
     impl ProviderAdapter for CapturingProvider {
-        #[expect(
-            clippy::unnecessary_literal_bound,
-            reason = "ProviderAdapter trait signature returns &str."
-        )]
-        fn name(&self) -> &str {
-            "openai"
+        fn id(&self) -> &AdapterId {
+            &self.id
         }
 
-        async fn complete(&self, request: &Request) -> Result<Response, LlmError> {
-            self.captured.lock().unwrap().push(request.clone());
-            Ok(Response {
-                id:            "resp_title".to_string(),
-                model:         request.model.clone(),
-                provider:      "openai".to_string(),
-                message:       Message::assistant(self.response_text.clone()),
-                finish_reason: FinishReason::Stop,
-                usage:         TokenCounts::default(),
-                raw:           None,
-                warnings:      Vec::new(),
-                rate_limit:    None,
-                cost_usd:      None,
-                cost_source:   None,
-            })
+        async fn complete(&self, call: &ResolvedCall) -> Result<Response, LlmError> {
+            self.captured.lock().unwrap().push(CapturedCall {
+                provider:          call.route().provider().id().to_string(),
+                model:             call.route().model().id().to_string(),
+                max_output_tokens: call.request().max_output_tokens(),
+            });
+            Ok(fabro_llm::test_support::text_response(
+                call.route().provider().id().as_str(),
+                call.route().model().id().as_str(),
+                &self.response_text,
+            ))
         }
 
-        async fn stream(&self, _request: &Request) -> Result<StreamEventStream, LlmError> {
-            Ok(Pin::from(Box::new(stream::empty::<
-                Result<StreamEvent, LlmError>,
-            >())))
-        }
-
-        async fn count_input_tokens(
-            &self,
-            _request: &Request,
-        ) -> Result<Option<InputTokenCount>, LlmError> {
-            Ok(None)
+        async fn stream(&self, call: &ResolvedCall) -> Result<ResponseStream, LlmError> {
+            let response = self.complete(call).await?;
+            Ok(fabro_llm::test_support::response_to_stream(response))
         }
     }
 }

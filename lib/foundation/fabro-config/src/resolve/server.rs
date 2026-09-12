@@ -1,13 +1,15 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use fabro_types::SandboxProviderKind;
 use fabro_types::settings::server::{
     GithubIntegrationSettings, GithubIntegrationStrategy, IntegrationWebhooksSettings,
-    ObjectStoreProvider, ObjectStoreSettings, ServerApiSettings, ServerArtifactsSettings,
-    ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings,
-    ServerListenSettings, ServerLoggingSettings, ServerNamespace, ServerSandboxProviderSettings,
-    ServerSandboxProvidersSettings, ServerSandboxSettings, ServerSchedulerSettings,
-    ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
-    WebhookStrategy,
+    ObjectStoreProvider, ObjectStoreSettings, SandboxPluginSettings, ServerApiSettings,
+    ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings,
+    ServerIntegrationsSettings, ServerListenSettings, ServerLoggingSettings, ServerNamespace,
+    ServerSandboxProviderSettings, ServerSandboxProvidersSettings, ServerSandboxSettings,
+    ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings,
+    SlackIntegrationSettings, WebhookStrategy,
 };
 use fabro_util::Home;
 
@@ -39,7 +41,7 @@ pub fn resolve_server(layer: &ServerLayer, errors: &mut Vec<ResolveError>) -> Se
         api: ServerApiSettings { url: api_url },
         web,
         auth,
-        sandbox: resolve_sandbox(layer.sandbox.as_ref()),
+        sandbox: resolve_sandbox(layer.sandbox.as_ref(), errors),
         storage: storage.clone(),
         artifacts: resolve_artifacts(layer.artifacts.as_ref(), &storage.root, errors),
         slatedb: resolve_slatedb(layer.slatedb.as_ref(), &storage.root, errors),
@@ -66,28 +68,77 @@ pub fn resolve_server(layer: &ServerLayer, errors: &mut Vec<ResolveError>) -> Se
     }
 }
 
-fn resolve_sandbox(layer: Option<&ServerSandboxLayer>) -> ServerSandboxSettings {
-    let providers = layer.and_then(|sandbox| sandbox.providers.as_ref());
+fn resolve_sandbox(
+    layer: Option<&ServerSandboxLayer>,
+    errors: &mut Vec<ResolveError>,
+) -> ServerSandboxSettings {
+    let configured = layer
+        .and_then(|sandbox| sandbox.providers.as_ref())
+        .map(|providers| &providers.entries);
+    let mut entries = BTreeMap::new();
+    // Bundled providers always have a policy entry; missing means enabled.
+    for kind in SandboxProviderKind::bundled_kinds() {
+        let layer = configured.and_then(|entries| entries.get(&kind));
+        let path = format!("server.sandbox.providers.{kind}");
+        if let Some(layer) = layer {
+            reject_plugin_fields_for_bundled(layer, &path, errors);
+        }
+        entries.insert(kind, ServerSandboxProviderSettings {
+            enabled: layer.and_then(|provider| provider.enabled).unwrap_or(true),
+            plugin:  None,
+        });
+    }
+    for (kind, layer) in configured.into_iter().flatten() {
+        if kind.bundled().is_some() {
+            continue;
+        }
+        entries.insert(kind.clone(), ServerSandboxProviderSettings {
+            enabled: layer.enabled.unwrap_or(true),
+            plugin:  Some(SandboxPluginSettings {
+                path:        layer.path.clone(),
+                sha256:      layer.sha256.clone(),
+                dev:         layer.dev.unwrap_or(false),
+                args:        layer.args.clone().unwrap_or_default(),
+                env:         layer.env.clone().unwrap_or_default(),
+                inherit_env: layer.inherit_env.clone().unwrap_or_default(),
+            }),
+        });
+    }
     ServerSandboxSettings {
-        providers: ServerSandboxProvidersSettings {
-            local:   resolve_sandbox_provider(
-                providers.and_then(|providers| providers.local.as_ref()),
-            ),
-            docker:  resolve_sandbox_provider(
-                providers.and_then(|providers| providers.docker.as_ref()),
-            ),
-            daytona: resolve_sandbox_provider(
-                providers.and_then(|providers| providers.daytona.as_ref()),
-            ),
-        },
+        providers: ServerSandboxProvidersSettings { entries },
     }
 }
 
-fn resolve_sandbox_provider(
-    layer: Option<&ServerSandboxProviderLayer>,
-) -> ServerSandboxProviderSettings {
-    ServerSandboxProviderSettings {
-        enabled: layer.and_then(|provider| provider.enabled).unwrap_or(true),
+fn reject_plugin_fields_for_bundled(
+    layer: &ServerSandboxProviderLayer,
+    path: &str,
+    errors: &mut Vec<ResolveError>,
+) {
+    let ServerSandboxProviderLayer {
+        enabled: _,
+        path: plugin_path,
+        sha256,
+        dev,
+        args,
+        env,
+        inherit_env,
+    } = layer;
+    let set = [
+        ("path", plugin_path.is_some()),
+        ("sha256", sha256.is_some()),
+        ("dev", dev.is_some()),
+        ("args", args.is_some()),
+        ("env", env.is_some()),
+        ("inherit_env", inherit_env.is_some()),
+    ];
+    for (field, is_set) in set {
+        if is_set {
+            errors.push(ResolveError::Invalid {
+                path:   format!("{path}.{field}"),
+                reason: "bundled sandbox providers run in-process and take no plugin settings"
+                    .to_string(),
+            });
+        }
     }
 }
 

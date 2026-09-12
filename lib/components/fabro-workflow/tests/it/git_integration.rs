@@ -3,21 +3,26 @@
     reason = "These git integration tests intentionally exercise the real git CLI to validate repository helper behavior."
 )]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use fabro_agent::Sandbox;
 use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
+use fabro_sandbox::RunSandbox;
 use fabro_types::{RunEvent, WorkflowSettings, fixtures};
 use fabro_workflow::event::Emitter;
 use fabro_workflow::git;
 use fabro_workflow::handler::HandlerRegistry;
+use fabro_workflow::handler::command::CommandHandler;
 use fabro_workflow::handler::exit::ExitHandler;
 use fabro_workflow::handler::start::StartHandler;
+use fabro_workflow::outcome::StageOutcome;
 use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
-use fabro_workflow::test_support::run_graph;
+use fabro_workflow::test_support::{run_graph, run_graph_with_env};
+use sandbox_driver::{
+    Capabilities, DirEntry, Exec, FileMetadata, Filesystem, PlatformInfo, SandboxId, SandboxStatus,
+};
 use tokio_util::sync::CancellationToken;
 
 fn assert_success(output: &Output, context: &str) {
@@ -114,8 +119,12 @@ fn list_branch(repo_dir: &Path, branch: &str) -> String {
     String::from_utf8(output.stdout).expect("git branch --list output should be UTF-8")
 }
 
-fn local_env(repo: &Path) -> Arc<dyn Sandbox> {
-    Arc::new(fabro_agent::LocalSandbox::new(repo.to_path_buf()))
+async fn local_env(repo: &Path) -> Arc<RunSandbox> {
+    Arc::new(
+        fabro_sandbox::local_sandbox(repo.to_path_buf())
+            .await
+            .expect("local sandbox should be created"),
+    )
 }
 
 fn simple_graph() -> Graph {
@@ -162,6 +171,7 @@ fn test_run_options(run_dir: &Path) -> RunOptions {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         workflow_slug:    None,
     }
 }
@@ -303,7 +313,7 @@ async fn git_checkpoint_skips_start_node() {
     Box::pin(run_graph(
         make_registry(),
         Arc::new(emitter),
-        local_env(repo),
+        local_env(repo).await,
         &g,
         &run_options,
     ))
@@ -332,105 +342,121 @@ async fn git_checkpoint_skips_start_node() {
 /// local checkout, but the workflow engine's run directory is reported as
 /// inaccessible (as it is for Docker/Daytona) and the sandbox exposes a
 /// runtime directory outside the checkout.
-struct RemoteRuntimeSandbox {
-    inner:             fabro_agent::LocalSandbox,
-    hidden_path:       String,
+struct RemoteStyleSandbox {
+    inner:             Arc<dyn sandbox_driver::Sandbox>,
+    fs:                HidingFs,
     runtime_directory: String,
 }
 
-#[async_trait::async_trait]
-impl Sandbox for RemoteRuntimeSandbox {
-    async fn read_file_bytes(&self, path: &str) -> fabro_sandbox::Result<Vec<u8>> {
-        self.inner.read_file_bytes(path).await
-    }
-
-    async fn write_file(&self, path: &str, content: &str) -> fabro_sandbox::Result<()> {
-        self.inner.write_file(path, content).await
-    }
-
-    async fn delete_file(&self, path: &str) -> fabro_sandbox::Result<()> {
-        self.inner.delete_file(path).await
-    }
-
-    async fn file_exists(&self, path: &str) -> fabro_sandbox::Result<bool> {
-        if path == self.hidden_path {
-            return Ok(false);
+impl RemoteStyleSandbox {
+    fn over(
+        inner: Arc<dyn sandbox_driver::Sandbox>,
+        hidden_path: String,
+        runtime_directory: String,
+    ) -> Self {
+        Self {
+            fs: HidingFs {
+                inner: Arc::clone(&inner),
+                hidden_path,
+            },
+            inner,
+            runtime_directory,
         }
-        self.inner.file_exists(path).await
+    }
+}
+
+#[async_trait::async_trait]
+impl sandbox_driver::Sandbox for RemoteStyleSandbox {
+    fn id(&self) -> &SandboxId {
+        self.inner.id()
     }
 
-    async fn list_directory(
-        &self,
-        path: &str,
-        depth: Option<usize>,
-    ) -> fabro_sandbox::Result<Vec<fabro_agent::DirEntry>> {
-        self.inner.list_directory(path, depth).await
+    fn capabilities(&self) -> &Capabilities {
+        self.inner.capabilities()
     }
 
-    async fn exec_command(
-        &self,
-        command: &str,
-        timeout_ms: u64,
-        working_dir: Option<&str>,
-        env_vars: Option<&HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-    ) -> fabro_sandbox::Result<fabro_agent::ExecResult> {
-        self.inner
-            .exec_command(command, timeout_ms, working_dir, env_vars, cancel_token)
-            .await
-    }
-
-    async fn grep(
-        &self,
-        pattern: &str,
-        path: &str,
-        options: &fabro_sandbox::GrepOptions,
-    ) -> fabro_sandbox::Result<Vec<String>> {
-        self.inner.grep(pattern, path, options).await
-    }
-
-    async fn download_file_to_local(
-        &self,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> fabro_sandbox::Result<()> {
-        self.inner
-            .download_file_to_local(remote_path, local_path)
-            .await
-    }
-
-    async fn upload_file_from_local(
-        &self,
-        local_path: &Path,
-        remote_path: &str,
-    ) -> fabro_sandbox::Result<()> {
-        self.inner
-            .upload_file_from_local(local_path, remote_path)
-            .await
-    }
-
-    async fn initialize(&self) -> fabro_sandbox::Result<()> {
-        Ok(())
-    }
-
-    async fn cleanup(&self) -> fabro_sandbox::Result<()> {
-        Ok(())
+    async fn describe(&self) -> sandbox_driver::Result<SandboxStatus> {
+        self.inner.describe().await
     }
 
     fn working_directory(&self) -> &str {
         self.inner.working_directory()
     }
 
+    async fn environment(&self) -> sandbox_driver::Result<BTreeMap<String, String>> {
+        self.inner.environment().await
+    }
+
     fn runtime_directory(&self) -> Option<&str> {
         Some(&self.runtime_directory)
     }
 
-    fn platform(&self) -> &str {
-        self.inner.platform()
+    async fn platform_info(&self) -> sandbox_driver::Result<PlatformInfo> {
+        self.inner.platform_info().await
     }
 
-    fn os_version(&self) -> String {
-        self.inner.os_version()
+    async fn start(&self) -> sandbox_driver::Result<()> {
+        self.inner.start().await
+    }
+
+    async fn stop(&self) -> sandbox_driver::Result<()> {
+        self.inner.stop().await
+    }
+
+    async fn delete(&self) -> sandbox_driver::Result<()> {
+        self.inner.delete().await
+    }
+
+    fn exec(&self) -> &dyn Exec {
+        self.inner.exec()
+    }
+
+    fn fs(&self) -> &dyn Filesystem {
+        &self.fs
+    }
+}
+
+/// The real filesystem with one path reported absent.
+struct HidingFs {
+    inner:       Arc<dyn sandbox_driver::Sandbox>,
+    hidden_path: String,
+}
+
+#[async_trait::async_trait]
+impl Filesystem for HidingFs {
+    async fn read(&self, path: &str) -> sandbox_driver::Result<Vec<u8>> {
+        self.inner.fs().read(path).await
+    }
+
+    async fn write(&self, path: &str, content: &[u8]) -> sandbox_driver::Result<()> {
+        self.inner.fs().write(path, content).await
+    }
+
+    async fn delete(&self, path: &str, recursive: bool) -> sandbox_driver::Result<()> {
+        self.inner.fs().delete(path, recursive).await
+    }
+
+    async fn exists(&self, path: &str) -> sandbox_driver::Result<bool> {
+        if path == self.hidden_path {
+            return Ok(false);
+        }
+        self.inner.fs().exists(path).await
+    }
+
+    async fn metadata(&self, path: &str) -> sandbox_driver::Result<FileMetadata> {
+        self.inner.fs().metadata(path).await
+    }
+
+    async fn list_dir(&self, path: &str, depth: usize) -> sandbox_driver::Result<Vec<DirEntry>> {
+        self.inner.fs().list_dir(path, depth).await
+    }
+
+    async fn create_dir(&self, path: &str) -> sandbox_driver::Result<()> {
+        self.inner.fs().create_dir(path).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> sandbox_driver::Result<()> {
+        self.inner.fs().rename(from, to).await
     }
 }
 
@@ -477,11 +503,17 @@ async fn remote_prompt_demotion_stays_outside_checkout_and_survives_checkpoint()
     let run_dir = dir.path().join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
 
-    let sandbox = RemoteRuntimeSandbox {
-        inner:             fabro_agent::LocalSandbox::new(repo_dir.clone()),
-        hidden_path:       run_dir.to_string_lossy().to_string(),
-        runtime_directory: runtime_dir.to_string_lossy().to_string(),
-    };
+    let local = fabro_sandbox::local_sandbox(repo_dir.clone())
+        .await
+        .expect("local sandbox should be created");
+    let sandbox = RunSandbox::new(
+        fabro_sandbox::SandboxProviderKind::LOCAL,
+        Arc::new(RemoteStyleSandbox::over(
+            Arc::clone(local.handle().expect("local sandbox is initialized")),
+            run_dir.to_string_lossy().to_string(),
+            runtime_dir.to_string_lossy().to_string(),
+        )),
+    );
 
     let store = store_test_support::test_database(
         Arc::new(InMemory::new()),
@@ -557,4 +589,236 @@ async fn remote_prompt_demotion_stays_outside_checkout_and_survives_checkpoint()
         sandbox.read_file_bytes(&blob_path).await.unwrap(),
         oversized_bytes
     );
+}
+
+// ---------------------------------------------------------------------------
+// One Git identity per run: engine checkpoints and workflow commands agree.
+// ---------------------------------------------------------------------------
+
+fn git_stdout(repo_dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .unwrap_or_else(|err| panic!("git {args:?} should run: {err}"));
+    assert_success(&output, &format!("git {args:?}"));
+    String::from_utf8(output.stdout)
+        .expect("git output should be UTF-8")
+        .trim()
+        .to_string()
+}
+
+/// `author name`, `author email`, `committer name`, `committer email`.
+fn commit_identity(repo_dir: &Path, rev: &str) -> Vec<String> {
+    git_stdout(repo_dir, &[
+        "show",
+        "-s",
+        "--format=%an%n%ae%n%cn%n%ce",
+        rev,
+    ])
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
+fn set_local_identity(repo_dir: &Path, name: &str, email: &str) {
+    for (key, value) in [("user.name", name), ("user.email", email)] {
+        let output = Command::new("git")
+            .args(["config", key, value])
+            .current_dir(repo_dir)
+            .output()
+            .expect("git config should run");
+        assert_success(&output, "git config");
+    }
+}
+
+fn command_node(id: &str, script: &str) -> Node {
+    let mut node = Node::new(id);
+    node.attrs.insert(
+        "shape".to_string(),
+        AttrValue::String("parallelogram".to_string()),
+    );
+    node.attrs
+        .insert("script".to_string(), AttrValue::String(script.to_string()));
+    node
+}
+
+fn identity_registry() -> HandlerRegistry {
+    let mut registry = make_registry();
+    registry.register("command", Box::new(CommandHandler));
+    registry
+}
+
+/// The identity a workflow command sees is the run's, not the checkout's
+/// local config, not an inherited `GIT_*` variable, and not a
+/// `[run.environment]` entry. It reaches the primary checkout, a clone the
+/// workflow creates, and a repository the workflow initializes, and the
+/// engine's own checkpoint commit carries the same identity.
+#[tokio::test]
+async fn run_identity_governs_engine_and_workflow_commits_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    init_repo(&repo_dir);
+    set_local_identity(&repo_dir, "Local Config", "local@example.com");
+    let base_sha = git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let identity = fabro_types::GitIdentity {
+        name:   "fabro-sh[bot]".to_string(),
+        email:  "281434857+fabro-sh[bot]@users.noreply.github.com".to_string(),
+        source: fabro_types::GitIdentitySource::GithubApp,
+    };
+    let expected = vec![
+        identity.name.clone(),
+        identity.email.clone(),
+        identity.name.clone(),
+        identity.email.clone(),
+    ];
+
+    let clone_dir = dir.path().join("clone");
+    let fresh_dir = dir.path().join("fresh");
+    let script = format!(
+        "set -e
+        printf work > work.txt && git add work.txt && git commit -q -m 'workflow commit'
+        git clone -q . {clone} && (cd {clone} && printf x > x.txt && git add x.txt && git commit -q -m 'clone commit')
+        git init -q {fresh} && (cd {fresh} && printf y > y.txt && git add y.txt && git commit -q -m 'fresh commit')",
+        clone = clone_dir.display(),
+        fresh = fresh_dir.display(),
+    );
+
+    let mut graph = simple_graph();
+    graph
+        .nodes
+        .insert("work".to_string(), command_node("work", &script));
+    graph.edges.clear();
+    graph.edges.push(Edge::new("start", "work"));
+    graph.edges.push(Edge::new("work", "exit"));
+
+    let run_tmp = tempfile::tempdir().unwrap();
+    let mut run_options = test_run_options(run_tmp.path());
+    run_options.git_identity = Some(identity.clone());
+    run_options.git = Some(GitCheckpointOptions {
+        base_sha:   Some(base_sha),
+        run_branch: None,
+    });
+
+    // A `[run.environment]` entry and an inherited host variable both name a
+    // different author; the run identity must win over both.
+    let env = HashMap::from([
+        ("GIT_AUTHOR_NAME".to_string(), "Run Env".to_string()),
+        (
+            "GIT_COMMITTER_EMAIL".to_string(),
+            "run-env@example.com".to_string(),
+        ),
+    ]);
+    let outcome = run_graph_with_env(
+        identity_registry(),
+        Arc::new(Emitter::new(fixtures::RUN_2)),
+        local_env(&repo_dir).await,
+        &graph,
+        &run_options,
+        env,
+    )
+    .await
+    .expect("workflow should complete");
+    assert_eq!(outcome.status, StageOutcome::Succeeded, "{outcome:?}");
+
+    // The workflow's own commit in the primary checkout.
+    assert_eq!(
+        commit_identity(&repo_dir, "HEAD~1"),
+        expected,
+        "workflow commit in the primary checkout"
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["log", "-1", "--format=%s", "HEAD~1"]),
+        "workflow commit"
+    );
+    // The engine's checkpoint commit on top of it.
+    assert_eq!(
+        commit_identity(&repo_dir, "HEAD"),
+        expected,
+        "engine checkpoint commit"
+    );
+    assert!(
+        git_stdout(&repo_dir, &["log", "-1", "--format=%s", "HEAD"]).starts_with("fabro("),
+        "HEAD should be the checkpoint commit"
+    );
+    // A clone the workflow created and a repository it initialized.
+    assert_eq!(
+        commit_identity(&clone_dir, "HEAD"),
+        expected,
+        "clone commit"
+    );
+    assert_eq!(
+        commit_identity(&fresh_dir, "HEAD"),
+        expected,
+        "fresh repo commit"
+    );
+
+    // The checkout's own configuration is left alone.
+    assert_eq!(
+        git_stdout(&repo_dir, &["config", "user.name"]),
+        "Local Config"
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["config", "user.email"]),
+        "local@example.com"
+    );
+}
+
+/// Two runs with different identities in the same process do not leak into
+/// each other: each run's commits carry only its own identity.
+#[tokio::test]
+async fn concurrent_runs_keep_their_own_identities() {
+    async fn run_with(name: &str, email: &str) -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        init_repo(&repo_dir);
+        let mut graph = simple_graph();
+        graph.nodes.insert(
+            "work".to_string(),
+            command_node(
+                "work",
+                "for i in 1 2 3; do printf $i > f$i.txt; git add f$i.txt; git commit -q -m c$i; \
+                 sleep 0.05; done",
+            ),
+        );
+        graph.edges.clear();
+        graph.edges.push(Edge::new("start", "work"));
+        graph.edges.push(Edge::new("work", "exit"));
+        let run_tmp = tempfile::tempdir().unwrap();
+        let mut run_options = test_run_options(run_tmp.path());
+        run_options.run_id = fabro_types::RunId::new();
+        run_options.git_identity = Some(fabro_types::GitIdentity {
+            name:   name.to_string(),
+            email:  email.to_string(),
+            source: fabro_types::GitIdentitySource::Explicit,
+        });
+        run_graph(
+            identity_registry(),
+            Arc::new(Emitter::new(run_options.run_id)),
+            local_env(&repo_dir).await,
+            &graph,
+            &run_options,
+        )
+        .await
+        .expect("workflow should complete");
+        let identities = git_stdout(&repo_dir, &["log", "--format=%an <%ae> %cn <%ce>", "-3"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (dir, identities)
+    }
+
+    let (first, second) = tokio::join!(
+        run_with("Run One", "one@example.com"),
+        run_with("Run Two", "two@example.com"),
+    );
+    assert_eq!(first.1, vec![
+        "Run One <one@example.com> Run One <one@example.com>";
+        3
+    ]);
+    assert_eq!(second.1, vec![
+        "Run Two <two@example.com> Run Two <two@example.com>";
+        3
+    ]);
 }

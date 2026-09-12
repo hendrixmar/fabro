@@ -4,18 +4,19 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use fabro_agent::Sandbox;
-use fabro_agent::tool_registry::ToolContext;
-use fabro_auth::CredentialSource;
-use fabro_llm::client::Client as LlmClient;
-use fabro_llm::generate::{GenerateParams, generate_object};
-use fabro_llm::types::{Message, Request, ToolResult};
-use fabro_model::Catalog;
+use fabro_llm::credentials::CredentialProvider;
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::{Client, ClientOptions, Request};
 use fabro_redact::redacted_url_for_log;
+use fabro_sandbox::{ExecResultExt as _, RunSandbox, SecretRedactor};
+use fabro_types::PermissionLevel;
 use fabro_types::settings::{InterpString, ResolveCtx, ResolveError};
+use pebble_coding_agent::extensions::{
+    SystemPromptContext, SystemPromptDecision, SystemPromptTransform,
+};
+use pebble_coding_agent::{CodingAgent, CodingAgentOptions, Error as AgentError, ShutdownReason};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout as tokio_timeout;
-use tokio_util::sync::CancellationToken;
 
 use crate::config::{HookDefinition, HookType, TlsMode};
 use crate::types::{
@@ -23,6 +24,9 @@ use crate::types::{
 };
 
 const HOOK_EVALUATOR_SYSTEM_PROMPT: &str = "You are a hook evaluator for a workflow engine. Given context about a workflow event, evaluate the condition.";
+
+/// How many tool rounds an agent hook may run when its definition names none.
+const DEFAULT_MAX_TOOL_ROUNDS: u32 = 50;
 
 static HOOK_RESPONSE_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
     serde_json::json!({
@@ -36,6 +40,17 @@ static HOOK_RESPONSE_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
     })
 });
 
+/// Replaces the profile's system prompt with the hook evaluator's. An agent
+/// hook is not a coding session: no memory, no skills, no environment
+/// preamble, just the evaluation contract.
+struct HookEvaluatorPrompt;
+
+impl SystemPromptTransform for HookEvaluatorPrompt {
+    fn transform(&self, _context: SystemPromptContext<'_>) -> SystemPromptDecision {
+        SystemPromptDecision::Replace(HOOK_EVALUATOR_SYSTEM_PROMPT.to_owned())
+    }
+}
+
 fn duration_ms(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -47,9 +62,9 @@ pub trait HookExecutor: Send + Sync {
         &self,
         definition: &HookDefinition,
         context: &HookContext,
-        sandbox: Arc<dyn Sandbox>,
+        sandbox: Arc<RunSandbox>,
         execution_context: &HookExecutionContext,
-        llm_source: &dyn CredentialSource,
+        llm_source: Arc<dyn CredentialProvider>,
         catalog: Arc<Catalog>,
     ) -> HookResult;
 }
@@ -128,7 +143,7 @@ impl HookExecutorImpl {
         definition: &HookDefinition,
         command: &InterpString,
         context: &HookContext,
-        sandbox: &Arc<dyn Sandbox>,
+        sandbox: &Arc<RunSandbox>,
         execution_context: &HookExecutionContext,
     ) -> HookDecision {
         let command = match resolve_interp(command) {
@@ -174,7 +189,10 @@ impl HookExecutorImpl {
                 )
                 .await
             {
-                Ok(result) => Self::parse_decision(result.exit_code.unwrap_or(-1), &result.stdout),
+                Ok(result) => Self::parse_decision(
+                    result.program_exit_code().unwrap_or(-1),
+                    &result.stdout_lossy(),
+                ),
                 Err(e) => HookDecision::Block {
                     reason: Some(format!("sandbox exec failed: {e}")),
                 },
@@ -282,7 +300,7 @@ impl HookExecutorImpl {
         prompt: &InterpString,
         model: Option<&InterpString>,
         context: &HookContext,
-        llm_source: &dyn CredentialSource,
+        llm_source: Arc<dyn CredentialProvider>,
         catalog: Arc<Catalog>,
     ) -> HookDecision {
         let (prompt, model) = match Self::resolve_prompt_and_model(prompt, model) {
@@ -299,33 +317,44 @@ impl HookExecutorImpl {
         let user_msg = Self::build_hook_user_message(&prompt, context);
 
         Self::execute_llm_with_timeout(definition.timeout(), "prompt", || async move {
-            let client = match LlmClient::from_source(llm_source, catalog).await {
-                Ok(client) => Arc::new(client),
+            let client = match Self::build_client(catalog, llm_source).await {
+                Ok(client) => client,
                 Err(e) => {
                     tracing::warn!(error = %e, "prompt hook client creation failed, proceeding");
                     return HookDecision::Proceed;
                 }
             };
 
-            let params = GenerateParams::new(&resolved_model, client)
+            let request = Request::builder()
+                .model(&resolved_model)
                 .system(HOOK_EVALUATOR_SYSTEM_PROMPT)
-                .prompt(user_msg)
-                .max_tokens(1024);
+                .user(user_msg)
+                .max_output_tokens(1024)
+                .build();
+            let request = match request {
+                Ok(request) => request,
+                Err(e) => {
+                    tracing::warn!(error = %e, "prompt hook request invalid, proceeding");
+                    return HookDecision::Proceed;
+                }
+            };
 
-            match generate_object(params, HOOK_RESPONSE_SCHEMA.clone()).await {
-                Ok(result) => if let Some(obj) = result.output { match serde_json::from_value::<PromptHookResponse>(obj) {
-                    Ok(resp) if resp.ok => HookDecision::Proceed,
-                    Ok(resp) => HookDecision::Block {
-                        reason: resp.reason,
-                    },
-                    Err(e) => {
-                        tracing::warn!(error = %e, "prompt hook response deserialize failed, proceeding");
-                        HookDecision::Proceed
+            match client
+                .complete_object(request, "hook_response", HOOK_RESPONSE_SCHEMA.clone())
+            .await
+            {
+                Ok(completion) => {
+                    match serde_json::from_value::<PromptHookResponse>(completion.object) {
+                        Ok(resp) if resp.ok => HookDecision::Proceed,
+                        Ok(resp) => HookDecision::Block {
+                            reason: resp.reason,
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "prompt hook response deserialize failed, proceeding");
+                            HookDecision::Proceed
+                        }
                     }
-                } } else {
-                    tracing::warn!("prompt hook returned no structured output, proceeding");
-                    HookDecision::Proceed
-                },
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "prompt hook LLM call failed, proceeding");
                     HookDecision::Proceed
@@ -335,19 +364,30 @@ impl HookExecutorImpl {
         .await
     }
 
-    /// Execute an agent hook: multi-turn LLM call with sandbox tool access.
+    /// Execute an agent hook: a coding agent evaluates the condition with the
+    /// sandbox's tools and answers with the same `{ok, reason}` object as a
+    /// prompt hook.
     ///
-    /// Reuses the core `ToolRegistry` from `fabro_agent` so the agent hook has
-    /// the same tools (read_file, write_file, shell, grep, glob, etc.) as
-    /// a normal agent session.
+    /// The agent runs pebble's full tool set at `PermissionLevel::Full`, with
+    /// no memory or skills, the evaluator system prompt in place of the
+    /// profile's, and `max_tool_rounds` as pebble's tool-round budget.
+    /// Exhausting the budget, an LLM failure, or a timeout all fail open.
+    ///
+    /// Fabro's `max_tool_rounds` names how many model turns the hook may
+    /// take, executing the tools each asks for, before it proceeds on a turn
+    /// that still asks for tools. Pebble's budget of `rounds` lets `rounds`
+    /// tool turns run and refuses the next one without running its tools, so
+    /// `max_tool_rounds - 1` reaches the same decision at the same turn and
+    /// spares the last, useless tool execution. Zero is a loop that never
+    /// asks the model: the hook proceeds without an agent.
     async fn execute_agent(
         definition: &HookDefinition,
         prompt: &InterpString,
         model: Option<&InterpString>,
         max_tool_rounds: Option<u32>,
         context: &HookContext,
-        sandbox: Arc<dyn Sandbox>,
-        llm_source: &dyn CredentialSource,
+        sandbox: Arc<RunSandbox>,
+        llm_source: Arc<dyn CredentialProvider>,
         catalog: Arc<Catalog>,
     ) -> HookDecision {
         let (prompt, model) = match Self::resolve_prompt_and_model(prompt, model) {
@@ -362,9 +402,17 @@ impl HookExecutorImpl {
 
         let resolved_model = Self::resolve_model(model.as_deref());
         let user_msg = Self::build_hook_user_message(&prompt, context);
+        let Some(rounds) = max_tool_rounds
+            .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
+            .checked_sub(1)
+        else {
+            tracing::warn!("agent hook allows no tool rounds, proceeding");
+            return HookDecision::Proceed;
+        };
+        let rounds = usize::try_from(rounds).unwrap_or(usize::MAX);
 
         Self::execute_llm_with_timeout(definition.timeout(), "agent", || async move {
-            let client = match LlmClient::from_source(llm_source, catalog).await {
+            let client = match Self::build_client(catalog, llm_source).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "agent hook client creation failed, proceeding");
@@ -372,86 +420,58 @@ impl HookExecutorImpl {
                 }
             };
 
-            let options = fabro_agent::NativeToolOptions::default();
-            let mut registry = fabro_agent::ToolRegistry::new();
-            fabro_agent::register_core_tools(&mut registry, &options, None);
-            let tool_defs = registry.definitions();
-
-            let mut messages = vec![
-                Message::system(HOOK_EVALUATOR_SYSTEM_PROMPT),
-                Message::user(user_msg),
-            ];
-
-            let rounds = max_tool_rounds.unwrap_or(50);
-            let cancel = CancellationToken::new();
-
-            for _ in 0..rounds {
-                let request = Request {
-                    model:            resolved_model.clone(),
-                    messages:         messages.clone(),
-                    provider:         None,
-                    tools:            Some(tool_defs.clone()),
-                    tool_choice:      None,
-                    response_format:  None,
-                    temperature:      None,
-                    top_p:            None,
-                    max_tokens:       None,
-                    stop_sequences:   None,
-                    reasoning_effort: None,
-                    speed:            None,
-                    metadata:         None,
-                    provider_options: None,
-                };
-
-                let response = match client.complete(&request).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "agent hook LLM call failed, proceeding");
-                        return HookDecision::Proceed;
-                    }
-                };
-
-                let tool_calls = response.tool_calls();
-                if tool_calls.is_empty() {
-                    return Self::parse_prompt_response(&response.text());
+            let options = CodingAgentOptions::default()
+                .with_context_compaction(false)
+                .with_max_tool_rounds(rounds);
+            let mut agent = match CodingAgent::builder(client, sandbox)
+                .model(resolved_model)
+                .permission_level(PermissionLevel::Full)
+                .system_prompt_transform(Arc::new(HookEvaluatorPrompt))
+                .redactor(Arc::new(SecretRedactor))
+                .options(options)
+                .build()
+                .await
+            {
+                Ok(agent) => agent,
+                Err(e) => {
+                    tracing::warn!(error = %e, "agent hook agent build failed, proceeding");
+                    return HookDecision::Proceed;
                 }
+            };
 
-                messages.push(response.message.clone());
-
-                for tc in &tool_calls {
-                    let tool = registry.get(&tc.name).cloned();
-                    let ctx = ToolContext {
-                        env:                 sandbox.clone(),
-                        cancel:              cancel.child_token(),
-                        tool_env_provider:   None,
-                        session_id:          None,
-                        root_session_id:     None,
-                        tool_call_id:        Some(tc.id.clone()),
-                        agent_event_emitter: None,
-                    };
-                    let result = match tool {
-                        Some(t) => match (t.executor)(tc.arguments.clone(), ctx).await {
-                            Ok(output) => {
-                                ToolResult::success(tc.id.clone(), serde_json::json!(output))
-                            }
-                            Err(err) => ToolResult::error(tc.id.clone(), err),
-                        },
-                        None => {
-                            ToolResult::error(tc.id.clone(), format!("Unknown tool: {}", tc.name))
-                        }
-                    };
-                    messages.push(Message::tool_result(
-                        result.tool_call_id,
-                        result.content,
-                        result.is_error,
-                    ));
+            let report = agent.prompt(user_msg).await;
+            let decision = match report.result {
+                Ok(output) => Self::parse_prompt_response(output.text.as_deref().unwrap_or("")),
+                Err(AgentError::ToolRoundsExhausted { .. }) => {
+                    tracing::warn!("agent hook exhausted max tool rounds, proceeding");
+                    HookDecision::Proceed
                 }
+                Err(e) => {
+                    tracing::warn!(error = %e, "agent hook did not complete, proceeding");
+                    HookDecision::Proceed
+                }
+            };
+            if let Err(e) = agent.shutdown(ShutdownReason::Completed).await {
+                tracing::debug!(error = %e, "agent hook session did not shut down cleanly");
             }
-
-            tracing::warn!("agent hook exhausted max tool rounds, proceeding");
-            HookDecision::Proceed
+            decision
         })
         .await
+    }
+
+    /// The LLM client hooks dispatch through: every provider the source can
+    /// serve, with standard retries.
+    async fn build_client(
+        catalog: Arc<Catalog>,
+        llm_source: Arc<dyn CredentialProvider>,
+    ) -> Result<Client, fabro_llm::LlmSetupError> {
+        fabro_llm::build_client(
+            Catalog::clone(&catalog),
+            llm_source,
+            ClientOptions::standard(),
+        )
+        .await
+        .map(|built| built.client)
     }
 
     /// Build an HTTP client for the given TLS mode.
@@ -627,9 +647,9 @@ impl HookExecutor for HookExecutorImpl {
         &self,
         definition: &HookDefinition,
         context: &HookContext,
-        sandbox: Arc<dyn Sandbox>,
+        sandbox: Arc<RunSandbox>,
         execution_context: &HookExecutionContext,
-        llm_source: &dyn CredentialSource,
+        llm_source: Arc<dyn CredentialProvider>,
         catalog: Arc<Catalog>,
     ) -> HookResult {
         use std::sync::OnceLock;
@@ -728,7 +748,8 @@ impl HookExecutor for HookExecutorImpl {
 
 #[cfg(test)]
 mod tests {
-    use fabro_auth::{CredentialSource, test_support};
+    use fabro_auth::test_support;
+    use fabro_llm::credentials::CredentialProvider;
     use fabro_types::fixtures;
     use fabro_types::settings::ResolveErrorKind;
 
@@ -740,18 +761,20 @@ mod tests {
         HookContext::new(HookEvent::StageStart, fixtures::RUN_1, "test-wf".into())
     }
 
-    fn make_sandbox() -> Arc<dyn Sandbox> {
-        Arc::new(fabro_agent::LocalSandbox::new(
-            std::env::current_dir().unwrap(),
-        ))
+    async fn make_sandbox() -> Arc<RunSandbox> {
+        Arc::new(
+            fabro_sandbox::local_sandbox(std::env::current_dir().unwrap())
+                .await
+                .unwrap(),
+        )
     }
 
-    fn test_llm_source() -> Arc<dyn CredentialSource> {
+    fn test_llm_source() -> Arc<dyn CredentialProvider> {
         test_support::vault_only_credential_source()
     }
 
     fn test_catalog() -> Arc<Catalog> {
-        Arc::new(Catalog::from_builtin().unwrap())
+        Arc::new(fabro_llm::default_catalog())
     }
 
     fn test_http_client() -> fabro_http::HttpClient {
@@ -833,7 +856,7 @@ mod tests {
         let executor = HookExecutorImpl;
         let def = make_definition("exit 0");
         let ctx = make_context();
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let source = test_llm_source();
         let result = executor
             .execute(
@@ -841,7 +864,7 @@ mod tests {
                 &ctx,
                 sandbox,
                 &HookExecutionContext::default(),
-                source.as_ref(),
+                Arc::clone(&source),
                 test_catalog(),
             )
             .await;
@@ -854,7 +877,7 @@ mod tests {
         let executor = HookExecutorImpl;
         let def = make_definition("exit 1");
         let ctx = make_context();
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let source = test_llm_source();
         let result = executor
             .execute(
@@ -862,7 +885,7 @@ mod tests {
                 &ctx,
                 sandbox,
                 &HookExecutionContext::default(),
-                source.as_ref(),
+                Arc::clone(&source),
                 test_catalog(),
             )
             .await;
@@ -874,7 +897,7 @@ mod tests {
         let executor = HookExecutorImpl;
         let def = make_definition("exit 2");
         let ctx = make_context();
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let source = test_llm_source();
         let result = executor
             .execute(
@@ -882,7 +905,7 @@ mod tests {
                 &ctx,
                 sandbox,
                 &HookExecutionContext::default(),
-                source.as_ref(),
+                Arc::clone(&source),
                 test_catalog(),
             )
             .await;
@@ -894,7 +917,7 @@ mod tests {
         let executor = HookExecutorImpl;
         let def = make_definition(r#"echo '{"decision": "skip", "reason": "test skip"}'"#);
         let ctx = make_context();
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let source = test_llm_source();
         let result = executor
             .execute(
@@ -902,7 +925,7 @@ mod tests {
                 &ctx,
                 sandbox,
                 &HookExecutionContext::default(),
-                source.as_ref(),
+                Arc::clone(&source),
                 test_catalog(),
             )
             .await;
@@ -918,7 +941,7 @@ mod tests {
         let def = make_definition("echo $ARC_EVENT:$ARC_RUN_ID:$ARC_WORKFLOW");
         let mut ctx = make_context();
         ctx.node_id = Some("plan".into());
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let source = test_llm_source();
         let result = executor
             .execute(
@@ -926,7 +949,7 @@ mod tests {
                 &ctx,
                 sandbox,
                 &HookExecutionContext::default(),
-                source.as_ref(),
+                Arc::clone(&source),
                 test_catalog(),
             )
             .await;
@@ -947,7 +970,7 @@ mod tests {
             sandbox:    Some(false),
         };
         let ctx = make_context();
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let source = test_llm_source();
         let result = executor
             .execute(
@@ -955,7 +978,7 @@ mod tests {
                 &ctx,
                 sandbox,
                 &HookExecutionContext::default(),
-                source.as_ref(),
+                Arc::clone(&source),
                 test_catalog(),
             )
             .await;
@@ -1433,7 +1456,7 @@ mod tests {
             sandbox:    Some(false),
         };
         let ctx = make_context();
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let source = test_llm_source();
         let result = executor
             .execute(
@@ -1441,7 +1464,7 @@ mod tests {
                 &ctx,
                 sandbox,
                 &HookExecutionContext::default(),
-                source.as_ref(),
+                Arc::clone(&source),
                 test_catalog(),
             )
             .await;
@@ -1453,7 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_hook_missing_env_blocks() {
-        let sandbox = make_sandbox();
+        let sandbox = make_sandbox().await;
         let decision = HookExecutorImpl::execute_command(
             &make_definition("echo {{ env.MISSING_HOOK_VALUE }}"),
             &interp("echo {{ env.MISSING_HOOK_VALUE }}"),
@@ -1475,7 +1498,7 @@ mod tests {
             &interp("{{ env.MISSING_HOOK_VALUE }}"),
             None,
             &make_context(),
-            test_llm_source().as_ref(),
+            test_llm_source(),
             test_catalog(),
         )
         .await;
@@ -1502,8 +1525,8 @@ mod tests {
             None,
             Some(1),
             &make_context(),
-            make_sandbox(),
-            test_llm_source().as_ref(),
+            make_sandbox().await,
+            test_llm_source(),
             test_catalog(),
         )
         .await;

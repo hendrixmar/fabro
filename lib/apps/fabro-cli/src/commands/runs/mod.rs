@@ -21,7 +21,7 @@ pub(crate) async fn dispatch(cmd: RunsCommands, base_ctx: &CommandContext) -> Re
             list::list_command(&args, &styles, base_ctx).await
         }
         RunsCommands::Rm(args) => rm::remove_command(&args, base_ctx).await,
-        RunsCommands::Inspect(args) => inspect::run(&args, base_ctx).await,
+        RunsCommands::Inspect(args) => Box::pin(inspect::run(&args, base_ctx)).await,
         RunsCommands::Approve(args) => approval::approve_command(&args, base_ctx).await,
         RunsCommands::Deny(args) => approval::deny_command(&args, base_ctx).await,
         RunsCommands::Archive(args) => archive::archive_command(&args, base_ctx).await,

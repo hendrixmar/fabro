@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
-use fabro_auth::{CredentialSource, SqlVaultCredentialSource};
-use fabro_config::{CliLayer, Storage, load_llm_catalog_settings};
-use fabro_model::Catalog;
+use fabro_auth::SqlVaultCredentialSource;
+use fabro_config::{CliLayer, Storage, load_llm_overlay};
+use fabro_llm::credentials::CredentialProvider;
+use fabro_llm::lithos_catalog::Catalog;
 use fabro_types::UserSettings;
 use fabro_types::settings::RunNamespace;
 use fabro_types::settings::cli::{OutputFormat, OutputVerbosity};
@@ -44,7 +45,7 @@ pub(crate) struct CommandContext {
     run_settings_key_presence: RunSettingsKeyPresence,
     server_mode: ServerMode,
     server: OnceCell<Arc<Client>>,
-    llm_source: OnceCell<Arc<dyn CredentialSource>>,
+    llm_source: OnceCell<Arc<dyn CredentialProvider>>,
     catalog: OnceLock<Arc<Catalog>>,
 }
 
@@ -163,7 +164,7 @@ impl CommandContext {
         Ok(Arc::clone(client))
     }
 
-    pub(crate) async fn llm_source(&self) -> Result<Arc<dyn CredentialSource>> {
+    pub(crate) async fn llm_source(&self) -> Result<Arc<dyn CredentialProvider>> {
         let storage_dir = self.storage_dir.clone();
 
         let source = self
@@ -173,9 +174,9 @@ impl CommandContext {
                 let store = SecretStore::open(storage.sqlite_path(), storage.secrets_path())
                     .await
                     .context("opening the Fabro secret store")?;
-                let source: Arc<dyn CredentialSource> =
+                let source: Arc<dyn CredentialProvider> =
                     Arc::new(SqlVaultCredentialSource::new(Arc::new(store)));
-                Ok::<Arc<dyn CredentialSource>, anyhow::Error>(source)
+                Ok::<Arc<dyn CredentialProvider>, anyhow::Error>(source)
             })
             .await?;
 
@@ -187,12 +188,7 @@ impl CommandContext {
             return Ok(Arc::clone(catalog));
         }
 
-        let llm_catalog_settings =
-            load_llm_catalog_settings(None).context("loading LLM catalog")?;
-        let catalog = Arc::new(
-            Catalog::from_builtin_with_overrides(&llm_catalog_settings)
-                .context("building LLM catalog")?,
-        );
+        let catalog = Arc::new(load_cli_catalog().context("building LLM catalog")?);
         if self.catalog.set(Arc::clone(&catalog)).is_ok() {
             return Ok(catalog);
         }
@@ -242,6 +238,18 @@ fn load_merged_settings(cli_layer: &CliLayer, server_mode: &ServerMode) -> Resul
             Some(cli_layer),
         ),
     }
+}
+
+/// The catalog CLI commands run against: lithos built-ins, Fabro policy, and
+/// the operator `[llm]` overlay from the active settings file.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The CLI honors OPENAI_BASE_URL from the process environment."
+)]
+pub(crate) fn load_cli_catalog() -> Result<Catalog> {
+    let overlay = load_llm_overlay(None).context("loading the LLM settings overlay")?;
+    fabro_llm::build_catalog(&overlay, &|name| std::env::var(name).ok())
+        .context("building the LLM catalog")
 }
 
 #[cfg(test)]

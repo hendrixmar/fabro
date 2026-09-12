@@ -4,16 +4,18 @@ use std::sync::Arc;
 
 use fabro_graphviz::graph::Graph;
 use fabro_interview::Interviewer;
+use fabro_llm::lithos_catalog::Catalog;
 use fabro_mcp::config::McpServerSettings;
-use fabro_model::{Catalog, ProviderId};
 use fabro_sandbox::SandboxSpec;
 use fabro_template::TemplateContext;
 use fabro_types::settings::run::{
     PullRequestSettings, ResolvedGithubIntegration, RunModelControls,
 };
+use fabro_types::settings::server::ServerSandboxProvidersSettings;
 use fabro_types::{ManifestPath, RunId, RunProjection};
 use fabro_validate::{Diagnostic, Severity};
 use fabro_vault::Vault;
+use lithos_llm::catalog::ProviderId;
 use tokio::sync::RwLock as AsyncRwLock;
 
 use crate::artifact_upload::ArtifactSink;
@@ -306,6 +308,9 @@ pub struct InitOptions {
     pub hooks:             fabro_hooks::HookSettings,
     pub sandbox_env:       SandboxEnvSpec,
     pub vault:             Arc<AsyncRwLock<Vault>>,
+    /// The server's sandbox provider settings, for reattaching a run's
+    /// sandbox on resume.
+    pub sandbox_providers: ServerSandboxProvidersSettings,
     pub git:               Option<GitCheckpointOptions>,
     pub registry_override: Option<Arc<HandlerRegistry>>,
     pub artifact_sink:     Option<ArtifactSink>,

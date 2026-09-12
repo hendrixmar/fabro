@@ -11,7 +11,7 @@ pub enum Error {
     Workflow(#[from] fabro_workflow::Error),
 
     #[error(transparent)]
-    Agent(#[from] fabro_agent::Error),
+    Agent(#[from] pebble_coding_agent::Error),
 
     #[error(transparent)]
     Llm(#[from] fabro_llm::Error),
@@ -179,9 +179,11 @@ impl From<Error> for ApiError {
 /// middleware, and local configuration failures, return 502.
 impl From<fabro_llm::Error> for ApiError {
     fn from(err: fabro_llm::Error) -> Self {
-        match err {
-            fabro_llm::Error::InvalidRequest { message } => Self::bad_request(message),
-            err => Self::new(StatusCode::BAD_GATEWAY, format!("LLM error: {err}")),
+        match err.kind() {
+            fabro_llm::ErrorKind::InvalidRequest | fabro_llm::ErrorKind::ModelSelection => {
+                Self::bad_request(err.message().to_string())
+            }
+            _ => Self::new(StatusCode::BAD_GATEWAY, format!("LLM error: {err}")),
         }
     }
 }

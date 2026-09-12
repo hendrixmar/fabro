@@ -564,12 +564,12 @@ mod tests {
         });
         projection.sandbox = Some(RunSandbox::ready(
             RunSandboxPlan {
-                provider: SandboxProviderKind::Local,
+                provider: SandboxProviderKind::LOCAL,
                 image:    None,
                 snapshot: None,
             },
             RunSandboxInstance {
-                provider: SandboxProviderKind::Local,
+                provider: SandboxProviderKind::LOCAL,
                 image:    None,
                 snapshot: None,
                 runtime:  fabro_types::RunSandboxRuntime {

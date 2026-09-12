@@ -49,18 +49,10 @@ fn sample_checkpoint() -> Checkpoint {
 
 fn sample_usage() -> BilledModelUsage {
     serde_json::from_value(json!({
-        "input": {
-            "usage": {
-                "model": {
-                    "provider": "openai",
-                    "model_id": "gpt-5.2"
-                },
-                "tokens": {
-                    "input_tokens": 123,
-                    "output_tokens": 45
-                }
-            },
-            "facts": { "algorithm": "openai" }
+        "model": { "provider": "openai", "model_id": "gpt-5.2" },
+        "tokens": {
+            "input": 123,
+            "output": 45
         },
         "total_usd_micros": 168
     }))
@@ -92,12 +84,12 @@ fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
         diff:       RunDiff::default(),
     });
     let sandbox_plan = RunSandboxPlan {
-        provider: SandboxProviderKind::Local,
+        provider: SandboxProviderKind::LOCAL,
         image:    None,
         snapshot: None,
     };
     projection.sandbox = Some(RunSandbox::ready(sandbox_plan, RunSandboxInstance {
-        provider: SandboxProviderKind::Local,
+        provider: SandboxProviderKind::LOCAL,
         image:    None,
         snapshot: None,
         runtime:  RunSandboxRuntime {

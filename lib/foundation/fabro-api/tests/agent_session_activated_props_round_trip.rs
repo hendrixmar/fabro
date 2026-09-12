@@ -2,7 +2,8 @@ use std::any::{TypeId, type_name};
 
 use fabro_api::types::AgentSessionActivatedProps as ApiAgentSessionActivatedProps;
 use fabro_types::run_event::AgentSessionActivatedProps;
-use fabro_types::{PermissionLevel, ReasoningEffort, SessionCapability, Speed};
+use fabro_types::{PermissionLevel, SessionCapability};
+use lithos_llm::types::{ReasoningEffort, Speed};
 use serde_json::json;
 
 #[test]

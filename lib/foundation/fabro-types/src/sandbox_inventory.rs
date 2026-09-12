@@ -1,36 +1,14 @@
-use std::collections::BTreeMap;
-
+use sandbox_driver::SandboxStatus;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    SandboxNetwork, SandboxProviderKind, SandboxResources, SandboxState, SandboxTimestamps,
-};
+use crate::SandboxProviderKind;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One sandbox of fabro's inventory: the provider fabro connected it
+/// through, and the status the sandbox driver reports for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxInfo {
-    pub provider:          SandboxProviderKind,
-    pub id:                String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name:      Option<String>,
-    pub state:             SandboxState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_state:      Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image:             Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot:          Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region:            Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_url:           Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<String>,
-    pub resources:         SandboxResources,
-    #[serde(default)]
-    pub network:           SandboxNetwork,
-    #[serde(default)]
-    pub labels:            BTreeMap<String, String>,
-    pub timestamps:        SandboxTimestamps,
+    pub provider: SandboxProviderKind,
+    pub status:   SandboxStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +23,7 @@ pub struct SandboxListMeta {
     pub provider_errors: Vec<SandboxProviderLookupError>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxListResponse {
     pub data: Vec<SandboxInfo>,
     pub meta: SandboxListMeta,

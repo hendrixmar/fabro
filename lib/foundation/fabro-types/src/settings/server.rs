@@ -5,6 +5,7 @@
 //! scheduler, logging, integrations). Same-host and split-host deployments
 //! use the same schema.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration as StdDuration;
 
@@ -12,6 +13,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::duration::Duration;
+use crate::SandboxProviderKind;
 
 /// A structurally resolved `[server]` view for consumers.
 ///
@@ -110,44 +112,101 @@ pub struct ServerAuthGithubSettings {
     pub allowed_usernames: Vec<String>,
 }
 
+/// `[server.sandbox]` — which sandbox providers this server may launch.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSandboxSettings {
     pub providers: ServerSandboxProvidersSettings,
 }
 
+/// Per-provider policy keyed by provider kind.
+///
+/// The resolver always materializes the bundled kinds (`local`, `docker`,
+/// `daytona`). Any other key names a sandbox-driver plugin executable and
+/// carries its launch settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ServerSandboxProvidersSettings {
-    pub local:   ServerSandboxProviderSettings,
-    pub docker:  ServerSandboxProviderSettings,
-    pub daytona: ServerSandboxProviderSettings,
+    pub entries: BTreeMap<SandboxProviderKind, ServerSandboxProviderSettings>,
 }
 
 impl ServerSandboxProvidersSettings {
-    /// Per-provider policy entry.
+    /// Policy for one provider kind, when the server knows the kind.
     #[must_use]
-    pub fn for_provider(
+    pub fn get(&self, provider: &SandboxProviderKind) -> Option<&ServerSandboxProviderSettings> {
+        self.entries.get(provider)
+    }
+
+    /// Whether the server may launch this provider. A kind without an entry
+    /// is disabled: nothing configured it.
+    #[must_use]
+    pub fn is_enabled(&self, provider: &SandboxProviderKind) -> bool {
+        self.get(provider).is_some_and(|entry| entry.enabled)
+    }
+
+    /// Kinds the server may launch, in key order.
+    pub fn enabled_kinds(&self) -> impl Iterator<Item = &SandboxProviderKind> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.enabled)
+            .map(|(kind, _)| kind)
+    }
+
+    /// Enabled kinds that are served by a plugin executable.
+    pub fn enabled_plugins(
         &self,
-        provider: crate::SandboxProviderKind,
-    ) -> &ServerSandboxProviderSettings {
-        match provider {
-            crate::SandboxProviderKind::Local => &self.local,
-            crate::SandboxProviderKind::Docker => &self.docker,
-            crate::SandboxProviderKind::Daytona => &self.daytona,
+    ) -> impl Iterator<Item = (&SandboxProviderKind, &SandboxPluginSettings)> {
+        self.entries.iter().filter_map(|(kind, entry)| {
+            (entry.enabled)
+                .then_some(entry.plugin.as_ref())
+                .flatten()
+                .map(|plugin| (kind, plugin))
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerSandboxProviderSettings {
+    pub enabled: bool,
+    /// Launch settings for a plugin provider. Absent for bundled kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin:  Option<SandboxPluginSettings>,
+}
+
+impl Default for ServerSandboxProviderSettings {
+    // The resolver defaults each bundled provider to enabled; keep the struct
+    // default aligned with that so callers that bypass the resolver behave
+    // identically.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            plugin:  None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerSandboxProviderSettings {
-    pub enabled: bool,
-}
-
-impl Default for ServerSandboxProviderSettings {
-    // The resolver defaults each provider to enabled; keep the struct default
-    // aligned with that so callers that bypass the resolver behave identically.
-    fn default() -> Self {
-        Self { enabled: true }
-    }
+/// How the server launches a sandbox-driver plugin executable.
+///
+/// The executable speaks the sandbox-driver JSON-RPC protocol on stdio. It
+/// starts with a scrubbed environment: only `env` and the ambient variables
+/// named in `inherit_env` reach it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxPluginSettings {
+    /// Executable path. When absent the server searches `PATH` for
+    /// `fabro-sandbox-<kind>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path:        Option<String>,
+    /// Pinned SHA-256 of the executable, hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256:      Option<String>,
+    /// Allow launching without a checksum.
+    #[serde(default)]
+    pub dev:         bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args:        Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env:         BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherit_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

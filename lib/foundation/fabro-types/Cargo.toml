@@ -21,9 +21,11 @@ workspace = true
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, optional = true }
 dirs.workspace = true
-fabro-model = { path = "../fabro-model" }
 fabro-util = { path = "../fabro-util" }
 hex.workspace = true
+lithos-llm = { workspace = true, features = ["runtime"] }
+pebble-coding-agent.workspace = true
+sandbox-driver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -31,6 +33,8 @@ strum.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 ulid.workspace = true
+unicase.workspace = true
+unicode-normalization.workspace = true
 url.workspace = true
 
 [dev-dependencies]

@@ -1,5 +1,11 @@
 # Fabro MCP Server — QA Test Plan
 
+> Historical manual QA results. The run-create source selectors and flat settings
+> below predate the registered-version contract. Current calls register file contents
+> with `fabro_workflow_version_create`, then pass `workflow_version_id`, an explicit
+> standalone `target`, and nested `args` to `fabro_run_create`. See
+> [the current MCP guide](../public/agents/mcp.mdx) for the supported contract.
+
 One-time manual QA pass for the 5 tools exposed by `fabro-mcp-server`. Source of truth: `lib/apps/fabro-mcp-server/src/run_tools/`.
 
 This plan is **not** a template for adding automated test coverage — it exists to drive a single hands-on sweep against a real running server. Tick boxes as scenarios pass; add notes inline for failures or surprising behavior. Open bugs/PRs for issues found; do not port these scenarios into the Rust test suite.

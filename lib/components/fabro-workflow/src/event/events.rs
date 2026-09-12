@@ -9,8 +9,8 @@ use ::fabro_types::{
     RunTiming, SandboxProviderKind, StageId, StageOutcome, StageTiming, SuccessReason,
     WorkflowVersionId, run_event as fabro_types,
 };
-use fabro_agent::{AgentEvent, SandboxEvent};
-use fabro_model::{ReasoningEffort, Speed};
+use lithos_llm::types::{ReasoningEffort, Speed};
+use pebble_coding_agent::events::CodingAgentEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, run_failure_from_error};
@@ -495,17 +495,13 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         billing:  Option<BilledModelUsage>,
     },
-    /// Forwarded from an agent session, tagged with the workflow stage.
+    /// One coding-agent event, tagged with the workflow stage that produced
+    /// it. Pebble's envelope is kept whole: `seq`, `stream_id`, session ids,
+    /// `tool_call_id`, and `timestamp`.
     Agent {
-        stage:             String,
-        visit:             u32,
-        event:             AgentEvent,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_id:        Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_session_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tool_call_id:      Option<String>,
+        stage: String,
+        visit: u32,
+        event: CodingAgentEvent,
     },
     SubgraphStarted {
         node_id:    String,
@@ -517,9 +513,16 @@ pub enum Event {
         status:         String,
         duration_ms:    u64,
     },
-    /// Forwarded from a sandbox lifecycle operation.
+    /// A fact about the run's sandbox from the pipeline bringing it up.
     Sandbox {
-        event: SandboxEvent,
+        event: SandboxLifecycle,
+    },
+    /// An event the sandbox driver reported about the run's sandbox (an
+    /// operation and its outcome, progress inside a create, a state
+    /// observation, a notice), kept whole. Named from the event; see
+    /// `fabro_types::sandbox_driver_event_name`.
+    SandboxDriver {
+        event: sandbox_driver::Event,
     },
     /// Emitted after the sandbox has been initialized (by engine lifecycle).
     SandboxInitialized {
@@ -560,6 +563,11 @@ pub enum Event {
     },
     SetupCompleted {
         duration_ms: u64,
+    },
+    /// The run resolved the Git author/committer identity it uses for every
+    /// commit: engine checkpoints, metadata commits, and workflow commands.
+    GitIdentityResolved {
+        identity: ::fabro_types::GitIdentity,
     },
     SetupFailed {
         command:          String,
@@ -608,16 +616,6 @@ pub enum Event {
         output_bytes:   u64,
         live_streaming: bool,
     },
-    /// A top-level agent session object started its lifecycle.
-    AgentSessionStarted {
-        session_id:        String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_session_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider:          Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model:             Option<String>,
-    },
     /// A stage has a currently steerable live session binding.
     AgentSessionActivated {
         node_id:          String,
@@ -643,7 +641,7 @@ pub enum Event {
         node_id:    String,
         visit:      u32,
         session_id: String,
-        tools:      Vec<fabro_types::AgentToolSummary>,
+        tools:      Vec<::fabro_types::ToolSummary>,
     },
     /// A stage's steerable live session binding ended.
     AgentSessionDeactivated {
@@ -651,11 +649,34 @@ pub enum Event {
         visit:      u32,
         session_id: String,
     },
-    /// A top-level agent session object ended its lifecycle.
-    AgentSessionEnded {
-        session_id:        String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_session_id: Option<String>,
+    /// An MCP server configured for a stage connected and listed its tools.
+    AgentMcpReady {
+        node_id:     String,
+        visit:       u32,
+        server_name: String,
+        tool_count:  usize,
+        tools:       Vec<fabro_types::AgentMcpToolSummary>,
+        /// Whole milliseconds from launch to the tools being listed.
+        #[serde(default)]
+        startup_ms:  u64,
+    },
+    /// An MCP server configured for a stage failed to start or connect.
+    AgentMcpFailed {
+        node_id:     String,
+        visit:       u32,
+        server_name: String,
+        error:       String,
+        /// Whole milliseconds from launch to the failure.
+        #[serde(default)]
+        startup_ms:  u64,
+    },
+    /// An MCP server that was ready lost its connection during the stage;
+    /// its tools fail until the session ends.
+    AgentMcpDisconnected {
+        node_id:     String,
+        visit:       u32,
+        server_name: String,
+        error:       String,
     },
     /// A run-level interrupt was delivered to a concrete steerable agent
     /// session/stage.
@@ -760,6 +781,60 @@ pub enum Event {
         creation_id: Option<PullRequestCreationId>,
         error:       String,
     },
+}
+
+/// The lifecycle of a run's sandbox as workflow events.
+///
+/// Initializing, ready, and failed are the pipeline's view of bringing the
+/// sandbox up — create, activate, and prepare the workspace as one step.
+/// The rest are the sandbox driver's own operations and snapshot work,
+/// the driver's own events are kept whole as [`Event::SandboxDriver`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SandboxLifecycle {
+    Initializing {
+        provider: String,
+    },
+    Ready {
+        provider:    String,
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name:        Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url:         Option<String>,
+    },
+    InitializeFailed {
+        provider:    String,
+        error:       String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        causes:      Vec<String>,
+        duration_ms: u64,
+    },
+}
+
+impl SandboxLifecycle {
+    pub fn trace(&self) {
+        use tracing::{debug, error, info};
+        match self {
+            Self::Initializing { provider } => {
+                debug!(provider, "Sandbox initializing");
+            }
+            Self::Ready {
+                provider,
+                duration_ms,
+                ..
+            } => {
+                info!(provider, duration_ms, "Sandbox ready");
+            }
+            Self::InitializeFailed {
+                provider,
+                error,
+                causes,
+                duration_ms,
+            } => {
+                error!(provider, error, causes = ?causes, duration_ms, "Sandbox init failed");
+            }
+        }
+    }
 }
 
 impl Event {
@@ -1311,7 +1386,9 @@ impl Event {
             } => {
                 debug!(node_id, model, provider, "Prompt completed");
             }
-            Self::Agent { .. } | Self::Sandbox { .. } => {}
+            Self::Agent { event, .. } => event.event.trace(&event.session_id),
+            Self::Sandbox { event } => event.trace(),
+            Self::SandboxDriver { event } => trace_driver_event(event),
             Self::SandboxInitialized {
                 working_directory,
                 provider,
@@ -1361,6 +1438,14 @@ impl Event {
             }
             Self::SetupCompleted { duration_ms } => {
                 info!(duration_ms, "Setup completed");
+            }
+            Self::GitIdentityResolved { identity } => {
+                info!(
+                    name = %identity.name,
+                    email = %identity.email,
+                    source = %identity.source,
+                    "Git identity resolved"
+                );
             }
             Self::SetupFailed {
                 command,
@@ -1442,14 +1527,6 @@ impl Event {
                     "Command completed"
                 );
             }
-            Self::AgentSessionStarted {
-                session_id,
-                provider,
-                model,
-                ..
-            } => {
-                debug!(session_id, ?provider, ?model, "Agent session started");
-            }
             Self::AgentSessionActivated {
                 node_id,
                 visit,
@@ -1479,8 +1556,41 @@ impl Event {
             } => {
                 debug!(node_id, visit, session_id, "Agent session deactivated");
             }
-            Self::AgentSessionEnded { session_id, .. } => {
-                debug!(session_id, "Agent session ended");
+            Self::AgentMcpReady {
+                node_id,
+                visit,
+                server_name,
+                tool_count,
+                startup_ms,
+                ..
+            } => {
+                debug!(
+                    node_id,
+                    visit, server_name, tool_count, startup_ms, "MCP server ready"
+                );
+            }
+            Self::AgentMcpFailed {
+                node_id,
+                visit,
+                server_name,
+                error,
+                startup_ms,
+            } => {
+                warn!(
+                    node_id,
+                    visit, server_name, error, startup_ms, "MCP server failed"
+                );
+            }
+            Self::AgentMcpDisconnected {
+                node_id,
+                visit,
+                server_name,
+                error,
+            } => {
+                warn!(
+                    node_id,
+                    visit, server_name, error, "MCP server disconnected"
+                );
             }
             Self::AgentInterruptInjected {
                 node_id,
@@ -1581,5 +1691,24 @@ impl Event {
                 error!(error = %error, "Pull request creation failed");
             }
         }
+    }
+}
+
+/// Traces a sandbox driver event under its run event name.
+fn trace_driver_event(event: &sandbox_driver::Event) {
+    use sandbox_driver::EventBody as Body;
+    use tracing::{debug, info, warn};
+
+    let name = fabro_types::sandbox_driver_event_name(event);
+    match &event.body {
+        Body::OperationFailed { error, .. } => {
+            warn!(event = %name, error = %error.message, "Sandbox driver operation failed");
+        }
+        Body::OperationCompleted { duration, .. } => {
+            let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+            info!(event = %name, duration_ms, "Sandbox driver operation completed");
+        }
+        Body::OperationStarted { .. } => info!(event = %name, "Sandbox driver operation started"),
+        _ => debug!(event = %name, "Sandbox driver event"),
     }
 }

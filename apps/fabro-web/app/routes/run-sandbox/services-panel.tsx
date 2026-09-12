@@ -77,7 +77,6 @@ export function ServicesPanelView({
   const [previewError, setPreviewError] = useState<string | null>(null);
 
   const services = servicesQuery.data?.data ?? [];
-  const discoverySource = servicesQuery.data?.meta.source;
   const queryErrorMessage = describeQueryError(servicesQuery.error);
   const showLoading = servicesQuery.isLoading && !servicesQuery.data;
   const showError = queryErrorMessage !== null && !servicesQuery.data;
@@ -150,7 +149,6 @@ export function ServicesPanelView({
           <EmptyState title="No services" />
         ) : (
           <>
-            {discoverySource === "procfs" ? <ProcfsDiscoveryTip /> : null}
             <ServicesTable
               services={services}
               pendingPort={pendingPort}
@@ -168,17 +166,6 @@ function describeQueryError(error: unknown): string | null {
   if (error instanceof ApiError) return error.message;
   if (error instanceof Error) return error.message;
   return "Could not load services.";
-}
-
-function ProcfsDiscoveryTip() {
-  return (
-    <div className="mb-3 rounded-md border border-line bg-panel/60 px-3 py-2 text-xs leading-5 text-fg-3">
-      <span className="font-medium text-fg-2">Tip:</span>{" "}
-      Install <code className="font-mono text-fg-2">ss</code> in the sandbox
-      for improved services listing:{" "}
-      <code className="font-mono text-fg-2">apt-get install iproute2</code>
-    </div>
-  );
 }
 
 function ServicesTable({

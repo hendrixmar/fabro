@@ -15,9 +15,11 @@ leak-timeout = "500ms"
     filter = "package(fabro-workflow)"
     slow-timeout = { period = "2s", terminate-after = 3 }
 
+    # Real descendant regressions include bounded reaping and process probes.
+    # Leave room for their own watchdogs to run fail-safe fixture cleanup.
     [[profile.default.overrides]]
-    filter = "package(twin-openai) & test(debug_page_renders_in_headless_chrome)"
-    slow-timeout = { period = "30s", terminate-after = 1 }
+    filter = "package(fabro-proc) & binary(lifecycle)"
+    slow-timeout = { period = "10s", terminate-after = 3 }
 
 [profile.e2e]
 # E2E (ignored) tests: flag SLOW after 10s, hard-kill after 30s
@@ -48,6 +50,3 @@ leak-timeout = "2s"
     filter = "package(fabro-workflow)"
     slow-timeout = { period = "30s", terminate-after = 4 }
 
-    [[profile.ci.overrides]]
-    filter = "package(twin-openai) & test(debug_page_renders_in_headless_chrome)"
-    slow-timeout = { period = "60s", terminate-after = 2 }

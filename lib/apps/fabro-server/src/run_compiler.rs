@@ -33,7 +33,7 @@ use fabro_config::{
     CliLayer, EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer, MergeMap,
     RunLayer, SettingsLayer, WorkflowSettingsBuilder,
 };
-use fabro_model::{Catalog, ProviderId};
+use fabro_llm::lithos_catalog::Catalog;
 use fabro_types::settings::interp::{InterpString, ResolveError};
 use fabro_types::settings::run::{McpServerSettings, RunGoal};
 use fabro_types::{
@@ -47,6 +47,7 @@ use fabro_workflow::operations::{
     CreateRunPersistenceMetadata, MaterializedRun, WorkflowInput,
 };
 use fabro_workflow::workflow_bundle::{BundledWorkflow, WorkflowBundle};
+use lithos_llm::catalog::ProviderId;
 use tokio::task;
 
 /// One project settings source in the acquired source's path namespace.
@@ -683,7 +684,6 @@ mod tests {
 
     use fabro_config::EnvironmentDockerfileLayer;
     use fabro_graphviz::graph::AttrValue;
-    use fabro_model::Catalog;
     use fabro_types::settings::interp::ResolveCtx;
     use fabro_types::settings::run::RunGoal;
     use fabro_types::{AutomationRef, Principal, RunProvenance, SystemActorKind};
@@ -766,7 +766,10 @@ mod tests {
     }
 
     fn test_provider_ids() -> Vec<ProviderId> {
-        Catalog::builtin().all_provider_ids().into_iter().collect()
+        fabro_llm::test_support::test_catalog()
+            .enabled_provider_ids()
+            .into_iter()
+            .collect()
     }
 
     fn prepare_run(
@@ -985,7 +988,7 @@ include = ["reports/{{ vars.path }}/*.json"]
 
     #[test]
     fn graph_vars_are_hard_errors_and_successfully_render_when_present() {
-        let catalog = Arc::new(Catalog::from_builtin().unwrap());
+        let catalog = Arc::new(fabro_llm::test_support::test_catalog());
         let missing = prepare_run(raw_input(None, HashMap::new()), HashMap::new())
             .expect("settings preparation should not compile graph vars");
         let Err(error) = compile_graph(missing, test_provider_ids(), Arc::clone(&catalog)) else {
@@ -1046,7 +1049,7 @@ include = ["reports/{{ vars.path }}/*.json"]
             toml::Value::String("checkout".to_string()),
         );
         let expected_entrypoint = input.entrypoint.clone();
-        let catalog = Arc::new(Catalog::from_builtin().unwrap());
+        let catalog = Arc::new(fabro_llm::test_support::test_catalog());
 
         let prepared = prepare_run(
             input,

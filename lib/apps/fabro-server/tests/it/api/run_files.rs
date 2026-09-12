@@ -136,7 +136,7 @@ async fn append_local_sandbox_initialized(store: &Database, run_id: &RunId) {
                 .expect("test should run inside a source checkout")
                 .display()
                 .to_string(),
-            provider:          SandboxProviderKind::Local,
+            provider:          SandboxProviderKind::LOCAL,
             id:                "local:test-sandbox".to_string(),
             image:             None,
             snapshot:          None,

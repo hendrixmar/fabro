@@ -113,7 +113,7 @@ mod tests {
     use std::sync::Arc;
 
     use fabro_graphviz::graph::AttrValue;
-    use fabro_model::Catalog;
+    use fabro_llm::lithos_catalog::Catalog;
 
     use super::*;
     use crate::file_resolver::FilesystemFileResolver;
@@ -129,7 +129,7 @@ mod tests {
     }
 
     fn test_catalog() -> Arc<Catalog> {
-        Arc::new(Catalog::from_builtin().unwrap())
+        Arc::new(fabro_llm::test_support::test_catalog())
     }
 
     fn transform_options() -> TransformOptions {

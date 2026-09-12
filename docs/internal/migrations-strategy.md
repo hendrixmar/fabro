@@ -20,7 +20,7 @@ The crate-local `src/migrations.rs` module is the registry. It imports numbered 
 Examples:
 
 - `fabro-config` owns settings-file migrations.
-- `fabro-server` owns server startup migrations for `server.env` and vault files.
+- `fabro-server` owns server startup activation migrations for SQLite blob storage and run history.
 
 Keep migration APIs `pub(crate)` unless another crate genuinely orchestrates the migration.
 
@@ -125,7 +125,7 @@ If a migration removes entries from a file after writing another store, write th
 
 Choose the error policy deliberately.
 
-Use warn-and-continue only when the normal path may still succeed and compatibility is best-effort. The legacy vault-entry migration does this because an unreadable legacy shape should not block loading an otherwise usable vault file.
+Use warn-and-continue only when the normal path may still succeed and compatibility is best-effort.
 
 Return an error when the migration found data it must move or rewrite and cannot do so safely. This gives operators a precise migration failure instead of a later, misleading startup error.
 

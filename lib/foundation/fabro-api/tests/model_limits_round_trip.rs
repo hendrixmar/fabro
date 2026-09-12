@@ -1,7 +1,7 @@
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::ModelLimits as ApiModelLimits;
-use fabro_model::ModelLimits;
+use fabro_types::ModelLimits;
 
 #[test]
 fn model_limits_reuses_canonical_type() {
@@ -15,7 +15,7 @@ fn model_limits_json_matches_openapi_shape() {
         max_output:     Some(128_000),
     };
 
-    let json = serde_json::to_value(&limits).unwrap();
+    let json = serde_json::to_value(limits).unwrap();
     assert_eq!(json["context_window"], 1_000_000);
     assert_eq!(json["max_output"], 128_000);
 

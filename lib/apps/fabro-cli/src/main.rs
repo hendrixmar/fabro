@@ -586,6 +586,7 @@ mod tests {
         ProviderCommand, ProviderNamespace,
     };
     use clap::error::ErrorKind;
+    use lithos_llm::catalog::{ProviderId, builtin};
     use temp_env::with_var;
     use tokio::runtime::Runtime;
 
@@ -657,7 +658,7 @@ destination = "{destination}"
             Commands::Provider(ProviderNamespace {
                 command: ProviderCommand::Login(args),
             }) => {
-                assert_eq!(args.provider, fabro_model::ProviderId::openai());
+                assert_eq!(args.provider, builtin::openai());
             }
             _ => panic!("unexpected command variant"),
         }
@@ -671,7 +672,7 @@ destination = "{destination}"
             Commands::Provider(ProviderNamespace {
                 command: ProviderCommand::Login(args),
             }) => {
-                assert_eq!(args.provider, fabro_model::ProviderId::anthropic());
+                assert_eq!(args.provider, builtin::anthropic());
             }
             _ => panic!("unexpected command variant"),
         }
@@ -692,7 +693,7 @@ destination = "{destination}"
             Commands::Provider(ProviderNamespace {
                 command: ProviderCommand::Login(args),
             }) => {
-                assert_eq!(args.provider, fabro_model::ProviderId::anthropic());
+                assert_eq!(args.provider, builtin::anthropic());
                 assert!(args.api_key_stdin);
             }
             _ => panic!("unexpected command variant"),
@@ -1201,7 +1202,7 @@ destination = "{destination}"
             Commands::Provider(ProviderNamespace {
                 command: ProviderCommand::Login(args),
             }) => {
-                assert_eq!(args.provider, fabro_model::ProviderId::new("bogus"));
+                assert_eq!(args.provider, ProviderId::new("bogus"));
             }
             _ => panic!("expected provider login command"),
         }

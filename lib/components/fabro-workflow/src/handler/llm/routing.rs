@@ -1,6 +1,8 @@
 use fabro_graphviz::graph::{self, Node};
-use fabro_model::{AgentProfileKind, Catalog, ProviderId};
-use fabro_types::AgentBackend;
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::{ModelSelectionError, catalog, selection};
+use fabro_types::{AgentBackend, AgentProfileKind};
+use lithos_llm::catalog::ProviderId;
 
 use crate::error::Error;
 
@@ -50,38 +52,42 @@ pub(crate) fn resolve_provider_context(
     provider_attr: Option<&str>,
 ) -> Result<ProviderContext, Error> {
     let provider_id = if let Some(provider) = provider_attr {
-        let requested = ProviderId::from(provider);
         catalog
-            .provider(&requested)
+            .enabled_provider(provider)
+            .map(|found| found.id().clone())
             .ok_or_else(|| {
                 Error::Precondition(format!("Provider \"{provider}\" is not configured"))
             })?
-            .id
-            .clone()
     } else if catalog
-        .get_on_provider(default_provider_id, model)
+        .enabled_provider(default_provider_id.as_str())
+        .and_then(|provider| provider.offering(model))
         .is_some()
     {
         // The run's selected provider is a pin whenever it offers the model.
         default_provider_id.clone()
     } else {
-        match catalog.select(model, None, &catalog.all_provider_ids()) {
-            Ok(model) => model.provider.clone(),
-            Err(fabro_model::ModelSelectionError::UnknownSelector { .. }) => {
-                default_provider_id.clone()
-            }
+        match selection::select(
+            catalog,
+            model,
+            None,
+            &catalog.enabled_provider_ids().into_iter().collect(),
+        ) {
+            Ok(entry) => entry.provider.id().clone(),
+            Err(ModelSelectionError::UnknownSelector { .. }) => default_provider_id.clone(),
             Err(error) => return Err(error.into()),
         }
     };
 
-    let provider = catalog.provider(&provider_id).ok_or_else(|| {
-        Error::Precondition(format!("Provider \"{provider_id}\" is not configured"))
-    })?;
-    let profile_kind = catalog
-        .effective_agent_profile(&provider.id, Some(model))
+    let provider_id = catalog
+        .enabled_provider(provider_id.as_str())
+        .map(|provider| provider.id().clone())
+        .ok_or_else(|| {
+            Error::Precondition(format!("Provider \"{provider_id}\" is not configured"))
+        })?;
+    let profile_kind = catalog::agent_profile(catalog, provider_id.as_str(), Some(model))
         .expect("validated provider should resolve an agent profile");
     Ok(ProviderContext {
-        provider_id: provider.id.clone(),
+        provider_id,
         profile_kind,
     })
 }

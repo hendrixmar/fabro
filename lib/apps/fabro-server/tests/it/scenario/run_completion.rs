@@ -3,7 +3,6 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use fabro_auth::test_support;
-use fabro_model::{Catalog, ProviderId};
 use fabro_static::EnvVars;
 use fabro_test::{TwinScenario, TwinScenarios, twin_openai};
 use fabro_types::RunId;
@@ -32,18 +31,14 @@ const PROJECT_SKILL_AGENT_DOT: &str = r#"digraph ProjectSkillAgent {
 
 fn test_app_with_openai_agent_backend(openai_base_url: String, api_key: String) -> axum::Router {
     let settings = test_settings();
-    let llm_catalog_settings =
-        fabro_server::test_support::llm_catalog_settings_with_provider_base_url(
-            "openai",
-            openai_base_url,
-        );
-    let catalog = Arc::new(
-        Catalog::from_builtin_with_overrides(&llm_catalog_settings)
-            .expect("test catalog should build"),
-    );
+    let llm_overlay =
+        fabro_server::test_support::llm_overlay_with_provider_base_url("openai", openai_base_url);
+    let catalog = Arc::new(fabro_server::test_support::test_catalog_with_overlay(
+        &llm_overlay,
+    ));
     let source_api_key = api_key.clone();
     let env_api_key = api_key.clone();
-    let llm_source: Arc<dyn fabro_auth::CredentialSource> =
+    let llm_source: Arc<dyn fabro_llm::credentials::CredentialProvider> =
         test_support::env_credential_source(move |name| match name {
             "OPENAI_API_KEY" => Some(source_api_key.clone()),
             _ => None,
@@ -51,7 +46,7 @@ fn test_app_with_openai_agent_backend(openai_base_url: String, api_key: String) 
     let state = fabro_server::test_support::TestAppStateBuilder::new()
         .runtime_settings(settings.server_settings, settings.manifest_run_defaults)
         .max_concurrent_runs(5)
-        .llm_catalog_settings(llm_catalog_settings)
+        .llm_overlay(llm_overlay)
         .vault_entries([(EnvVars::OPENAI_API_KEY, api_key)])
         .registry_factory(move |interviewer| {
             let catalog = Arc::clone(&catalog);
@@ -60,9 +55,9 @@ fn test_app_with_openai_agent_backend(openai_base_url: String, api_key: String) 
             let steering_hub = Arc::new(fabro_workflow::SteeringHub::new(emitter));
             fabro_workflow::handler::default_registry(interviewer, move || {
                 Some(Box::new(
-                    fabro_workflow::handler::llm::AgentApiBackend::new_with_catalog(
+                    fabro_workflow::handler::llm::PebbleBackend::new_with_catalog(
                         OPENAI_AGENT_MODEL.to_string(),
-                        ProviderId::openai(),
+                        lithos_llm::catalog::builtin::openai(),
                         fabro_workflow::model_fallback::ModelFallbackPolicy::default(),
                         Arc::clone(&llm_source),
                         Arc::clone(&steering_hub),

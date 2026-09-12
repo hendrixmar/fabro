@@ -7,7 +7,7 @@ use axum::http::{Request, StatusCode};
 use fabro_config::{RunEnvironmentLayer, RunLayer, ServerSettingsBuilder};
 use fabro_server::server::{AppState, spawn_scheduler};
 use fabro_server::test_support::{
-    TestAppStateBuilder, build_test_router, llm_catalog_settings_with_provider_base_url,
+    TestAppStateBuilder, build_test_router, llm_overlay_with_provider_base_url,
     test_app_state as server_test_app_state, test_app_state_with_runtime_settings_and_env_lookup,
     test_app_state_with_runtime_settings_and_options_and_registry_factory,
 };
@@ -125,7 +125,7 @@ pub(crate) fn test_app_with_mock_anthropic(mock_base_url: &str) -> axum::Router 
     let state = TestAppStateBuilder::new()
         .runtime_settings(settings.server_settings, settings.manifest_run_defaults)
         .max_concurrent_runs(5)
-        .llm_catalog_settings(llm_catalog_settings_with_provider_base_url(
+        .llm_overlay(llm_overlay_with_provider_base_url(
             "anthropic",
             mock_base_url,
         ))

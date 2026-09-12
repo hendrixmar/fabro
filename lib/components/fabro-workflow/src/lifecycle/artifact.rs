@@ -39,7 +39,7 @@ const ARTIFACT_UPLOAD_RETRY_DELAYS: [Duration; 3] = [
 
 /// Sub-lifecycle responsible for artifact collection, offloading, and syncing.
 pub(crate) struct ArtifactLifecycle {
-    pub sandbox:        Arc<dyn fabro_sandbox::Sandbox>,
+    pub sandbox:        Arc<fabro_sandbox::RunSandbox>,
     pub run_store:      RunStoreHandle,
     pub emitter:        Arc<Emitter>,
     pub run_id:         RunId,
@@ -53,7 +53,7 @@ pub(crate) struct ArtifactLifecycle {
 
 impl ArtifactLifecycle {
     pub(crate) fn new(
-        sandbox: Arc<dyn fabro_sandbox::Sandbox>,
+        sandbox: Arc<fabro_sandbox::RunSandbox>,
         run_store: RunStoreHandle,
         emitter: Arc<Emitter>,
         run_id: RunId,
@@ -130,7 +130,7 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
         let artifact_capture_dir =
             tempfile::tempdir().map_err(|err| CoreError::Other(err.to_string()))?;
 
-        match collect_artifacts(&*self.sandbox, artifact_capture_dir.path(), artifact_globs).await {
+        match collect_artifacts(&self.sandbox, artifact_capture_dir.path(), artifact_globs).await {
             Ok(summary) => {
                 self.emit_collection_problem_notice(node_id, &summary);
                 let new_assets = self.new_captured_assets(&summary.captured_assets);
@@ -207,7 +207,7 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
 
         // Sync file-backed artifacts to sandbox environment
         if let Err(e) =
-            sync_artifacts_to_env(&mut result.outcome.context_updates, &*self.sandbox).await
+            sync_artifacts_to_env(&mut result.outcome.context_updates, &self.sandbox).await
         {
             self.emitter.notice(
                 RunNoticeLevel::Warn,

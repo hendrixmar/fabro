@@ -8,7 +8,7 @@ use fabro_core::lifecycle::{
 use fabro_core::outcome::NodeResult;
 use fabro_core::state::ExecutionState;
 use fabro_hooks::{HookContext, HookDecision, HookEvent, HookExecutionContext, HookRunner};
-use fabro_sandbox::Sandbox;
+use fabro_sandbox::RunSandbox;
 use fabro_types::RunId;
 
 use crate::graph::{WorkflowGraph, WorkflowNode};
@@ -22,7 +22,7 @@ type WfNodeDecision = NodeDecision<Option<BilledModelUsage>>;
 /// Sub-lifecycle responsible for running workflow hooks.
 pub(crate) struct HookLifecycle {
     pub hook_runner:            Option<Arc<HookRunner>>,
-    pub sandbox:                Arc<dyn Sandbox>,
+    pub sandbox:                Arc<RunSandbox>,
     pub hook_execution_context: HookExecutionContext,
     pub run_id:                 RunId,
     pub graph_name:             String,

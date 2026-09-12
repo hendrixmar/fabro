@@ -341,15 +341,6 @@ mod tests {
                 visit: 1,
             })
         ));
-        assert!(!replay_event_for_fork_projection(
-            &EventBody::AgentSessionStarted(fabro_types::run_event::AgentSessionStartedProps {
-                provider: Some("openai".to_string()),
-                model:    Some("gpt-5.4".to_string()),
-            })
-        ));
-        assert!(!replay_event_for_fork_projection(
-            &EventBody::AgentSessionEnded(fabro_types::run_event::AgentSessionEndedProps {})
-        ));
     }
 
     #[test]

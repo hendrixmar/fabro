@@ -22,7 +22,7 @@ import { SANDBOX_STATE_DISPLAY } from "../lib/sandbox-state";
 import type {
   RunSandbox,
   SandboxDetails,
-  SandboxNetwork,
+  SandboxNetworkPolicy,
   SandboxResources,
 } from "@qltysh/fabro-api-client";
 import FilesystemPanel from "./run-sandbox/filesystem-panel";
@@ -57,27 +57,47 @@ function nullableTimestamp(value: string | null | undefined): string {
   return value ? formatAbsoluteTs(value) : EMPTY_VALUE;
 }
 
-function nullableMemory(bytes: number | null | undefined): string {
-  return bytes != null ? formatBytesAsMemory(bytes) : EMPTY_VALUE;
+function nullableMegabytes(megabytes: number | null | undefined): string {
+  return megabytes != null ? formatBytesAsMemory(megabytes * 1024 * 1024) : EMPTY_VALUE;
 }
 
 function nullableCpu(cores: number | null | undefined): string {
   return cores != null ? formatCpuCores(cores) : EMPTY_VALUE;
 }
 
-type SandboxNetworkPolicy = SandboxNetwork["egress"];
-type SandboxNetworkPolicyMode = SandboxNetworkPolicy["mode"];
+function nullableCount(count: number | null | undefined): string {
+  return count != null ? String(count) : EMPTY_VALUE;
+}
 
-const NETWORK_POLICY_DISPLAY: Record<SandboxNetworkPolicyMode, string> = {
-  unknown:          "Unknown",
-  open:             "Open",
-  blocked:          "Blocked",
-  cidr_allow_list:  "CIDR allow list",
-  essentials_only:  "Essentials only",
+const NETWORK_POLICY_DISPLAY: Record<string, string> = {
+  provider_default: "Provider default",
+  allow_all:        "Allow all",
+  block:            "Blocked",
 };
 
-function networkPolicySummary(policy: SandboxNetworkPolicy): string {
-  return NETWORK_POLICY_DISPLAY[policy.mode] ?? policy.mode;
+/** The policy's name, and the entries of an allow list when it carries one. */
+function describeNetworkPolicy(
+  policy: SandboxNetworkPolicy | null | undefined,
+): { summary: string; entries: { label: string; values: string[] } | null } {
+  if (policy == null) {
+    return { summary: "Unknown", entries: null };
+  }
+  if (typeof policy === "string") {
+    return { summary: NETWORK_POLICY_DISPLAY[policy] ?? policy, entries: null };
+  }
+  if ("cidr_allow_list" in policy) {
+    return {
+      summary: "CIDR allow list",
+      entries: { label: "Allowed CIDRs", values: policy.cidr_allow_list.cidrs },
+    };
+  }
+  if ("domain_allow_list" in policy) {
+    return {
+      summary: "Domain allow list",
+      entries: { label: "Allowed domains", values: policy.domain_allow_list.domains },
+    };
+  }
+  return { summary: "Unknown", entries: null };
 }
 
 interface RowProps {
@@ -142,11 +162,12 @@ function Panel({ title, children }: PanelProps) {
 }
 
 function StatusStrip({ details }: { details: SandboxDetails }) {
-  const display = SANDBOX_STATE_DISPLAY[details.state] ?? SANDBOX_STATE_DISPLAY.unknown;
+  const status = details.status;
+  const display = SANDBOX_STATE_DISPLAY[status.state] ?? SANDBOX_STATE_DISPLAY.unknown;
   const provider = details.sandbox.provider;
+  const providerState = status.provider_state ?? "";
   const showNative =
-    details.native_state &&
-    details.native_state.toLowerCase() !== details.state.toLowerCase();
+    providerState.length > 0 && providerState.toLowerCase() !== status.state.toLowerCase();
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-md border border-line bg-panel/60 px-4 py-3 text-sm">
       <span className="font-mono text-xs text-fg-muted uppercase tracking-wide">
@@ -158,7 +179,7 @@ function StatusStrip({ details }: { details: SandboxDetails }) {
       </span>
       {showNative && (
         <span className="font-mono text-xs text-fg-muted">
-          ({details.native_state})
+          ({providerState})
         </span>
       )}
     </div>
@@ -167,20 +188,25 @@ function StatusStrip({ details }: { details: SandboxDetails }) {
 
 function OverviewPanel({ details }: { details: SandboxDetails }) {
   const sandbox = details.sandbox;
+  const status = details.status;
   const runtime = sandbox.runtime;
   return (
     <Panel title="Overview">
-      <Row label="ID" value={nullable(runtime?.id)} />
+      <Row label="ID" value={nullable(status.id || runtime?.id)} />
       <Row label="Working directory" value={nullable(runtime?.working_directory)} />
       <Row
         label="Region"
-        value={details.region ? details.region : sandbox.provider === "docker" ? "local" : EMPTY_VALUE}
+        value={status.region ? status.region : sandbox.provider === "docker" ? "local" : EMPTY_VALUE}
       />
-      <Row label="Image" value={nullable(sandbox.image ?? sandbox.snapshot)} />
-      {details.web_url && (
+      <Row
+        label="Image"
+        value={nullable(status.image ?? status.snapshot ?? sandbox.image ?? sandbox.snapshot)}
+      />
+      {status.sandbox_kind && <Row label="Kind" value={status.sandbox_kind} />}
+      {status.web_url && (
         <LinkRow
           label="Provider"
-          href={details.web_url}
+          href={status.web_url}
           text={
             sandbox.provider === "daytona"
               ? "Open in Daytona"
@@ -192,29 +218,25 @@ function OverviewPanel({ details }: { details: SandboxDetails }) {
   );
 }
 
-function ResourcesPanel({ resources }: { resources: SandboxResources }) {
+function ResourcesPanel({ resources }: { resources: SandboxResources | null | undefined }) {
   return (
     <Panel title="Resources">
-      <Row label="CPU" value={nullableCpu(resources.cpu_cores)} />
-      <Row label="Memory" value={nullableMemory(resources.memory_bytes)} />
-      <Row label="Disk" value={nullableMemory(resources.disk_bytes)} />
+      <Row label="CPU" value={nullableCpu(resources?.cpu_cores)} />
+      <Row label="Memory" value={nullableMegabytes(resources?.memory_mb)} />
+      <Row label="Disk" value={nullableMegabytes(resources?.disk_mb)} />
+      {resources?.gpus != null && <Row label="GPUs" value={nullableCount(resources.gpus)} />}
     </Panel>
   );
 }
 
-function NetworkPanel({ network }: { network: SandboxNetwork }) {
-  const cidrRows: Array<{ label: string; policy: SandboxNetworkPolicy }> = [
-    { label: "Egress CIDRs", policy: network.egress },
-    { label: "Ingress CIDRs", policy: network.ingress },
-  ].filter(({ policy }) => policy.mode === "cidr_allow_list");
-
+function NetworkPanel({ network }: { network: SandboxNetworkPolicy | null | undefined }) {
+  const { summary, entries } = describeNetworkPolicy(network);
   return (
     <Panel title="Network">
-      <Row label="Egress" value={networkPolicySummary(network.egress)} />
-      <Row label="Ingress" value={networkPolicySummary(network.ingress)} />
-      {cidrRows.map(({ label, policy }) => (
-        <Row key={label} label={label} value={policy.cidrs.join(", ") || EMPTY_VALUE} />
-      ))}
+      <Row label="Policy" value={summary} />
+      {entries && (
+        <Row label={entries.label} value={entries.values.join(", ") || EMPTY_VALUE} />
+      )}
     </Panel>
   );
 }
@@ -237,11 +259,8 @@ function LabelsPanel({ labels }: { labels: { [key: string]: string } | null | un
 function TimestampsPanel({ details }: { details: SandboxDetails }) {
   return (
     <Panel title="Timestamps">
-      <Row label="Created" value={nullableTimestamp(details.timestamps.created_at)} />
-      <Row
-        label="Last activity"
-        value={nullableTimestamp(details.timestamps.last_activity_at)}
-      />
+      <Row label="Created" value={nullableTimestamp(details.status.created_at)} />
+      <Row label="Last updated" value={nullableTimestamp(details.status.updated_at)} />
     </Panel>
   );
 }
@@ -259,9 +278,9 @@ function DetailsColumn({ details }: { details: SandboxDetails | null }) {
     <div className="space-y-4">
       <StatusStrip details={details} />
       <OverviewPanel details={details} />
-      <ResourcesPanel resources={details.resources} />
-      <NetworkPanel network={details.network} />
-      <LabelsPanel labels={details.labels} />
+      <ResourcesPanel resources={details.status.resources} />
+      <NetworkPanel network={details.status.network} />
+      <LabelsPanel labels={details.status.labels} />
       <TimestampsPanel details={details} />
     </div>
   );

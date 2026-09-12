@@ -1,4 +1,4 @@
-use fabro_test::test_context;
+use fabro_test::TestContext;
 
 use super::{
     completed_nodes, find_run_dir, fixture, has_event, read_conclusion, sandbox_tests, timeout_for,
@@ -6,9 +6,7 @@ use super::{
 
 sandbox_tests!(agent_linear, keys = ["ANTHROPIC_API_KEY"]);
 
-fn scenario_agent_linear(sandbox: &str) {
-    let context = test_context!();
-
+fn scenario_agent_linear(context: &TestContext, sandbox: &str) {
     context
         .run_cmd()
         .args([
@@ -23,7 +21,7 @@ fn scenario_agent_linear(sandbox: &str) {
         .assert()
         .success();
 
-    let run_dir = find_run_dir(&context);
+    let run_dir = find_run_dir(context);
     let conclusion = read_conclusion(&run_dir);
     assert_eq!(conclusion["status"].as_str(), Some("succeeded"));
 

@@ -7,7 +7,7 @@ use fabro_automation::{
 };
 use fabro_environment::EnvironmentId;
 use fabro_store::{RunSummaryListQuery, RunSummaryVisibility};
-use fabro_types::{AutomationRef, RunId, SandboxProviderKind};
+use fabro_types::{AutomationRef, RunId};
 use fabro_util::error as error_util;
 use serde::Serialize;
 
@@ -282,7 +282,7 @@ pub(in crate::server) fn resolve_automation_environment(
             "automation_environment_not_found",
         ));
     };
-    if !environment.settings.provider.is_clone_based() {
+    if !environment.settings.provider.clones_workspace() {
         return Err(ApiError::with_code(
             status,
             format!(
@@ -291,9 +291,9 @@ pub(in crate::server) fn resolve_automation_environment(
             "automation_environment_incompatible",
         ));
     }
-    let provider = SandboxProviderKind::from(environment.settings.provider);
+    let provider = environment.settings.provider.clone();
     if let Some(message) =
-        run_manifest::sandbox_provider_policy_error(&state.server_settings(), provider)
+        run_manifest::sandbox_provider_policy_error(&state.server_settings(), &provider)
     {
         return Err(ApiError::with_code(
             status,
@@ -302,10 +302,9 @@ pub(in crate::server) fn resolve_automation_environment(
         ));
     }
     if !state
-        .sandbox_provider_registry()
-        .providers()
-        .iter()
-        .any(|sandbox_provider| sandbox_provider.kind() == provider)
+        .sandbox_inventory()
+        .kinds()
+        .any(|kind| *kind == provider)
     {
         return Err(ApiError::with_code(
             status,

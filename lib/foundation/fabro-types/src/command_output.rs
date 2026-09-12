@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+pub use pebble_coding_agent::events::CommandTermination;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -21,34 +22,6 @@ use strum::{Display, EnumString, IntoStaticStr};
 pub enum CommandOutputStream {
     Stdout,
     Stderr,
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    Display,
-    EnumString,
-    IntoStaticStr,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum CommandTermination {
-    Exited,
-    TimedOut,
-    Cancelled,
-}
-
-impl CommandTermination {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        self.into()
-    }
 }
 
 impl CommandOutputStream {

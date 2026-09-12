@@ -41,7 +41,8 @@ mod run_intent;
 mod run_manifest;
 mod run_selector;
 mod run_title_generation;
-pub mod run_tool_manifest;
+#[cfg(test)]
+mod run_tool_create;
 pub mod security_headers;
 pub mod serve;
 pub mod server;
@@ -59,4 +60,4 @@ mod worker_token;
 pub use error::{ApiError, Error, Result};
 pub use run_manifest::workflow_bundle_from_manifest;
 pub use server_secrets::process_env_snapshot;
-pub use startup::{migrate_startup_vault, validate_startup, validate_startup_configuration};
+pub use startup::{validate_startup, validate_startup_configuration};

@@ -15,12 +15,13 @@
 
 
 /**
- * Whether `cost_usd` came from provider billing data (authoritative) or catalog price estimation (estimated).
+ * Where a cost came from: `catalog` (estimated from catalog prices), `provider` (the provider\'s own billing data), or `application`.
  */
 
 export const CostSource = {
-    AUTHORITATIVE: 'authoritative',
-    ESTIMATED: 'estimated'
+    CATALOG: 'catalog',
+    PROVIDER: 'provider',
+    APPLICATION: 'application'
 } as const;
 
 export type CostSource = typeof CostSource[keyof typeof CostSource];

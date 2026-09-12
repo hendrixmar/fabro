@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use fabro_config::{Storage, envfile};
 use fabro_static::EnvVars;
-use fabro_types::settings::run::EnvironmentProvider;
+use fabro_types::{BundledProvider, SandboxProviderKind};
 use fabro_util::dev_token;
 use fabro_vault::SecretStore;
 pub use fabro_vault::SecretStoreWrite;
@@ -136,12 +136,12 @@ pub fn default_web_url() -> String {
 }
 
 pub async fn seed_environments_in_storage(storage_dir: &Path) -> Result<()> {
-    seed_default_environment_in_storage(storage_dir, EnvironmentProvider::Docker).await
+    seed_default_environment_in_storage(storage_dir, SandboxProviderKind::DOCKER).await
 }
 
 pub async fn seed_default_environment_in_storage(
     storage_dir: &Path,
-    provider: EnvironmentProvider,
+    provider: SandboxProviderKind,
 ) -> Result<()> {
     let database = open_migrated_database(storage_dir).await?;
     fabro_environment::seed_default_environment(database.pool(), provider).await?;
@@ -478,20 +478,15 @@ fn write_sandbox_provider_policy(
     selection: InstallSandboxSelection,
     allow_local: bool,
 ) -> Result<()> {
-    use fabro_types::SandboxProviderKind;
     let sandbox = ensure_table(server, "sandbox")?;
     let providers = ensure_table(sandbox, "providers")?;
-    for provider in [
-        SandboxProviderKind::Local,
-        SandboxProviderKind::Docker,
-        SandboxProviderKind::Daytona,
-    ] {
+    for provider in SandboxProviderKind::bundled_kinds().filter_map(|kind| kind.bundled()) {
         // Only enable the providers the operator configured or allowed in the
         // install wizard: the chosen runtime, plus local when allowed.
         let enabled = match provider {
-            SandboxProviderKind::Local => allow_local,
-            SandboxProviderKind::Docker => selection == InstallSandboxSelection::Docker,
-            SandboxProviderKind::Daytona => selection == InstallSandboxSelection::Daytona,
+            BundledProvider::Local => allow_local,
+            BundledProvider::Docker => selection == InstallSandboxSelection::Docker,
+            BundledProvider::Daytona => selection == InstallSandboxSelection::Daytona,
         };
         let entry = ensure_table(providers, &provider.to_string())?;
         entry.insert("enabled".to_string(), toml::Value::Boolean(enabled));

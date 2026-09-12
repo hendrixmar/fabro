@@ -1,43 +1,32 @@
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use fabro_sandbox::{TerminalSize, open_terminal_for_run};
-use fabro_types::{
-    RunSandboxInstance, SandboxProviderKind, SandboxServiceDiscoverySource, SandboxServiceListMeta,
+use fabro_sandbox::{
+    FileKind, ProviderAccess, PtySize, RunSandbox, open_terminal_for_run, reconnect_for_run,
 };
+use fabro_types::{RunSandboxInstance, SandboxProviderKind};
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
+use sandbox_driver::{ListeningPort, Services as _};
 
 use super::super::{
-    ApiError, AppState, Bytes, DaytonaSandbox, EnvVars, HeaderMap, IntoResponse, Json,
-    NamedTempFile, Path, PreviewUrlRequest, PreviewUrlResponse, Query, RequiredUser, Response,
-    Router, RunId, Sandbox, SandboxDetails, SandboxFileEntry, SandboxFileListResponse,
-    SandboxService, SandboxServiceListResponse, SshAccessRequest, SshAccessResponse, State,
-    StatusCode, VncPreviewResponse, collect_causes, fs, get, octet_stream_response,
-    parse_run_id_path, post, reconnect_for_run, reject_if_archived, render_with_causes,
-    sandbox_details,
+    ApiError, AppState, Bytes, HeaderMap, IntoResponse, Json, NamedTempFile, Path,
+    PreviewUrlRequest, PreviewUrlResponse, Query, RequiredUser, Response, Router, RunId,
+    SandboxDetails, SandboxFileEntry, SandboxFileListResponse, SandboxService,
+    SandboxServiceListResponse, SshAccessRequest, SshAccessResponse, State, StatusCode,
+    VncPreviewResponse, collect_causes, fs, get, octet_stream_response, parse_run_id_path, post,
+    reject_if_archived, render_with_causes, sandbox_details,
 };
 
 const MAX_TERMINAL_CONTROL_BYTES: usize = 4096;
 const DEFAULT_VNC_NO_VNC_PORT: u16 = 6080;
 const DEFAULT_VNC_TTL_SECS: i32 = 3600;
-const LIST_SANDBOX_SERVICES_COMMAND: &str = r#"if command -v ss >/dev/null 2>&1; then
-  ss -H -ltnp && exit 0
-fi
-printf 'FABRO_PROC_NET_TCP procfs\n'
-for file in /proc/net/tcp /proc/net/tcp6; do
-  if [ -r "$file" ]; then
-    printf 'FABRO_PROC_NET_TCP %s\n' "$file"
-    while IFS= read -r line; do
-      printf '%s\n' "$line"
-    done < "$file"
-  fi
-done"#;
-const LIST_SANDBOX_SERVICES_FAILURE_LABEL: &str = "sandbox service discovery command";
-const LIST_SANDBOX_SERVICES_TIMEOUT_MS: u64 = 5_000;
+/// Header a Daytona unsigned preview needs; surfaced as the response token.
+const PREVIEW_TOKEN_HEADER: &str = "x-daytona-preview-token";
+const LIST_SANDBOX_SERVICES_FAILURE_LABEL: &str = "sandbox service discovery";
 // Daytona's signed preview points at the noVNC service root, which serves a
 // directory listing. Force the iframe to the actual viewer page with
 // autoconnect+scale so the user lands on the desktop, not a file index.
@@ -45,37 +34,24 @@ const VNC_VIEWER_PATH: &str = "/vnc.html";
 const VNC_VIEWER_AUTOCONNECT: (&str, &str) = ("autoconnect", "true");
 const VNC_VIEWER_RESIZE: (&str, &str) = ("resize", "scale");
 
+/// The provider-side steps behind a VNC preview, so the response shaping can
+/// be tested without a sandbox.
 trait VncSandbox {
-    fn start_computer_use(&self) -> BoxFuture<'_, fabro_sandbox::Result<()>>;
-    fn signed_preview_url(
-        &self,
-        port: u16,
-        expires_in_secs: i32,
-    ) -> BoxFuture<'_, fabro_sandbox::Result<String>>;
+    /// Starts the desktop and returns the signed viewer URL the provider
+    /// hands out for it.
+    fn vnc_viewer_url(&self) -> BoxFuture<'_, fabro_sandbox::Result<String>>;
 }
 
-impl VncSandbox for DaytonaSandbox {
-    fn start_computer_use(&self) -> BoxFuture<'_, fabro_sandbox::Result<()>> {
+impl VncSandbox for RunSandbox {
+    fn vnc_viewer_url(&self) -> BoxFuture<'_, fabro_sandbox::Result<String>> {
         async move {
-            let computer_use = self.computer_use().await?;
-            computer_use
-                .start()
+            let vnc = self.handle()?.vnc().ok_or_else(|| {
+                fabro_sandbox::Error::message("Sandbox provider does not support VNC previews.")
+            })?;
+            vnc.vnc_connection()
                 .await
-                .map_err(|err| fabro_sandbox::Error::context("Failed to start Computer Use", err))
-                .map(|_| ())
-        }
-        .boxed()
-    }
-
-    fn signed_preview_url(
-        &self,
-        port: u16,
-        expires_in_secs: i32,
-    ) -> BoxFuture<'_, fabro_sandbox::Result<String>> {
-        async move {
-            self.get_signed_preview_url(port, Some(expires_in_secs))
-                .await
-                .map(|preview| preview.url)
+                .map(|connection| connection.url)
+                .map_err(|err| fabro_sandbox::Error::context("Failed to open a VNC preview", err))
         }
         .boxed()
     }
@@ -109,12 +85,11 @@ async fn retrieve_run_sandbox(
         Ok(record) => record,
         Err(response) => return response,
     };
-    let daytona_api_key = match load_daytona_api_key(&state).await {
+    let access = match load_provider_access(&state).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let daytona_organization_id = state.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
-    match sandbox_details(&record, daytona_api_key, daytona_organization_id, Some(id)).await {
+    match sandbox_details(&record, &access, Some(id)).await {
         Ok(details) => Json::<SandboxDetails>(details).into_response(),
         Err(err) => {
             let detail = format!("{err:#}");
@@ -142,7 +117,7 @@ struct SandboxFileParams {
 
 #[derive(Debug, PartialEq, Eq)]
 enum TerminalClientMessage {
-    Resize(TerminalSize),
+    Resize(PtySize),
     Close,
 }
 
@@ -159,7 +134,7 @@ fn parse_terminal_control_message(text: &str) -> Result<TerminalClientMessage, &
     }
     match serde_json::from_str::<TerminalClientControl>(text) {
         Ok(TerminalClientControl::Resize { cols, rows }) if cols > 0 && rows > 0 => {
-            Ok(TerminalClientMessage::Resize(TerminalSize { cols, rows }))
+            Ok(TerminalClientMessage::Resize(PtySize { cols, rows }))
         }
         Ok(TerminalClientControl::Resize { .. }) => {
             Err("Terminal resize dimensions must be greater than zero.")
@@ -231,7 +206,7 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
             return;
         }
     };
-    let daytona_api_key = match load_daytona_api_key(&state).await {
+    let access = match load_provider_access(&state).await {
         Ok(value) => value,
         Err(response) => {
             let _ = socket
@@ -244,15 +219,7 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
             return;
         }
     };
-    let daytona_organization_id = state.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
-    let session = match open_terminal_for_run(
-        &record,
-        daytona_api_key,
-        daytona_organization_id,
-        Some(id),
-        TerminalSize::default(),
-    )
-    .await
+    let session = match open_terminal_for_run(&record, &access, Some(id), PtySize::default()).await
     {
         Ok(session) => session,
         Err(err) => {
@@ -285,7 +252,7 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
                     Ok(WsMessage::Binary(bytes)) => {
                         if let Err(err) = session.write_input(&bytes).await {
                             let _ = socket
-                                .send(terminal_server_text("error", Some(&err.display_with_causes())))
+                                .send(terminal_server_text("error", Some(&fabro_sandbox::display_for_log(&err))))
                                 .await;
                             break;
                         }
@@ -295,7 +262,7 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
                             Ok(TerminalClientMessage::Resize(size)) => {
                                 if let Err(err) = session.resize(size).await {
                                     let _ = socket
-                                        .send(terminal_server_text("error", Some(&err.display_with_causes())))
+                                        .send(terminal_server_text("error", Some(&fabro_sandbox::display_for_log(&err))))
                                         .await;
                                     break;
                                 }
@@ -330,7 +297,7 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
                     }
                     Err(err) => {
                         let _ = socket
-                            .send(terminal_server_text("error", Some(&err.display_with_causes())))
+                            .send(terminal_server_text("error", Some(&fabro_sandbox::display_for_log(&err))))
                             .await;
                         break;
                     }
@@ -339,7 +306,7 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
         }
     }
     if let Err(err) = session.close().await {
-        tracing::warn!(error = %err.display_with_causes(), run_id = %id, "failed to close run terminal session");
+        tracing::warn!(error = %fabro_sandbox::display_for_log(&err), run_id = %id, "failed to close run terminal session");
     }
 }
 
@@ -363,18 +330,35 @@ async fn generate_preview_url(
     let Ok(port) = u16::try_from(request.port) else {
         return ApiError::bad_request("Port must fit in a u16.").into_response();
     };
-    let Ok(expires_in_secs) = i32::try_from(request.expires_in_secs.get()) else {
+    if i32::try_from(request.expires_in_secs.get()).is_err() {
         return ApiError::bad_request("Preview expiry exceeds supported range.").into_response();
-    };
+    }
 
-    let sandbox = match reconnect_daytona_sandbox(&state, &id).await {
+    let record = match load_run_sandbox_instance(&state, &id).await {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    let sandbox = match reconnect_run_sandbox_instance(&state, &id, &record).await {
         Ok(sandbox) => sandbox,
         Err(response) => return response,
     };
+    let handle = match sandbox.handle() {
+        Ok(handle) => handle,
+        Err(err) => {
+            return ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response();
+        }
+    };
+    let Some(previews) = handle.preview_urls() else {
+        return ApiError::new(
+            StatusCode::CONFLICT,
+            "Sandbox provider does not support preview URLs.",
+        )
+        .into_response();
+    };
 
     let response = if request.signed {
-        match sandbox
-            .get_signed_preview_url(port, Some(expires_in_secs))
+        match previews
+            .signed_preview_url(port, Duration::from_secs(request.expires_in_secs.get()))
             .await
         {
             Ok(preview) => PreviewUrlResponse {
@@ -382,19 +366,17 @@ async fn generate_preview_url(
                 url:   preview.url,
             },
             Err(err) => {
-                return ApiError::new(StatusCode::CONFLICT, err.display_with_causes())
-                    .into_response();
+                return ApiError::new(StatusCode::CONFLICT, err.to_string()).into_response();
             }
         }
     } else {
-        match sandbox.get_preview_link(port).await {
+        match previews.preview_url(port).await {
             Ok(preview) => PreviewUrlResponse {
-                token: Some(preview.token),
+                token: preview.headers.get(PREVIEW_TOKEN_HEADER).cloned(),
                 url:   preview.url,
             },
             Err(err) => {
-                return ApiError::new(StatusCode::CONFLICT, err.display_with_causes())
-                    .into_response();
+                return ApiError::new(StatusCode::CONFLICT, err.to_string()).into_response();
             }
         }
     };
@@ -417,45 +399,43 @@ async fn create_ssh_access(
         Err(response) => return response,
     };
 
-    match record.provider {
-        SandboxProviderKind::Daytona => {
-            let sandbox = match reconnect_daytona_sandbox_instance(&state, &record).await {
-                Ok(sandbox) => sandbox,
-                Err(response) => return response,
-            };
-            match sandbox.create_ssh_access(Some(request.ttl_minutes)).await {
-                Ok(command) => {
-                    (StatusCode::CREATED, Json(SshAccessResponse { command })).into_response()
-                }
-                Err(err) => {
-                    ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
-                }
-            }
+    if record.provider == SandboxProviderKind::LOCAL {
+        return ApiError::new(
+            StatusCode::CONFLICT,
+            "Sandbox provider does not support access commands.",
+        )
+        .into_response();
+    }
+    let sandbox = match reconnect_run_sandbox_instance(&state, &id, &record).await {
+        Ok(sandbox) => sandbox,
+        Err(response) => return response,
+    };
+    let handle = match sandbox.handle() {
+        Ok(handle) => handle,
+        Err(err) => {
+            return ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response();
         }
-        SandboxProviderKind::Docker => {
-            let sandbox = match reconnect_run_sandbox_instance(&state, &id, &record).await {
-                Ok(sandbox) => sandbox,
-                Err(response) => return response,
-            };
-            match sandbox.ssh_access_command().await {
-                Ok(Some(command)) => {
-                    (StatusCode::CREATED, Json(SshAccessResponse { command })).into_response()
-                }
-                Ok(None) => ApiError::new(
-                    StatusCode::CONFLICT,
-                    "Sandbox provider does not support access commands.",
-                )
-                .into_response(),
-                Err(err) => {
-                    ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
-                }
-            }
+    };
+    // Providers with a leased SSH gateway honor the requested lifetime;
+    // providers with a fixed local command return it as is.
+    let result = match handle.ssh() {
+        Some(ssh) => ssh
+            .ssh_access(Some(Duration::from_secs_f64(request.ttl_minutes * 60.0)))
+            .await
+            .map(|access| Some(access.command))
+            .map_err(|err| fabro_sandbox::Error::context("Failed to create SSH access", err)),
+        None => sandbox.ssh_access_command().await,
+    };
+    match result {
+        Ok(Some(command)) => {
+            (StatusCode::CREATED, Json(SshAccessResponse { command })).into_response()
         }
-        SandboxProviderKind::Local => ApiError::new(
+        Ok(None) => ApiError::new(
             StatusCode::CONFLICT,
             "Sandbox provider does not support access commands.",
         )
         .into_response(),
+        Err(err) => ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response(),
     }
 }
 
@@ -472,36 +452,31 @@ async fn create_sandbox_vnc_preview(
         Ok(record) => record,
         Err(response) => return response,
     };
-    if record.provider != SandboxProviderKind::Daytona {
+    if record.provider != SandboxProviderKind::DAYTONA {
         return ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
             "Sandbox provider does not support VNC previews.",
         )
         .into_response();
     }
-    let sandbox = match reconnect_daytona_sandbox_instance(&state, &record).await {
+    let sandbox = match reconnect_run_sandbox_instance(&state, &id, &record).await {
         Ok(sandbox) => sandbox,
         Err(response) => return response,
     };
-    match build_vnc_preview_response(&sandbox).await {
+    match build_vnc_preview_response(&record.provider, &sandbox).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(response) => response,
     }
 }
 
 async fn build_vnc_preview_response(
+    provider: &SandboxProviderKind,
     sandbox: &impl VncSandbox,
 ) -> Result<VncPreviewResponse, Response> {
-    sandbox.start_computer_use().await.map_err(|err| {
+    let url = sandbox.vnc_viewer_url().await.map_err(|err| {
         ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
     })?;
-    let signed = sandbox
-        .signed_preview_url(DEFAULT_VNC_NO_VNC_PORT, DEFAULT_VNC_TTL_SECS)
-        .await
-        .map_err(|err| {
-            ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
-        })?;
-    let url = vnc_viewer_url(&signed).map_err(|err| {
+    let url = vnc_viewer_url(&url).map_err(|err| {
         ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
     })?;
     Ok(VncPreviewResponse {
@@ -511,11 +486,14 @@ async fn build_vnc_preview_response(
         .expect("default VNC TTL should be nonzero"),
         port: NonZeroU64::new(u64::from(DEFAULT_VNC_NO_VNC_PORT))
             .expect("default VNC port should be nonzero"),
-        provider: "daytona".to_string(),
+        provider: provider.to_string(),
         url,
     })
 }
 
+/// Pins the viewer URL to the noVNC page with autoconnect and scaling. The
+/// provider already points at the viewer; this makes the query idempotent
+/// so a URL that already carries the viewer parameters is not duplicated.
 fn vnc_viewer_url(signed_url: &str) -> fabro_sandbox::Result<String> {
     // Internal URL manipulation, not logging — `DisplaySafeUrl` is for
     // logging/error boundaries. The signed URL may carry a credential, so
@@ -526,10 +504,22 @@ fn vnc_viewer_url(signed_url: &str) -> fabro_sandbox::Result<String> {
     )]
     let mut url = url::Url::parse(signed_url)
         .map_err(|err| fabro_sandbox::Error::context("Failed to parse signed VNC URL", err))?;
+    let preserved: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| key != VNC_VIEWER_AUTOCONNECT.0 && key != VNC_VIEWER_RESIZE.0)
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
     url.set_path(VNC_VIEWER_PATH);
-    url.query_pairs_mut()
-        .append_pair(VNC_VIEWER_AUTOCONNECT.0, VNC_VIEWER_AUTOCONNECT.1)
-        .append_pair(VNC_VIEWER_RESIZE.0, VNC_VIEWER_RESIZE.1);
+    url.set_query(None);
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in &preserved {
+            pairs.append_pair(key, value);
+        }
+        pairs
+            .append_pair(VNC_VIEWER_AUTOCONNECT.0, VNC_VIEWER_AUTOCONNECT.1)
+            .append_pair(VNC_VIEWER_RESIZE.0, VNC_VIEWER_RESIZE.1);
+    }
     Ok(url.into())
 }
 
@@ -552,8 +542,8 @@ async fn list_sandbox_files(
             data: entries
                 .into_iter()
                 .map(|entry| SandboxFileEntry {
-                    is_dir: entry.is_dir,
-                    name:   entry.name,
+                    is_dir: entry.kind == FileKind::Directory,
+                    name:   entry.path,
                     size:   entry.size.map(u64::cast_signed),
                 })
                 .collect(),
@@ -576,145 +566,48 @@ async fn list_sandbox_services(
         Ok(record) => record,
         Err(response) => return response,
     };
-    let provider = record.provider;
+    let provider = record.provider.clone();
     let sandbox = match reconnect_run_sandbox_instance(&state, &id, &record).await {
         Ok(sandbox) => sandbox,
         Err(response) => return response,
     };
-    let result = match sandbox
-        .exec_command(
-            LIST_SANDBOX_SERVICES_COMMAND,
-            LIST_SANDBOX_SERVICES_TIMEOUT_MS,
-            None,
-            None,
-            None,
-        )
-        .await
-    {
-        Ok(result) => result,
+    let services = match sandbox.services() {
+        Ok(services) => services,
         Err(err) => {
-            return ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response();
+            return ApiError::new(StatusCode::NOT_IMPLEMENTED, err.display_with_causes())
+                .into_response();
         }
     };
-    if !result.is_success() {
-        return ApiError::new(
-            StatusCode::CONFLICT,
-            sandbox_service_command_failure_detail(&result),
-        )
-        .into_response();
-    }
-
-    let discovery = parse_sandbox_services(&result.stdout, provider);
+    let ports = match services.listening_ports().await {
+        Ok(ports) => ports,
+        Err(err) => {
+            return ApiError::new(
+                StatusCode::CONFLICT,
+                format!("{LIST_SANDBOX_SERVICES_FAILURE_LABEL} failed: {err}"),
+            )
+            .into_response();
+        }
+    };
     Json(SandboxServiceListResponse {
-        data: discovery.services,
-        meta: SandboxServiceListMeta {
-            source: discovery.source,
-        },
+        data: services_from_ports(ports, &provider),
     })
     .into_response()
 }
 
-fn sandbox_service_command_failure_detail(result: &fabro_sandbox::ExecResult) -> String {
-    let stderr = result.stderr.trim();
-    if !stderr.is_empty() {
-        return stderr.to_string();
-    }
-    let stdout = result.stdout.trim();
-    if !stdout.is_empty() {
-        return stdout.to_string();
-    }
-    format!("{LIST_SANDBOX_SERVICES_FAILURE_LABEL} failed")
-}
-
-struct SandboxServiceDiscovery {
-    services: Vec<SandboxService>,
-    source:   SandboxServiceDiscoverySource,
-}
-
-fn parse_sandbox_services(output: &str, provider: SandboxProviderKind) -> SandboxServiceDiscovery {
-    if output
-        .lines()
-        .any(|line| line.trim_start().starts_with("FABRO_PROC_NET_TCP "))
-    {
-        SandboxServiceDiscovery {
-            services: parse_proc_net_listening_services(output, provider),
-            source:   SandboxServiceDiscoverySource::Procfs,
-        }
-    } else {
-        SandboxServiceDiscovery {
-            services: parse_ss_listening_services(output, provider),
-            source:   SandboxServiceDiscoverySource::Ss,
-        }
-    }
-}
-
-fn parse_ss_listening_services(output: &str, provider: SandboxProviderKind) -> Vec<SandboxService> {
-    let mut services = BTreeMap::<u16, SandboxService>::new();
-    for line in output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        let Some(address) = fields.get(3).copied() else {
-            continue;
-        };
-        let Some(port) = parse_ss_local_port(address) else {
-            continue;
-        };
-        let process = (fields.len() > 5).then(|| fields[5..].join(" "));
-        push_service(&mut services, provider, port, address.to_string(), process);
-    }
-    sorted_services(services)
-}
-
-fn parse_ss_local_port(address: &str) -> Option<u16> {
-    let port = address.rsplit_once(':')?.1.parse::<u16>().ok()?;
-    (port > 0).then_some(port)
-}
-
-#[derive(Clone, Copy)]
-enum ProcNetFamily {
-    Ipv4,
-    Ipv6,
-}
-
-fn parse_proc_net_listening_services(
-    output: &str,
-    provider: SandboxProviderKind,
+/// The driver's listeners grouped by port, previewable ports first.
+fn services_from_ports(
+    ports: Vec<ListeningPort>,
+    provider: &SandboxProviderKind,
 ) -> Vec<SandboxService> {
     let mut services = BTreeMap::<u16, SandboxService>::new();
-    let mut family = None;
-    for line in output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if let Some(path) = line.strip_prefix("FABRO_PROC_NET_TCP ") {
-            family = if path.ends_with("/tcp6") {
-                Some(ProcNetFamily::Ipv6)
-            } else {
-                Some(ProcNetFamily::Ipv4)
-            };
-            continue;
-        }
-        if line.starts_with("sl") {
-            continue;
-        }
-        let Some(family) = family else {
-            continue;
-        };
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        let (Some(local_address), Some(state)) = (fields.get(1), fields.get(3)) else {
-            continue;
-        };
-        if *state != "0A" {
-            continue;
-        }
-        let Some((address, port)) = parse_proc_net_local_address(local_address, family) else {
-            continue;
-        };
-        push_service(&mut services, provider, port, address, None);
+    for listener in ports {
+        push_service(
+            &mut services,
+            provider,
+            listener.port,
+            listener.address,
+            listener.process,
+        );
     }
     sorted_services(services)
 }
@@ -725,43 +618,9 @@ fn sorted_services(services: BTreeMap<u16, SandboxService>) -> Vec<SandboxServic
     services
 }
 
-fn parse_proc_net_local_address(value: &str, family: ProcNetFamily) -> Option<(String, u16)> {
-    let (address_hex, port_hex) = value.split_once(':')?;
-    let port = u16::from_str_radix(port_hex, 16).ok()?;
-    if port == 0 {
-        return None;
-    }
-    let address = match family {
-        ProcNetFamily::Ipv4 => format!("{}:{port}", parse_proc_net_ipv4(address_hex)?),
-        ProcNetFamily::Ipv6 => format!("[{}]:{port}", parse_proc_net_ipv6(address_hex)?),
-    };
-    Some((address, port))
-}
-
-fn parse_proc_net_ipv4(value: &str) -> Option<Ipv4Addr> {
-    if value.len() != 8 {
-        return None;
-    }
-    let raw = u32::from_str_radix(value, 16).ok()?;
-    Some(Ipv4Addr::from(raw.to_le_bytes()))
-}
-
-fn parse_proc_net_ipv6(value: &str) -> Option<Ipv6Addr> {
-    if value.len() != 32 {
-        return None;
-    }
-    let mut bytes = [0_u8; 16];
-    for (chunk_index, chunk) in value.as_bytes().chunks_exact(8).enumerate() {
-        let chunk = std::str::from_utf8(chunk).ok()?;
-        let raw = u32::from_str_radix(chunk, 16).ok()?;
-        bytes[chunk_index * 4..chunk_index * 4 + 4].copy_from_slice(&raw.to_le_bytes());
-    }
-    Some(Ipv6Addr::from(bytes))
-}
-
 fn push_service(
     services: &mut BTreeMap<u16, SandboxService>,
-    provider: SandboxProviderKind,
+    provider: &SandboxProviderKind,
     port: u16,
     address: String,
     process: Option<String>,
@@ -778,8 +637,8 @@ fn push_service(
     }
 }
 
-fn preview_supported(provider: SandboxProviderKind, port: u16) -> bool {
-    provider == SandboxProviderKind::Daytona && (3000..=9999).contains(&port)
+fn preview_supported(provider: &SandboxProviderKind, port: u16) -> bool {
+    *provider == SandboxProviderKind::DAYTONA && (3000..=9999).contains(&port)
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
@@ -864,18 +723,19 @@ async fn put_sandbox_file(
 async fn reconnect_run_sandbox(
     state: &Arc<AppState>,
     run_id: &RunId,
-) -> Result<Box<dyn Sandbox>, Response> {
+) -> Result<RunSandbox, Response> {
     let record = load_run_sandbox_instance(state, run_id).await?;
     reconnect_run_sandbox_instance(state, run_id, &record).await
 }
 
+/// Reconnects a run's sandbox and brings it to running.
 async fn reconnect_run_sandbox_instance(
     state: &Arc<AppState>,
     run_id: &RunId,
     record: &RunSandboxInstance,
-) -> Result<Box<dyn Sandbox>, Response> {
-    let daytona_api_key = load_daytona_api_key(state).await?;
-    let sandbox = reconnect_for_run(record, daytona_api_key, Some(*run_id))
+) -> Result<RunSandbox, Response> {
+    let access = load_provider_access(state).await?;
+    let sandbox = reconnect_for_run(record, &access, Some(*run_id), None)
         .await
         .map_err(|err| {
             let detail = render_with_causes(&err.to_string(), &collect_causes(err.as_ref()));
@@ -887,64 +747,15 @@ async fn reconnect_run_sandbox_instance(
     Ok(sandbox)
 }
 
-async fn reconnect_daytona_sandbox(
-    state: &Arc<AppState>,
-    run_id: &RunId,
-) -> Result<DaytonaSandbox, Response> {
-    let record = load_run_sandbox_instance(state, run_id).await?;
-    reconnect_daytona_sandbox_instance(state, &record).await
-}
-
-async fn reconnect_daytona_sandbox_instance(
-    state: &Arc<AppState>,
-    record: &RunSandboxInstance,
-) -> Result<DaytonaSandbox, Response> {
-    if record.provider != SandboxProviderKind::Daytona {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "Sandbox provider does not support this capability.",
+async fn load_provider_access(state: &AppState) -> Result<ProviderAccess, Response> {
+    state.provider_access().await.map_err(|err| {
+        tracing::error!(error = ?err, "Loading Daytona API key failed");
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "secret store operation failed",
         )
-        .into_response());
-    }
-    let runtime = &record.runtime;
-    let Some(repo_cloned) = runtime.repo_cloned else {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "Sandbox record is missing clone metadata.",
-        )
-        .into_response());
-    };
-    let daytona_api_key = load_daytona_api_key(state).await?;
-    let sandbox = DaytonaSandbox::reconnect(
-        &runtime.id,
-        daytona_api_key,
-        repo_cloned,
-        runtime.working_directory.clone(),
-        runtime.clone_origin_url.clone(),
-        runtime.clone_branch.clone(),
-    )
-    .await
-    .map_err(|err| {
-        ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
-    })?;
-    sandbox.activate().await.map_err(|err| {
-        ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
-    })?;
-    Ok(sandbox)
-}
-
-async fn load_daytona_api_key(state: &AppState) -> Result<Option<String>, Response> {
-    state
-        .vault_secret(EnvVars::DAYTONA_API_KEY)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = ?err, "Loading Daytona API key failed");
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "secret store operation failed",
-            )
-            .into_response()
-        })
+        .into_response()
+    })
 }
 
 async fn load_run_sandbox_instance(
@@ -973,7 +784,7 @@ mod tests {
     fn terminal_control_accepts_resize_and_close() {
         assert_eq!(
             parse_terminal_control_message(r#"{"type":"resize","cols":120,"rows":32}"#),
-            Ok(TerminalClientMessage::Resize(TerminalSize {
+            Ok(TerminalClientMessage::Resize(PtySize {
                 cols: 120,
                 rows: 32,
             }))
@@ -1053,104 +864,28 @@ mod tests {
     }
 
     #[test]
-    fn ss_parser_extracts_addresses_processes_and_preview_support() {
-        let services = parse_ss_listening_services(
-            r#"
-LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:* users:(("node",pid=42,fd=23))
-LISTEN 0 4096 0.0.0.0:5173 0.0.0.0:* users:(("vite",pid=84,fd=19))
-LISTEN 0 4096 [::]:8080 [::]:* users:(("server",pid=126,fd=9))
-LISTEN 0 4096 [::1]:2500 [::]:* users:(("debug",pid=168,fd=7))
-"#,
-            SandboxProviderKind::Daytona,
-        );
-
-        assert_eq!(services.len(), 4);
-        assert_eq!(services[0].port, 3000);
-        assert_eq!(services[0].addresses, vec!["127.0.0.1:3000"]);
-        assert_eq!(services[0].processes, vec![
-            r#"users:(("node",pid=42,fd=23))"#
-        ]);
-        assert!(services[0].preview_supported);
-        assert_eq!(services[1].port, 5173);
-        assert_eq!(services[1].addresses, vec!["0.0.0.0:5173"]);
-        assert!(services[1].preview_supported);
-        assert_eq!(services[2].port, 8080);
-        assert_eq!(services[2].addresses, vec!["[::]:8080"]);
-        assert!(services[2].preview_supported);
-        assert_eq!(services[3].port, 2500);
-        assert_eq!(services[3].addresses, vec!["[::1]:2500"]);
-        assert_eq!(services[3].processes, vec![
-            r#"users:(("debug",pid=168,fd=7))"#
-        ]);
-        assert!(!services[3].preview_supported);
-    }
-
-    #[test]
-    fn ss_parser_ignores_malformed_and_non_numeric_ports() {
-        let services = parse_ss_listening_services(
-            r#"
-LISTEN 0 4096 127.0.0.1:not-a-port 0.0.0.0:* users:(("node",pid=42,fd=23))
-LISTEN 0 4096 missing-peer
-not enough fields
-LISTEN 0 4096 127.0.0.1:0 0.0.0.0:* users:(("zero",pid=1,fd=2))
-LISTEN 0 4096 127.0.0.1:65536 0.0.0.0:* users:(("large",pid=1,fd=2))
-"#,
-            SandboxProviderKind::Daytona,
-        );
-
-        assert!(services.is_empty());
-    }
-
-    #[test]
-    fn ss_parser_groups_duplicate_ports_and_deduplicates_values() {
-        let services = parse_ss_listening_services(
-            r#"
-LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:* users:(("node",pid=42,fd=23))
-LISTEN 0 4096 0.0.0.0:3000 0.0.0.0:* users:(("node",pid=42,fd=23))
-LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:* users:(("node",pid=42,fd=23))
-LISTEN 0 4096 [::]:3000 [::]:* users:(("vite",pid=84,fd=19))
-"#,
-            SandboxProviderKind::Daytona,
-        );
-
-        assert_eq!(services, vec![SandboxService {
-            port:              3000,
-            addresses:         vec![
-                "127.0.0.1:3000".to_string(),
-                "0.0.0.0:3000".to_string(),
-                "[::]:3000".to_string(),
+    fn listening_ports_group_by_port_and_sort_previewable_first() {
+        let mut node = ListeningPort::new(3000, "127.0.0.1:3000");
+        node.process = Some("node".to_string());
+        let mut node_v6 = ListeningPort::new(3000, "[::]:3000");
+        node_v6.process = Some("node".to_string());
+        let mut debug = ListeningPort::new(2500, "[::1]:2500");
+        debug.process = Some("pid=168".to_string());
+        let services = services_from_ports(
+            vec![
+                debug,
+                node,
+                node_v6,
+                ListeningPort::new(5173, "0.0.0.0:5173"),
             ],
-            processes:         vec![
-                r#"users:(("node",pid=42,fd=23))"#.to_string(),
-                r#"users:(("vite",pid=84,fd=19))"#.to_string(),
-            ],
-            preview_supported: true,
-        }]);
-    }
-
-    #[test]
-    fn proc_net_parser_extracts_listening_tcp_services_without_processes() {
-        let discovery = parse_sandbox_services(
-            r"
-FABRO_PROC_NET_TCP /proc/net/tcp
-  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
-   0: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000   501        0 11111
-   1: 00000000:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000   501        0 22222
-   2: 0100007F:2328 00000000:0000 01 00000000:00000000 00:00000000 00000000   501        0 33333
-FABRO_PROC_NET_TCP /proc/net/tcp6
-  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
-   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000   501        0 44444
-   1: 00000000000000000000000001000000:09C4 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000   501        0 55555
-",
-            SandboxProviderKind::Daytona,
+            &SandboxProviderKind::DAYTONA,
         );
 
-        assert_eq!(discovery.source, SandboxServiceDiscoverySource::Procfs);
-        assert_eq!(discovery.services, vec![
+        assert_eq!(services, vec![
             SandboxService {
                 port:              3000,
-                addresses:         vec!["127.0.0.1:3000".to_string()],
-                processes:         vec![],
+                addresses:         vec!["127.0.0.1:3000".to_string(), "[::]:3000".to_string()],
+                processes:         vec!["node".to_string()],
                 preview_supported: true,
             },
             SandboxService {
@@ -1160,15 +895,9 @@ FABRO_PROC_NET_TCP /proc/net/tcp6
                 preview_supported: true,
             },
             SandboxService {
-                port:              8080,
-                addresses:         vec!["[::]:8080".to_string()],
-                processes:         vec![],
-                preview_supported: true,
-            },
-            SandboxService {
                 port:              2500,
                 addresses:         vec!["[::1]:2500".to_string()],
-                processes:         vec![],
+                processes:         vec!["pid=168".to_string()],
                 preview_supported: false,
             },
         ]);
@@ -1176,70 +905,26 @@ FABRO_PROC_NET_TCP /proc/net/tcp6
 
     #[test]
     fn preview_support_is_daytona_only_for_documented_range() {
-        assert!(!preview_supported(SandboxProviderKind::Daytona, 2500));
-        assert!(preview_supported(SandboxProviderKind::Daytona, 3000));
-        assert!(preview_supported(SandboxProviderKind::Daytona, 9999));
-        assert!(!preview_supported(SandboxProviderKind::Daytona, 10000));
-        assert!(!preview_supported(SandboxProviderKind::Docker, 3000));
-    }
-
-    #[test]
-    fn sandbox_service_command_failure_prefers_stderr_then_stdout() {
-        let mut result = fabro_sandbox::ExecResult {
-            stdout:      "stdout detail".to_string(),
-            stderr:      "stderr detail".to_string(),
-            exit_code:   Some(127),
-            termination: fabro_types::CommandTermination::Exited,
-            duration_ms: 10,
-        };
-        assert_eq!(
-            sandbox_service_command_failure_detail(&result),
-            "stderr detail"
-        );
-
-        result.stderr.clear();
-        assert_eq!(
-            sandbox_service_command_failure_detail(&result),
-            "stdout detail"
-        );
-
-        result.stdout.clear();
-        assert_eq!(
-            sandbox_service_command_failure_detail(&result),
-            "sandbox service discovery command failed"
-        );
+        assert!(!preview_supported(&SandboxProviderKind::DAYTONA, 2500));
+        assert!(preview_supported(&SandboxProviderKind::DAYTONA, 3000));
+        assert!(preview_supported(&SandboxProviderKind::DAYTONA, 9999));
+        assert!(!preview_supported(&SandboxProviderKind::DAYTONA, 10000));
+        assert!(!preview_supported(&SandboxProviderKind::DOCKER, 3000));
     }
 
     struct FakeVncSandbox {
-        start_error:      Option<&'static str>,
-        signed_url_error: Option<&'static str>,
-        signed_url:       &'static str,
+        error:      Option<&'static str>,
+        viewer_url: &'static str,
     }
 
     impl VncSandbox for FakeVncSandbox {
-        fn start_computer_use(
+        fn vnc_viewer_url(
             &self,
-        ) -> futures_util::future::BoxFuture<'_, fabro_sandbox::Result<()>> {
-            async move {
-                match self.start_error {
-                    Some(message) => Err(fabro_sandbox::Error::message(message)),
-                    None => Ok(()),
-                }
-            }
-            .boxed()
-        }
-
-        fn signed_preview_url(
-            &self,
-            port: u16,
-            expires_in_secs: i32,
         ) -> futures_util::future::BoxFuture<'_, fabro_sandbox::Result<String>> {
             async move {
-                assert_eq!(port, DEFAULT_VNC_NO_VNC_PORT);
-                assert_eq!(expires_in_secs, DEFAULT_VNC_TTL_SECS);
-                match self.signed_url_error {
+                match self.error {
                     Some(message) => Err(fabro_sandbox::Error::message(message)),
-                    None => Ok(self.signed_url.to_string()),
+                    None => Ok(self.viewer_url.to_string()),
                 }
             }
             .boxed()
@@ -1249,12 +934,13 @@ FABRO_PROC_NET_TCP /proc/net/tcp6
     #[tokio::test]
     async fn vnc_preview_response_uses_daytona_defaults() {
         let sandbox = FakeVncSandbox {
-            start_error:      None,
-            signed_url_error: None,
-            signed_url:       "https://preview.example.test/sandbox/6080",
+            error:      None,
+            viewer_url: "https://preview.example.test/vnc.html?autoconnect=true&resize=scale",
         };
 
-        let response = build_vnc_preview_response(&sandbox).await.unwrap();
+        let response = build_vnc_preview_response(&SandboxProviderKind::DAYTONA, &sandbox)
+            .await
+            .unwrap();
 
         assert_eq!(
             response.url,
@@ -1295,29 +981,29 @@ FABRO_PROC_NET_TCP /proc/net/tcp6
     }
 
     #[tokio::test]
-    async fn vnc_preview_response_maps_computer_use_start_failure_to_conflict() {
+    async fn vnc_preview_response_maps_provider_failure_to_conflict() {
         let sandbox = FakeVncSandbox {
-            start_error:      Some("computer use failed"),
-            signed_url_error: None,
-            signed_url:       "https://preview.example.test/sandbox/6080",
+            error:      Some("computer use failed"),
+            viewer_url: "https://preview.example.test/sandbox/6080",
         };
 
-        let response = build_vnc_preview_response(&sandbox).await.unwrap_err();
+        let response = build_vnc_preview_response(&SandboxProviderKind::DAYTONA, &sandbox)
+            .await
+            .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
-    #[tokio::test]
-    async fn vnc_preview_response_maps_signed_preview_failure_to_conflict() {
-        let sandbox = FakeVncSandbox {
-            start_error:      None,
-            signed_url_error: Some("preview failed"),
-            signed_url:       "https://preview.example.test/sandbox/6080",
-        };
-
-        let response = build_vnc_preview_response(&sandbox).await.unwrap_err();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+    #[test]
+    fn vnc_viewer_url_does_not_duplicate_viewer_parameters() {
+        let url = super::vnc_viewer_url(
+            "https://6080-preview.example.test/vnc.html?token=abc&autoconnect=true&resize=scale",
+        )
+        .expect("parse");
+        assert_eq!(
+            url,
+            "https://6080-preview.example.test/vnc.html?token=abc&autoconnect=true&resize=scale"
+        );
     }
 }
 
@@ -1325,6 +1011,7 @@ FABRO_PROC_NET_TCP /proc/net/tcp6
 mod retrieve_sandbox_tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use fabro_sandbox::test_support::local_sandbox_id;
     use fabro_types::{Graph, RunId, WorkflowSettings, test_support};
     use serde_json::{Value, json};
     use tower::ServiceExt;
@@ -1378,6 +1065,26 @@ mod retrieve_sandbox_tests {
         run_id: &RunId,
         provider: &str,
     ) {
+        append_sandbox_initialized_in(
+            run_store,
+            run_id,
+            provider,
+            &format!("{provider}:sandbox-id"),
+            "/workspace",
+        )
+        .await;
+    }
+
+    /// A local sandbox reconnects by the id the Host provider derives from
+    /// its working directory, so a test that reaches one records an
+    /// existing directory under the id fabro would have written for it.
+    async fn append_sandbox_initialized_in(
+        run_store: &fabro_store::RunDatabase,
+        run_id: &RunId,
+        provider: &str,
+        id: &str,
+        working_directory: &str,
+    ) {
         let payload = fabro_store::EventPayload::new(
             json!({
                 "id": "evt-sandbox-init",
@@ -1386,8 +1093,8 @@ mod retrieve_sandbox_tests {
                 "event": "sandbox.initialized",
                 "properties": {
                     "provider": provider,
-                    "id": format!("{provider}:sandbox-id"),
-                    "working_directory": "/workspace",
+                    "id": id,
+                    "working_directory": working_directory,
                 },
             }),
             run_id,
@@ -1521,7 +1228,10 @@ mod retrieve_sandbox_tests {
             .await
             .expect("test run should be creatable");
         append_run_created(&run_store, &run_id).await;
-        append_sandbox_initialized(&run_store, &run_id, "local").await;
+        let workspace = tempfile::tempdir().expect("scratch directory");
+        let working_directory = workspace.path().to_str().expect("utf-8").to_owned();
+        let id = local_sandbox_id(workspace.path()).await;
+        append_sandbox_initialized_in(&run_store, &run_id, "local", &id, &working_directory).await;
 
         let response = app
             .oneshot(req_get(&format!("/api/v1/runs/{run_id}/sandbox")))
@@ -1530,18 +1240,22 @@ mod retrieve_sandbox_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["sandbox"]["provider"], "local");
-        assert_eq!(body["sandbox"]["runtime"]["id"], "local:sandbox-id");
+        assert_eq!(body["sandbox"]["runtime"]["id"], id);
         assert_eq!(
             body["sandbox"]["runtime"]["working_directory"],
-            "/workspace"
+            working_directory
         );
-        assert_eq!(body["state"], "running");
-        assert!(body.get("name").is_none());
+        assert_eq!(body["status"]["state"], "running");
+        assert_eq!(body["status"]["workspace_ownership"], "designated");
+        assert!(
+            body["status"]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("host-dir-")),
+            "{}",
+            body["status"]["id"]
+        );
+        assert!(body.get("state").is_none(), "the status is not flattened");
         assert!(body.get("identifier").is_none());
-        assert!(body["resources"].is_object());
-        assert_eq!(body["network"]["egress"]["mode"], "unknown");
-        assert_eq!(body["network"]["ingress"]["mode"], "unknown");
-        assert!(body["timestamps"].is_object());
     }
 
     #[tokio::test]
@@ -1555,7 +1269,15 @@ mod retrieve_sandbox_tests {
             .await
             .expect("test run should be creatable");
         append_run_created(&run_store, &run_id).await;
-        append_sandbox_initialized(&run_store, &run_id, "local").await;
+        let workspace = tempfile::tempdir().expect("scratch directory");
+        append_sandbox_initialized_in(
+            &run_store,
+            &run_id,
+            "local",
+            &local_sandbox_id(workspace.path()).await,
+            workspace.path().to_str().expect("utf-8"),
+        )
+        .await;
 
         let response = app
             .oneshot(req_post(&format!("/api/v1/runs/{run_id}/sandbox/vnc")))

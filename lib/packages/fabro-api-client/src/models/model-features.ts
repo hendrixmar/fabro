@@ -13,12 +13,9 @@
  */
 
 
-// May contain unused imports in some cases
-// @ts-ignore
-import type { ReasoningEffortFeature } from './reasoning-effort-feature';
 
 /**
- * Capability flags for a model.
+ * Capability flags for a model, from the lithos catalog.
  */
 export interface ModelFeatures {
     /**
@@ -26,24 +23,19 @@ export interface ModelFeatures {
      */
     'tools': boolean;
     /**
-     * Whether the model supports vision/image inputs.
+     * Whether the model supports image inputs.
      */
     'vision': boolean;
     /**
      * Whether the model supports extended reasoning.
      */
     'reasoning': boolean;
-    'reasoning_effort': ReasoningEffortFeature;
     /**
      * Whether the model endpoint supports prompt caching.
      */
     'prompt_cache': boolean;
     /**
-     * Whether the endpoint only caches when the request marks the cacheable prefix with Anthropic-style cache_control breakpoints (e.g. Claude via OpenRouter).
-     */
-    'cache_control_breakpoints': boolean;
-    /**
      * Whether the model accepts classic sampling parameters (temperature, top_p).
      */
-    'sampling_params': boolean;
+    'sampling': boolean;
 }

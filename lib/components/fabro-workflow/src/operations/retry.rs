@@ -333,7 +333,7 @@ mod tests {
         .await
         .unwrap();
         event::append_event(&source_store, &source_run_id, &Event::SandboxInitialized {
-            provider:          fabro_types::SandboxProviderKind::Local,
+            provider:          fabro_types::SandboxProviderKind::LOCAL,
             id:                "sandbox-source".to_string(),
             working_directory: "/tmp/source".to_string(),
             image:             None,

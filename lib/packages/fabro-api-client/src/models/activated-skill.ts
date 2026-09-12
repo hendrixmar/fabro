@@ -15,12 +15,12 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { AgentSkillActivationSource } from './agent-skill-activation-source';
+import type { SkillActivationSource } from './skill-activation-source';
 
 /**
  * One observed agent skill activation.
  */
 export interface ActivatedSkill {
     'name': string;
-    'source': AgentSkillActivationSource;
+    'source': SkillActivationSource;
 }

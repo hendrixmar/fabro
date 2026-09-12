@@ -27,13 +27,13 @@ export interface Provider {
      */
     'display_name': string;
     /**
-     * Protocol adapter the provider speaks.
+     * lithos adapter id the provider speaks, such as `anthropic`, `openai`, `gemini`, or `openai-compatible`.
      */
-    'adapter': ProviderAdapterEnum;
+    'adapter': string;
     /**
-     * Operator-set base URL override, if any.
+     * Effective API base URL, including any operator override.
      */
-    'base_url'?: string | null;
+    'base_url': string;
     /**
      * URL where an operator can obtain an API key for this provider.
      */
@@ -63,12 +63,3 @@ export interface Provider {
      */
     'expected_secret_name'?: string | null;
 }
-
-export const ProviderAdapterEnum = {
-    ANTHROPIC: 'anthropic',
-    OPENAI: 'openai',
-    GEMINI: 'gemini',
-    OPENAI_COMPATIBLE: 'openai_compatible'
-} as const;
-
-export type ProviderAdapterEnum = typeof ProviderAdapterEnum[keyof typeof ProviderAdapterEnum];

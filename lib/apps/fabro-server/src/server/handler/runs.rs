@@ -21,18 +21,18 @@ use fabro_api::types::{
 use fabro_config::{CliLayer, RunLayer, Storage, project};
 use fabro_environment::{DEFAULT_ENVIRONMENT_ID, EnvironmentId};
 use fabro_interview::AnswerSubmission;
-use fabro_llm::client::Client as LlmClient;
+use fabro_llm::Client as LlmClient;
 use fabro_manifest::RunOverrideInput;
 use fabro_static::EnvVars;
 use fabro_store::{
     RunSummaryListQuery, RunSummarySort, RunSummarySortDirection, RunSummaryVisibility,
 };
 use fabro_types::{
-    AutomationRef, ManifestPath, Principal, Run, RunClientProvenance, RunId, RunProvenance,
-    RunServerProvenance, RunStatusKind, RunTarget, SandboxProviderKind, StageContextWindow,
-    StageContextWindowStaleness, StageContextWindowUnavailableReason, StageHandler,
-    StageModelUsage, StageProjection, SystemActorKind, ValidatedRunTarget,
-    json_scalar_to_toml_value, parse_blob_ref,
+    AutomationRef, ContextWindowStaleness, ManifestPath, Principal, Run, RunClientProvenance,
+    RunId, RunProvenance, RunServerProvenance, RunStatusKind, RunTarget, SandboxProviderKind,
+    StageContextWindow, StageContextWindowUnavailableReason, StageHandler, StageModelUsage,
+    StageProjection, SystemActorKind, ValidatedRunTarget, json_scalar_to_toml_value,
+    parse_blob_ref,
 };
 use fabro_util::error as error_util;
 use fabro_util::version::FABRO_VERSION;
@@ -40,6 +40,7 @@ use fabro_workflow::command_log::{command_log_path, read_json_string_blob, read_
 use fabro_workflow::run_status::RunStatus;
 use fabro_workflow::workflow_bundle::WorkflowBundle;
 use fabro_workflow::{Error as WorkflowError, operations};
+use lithos_llm::catalog::ProviderId;
 use strum::VariantArray as _;
 use tokio::fs;
 use tracing::info;
@@ -640,6 +641,9 @@ pub(crate) async fn create_run_from_intent(
         Ok(id) => id,
         Err(error) => return run_intent_admission_error(error.into()),
     };
+    if let Err(error) = validate_intent_actor_target(&state, &actor, &target).await {
+        return run_intent_admission_error(error);
+    }
     let blobs = state.store_ref().blobs();
     let version_store = fabro_workflow_version::WorkflowVersionStore::new(blobs);
     let closure = match version_store.get_closure(&intent.workflow_version_id).await {
@@ -953,18 +957,19 @@ async fn finalize_created_run(
             let workflow = run_title_generation::workflow_summary(&run_spec.graph);
             let run_inputs = run_spec.settings.run.inputs.clone();
             let title_catalog = state.catalog();
-            let title_model = title_catalog.small_default_for_configured_ids(&ready_provider_ids);
-            spawn_generated_title_task(GeneratedTitleTask {
-                state: Arc::clone(&state),
-                run_id: created.run_id,
-                deterministic_title,
-                workflow_target: title_generation_target.to_string(),
-                workflow,
-                run_inputs,
-                client: llm_result.client,
-                model_id: title_model.id.to_string(),
-                provider_id: title_model.provider.clone(),
-            });
+            if let Some(title_model) = title_catalog.small_default_for(&ready_provider_ids) {
+                spawn_generated_title_task(GeneratedTitleTask {
+                    state: Arc::clone(&state),
+                    run_id: created.run_id,
+                    deterministic_title,
+                    workflow_target: title_generation_target.to_string(),
+                    workflow,
+                    run_inputs,
+                    client: llm_result.client,
+                    model_id: title_model.model.id().to_string(),
+                    provider_id: title_model.provider.id().clone(),
+                });
+            }
         }
     }
     style.log_created(created.run_id);
@@ -983,6 +988,7 @@ fn run_intent_admission_error(error: RunIntentAdmissionError) -> Response {
     match &error {
         RunIntentAdmissionError::VersionStore { .. }
         | RunIntentAdmissionError::VariableSnapshot { .. }
+        | RunIntentAdmissionError::WorkerRun { .. }
         | RunIntentAdmissionError::Environment(EnvironmentSelectionError::CredentialStore {
             ..
         }) => {
@@ -1001,6 +1007,7 @@ fn run_intent_admission_error(error: RunIntentAdmissionError) -> Response {
         }
         RunIntentAdmissionError::Target(_)
         | RunIntentAdmissionError::FolderTarget(_)
+        | RunIntentAdmissionError::WorkerRunNotFound { .. }
         | RunIntentAdmissionError::Environment(_) => {}
     }
 
@@ -1074,7 +1081,44 @@ fn run_intent_admission_error(error: RunIntentAdmissionError) -> Response {
             "failed to load run variables",
             "variable_store_error",
         ),
+        RunIntentAdmissionError::WorkerRun { .. } => intent_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to inspect originating worker run",
+            "worker_run_store_error",
+        ),
+        RunIntentAdmissionError::WorkerRunNotFound { .. } => intent_error(
+            StatusCode::NOT_FOUND,
+            "originating worker run not found",
+            "worker_run_not_found",
+        ),
     }
+}
+
+async fn validate_intent_actor_target(
+    state: &AppState,
+    actor: &Principal,
+    target: &RunTarget,
+) -> Result<(), RunIntentAdmissionError> {
+    let (Principal::Worker { run_id }, RunTarget::Folder { .. }) = (actor, target) else {
+        return Ok(());
+    };
+    let projection = state
+        .stores
+        .runs
+        .load_run_projection(run_id)
+        .await
+        .map_err(|source| RunIntentAdmissionError::WorkerRun {
+            run_id: *run_id,
+            source,
+        })?
+        .ok_or(RunIntentAdmissionError::WorkerRunNotFound { run_id: *run_id })?;
+    if !projection.spec.settings.run.environment.provider.is_local() {
+        return Err(EnvironmentSelectionError::TargetUnsupported {
+            detail: "folder targets created by a worker require a Local parent environment",
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn select_intent_environment_id(
@@ -1102,21 +1146,20 @@ async fn validate_intent_environment(
     let configured_provider = run_manifest::configured_sandbox_provider(&settings.run);
     let effective_provider = run_manifest::effective_sandbox_provider(&settings.run);
     let image = &settings.run.environment.image;
-    let image_incompatible = match effective_provider {
-        SandboxProviderKind::Docker => image.docker.is_none() && image.dockerfile.is_some(),
-        SandboxProviderKind::Local | SandboxProviderKind::Daytona => false,
-    };
+    let image_incompatible = effective_provider == SandboxProviderKind::DOCKER
+        && image.docker.is_none()
+        && image.dockerfile.is_some();
     let (target_incompatible, detail) = match target {
         RunTarget::Git(_) => (
-            configured_provider == SandboxProviderKind::Local || !settings.run.clone.enabled,
+            configured_provider == SandboxProviderKind::LOCAL || !settings.run.clone.enabled,
             "Git targets require a compatible clone-enabled Docker or Daytona environment",
         ),
         RunTarget::None {} => (
-            configured_provider == SandboxProviderKind::Local,
+            configured_provider == SandboxProviderKind::LOCAL,
             "none targets require a compatible Docker or Daytona environment",
         ),
         RunTarget::Folder { .. } => (
-            configured_provider != SandboxProviderKind::Local,
+            configured_provider != SandboxProviderKind::LOCAL,
             "folder targets require a Local environment",
         ),
     };
@@ -1125,18 +1168,18 @@ async fn validate_intent_environment(
     }
     // Settings resolution drops `run.pull_request` unless it is enabled, so
     // `Some` means automatic pull requests were requested.
-    if !configured_provider.is_clone_based() && settings.run.pull_request.is_some() {
+    if !configured_provider.clones_workspace() && settings.run.pull_request.is_some() {
         return Err(EnvironmentSelectionError::AutomaticPullRequestUnsupported);
     }
     if let Some(detail) =
-        run_manifest::sandbox_provider_policy_error(&state.server_settings(), effective_provider)
+        run_manifest::sandbox_provider_policy_error(&state.server_settings(), &effective_provider)
     {
         return Err(EnvironmentSelectionError::ProviderDisabled {
             provider: effective_provider,
             detail,
         });
     }
-    if effective_provider == SandboxProviderKind::Daytona {
+    if effective_provider == SandboxProviderKind::DAYTONA {
         match state.vault_secret(EnvVars::DAYTONA_API_KEY).await {
             Ok(Some(key)) if !key.trim().is_empty() => {}
             Ok(_) => {
@@ -1380,7 +1423,7 @@ pub(crate) async fn create_run_from_manifest(
     let prepared = prepared.with_web_url(state.run_web_url(&run_id));
     let provider = run_manifest::effective_sandbox_provider(&prepared.settings().run);
     if let Some(error) =
-        run_manifest::sandbox_provider_policy_error(&state.server_settings(), provider)
+        run_manifest::sandbox_provider_policy_error(&state.server_settings(), &provider)
     {
         return ApiError::bad_request(error).into_response();
     }
@@ -1408,7 +1451,7 @@ struct GeneratedTitleTask {
     run_inputs:          std::collections::HashMap<String, toml::Value>,
     client:              LlmClient,
     model_id:            String,
-    provider_id:         fabro_model::ProviderId,
+    provider_id:         ProviderId,
 }
 
 fn spawn_generated_title_task(task: GeneratedTitleTask) {
@@ -1740,7 +1783,7 @@ async fn get_run_stage_context_window(
 
     let mut response = StageContextWindow::available(stage_id, snapshot);
     if stage.state.is_terminal() {
-        response.staleness = StageContextWindowStaleness::Stored;
+        response.staleness = ContextWindowStaleness::Stored;
     }
     Json(response).into_response()
 }

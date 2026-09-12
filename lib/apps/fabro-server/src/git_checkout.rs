@@ -4,10 +4,12 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use fabro_proc::ProcessError;
 use fabro_store::KeyedMutex;
 use fabro_types::{GitHubRepositorySlug, GitRunTarget};
+use tokio::fs;
 use tokio::process::Command;
-use tokio::{fs, time};
+use tokio_util::sync::CancellationToken;
 
 const GIT_CLONE_TIMEOUT: Duration = Duration::from_mins(2);
 const GIT_FETCH_TIMEOUT: Duration = Duration::from_mins(1);
@@ -483,18 +485,28 @@ async fn run_git_plan(plan: GitCommandPlan) -> Result<Vec<u8>, GitCommandError> 
     if let Some(current_dir) = plan.current_dir.as_ref() {
         command.current_dir(current_dir);
     }
-    command.kill_on_drop(true);
-
-    let output = time::timeout(plan.timeout, command.output())
-        .await
-        .map_err(|_| GitCommandError::Timeout {
+    let output = fabro_proc::capture(
+        &mut command,
+        Some(plan.timeout),
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .map_err(|err| match err {
+        ProcessError::TimedOut => GitCommandError::Timeout {
             command:      safe_command_label(&plan),
             timeout_secs: plan.timeout.as_secs(),
-        })?
-        .map_err(|err| GitCommandError::Spawn {
+        },
+        ProcessError::Io(source) => GitCommandError::Spawn {
             command: safe_command_label(&plan),
-            source:  err,
-        })?;
+            source,
+        },
+        ProcessError::Cancelled => GitCommandError::Spawn {
+            command: safe_command_label(&plan),
+            source:  std::io::Error::new(std::io::ErrorKind::Interrupted, err),
+        },
+    })?
+    .output;
 
     if output.status.success() {
         return Ok(output.stdout);
@@ -546,12 +558,106 @@ mod tests {
         reason = "Git checkout unit tests build local git repositories and inspect temp files synchronously."
     )]
 
+    use std::error::Error;
     use std::fs;
     use std::path::Path;
 
     use tempfile::TempDir;
+    use tokio::{task, time};
 
     use super::*;
+
+    fn shell_plan(script: &str, directory: &Path) -> GitCommandPlan {
+        GitCommandPlan {
+            program:          "sh".to_string(),
+            args:             vec!["-c".to_string(), script.to_string()],
+            env:              vec![
+                ("HOME".to_string(), directory.display().to_string()),
+                ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+                ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+            ],
+            current_dir:      Some(directory.to_path_buf()),
+            timeout:          Duration::from_secs(5),
+            sensitive_values: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn git_plan_capture_preserves_bytes_environment_and_diagnostics() {
+        let temp = TempDir::new().unwrap();
+        let mut plan = shell_plan(
+            "printf '%s' \"$TEST_CAPTURE_VALUE\"; head -c 200000 /dev/zero; printf '\\377'",
+            temp.path(),
+        );
+        plan.env.push((
+            "TEST_CAPTURE_VALUE".to_string(),
+            "literal $(command)".to_string(),
+        ));
+        let output = run_git_plan(plan).await.unwrap();
+        assert!(output.starts_with(b"literal $(command)"));
+        assert_eq!(output.len(), 200_019);
+        assert_eq!(output.last(), Some(&255));
+
+        let mut plan = shell_plan(
+            "printf stdout; printf '%s' \"$TEST_CAPTURE_VALUE\" >&2; exit 7",
+            temp.path(),
+        );
+        let secret = "fixture-secret-value";
+        plan.env
+            .push(("TEST_CAPTURE_VALUE".to_string(), secret.to_string()));
+        plan.sensitive_values.push(secret.to_string());
+        let error = run_git_plan(plan).await.unwrap_err();
+        let message = error.to_string();
+        assert!(!message.contains(secret));
+        assert!(message.ends_with("REDACTED"));
+
+        let mut plan = shell_plan("exit 0", temp.path());
+        plan.program = "/nonexistent/fabro-test-git".to_string();
+        let error = run_git_plan(plan).await.unwrap_err();
+        assert!(Error::source(&error).unwrap().is::<std::io::Error>());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_plan_deadline_includes_held_pipe() {
+        struct Cleanup(TempDir);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(pid) = fs::read_to_string(self.0.path().join("leader.pid"))
+                    .ok()
+                    .and_then(|value| value.trim().parse().ok())
+                {
+                    fabro_proc::sigkill_process_group(pid);
+                }
+            }
+        }
+        let fixture = Cleanup(TempDir::new().unwrap());
+        let mut plan = shell_plan(
+            "echo $$ > leader.pid; sleep 60 & echo $! > helper.pid; exit 0",
+            fixture.0.path(),
+        );
+        plan.timeout = Duration::from_millis(200);
+        let error = time::timeout(Duration::from_secs(8), run_git_plan(plan))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, GitCommandError::Timeout { .. }));
+        let helper: u32 = fs::read_to_string(fixture.0.path().join("helper.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            while task::spawn_blocking(move || fabro_proc::process_running_strict(helper))
+                .await
+                .unwrap()
+            {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     fn repository_slug(value: &str) -> GitHubRepositorySlug {
         GitHubRepositorySlug::try_new(value).expect("slug should parse")

@@ -3,14 +3,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use fabro_agent::cli::AgentArgs;
 use fabro_config::{CliLayer, CliLoggingLayer, CliOutputLayer, CliUpdatesLayer};
-use fabro_model::ReasoningEffort;
 use fabro_server::serve::DEFAULT_TCP_PORT;
 use fabro_static::EnvVars;
 use fabro_types::settings::cli::{OutputFormat, OutputVerbosity};
 use fabro_types::settings::run::MergeStrategy;
+use fabro_types::{GitHubRepositorySlug, PermissionLevel};
 use fabro_util::printer::Printer;
+use lithos_llm::catalog::ProviderId;
+use lithos_llm::types::ReasoningEffort;
 
 pub(crate) const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -232,11 +233,40 @@ pub(crate) struct RunArgs {
     #[command(flatten)]
     pub(crate) inputs: InputOverrideArgs,
 
-    /// Local workflow name, checkout path, .fabro file, or workflow TOML
+    /// Workflow name, path, or OWNER/REPO[@REF]:WORKFLOW
     #[arg(required = true)]
     pub(crate) workflow: Option<PathBuf>,
 
-    /// Execute with simulated LLM backend
+    /// Acquire workflow source locally from a GitHub OWNER/REPO using native
+    /// Git credentials
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) workflow_repo: Option<GitHubRepositorySlug>,
+
+    /// Workflow branch, tag, HEAD (default), or full commit SHA; qualify
+    /// ambiguous names
+    #[arg(long, requires = "workflow_repo", value_name = "REF")]
+    pub(crate) workflow_ref: Option<String>,
+
+    /// Observe this target directory instead of cwd; Folder targets require
+    /// server filesystem access
+    #[arg(long, conflicts_with_all = ["target_repo", "target_repo_selector"], value_name = "PATH")]
+    pub(crate) target_from: Option<PathBuf>,
+
+    /// Target GitHub repository and optional working branch
+    #[arg(long = "target", conflicts_with_all = ["target_repo", "target_branch"], value_name = "OWNER/REPO[@BRANCH]")]
+    pub(crate) target_repo_selector: Option<String>,
+
+    /// Target GitHub OWNER/REPO; the execution sandbox still needs its own
+    /// clone credentials
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) target_repo: Option<GitHubRepositorySlug>,
+
+    /// Target working branch (default: remote default branch), pinned to its
+    /// observed commit
+    #[arg(long, requires = "target_repo", value_name = "BRANCH")]
+    pub(crate) target_branch: Option<String>,
+
+    /// Simulate execution; workflow source may still be fetched and uploaded
     #[arg(long)]
     pub(crate) dry_run: bool,
 
@@ -836,7 +866,7 @@ pub(crate) struct ProviderLoginArgs {
 
     /// LLM provider to authenticate with
     #[arg(long)]
-    pub(crate) provider: fabro_model::ProviderId,
+    pub(crate) provider: ProviderId,
 
     /// Read an API key from stdin instead of prompting
     #[arg(long)]
@@ -1101,8 +1131,9 @@ pub(crate) struct ModelTestArgs {
     #[arg(long, alias = "deep")]
     pub(crate) tools: bool,
 
-    /// Request a reasoning-effort level
-    #[arg(long, value_enum)]
+    /// Request a reasoning-effort level (minimal, low, medium, high, xhigh,
+    /// max)
+    #[arg(long, value_parser = parse_reasoning_effort_arg)]
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -1113,6 +1144,111 @@ pub(crate) struct ExecArgs {
 
     #[command(flatten)]
     pub(crate) agent: AgentArgs,
+}
+
+/// Agent tool permission level, as the `--permissions` flag spells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PermissionsArg {
+    ReadOnly,
+    ReadWrite,
+    Full,
+}
+
+impl From<PermissionsArg> for PermissionLevel {
+    fn from(value: PermissionsArg) -> Self {
+        match value {
+            PermissionsArg::ReadOnly => Self::ReadOnly,
+            PermissionsArg::ReadWrite => Self::ReadWrite,
+            PermissionsArg::Full => Self::Full,
+        }
+    }
+}
+
+/// Output format for `fabro exec`: human-readable assistant output on stdout
+/// with progress on stderr, or one coding agent event per line as JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ExecOutputFormat {
+    Text,
+    Json,
+}
+
+/// Arguments for the agentic `fabro exec` session.
+#[derive(Args)]
+pub(crate) struct AgentArgs {
+    /// Task prompt
+    pub(crate) prompt: String,
+
+    /// LLM provider (built-in or configured provider ID)
+    #[arg(long)]
+    pub(crate) provider: Option<String>,
+
+    /// Model name (defaults per provider)
+    #[arg(long)]
+    pub(crate) model: Option<String>,
+
+    /// Permission level for tool execution
+    #[arg(long, value_enum)]
+    pub(crate) permissions: Option<PermissionsArg>,
+
+    /// Skip interactive prompts; deny tools outside permission level
+    #[arg(long)]
+    pub(crate) auto_approve: bool,
+
+    /// Print LLM request/response debug info to stderr
+    #[arg(long)]
+    pub(crate) debug: bool,
+
+    /// Print full LLM request/response JSON to stderr
+    #[arg(long)]
+    pub(crate) verbose: bool,
+
+    /// Directory containing skill files (overrides default discovery)
+    #[arg(long)]
+    pub(crate) skills_dir: Option<String>,
+
+    /// Output format (text for human-readable, json for NDJSON event stream)
+    #[arg(long, value_enum)]
+    pub(crate) output_format: Option<ExecOutputFormat>,
+}
+
+impl AgentArgs {
+    /// Fill `None` fields from settings.toml values, then hardcoded defaults.
+    pub(crate) fn apply_cli_defaults(
+        &mut self,
+        provider: Option<&str>,
+        model: Option<&str>,
+        permissions: Option<PermissionLevel>,
+        output_format: Option<ExecOutputFormat>,
+    ) {
+        self.provider = self
+            .provider
+            .take()
+            .or_else(|| provider.map(String::from))
+            .or_else(|| Some("anthropic".to_string()));
+        self.model = self.model.take().or_else(|| model.map(String::from));
+        self.permissions = self
+            .permissions
+            .or_else(|| permissions.map(permissions_arg))
+            .or(Some(PermissionsArg::ReadWrite));
+        self.output_format = self
+            .output_format
+            .or(output_format)
+            .or(Some(ExecOutputFormat::Text));
+    }
+
+    /// The permission level after defaults are applied.
+    pub(crate) fn permission_level(&self) -> PermissionLevel {
+        self.permissions
+            .map_or(PermissionLevel::ReadWrite, PermissionLevel::from)
+    }
+}
+
+fn permissions_arg(level: PermissionLevel) -> PermissionsArg {
+    match level {
+        PermissionLevel::ReadOnly => PermissionsArg::ReadOnly,
+        PermissionLevel::ReadWrite => PermissionsArg::ReadWrite,
+        PermissionLevel::Full => PermissionsArg::Full,
+    }
 }
 
 #[derive(Args)]
@@ -1136,10 +1272,12 @@ pub(crate) struct UpgradeArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RunCommands {
-    /// Register a local workflow version, create a run, and start it
-    Run(RunArgs),
-    /// Register a local workflow version and create a submitted run
-    Create(RunArgs),
+    // Boxed so `RunArgs` does not dominate the size of the flattened
+    // `Commands` enum (clippy `large_enum_variant`).
+    /// Register a workflow version, create a run, and start it
+    Run(Box<RunArgs>),
+    /// Register a workflow version and create a submitted run
+    Create(Box<RunArgs>),
     /// Start a created workflow run on the server
     Start(StartArgs),
     /// Attach to a running or finished workflow run
@@ -1727,7 +1865,7 @@ pub(crate) struct InstallGithubArgs {
 #[derive(Args, Debug, Clone, Default)]
 pub(crate) struct InstallNonInteractiveArgs {
     #[arg(long, hide = true)]
-    pub(crate) llm_provider: Option<fabro_model::ProviderId>,
+    pub(crate) llm_provider: Option<ProviderId>,
 
     #[arg(long, hide = true)]
     pub(crate) llm_api_key_stdin: bool,
@@ -1853,4 +1991,54 @@ pub(crate) enum ProviderCommand {
 pub(crate) struct CompletionArgs {
     /// Shell to generate completions for
     pub shell: clap_complete::Shell,
+}
+
+fn parse_reasoning_effort_arg(value: &str) -> Result<ReasoningEffort, String> {
+    value.parse().map_err(|_| {
+        format!(
+            "unknown reasoning effort '{value}'; expected one of: {}",
+            ReasoningEffort::ALL
+                .into_iter()
+                .map(ReasoningEffort::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+#[cfg(test)]
+mod run_selection_grammar_tests {
+    use crate::commands::run::test_support::parse_run_args;
+
+    #[test]
+    fn run_selection_accepts_independent_resource_flags() {
+        for flags in [
+            vec![
+                "review",
+                "--workflow-repo",
+                "acme/workflows",
+                "--workflow-ref",
+                "refs/tags/v1",
+                "--target-repo",
+                "acme/app",
+                "--target-branch",
+                "release/topic",
+            ],
+            vec!["./review.toml", "--target-from", "../app"],
+        ] {
+            assert!(parse_run_args(flags).is_ok());
+        }
+    }
+
+    #[test]
+    fn run_selection_requires_modifier_owners_and_exclusive_targets() {
+        for flags in [
+            vec!["review", "--workflow-ref", "v1"],
+            vec!["review", "--target-branch", "release"],
+            vec!["review", "--target-from", ".", "--target-repo", "acme/app"],
+            vec!["--workflow-repo", "acme/workflows"],
+        ] {
+            assert!(parse_run_args(flags).is_err());
+        }
+    }
 }

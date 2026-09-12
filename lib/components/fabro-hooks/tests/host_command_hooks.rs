@@ -1,28 +1,31 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use fabro_agent::{LocalSandbox, Sandbox};
-use fabro_auth::{CredentialSource, test_support};
+use fabro_auth::test_support;
 use fabro_hooks::{
     HookContext, HookDecision, HookDefinition, HookEvent, HookExecutionContext, HookRunner,
     HookSettings, InterpString,
 };
-use fabro_model::Catalog;
+use fabro_llm::credentials::CredentialProvider;
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_sandbox::{RunSandbox, local_sandbox};
 use fabro_types::RunId;
 use tokio::fs;
 
-fn test_llm_source() -> Arc<dyn CredentialSource> {
+fn test_llm_source() -> Arc<dyn CredentialProvider> {
     test_support::vault_only_credential_source()
 }
 
 fn test_catalog() -> Arc<Catalog> {
-    Arc::new(Catalog::from_builtin().expect("default catalog should build"))
+    Arc::new(fabro_llm::default_catalog())
 }
 
-fn local_sandbox() -> Arc<dyn Sandbox> {
-    Arc::new(LocalSandbox::new(
-        std::env::current_dir().expect("test process should have a cwd"),
-    ))
+async fn test_sandbox() -> Arc<RunSandbox> {
+    Arc::new(
+        local_sandbox(std::env::current_dir().expect("test process should have a cwd"))
+            .await
+            .expect("local sandbox should be created"),
+    )
 }
 
 #[tokio::test]
@@ -62,7 +65,7 @@ async fn host_command_hook_uses_host_workdir_not_sandbox_workdir() {
     );
 
     let decision = runner
-        .run(&context, local_sandbox(), HookExecutionContext {
+        .run(&context, test_sandbox().await, HookExecutionContext {
             host_source_dir:  Some(host_work_dir.clone()),
             sandbox_work_dir: Some(container_only_work_dir.to_path_buf()),
         })

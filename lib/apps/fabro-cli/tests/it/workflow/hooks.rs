@@ -66,29 +66,24 @@ fn twin_server_storage_dir(context: &fabro_test::TestContext) -> std::path::Path
     context.temp_dir.join("hook-server-storage")
 }
 
-fn settings_with_hook(context: &fabro_test::TestContext, hook: &str) -> String {
-    if TestMode::from_env().is_twin() {
+/// The twin-mode server settings: a private storage root and dev-token auth.
+/// Live mode runs against the developer's own settings.
+fn write_server_settings(context: &fabro_test::TestContext) {
+    if !TestMode::from_env().is_twin() {
+        return;
+    }
+    context.write_home(
+        ".fabro/settings.toml",
         format!(
             r#"[server.storage]
 root = "{}"
 
 [server.auth]
 methods = ["dev-token"]
-
-{hook}"#,
+"#,
             toml_path(&twin_server_storage_dir(context)),
-        )
-    } else {
-        hook.to_string()
-    }
-}
-
-fn write_hook_settings(context: &fabro_test::TestContext, hook: &str) {
-    let settings = settings_with_hook(context, hook);
-    if settings.trim().is_empty() {
-        return;
-    }
-    context.write_home(".fabro/settings.toml", settings);
+        ),
+    );
 }
 
 fn seed_openai_vault(storage_dir: &std::path::Path, api_key: &str) {
@@ -111,6 +106,31 @@ fn configure_twin_server(
 fn write_workflow(context: &fabro_test::TestContext, name: &str, dot: &str) -> std::path::PathBuf {
     context.write_temp(name, dot);
     context.temp_dir.join(name)
+}
+
+/// A workflow config that bundles the graph `<name>.fabro` with `hooks`,
+/// which is where run hooks live: `fabro run` does not transmit `run`
+/// settings from the user's settings file. Returns the config path to run.
+fn write_hooked_workflow(
+    context: &fabro_test::TestContext,
+    name: &str,
+    dot: &str,
+    hooks: &str,
+) -> std::path::PathBuf {
+    let graph = format!("{name}.fabro");
+    context.write_temp(&graph, dot);
+    let config = format!("{name}.toml");
+    context.write_temp(
+        &config,
+        format!(
+            r#"_version = 1
+
+[workflow]
+graph = "{graph}"
+{hooks}"#
+        ),
+    );
+    context.temp_dir.join(config)
 }
 
 fn configure_hook_env(cmd: &mut assert_cmd::Command, hook_model: &str) {
@@ -141,8 +161,15 @@ async fn conclusion_status(context: &fabro_test::TestContext) -> String {
 #[fabro_macros::e2e_test(twin, live("ANTHROPIC_API_KEY"))]
 async fn hook_prompt_proceed_allows_run() {
     let mut context = test_context!();
-    write_hook_settings(
+    write_server_settings(&context);
+    let workflow = write_hooked_workflow(
         &context,
+        "hook_prompt_proceed",
+        r"digraph HookTest {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            start -> exit
+        }",
         &format!(
             r#"
 [[run.hooks]]
@@ -153,15 +180,6 @@ model = "{model}"
 "#,
             model = hook_model()
         ),
-    );
-    let workflow = write_workflow(
-        &context,
-        "hook_prompt_proceed.fabro",
-        r"digraph HookTest {
-            start [shape=Mdiamond]
-            exit [shape=Msquare]
-            start -> exit
-        }",
     );
 
     if TestMode::from_env().is_twin() {
@@ -190,8 +208,15 @@ model = "{model}"
 #[fabro_macros::e2e_test(twin, live("ANTHROPIC_API_KEY"))]
 async fn hook_prompt_block_prevents_run() {
     let mut context = test_context!();
-    write_hook_settings(
+    write_server_settings(&context);
+    let workflow = write_hooked_workflow(
         &context,
+        "hook_prompt_block",
+        r"digraph HookTest {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            start -> exit
+        }",
         &format!(
             r#"
 [[run.hooks]]
@@ -202,15 +227,6 @@ model = "{model}"
 "#,
             model = hook_model()
         ),
-    );
-    let workflow = write_workflow(
-        &context,
-        "hook_prompt_block.fabro",
-        r"digraph HookTest {
-            start [shape=Mdiamond]
-            exit [shape=Msquare]
-            start -> exit
-        }",
     );
 
     let output = if TestMode::from_env().is_twin() {
@@ -246,8 +262,15 @@ model = "{model}"
 #[fabro_macros::e2e_test(twin, live("ANTHROPIC_API_KEY"))]
 async fn hook_agent_proceed_allows_run() {
     let mut context = test_context!();
-    write_hook_settings(
+    write_server_settings(&context);
+    let workflow = write_hooked_workflow(
         &context,
+        "hook_agent_proceed",
+        r"digraph HookTest {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            start -> exit
+        }",
         &format!(
             r#"
 [[run.hooks]]
@@ -260,15 +283,6 @@ agent = "enabled"
 "#,
             model = hook_model()
         ),
-    );
-    let workflow = write_workflow(
-        &context,
-        "hook_agent_proceed.fabro",
-        r"digraph HookTest {
-            start [shape=Mdiamond]
-            exit [shape=Msquare]
-            start -> exit
-        }",
     );
 
     if TestMode::from_env().is_twin() {
@@ -299,8 +313,15 @@ async fn hook_agent_with_tool_use() {
     let mut context = test_context!();
     let marker = context.temp_dir.join("hook_check.txt");
     std::fs::write(&marker, "READY").unwrap();
-    write_hook_settings(
+    write_server_settings(&context);
+    let workflow = write_hooked_workflow(
         &context,
+        "hook_agent_tools",
+        r"digraph HookTest {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            start -> exit
+        }",
         &format!(
             r#"
 [[run.hooks]]
@@ -314,15 +335,6 @@ agent = "enabled"
             path = marker.display(),
             model = hook_model()
         ),
-    );
-    let workflow = write_workflow(
-        &context,
-        "hook_agent_tools.fabro",
-        r"digraph HookTest {
-            start [shape=Mdiamond]
-            exit [shape=Msquare]
-            start -> exit
-        }",
     );
 
     if TestMode::from_env().is_twin() {
@@ -355,7 +367,7 @@ agent = "enabled"
 #[fabro_macros::e2e_test(twin, live("ANTHROPIC_API_KEY"))]
 async fn arc_e2e_with_real_llm() {
     let mut context = test_context!();
-    write_hook_settings(&context, "");
+    write_server_settings(&context);
     let hello = context.temp_dir.join("hello.txt");
     let workflow = write_workflow(
         &context,

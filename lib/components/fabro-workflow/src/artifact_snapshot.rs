@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use fabro_agent::Sandbox;
-use fabro_sandbox::{SandboxFile, WalkOptions};
+use fabro_sandbox::{RunSandbox, SandboxFile, WalkOptions};
 use fabro_types::ArtifactUpload;
 use fabro_util::workspace_glob::WorkspaceGlobSet;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
@@ -110,16 +109,15 @@ async fn compute_artifact_info(
 
 /// Collect artifact files matching the configured workspace globs.
 pub async fn collect_artifacts(
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     artifact_capture_dir: &Path,
     globs: &WorkspaceGlobSet,
 ) -> Result<ArtifactCollectionSummary, String> {
-    let walk_options = WalkOptions {
-        excluded_directory_names: EXCLUDE_DIRS
-            .iter()
-            .map(|directory| (*directory).to_string())
-            .collect(),
-    };
+    let mut walk_options = WalkOptions::default();
+    walk_options.exclude_dirs = EXCLUDE_DIRS
+        .iter()
+        .map(|directory| (*directory).to_string())
+        .collect();
     let walk_options = &walk_options;
     let traversal_roots = globs
         .traversal_roots()
@@ -306,7 +304,7 @@ mod tests {
         let sandbox = asset_sandbox(contents);
         let globs = workspace_globs(&[".ai/reports/*.md", ".ai/plans/????-??-??-*.md"]);
 
-        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+        let summary = collect_artifacts(&sandbox.sandbox(), stage_dir.path(), &globs)
             .await
             .unwrap();
 
@@ -331,7 +329,7 @@ mod tests {
         )]));
         let globs = workspace_globs(&["test-results/**"]);
 
-        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+        let summary = collect_artifacts(&sandbox.sandbox(), stage_dir.path(), &globs)
             .await
             .unwrap();
 
@@ -356,29 +354,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_artifacts_downloads_provider_resolved_paths() {
-        let stage_dir = tempfile::tempdir().unwrap();
-        let file = SandboxFile {
-            path:          "provider-object:report-1".to_string(),
-            relative_path: "test-results/r.xml".to_string(),
-            size:          7,
-        };
-        let sandbox = MockSandbox {
-            files: HashMap::from([(file.path.clone(), "<test/>".to_string())]),
-            ..MockSandbox::linux()
-        }
-        .with_walk_files(vec![file]);
-        let globs = workspace_globs(&["test-results/**"]);
-
-        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
-            .await
-            .unwrap();
-
-        assert_eq!(summary.files_copied, 1);
-        assert_eq!(summary.captured_assets[0].path, "test-results/r.xml");
-    }
-
-    #[tokio::test]
     async fn collect_artifacts_rechecks_downloaded_file_size() {
         let stage_dir = tempfile::tempdir().unwrap();
         let content = "x".repeat(usize::try_from(MAX_FILE_SIZE + 1).unwrap());
@@ -390,7 +365,7 @@ mod tests {
         .with_walk_files(vec![file]);
         let globs = workspace_globs(&["test-results/**"]);
 
-        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+        let summary = collect_artifacts(&sandbox.sandbox(), stage_dir.path(), &globs)
             .await
             .unwrap();
 
@@ -413,7 +388,7 @@ mod tests {
         ]));
         let globs = workspace_globs(&["**/*.md"]);
 
-        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+        let summary = collect_artifacts(&sandbox.sandbox(), stage_dir.path(), &globs)
             .await
             .unwrap();
 
@@ -430,7 +405,7 @@ mod tests {
         )]));
         let globs = workspace_globs(&[".ai/**/*.md", ".ai/reports/*.md"]);
 
-        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+        let summary = collect_artifacts(&sandbox.sandbox(), stage_dir.path(), &globs)
             .await
             .unwrap();
 
@@ -444,7 +419,7 @@ mod tests {
         let sandbox = asset_sandbox(HashMap::new()).with_walk_files_error("permission denied");
         let globs = workspace_globs(&["test-results/**"]);
 
-        let error = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+        let error = collect_artifacts(&sandbox.sandbox(), stage_dir.path(), &globs)
             .await
             .expect_err("failed traversal should fail artifact collection");
 
@@ -461,7 +436,7 @@ mod tests {
         ]);
         let globs = workspace_globs(&["test-results/**"]);
 
-        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+        let summary = collect_artifacts(&sandbox.sandbox(), stage_dir.path(), &globs)
             .await
             .unwrap();
 

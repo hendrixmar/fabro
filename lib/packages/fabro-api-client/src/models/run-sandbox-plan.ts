@@ -13,15 +13,15 @@
  */
 
 
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxProviderKind } from './sandbox-provider-kind';
 
 /**
  * Requested sandbox provider and base image/snapshot from run settings.
  */
 export interface RunSandboxPlan {
-    'provider': SandboxProviderKind;
+    /**
+     * Sandbox provider kind. `local`, `docker`, and `daytona` are bundled with the server; any other value names a sandbox-driver plugin configured under `server.sandbox.providers.<kind>`.
+     */
+    'provider': string;
     'image'?: string | null;
     'snapshot'?: string | null;
 }

@@ -15,7 +15,7 @@
 
 
 /**
- * A listening TCP service discovered inside a run sandbox.
+ * A TCP port a process inside a run sandbox listens on, as the sandbox driver reports it.
  */
 export interface SandboxService {
     /**
@@ -23,11 +23,11 @@ export interface SandboxService {
      */
     'port': number;
     /**
-     * Local bind addresses discovered from `ss` or `/proc/net/tcp*`.
+     * Local bind addresses the sandbox reports for the port.
      */
     'addresses': Array<string>;
     /**
-     * Visible process summaries when available. Empty when the sandbox only supports `/proc/net/tcp*` discovery.
+     * The listening processes, when the sandbox can name them (`node`, or `pid=1234`). Empty when it cannot.
      */
     'processes': Array<string>;
     /**

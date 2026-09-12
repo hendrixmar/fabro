@@ -39,7 +39,7 @@ use crate::server::{
     spawn_automation_scheduler, spawn_pull_request_creation_supervisor, spawn_scheduler,
 };
 use crate::server_secrets::{ServerSecrets, process_env_snapshot};
-use crate::startup::{migrate_startup_vault, resolve_startup, validate_startup_configuration};
+use crate::startup::{resolve_startup, validate_startup_configuration};
 use crate::{migrations, static_files};
 
 pub const DEFAULT_TCP_PORT: u16 = 32276;
@@ -661,12 +661,11 @@ where
     let resolved_app_settings = ResolvedAppStateSettings {
         server_settings:       runtime_settings.server_settings,
         manifest_run_defaults: runtime_settings.manifest_run_defaults,
-        llm_catalog_settings:  runtime_settings.llm_catalog_settings,
+        llm_overlay:           runtime_settings.llm_overlay,
     };
     let resolved_server_settings = resolved_app_settings.server_settings.server.clone();
     validate_startup_configuration(&resolved_server_settings)?;
     let env_entries = process_env_snapshot();
-    migrate_startup_vault(&vault_path);
     let bind_request = resolve_bind_request_from_server_settings(
         &resolved_app_settings.server_settings,
         args.bind.as_deref(),
@@ -680,30 +679,6 @@ where
         .await
         .with_context(|| format!("importing legacy secrets file {}", vault_path.display()))?;
     let secret_store = fabro_vault::SecretStore::new(database.clone_pool());
-    let optional_report = migrations::migrate_optional_server_env_secrets_to_store(
-        &secret_store,
-        &server_env_path,
-        &env_entries,
-    )
-    .await
-    .context("migrate optional server env secrets into SQLite")?;
-    for warning in &optional_report.warnings {
-        warn!(
-            warning = %warning,
-            removal_deadline = migrations::OPTIONAL_SERVER_ENV_SECRETS_REMOVAL_DEADLINE,
-            "Optional server env secrets migration warning"
-        );
-    }
-    if optional_report.changed() {
-        warn!(
-            migrated_secrets = optional_report.migrated_secrets,
-            removed_env_entries = optional_report.removed_env_entries,
-            preserved_env_entries = optional_report.preserved_env_entries,
-            backup_path = ?optional_report.backup_path,
-            removal_deadline = migrations::OPTIONAL_SERVER_ENV_SECRETS_REMOVAL_DEADLINE,
-            "Migrated optional server env secrets into SQLite"
-        );
-    }
     let startup_vault = secret_store
         .snapshot()
         .await
@@ -824,7 +799,7 @@ where
         github_api_base_url: None,
         active_config_path,
         http_client: None,
-        sandbox_provider_registry: None,
+        sandbox_inventory: None,
         shutdown: shutdown.clone(),
         #[cfg(test)]
         worker_control_bus: None,
@@ -905,7 +880,7 @@ where
                             ResolvedAppStateSettings {
                                 server_settings:       resolved.server_settings,
                                 manifest_run_defaults: resolved.manifest_run_defaults,
-                                llm_catalog_settings:  resolved.llm_catalog_settings,
+                                llm_overlay:           resolved.llm_overlay,
                             }
                         });
                         match resolved {
@@ -1288,7 +1263,7 @@ mod tests {
         ResolvedAppStateSettings {
             manifest_run_defaults: manifest_run_defaults(source),
             server_settings:       server_settings(source),
-            llm_catalog_settings:  fabro_model::catalog::LlmCatalogSettings::default(),
+            llm_overlay:           fabro_config::LlmLayer::default(),
         }
     }
 

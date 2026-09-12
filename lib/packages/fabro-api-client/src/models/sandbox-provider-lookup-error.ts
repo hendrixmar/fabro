@@ -13,14 +13,14 @@
  */
 
 
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxProviderKind } from './sandbox-provider-kind';
 
 /**
  * Provider error captured during fail-soft sandbox inventory lookup.
  */
 export interface SandboxProviderLookupError {
-    'provider': SandboxProviderKind;
+    /**
+     * Sandbox provider kind. `local`, `docker`, and `daytona` are bundled with the server; any other value names a sandbox-driver plugin configured under `server.sandbox.providers.<kind>`.
+     */
+    'provider': string;
     'message': string;
 }

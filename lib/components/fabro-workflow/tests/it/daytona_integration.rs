@@ -1,4 +1,4 @@
-//! Integration tests for `DaytonaSandbox`.
+//! Integration tests for the driver-backed Daytona sandbox.
 //!
 //! These tests require a `DAYTONA_API_KEY` environment variable and network
 //! access. Run with: `cargo test --package arc-workflows -- --ignored daytona`
@@ -22,13 +22,14 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
-use fabro_agent::Sandbox;
 use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
-use fabro_sandbox::daytona::{DaytonaConfig, DaytonaSandbox};
+use fabro_sandbox::{
+    CloneRequest, DaytonaCredentials, ProviderAccess, RunSandbox, SandboxProviderKind,
+    provider_sandbox,
+};
 use fabro_static::EnvVars;
 use fabro_store::{ArtifactKey, ArtifactStore};
 use fabro_types::{RunId, StageId, WorkflowSettings, parse_blob_ref};
-use fabro_util::shell;
 use fabro_workflow::artifact;
 use fabro_workflow::context::Context;
 use fabro_workflow::error::Error;
@@ -42,6 +43,7 @@ use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
 use fabro_workflow::runtime_store::RunStoreHandle;
 use fabro_workflow::test_support::{WorkflowRunner, test_store_dir};
 use object_store::local::LocalFileSystem;
+use sandbox_driver::{LifecycleTimers, Resources, SandboxSource, SandboxSpec};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
@@ -181,7 +183,21 @@ async fn resolve_checkpoint_text(
     Ok(artifact::resolve_text_or_blob_ref_str(current, &run_store).await?)
 }
 
-async fn create_env() -> DaytonaSandbox {
+/// Live credentials from the process environment, the way the vault would
+/// supply them in production.
+fn daytona_access(credentials: DaytonaCredentials) -> ProviderAccess {
+    ProviderAccess {
+        daytona: Some(credentials),
+        ..ProviderAccess::default()
+    }
+}
+
+fn live_daytona_credentials() -> DaytonaCredentials {
+    let api_key = std::env::var(EnvVars::DAYTONA_API_KEY).expect("DAYTONA_API_KEY must be set");
+    DaytonaCredentials::from_api_key(api_key, |name| std::env::var(name).ok())
+}
+
+async fn create_env() -> RunSandbox {
     let creds = load_github_app_credentials();
     create_env_with_github_app(Some(creds)).await
 }
@@ -196,15 +212,13 @@ fn test_artifact_store(run_dir: &Path) -> ArtifactStore {
 
 async fn create_env_with_github_app(
     github_app: Option<fabro_github::GitHubCredentials>,
-) -> DaytonaSandbox {
-    DaytonaSandbox::new(
-        DaytonaConfig::default(),
-        github_app,
-        None,
-        None,
-        None,
-        None,
-        None,
+) -> RunSandbox {
+    provider_sandbox(
+        SandboxProviderKind::DAYTONA,
+        &daytona_access(live_daytona_credentials()),
+        SandboxSpec::new(SandboxSource::HostDirectory),
+        &CloneRequest::default(),
+        github_app.as_ref(),
         None,
     )
     .await
@@ -261,9 +275,9 @@ async fn daytona_exec_command() {
         .await
         .unwrap();
     assert_eq!(result.exit_code, Some(0));
-    assert!(result.stdout.contains("hello"));
+    assert!(result.stdout_lossy().contains("hello"));
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
@@ -277,9 +291,9 @@ async fn daytona_exec_command_with_pipe() {
         .await
         .unwrap();
     assert_eq!(result.exit_code, Some(0));
-    assert!(result.stdout.trim().contains('2'));
+    assert!(result.stdout_lossy().trim().contains('2'));
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
@@ -304,10 +318,13 @@ async fn daytona_exec_command_cancelled() {
         .unwrap();
 
     assert_eq!(result.exit_code, None);
-    assert!(result.is_cancelled());
-    assert_eq!(result.stderr, "Command cancelled");
+    assert!(matches!(
+        result.termination,
+        fabro_sandbox::Termination::Cancelled | fabro_sandbox::Termination::Killed
+    ));
+    assert_eq!(result.stderr_lossy(), "Command cancelled");
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
@@ -337,10 +354,10 @@ async fn daytona_exec_command_local_timeout() {
         "Command stalled for longer than the local timeout mechanism"
     );
     assert_eq!(result.exit_code, None);
-    assert!(result.is_timed_out());
-    assert_eq!(result.stderr, "Command timed out locally");
+    assert_eq!(result.termination, fabro_sandbox::Termination::TimedOut);
+    assert_eq!(result.stderr_lossy(), "Command timed out locally");
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
@@ -358,14 +375,14 @@ async fn daytona_file_round_trip() {
     assert!(env.file_exists(test_path).await.unwrap());
 
     // Read
-    let read_back = env.read_file(test_path, None, None).await.unwrap();
+    let read_back = env.read_file_text(test_path).await.unwrap();
     assert!(read_back.contains(content));
 
     // Delete
     env.delete_file(test_path).await.unwrap();
     assert!(!env.file_exists(test_path).await.unwrap());
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
@@ -390,33 +407,34 @@ async fn daytona_full_lifecycle() {
     assert!(!entries.is_empty());
 
     // Cleanup (deletes sandbox)
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
 async fn daytona_snapshot_sandbox() {
-    use fabro_sandbox::daytona::DaytonaSnapshotConfig;
-
-    let config = DaytonaConfig {
-        auto_stop_interval: Some(60),
-        snapshot: Some(DaytonaSnapshotConfig {
-            cpu:    Some(2),
-            memory: Some(4),
-            disk:   Some(10),
-            source: fabro_sandbox::daytona::DaytonaSnapshotSource::Dockerfile(
-                fabro_sandbox::daytona::DockerfileSource::Inline(
-                    "FROM ubuntu:22.04\nRUN apt-get update && apt-get install -y ripgrep"
-                        .to_string(),
-                ),
-            ),
-        }),
-        ..DaytonaConfig::default()
-    };
+    let mut resources = Resources::default();
+    resources.cpu_cores = Some(2);
+    resources.memory_mb = Some(4096);
+    resources.disk_mb = Some(10_240);
+    let mut timers = LifecycleTimers::default();
+    timers.auto_stop_after_idle = Some(std::time::Duration::from_hours(1));
+    let spec = SandboxSpec::new(SandboxSource::Dockerfile {
+        content: "FROM ubuntu:22.04\nRUN apt-get update && apt-get install -y ripgrep".to_string(),
+    })
+    .resources(resources)
+    .timers(timers);
 
     let creds = load_github_app_credentials();
-    let env = DaytonaSandbox::new(config, Some(creds), None, None, None, None, None, None)
-        .await
-        .expect("Failed to create Daytona client — is DAYTONA_API_KEY set?");
+    let env = provider_sandbox(
+        SandboxProviderKind::DAYTONA,
+        &daytona_access(live_daytona_credentials()),
+        spec,
+        &CloneRequest::default(),
+        Some(&creds),
+        None,
+    )
+    .await
+    .expect("Failed to create Daytona client — is DAYTONA_API_KEY set?");
     env.initialize().await.unwrap();
 
     // Verify rg is available (installed by snapshot)
@@ -425,9 +443,9 @@ async fn daytona_snapshot_sandbox() {
         .await
         .unwrap();
     assert_eq!(result.exit_code, Some(0));
-    assert!(result.stdout.contains("ripgrep"));
+    assert!(result.stdout_lossy().contains("ripgrep"));
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
@@ -472,14 +490,14 @@ async fn daytona_artifact_sync_uploads_and_rewrites_pointer() {
         "artifact file should exist in Daytona sandbox at {remote_path}"
     );
 
-    let remote_content = env.read_file(remote_path, None, None).await.unwrap();
+    let remote_content = env.read_file_text(remote_path).await.unwrap();
     assert!(
         remote_content.len() > 100 * 1024,
         "remote artifact should be >100KB, got {} bytes",
         remote_content.len()
     );
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +532,7 @@ impl Handler for LargeOutputHandler {
 async fn daytona_pipeline_artifact_offload_and_sync() {
     let env = create_env().await;
     env.initialize().await.unwrap();
-    let env: Arc<dyn Sandbox> = Arc::new(env);
+    let env: Arc<RunSandbox> = Arc::new(env);
 
     // Pipeline: start -> big_output -> exit
     let mut graph = Graph::new("DaytonaArtifactPipeline");
@@ -563,6 +581,7 @@ async fn daytona_pipeline_artifact_offload_and_sync() {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         pre_run_git:      None,
         fork_source_ref:  None,
         git:              None,
@@ -593,7 +612,7 @@ async fn daytona_pipeline_artifact_offload_and_sync() {
         "offloaded value should round-trip through the run store"
     );
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -630,7 +649,7 @@ impl Handler for FileWriterHandler {
 
 /// Set up git inside a Daytona sandbox for checkpoint commits.
 /// Returns (run_id, base_sha, branch_name) on success.
-async fn setup_daytona_git(sandbox: &dyn Sandbox) -> (RunId, String, String) {
+async fn setup_daytona_git(sandbox: &RunSandbox) -> (RunId, String, String) {
     // Get current HEAD as base SHA
     let sha_result = sandbox
         .exec_command("git rev-parse HEAD", 10_000, None, None, None)
@@ -640,9 +659,9 @@ async fn setup_daytona_git(sandbox: &dyn Sandbox) -> (RunId, String, String) {
         sha_result.exit_code,
         Some(0),
         "git rev-parse HEAD failed: {}",
-        sha_result.stderr
+        sha_result.stderr_lossy()
     );
-    let base_sha = sha_result.stdout.trim().to_string();
+    let base_sha = sha_result.stdout_lossy().trim().to_string();
 
     let run_id = RunId::from(Ulid::new());
     let branch_name = format!("fabro/run/{run_id}");
@@ -657,8 +676,8 @@ async fn setup_daytona_git(sandbox: &dyn Sandbox) -> (RunId, String, String) {
         Some(0),
         "git checkout -b failed (exit {:?}): stdout={} stderr={}",
         checkout_result.exit_code,
-        checkout_result.stdout,
-        checkout_result.stderr
+        checkout_result.stdout_lossy(),
+        checkout_result.stderr_lossy()
     );
 
     (run_id, base_sha, branch_name)
@@ -668,13 +687,13 @@ async fn setup_daytona_git(sandbox: &dyn Sandbox) -> (RunId, String, String) {
 async fn daytona_git_checkpoint_remote_emits_events() {
     let env = create_env().await;
     env.initialize().await.unwrap();
-    let env: Arc<dyn Sandbox> = Arc::new(env);
+    let env: Arc<RunSandbox> = Arc::new(env);
 
     // Install git if not available (the default ubuntu:22.04 image may not have it)
     let git_check = env
         .exec_command("git --version", 10_000, None, None, None)
         .await;
-    if git_check.as_ref().map_or(true, |r| !r.is_success()) {
+    if git_check.as_ref().map_or(true, |r| !r.success()) {
         let install = env
             .exec_command(
                 "apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1",
@@ -689,12 +708,12 @@ async fn daytona_git_checkpoint_remote_emits_events() {
             install.exit_code,
             Some(0),
             "git install failed: {}",
-            install.stderr
+            install.stderr_lossy()
         );
     }
 
     // Set up git in the sandbox
-    let (_run_id, base_sha, branch_name) = setup_daytona_git(&*env).await;
+    let (_run_id, base_sha, branch_name) = setup_daytona_git(&env).await;
 
     // Pipeline: start -> work -> exit
     let mut graph = Graph::new("DaytonaGitCheckpoint");
@@ -751,6 +770,7 @@ async fn daytona_git_checkpoint_remote_emits_events() {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         pre_run_git:      None,
         fork_source_ref:  None,
         git:              Some(GitCheckpointOptions {
@@ -803,7 +823,7 @@ async fn daytona_git_checkpoint_remote_emits_events() {
         "checkpoint should have git_commit_sha"
     );
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -816,13 +836,13 @@ async fn daytona_git_checkpoint_remote_emits_events() {
 async fn daytona_git_checkpoint_without_metadata_branch() {
     let env = create_env().await;
     env.initialize().await.unwrap();
-    let env: Arc<dyn Sandbox> = Arc::new(env);
+    let env: Arc<RunSandbox> = Arc::new(env);
 
     // Install git if not available
     let git_check = env
         .exec_command("git --version", 10_000, None, None, None)
         .await;
-    if git_check.as_ref().map_or(true, |r| !r.is_success()) {
+    if git_check.as_ref().map_or(true, |r| !r.success()) {
         let install = env
             .exec_command(
                 "apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1",
@@ -837,12 +857,12 @@ async fn daytona_git_checkpoint_without_metadata_branch() {
             install.exit_code,
             Some(0),
             "git install failed: {}",
-            install.stderr
+            install.stderr_lossy()
         );
     }
 
     // Set up git in the sandbox
-    let (run_id, base_sha, branch_name) = setup_daytona_git(&*env).await;
+    let (run_id, base_sha, branch_name) = setup_daytona_git(&env).await;
 
     // Pipeline: start -> work -> exit
     let mut graph = Graph::new("DaytonaCodeCheckpoint");
@@ -892,6 +912,7 @@ async fn daytona_git_checkpoint_without_metadata_branch() {
         github_app: None,
         base_branch: None,
         display_base_sha: None,
+        git_identity: None,
         pre_run_git: None,
         fork_source_ref: None,
         git: Some(GitCheckpointOptions {
@@ -916,8 +937,8 @@ async fn daytona_git_checkpoint_without_metadata_branch() {
         )
         .await
         .expect("git ref listing should succeed");
-    assert_eq!(refs.exit_code, Some(0));
-    assert!(refs.stdout.trim().is_empty());
+    assert_eq!(refs.exit_code, Some(0), "{}", refs.stderr_lossy());
+    assert!(refs.stdout_lossy().trim().is_empty());
 
     // Run identity remains in code commits, without a metadata SHA.
     let log_result = env
@@ -925,7 +946,7 @@ async fn daytona_git_checkpoint_without_metadata_branch() {
         .await
         .expect("git log should succeed");
     assert_eq!(log_result.exit_code, Some(0));
-    let commit_msg = log_result.stdout.trim().to_string();
+    let commit_msg = log_result.stdout_lossy().trim().to_string();
     assert!(
         !commit_msg.contains("Fabro-Checkpoint:"),
         "sandbox commit should not have Fabro-Checkpoint trailer, got:\n{commit_msg}"
@@ -935,7 +956,7 @@ async fn daytona_git_checkpoint_without_metadata_branch() {
         "sandbox commit should have Fabro-Run trailer, got:\n{commit_msg}"
     );
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -976,7 +997,7 @@ impl Handler for AssetCreatorHandler {
 async fn daytona_asset_collection() {
     let env = create_env().await;
     env.initialize().await.unwrap();
-    let env: Arc<dyn Sandbox> = Arc::new(env);
+    let env: Arc<RunSandbox> = Arc::new(env);
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -1036,6 +1057,7 @@ async fn daytona_asset_collection() {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         pre_run_git:      None,
         fork_source_ref:  None,
         git:              None,
@@ -1068,7 +1090,7 @@ async fn daytona_asset_collection() {
         "artifact scratch cache should not be created"
     );
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
@@ -1076,21 +1098,25 @@ async fn daytona_ssh_access() {
     let env = create_env().await;
     env.initialize().await.unwrap();
 
-    let ssh_command = env.create_ssh_access(Some(60.0)).await.unwrap();
+    let ssh_command = env
+        .ssh_access_command()
+        .await
+        .unwrap()
+        .expect("Daytona should offer an SSH command");
     assert!(!ssh_command.is_empty(), "ssh_command should not be empty");
     assert!(
         ssh_command.contains("ssh"),
         "ssh_command should contain 'ssh': {ssh_command}",
     );
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
 async fn daytona_ssh_access_before_init_fails() {
     let env = create_env().await;
 
-    let result = env.create_ssh_access(Some(60.0)).await;
+    let result = env.ssh_access_command().await;
     assert!(result.is_err(), "should fail before initialize()");
     assert!(
         result.unwrap_err().to_string().contains("not initialized"),
@@ -1125,7 +1151,7 @@ async fn daytona_clone_private_repo_with_github_app_iat() {
         "CLAUDE.md should exist after clone"
     );
     assert!(
-        result.stdout.contains("EXISTS"),
+        result.stdout_lossy().contains("EXISTS"),
         "clone should have populated the workspace"
     );
 
@@ -1133,7 +1159,7 @@ async fn daytona_clone_private_repo_with_github_app_iat() {
     let git_check = env
         .exec_command("git --version", 10_000, None, None, None)
         .await;
-    if git_check.as_ref().map_or(true, |r| !r.is_success()) {
+    if git_check.as_ref().map_or(true, |r| !r.success()) {
         let install = env
             .exec_command(
                 "apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1",
@@ -1148,7 +1174,7 @@ async fn daytona_clone_private_repo_with_github_app_iat() {
             install.exit_code,
             Some(0),
             "git install failed: {}",
-            install.stderr
+            install.stderr_lossy()
         );
     }
 
@@ -1159,12 +1185,12 @@ async fn daytona_clone_private_repo_with_github_app_iat() {
         .unwrap();
     assert_eq!(result.exit_code, Some(0));
     assert!(
-        result.stdout.contains("fabro-sh/fabro"),
+        result.stdout_lossy().contains("fabro-sh/fabro"),
         "origin should point to fabro-sh/fabro, got: {}",
-        result.stdout.trim()
+        result.stdout_lossy().trim()
     );
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 /// E2E: Verify that repos in an installed org get credentials (needed for
@@ -1230,13 +1256,13 @@ async fn daytona_git_push_run_branch_to_origin() {
     let creds = load_github_app_credentials();
     let env = create_env_with_github_app(Some(creds)).await;
     env.initialize().await.unwrap();
-    let env: Arc<dyn Sandbox> = Arc::new(env);
+    let env: Arc<RunSandbox> = Arc::new(env);
 
     // Install git if not available
     let git_check = env
         .exec_command("git --version", 10_000, None, None, None)
         .await;
-    if git_check.as_ref().map_or(true, |r| !r.is_success()) {
+    if git_check.as_ref().map_or(true, |r| !r.success()) {
         let install = env
             .exec_command(
                 "apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1",
@@ -1251,12 +1277,12 @@ async fn daytona_git_push_run_branch_to_origin() {
             install.exit_code,
             Some(0),
             "git install failed: {}",
-            install.stderr
+            install.stderr_lossy()
         );
     }
 
     // Set up git in the sandbox
-    let (run_id, base_sha, branch_name) = setup_daytona_git(&*env).await;
+    let (run_id, base_sha, branch_name) = setup_daytona_git(&env).await;
 
     // Pipeline: start -> work -> exit
     let mut graph = Graph::new("DaytonaGitPush");
@@ -1304,6 +1330,7 @@ async fn daytona_git_push_run_branch_to_origin() {
         github_app: None,
         base_branch: None,
         display_base_sha: None,
+        git_identity: None,
         pre_run_git: None,
         fork_source_ref: None,
         git: Some(GitCheckpointOptions {
@@ -1327,12 +1354,12 @@ async fn daytona_git_push_run_branch_to_origin() {
         ls_result.exit_code,
         Some(0),
         "git ls-remote failed: {}",
-        ls_result.stdout
+        ls_result.stdout_lossy()
     );
     assert!(
-        ls_result.stdout.contains(&branch_name),
+        ls_result.stdout_lossy().contains(&branch_name),
         "run branch should exist on origin after push, got: {}",
-        ls_result.stdout.trim()
+        ls_result.stdout_lossy().trim()
     );
 
     // Clean up the remote branch
@@ -1341,15 +1368,15 @@ async fn daytona_git_push_run_branch_to_origin() {
         .exec_command(&delete_cmd, 30_000, None, None, None)
         .await;
     if let Ok(r) = &delete_result {
-        if !r.is_success() {
+        if !r.success() {
             eprintln!(
                 "Warning: failed to delete remote branch {branch_name}: {}",
-                r.stdout
+                r.stdout_lossy()
             );
         }
     }
 
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 /// Diagnose toolbox proxy staleness after idle time.
@@ -1396,7 +1423,7 @@ async fn daytona_toolbox_idle_diagnostic() {
                 eprintln!(
                     "[t=+{sleep_secs}s] OK exit_code={:?} stdout={}",
                     r.exit_code,
-                    r.stdout.trim()
+                    r.stdout_lossy().trim()
                 );
             }
             Err(e) => {
@@ -1487,7 +1514,7 @@ async fn daytona_toolbox_idle_diagnostic() {
     }
 
     eprintln!("\n=== PASS: all idle durations survived ===");
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 /// E2E test for `fabro cp` against a live Daytona sandbox.
@@ -1496,8 +1523,8 @@ async fn daytona_toolbox_idle_diagnostic() {
 /// uploads a file, downloads it back, and verifies the round-trip.
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
 async fn daytona_cp_upload_download_round_trip() {
-    use fabro_sandbox::reconnect::reconnect;
-    use fabro_types::{RunSandboxInstance, SandboxProviderKind};
+    use fabro_sandbox::reconnect::reconnect_for_run;
+    use fabro_types::RunSandboxInstance;
 
     // 1. Create and initialize a real Daytona sandbox
     let env = create_env().await;
@@ -1511,7 +1538,7 @@ async fn daytona_cp_upload_download_round_trip() {
 
     // 2. Build initialized sandbox metadata (same as `fabro run` would persist)
     let record = RunSandboxInstance {
-        provider: SandboxProviderKind::Daytona,
+        provider: SandboxProviderKind::DAYTONA,
         image:    None,
         snapshot: None,
         runtime:  fabro_types::RunSandboxRuntime {
@@ -1529,7 +1556,11 @@ async fn daytona_cp_upload_download_round_trip() {
 
     // 3. Reconnect via the real cp::reconnect path
     let tmp = tempfile::tempdir().unwrap();
-    let reconnected = reconnect(&record, None)
+    let access = ProviderAccess {
+        daytona: Some(live_daytona_credentials()),
+        ..ProviderAccess::default()
+    };
+    let reconnected = reconnect_for_run(&record, &access, None, None)
         .await
         .expect("reconnect should succeed");
 
@@ -1548,10 +1579,7 @@ async fn daytona_cp_upload_download_round_trip() {
         env.file_exists("cp_test_upload.txt").await.unwrap(),
         "uploaded file should exist in the sandbox"
     );
-    let remote_content = env
-        .read_file("cp_test_upload.txt", None, None)
-        .await
-        .unwrap();
+    let remote_content = env.read_file_text("cp_test_upload.txt").await.unwrap();
     assert!(
         remote_content.contains("hello from fabro cp e2e test"),
         "expected uploaded content in sandbox, got: {remote_content}"
@@ -1590,26 +1618,33 @@ async fn daytona_cp_upload_download_round_trip() {
     );
 
     // 9. Cleanup
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"))]
 async fn daytona_computer_use_browser_screenshot() {
-    use base64::Engine;
-    let config = DaytonaConfig {
-        snapshot: None,
-        skip_clone: true,
-        ..DaytonaConfig::default()
-    };
-    let env = DaytonaSandbox::new(config, None, None, None, None, None, None, None)
-        .await
-        .expect("DAYTONA_API_KEY must be set");
+    let env = provider_sandbox(
+        SandboxProviderKind::DAYTONA,
+        &daytona_access(live_daytona_credentials()),
+        SandboxSpec::new(SandboxSource::HostDirectory),
+        &CloneRequest::none(),
+        None,
+        None,
+    )
+    .await
+    .expect("DAYTONA_API_KEY must be set");
     env.initialize().await.unwrap();
 
-    // 1. Start the computer use desktop environment (Xvfb, xfce4, etc.)
-    let cu = env.computer_use().await.unwrap();
-    let start_resp = cu.start().await.expect("computer_use.start() failed");
-    eprintln!("Computer use started: {:?}", start_resp.message);
+    // 1. Start the computer use desktop environment (Xvfb, xfce4, etc.) through the
+    //    driver's VNC facet, which also signs a viewer URL.
+    let vnc = env
+        .handle()
+        .expect("initialized sandbox has a handle")
+        .vnc()
+        .expect("Daytona exposes VNC");
+    let connection = vnc.vnc_connection().await.expect("VNC connection failed");
+    eprintln!("VNC viewer: {}", connection.url);
+    assert!(connection.url.contains("vnc.html"));
 
     // 2. Find or install a browser
     let check = env
@@ -1622,9 +1657,9 @@ async fn daytona_computer_use_browser_screenshot() {
         )
         .await
         .unwrap();
-    eprintln!("Browser check: {}", check.stdout.trim());
+    eprintln!("Browser check: {}", check.stdout_lossy().trim());
 
-    if check.stdout.trim() == "NONE" {
+    if check.stdout_lossy().trim() == "NONE" {
         let install_result = env
             .exec_command(
                 "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chromium 2>&1",
@@ -1635,7 +1670,7 @@ async fn daytona_computer_use_browser_screenshot() {
         eprintln!(
             "Browser install exit_code={:?}, last_line={}",
             install_result.exit_code,
-            install_result.stdout.lines().last().unwrap_or("")
+            install_result.stdout_lossy().lines().last().unwrap_or("")
         );
         assert_eq!(install_result.exit_code, Some(0), "Chromium install failed");
     }
@@ -1650,7 +1685,7 @@ async fn daytona_computer_use_browser_screenshot() {
         )
         .await
         .unwrap();
-    let browser = browser_bin.stdout.trim().to_string();
+    let browser = browser_bin.stdout_lossy().trim().to_string();
     eprintln!("Using browser: {browser}");
 
     // 3. Detect the DISPLAY that computer use started
@@ -1664,7 +1699,7 @@ async fn daytona_computer_use_browser_screenshot() {
         )
         .await
         .unwrap();
-    eprintln!("Xvfb process: {}", display_check.stdout.trim());
+    eprintln!("Xvfb process: {}", display_check.stdout_lossy().trim());
 
     // 4. Launch browser with setsid to fully detach, and log stderr
     let launch_cmd = format!(
@@ -1692,7 +1727,7 @@ async fn daytona_computer_use_browser_screenshot() {
         )
         .await
         .unwrap();
-    eprintln!("Chrome processes:\n{}", ps_check.stdout);
+    eprintln!("Chrome processes:\n{}", ps_check.stdout_lossy());
 
     let stderr_check = env
         .exec_command(
@@ -1704,54 +1739,41 @@ async fn daytona_computer_use_browser_screenshot() {
         )
         .await
         .unwrap();
-    eprintln!("Chrome stderr:\n{}", stderr_check.stdout);
+    eprintln!("Chrome stderr:\n{}", stderr_check.stdout_lossy());
 
-    // 5. Take a screenshot via the Computer Use API
-    let screenshot = cu
-        .screenshot()
-        .take_full_screen()
+    // 5. The desktop is serving: noVNC listens on its port.
+    let listening = env
+        .exec_command(
+            "ss -ltn 2>/dev/null | grep -q ':6080 ' || (command -v curl >/dev/null && curl -sf -o /dev/null http://127.0.0.1:6080/)",
+            10_000,
+            None,
+            None,
+            None,
+        )
         .await
-        .expect("screenshot failed");
-
-    let b64_data = screenshot
-        .screenshot
-        .expect("screenshot response had no data");
-    eprintln!(
-        "Screenshot captured: {} bytes base64 ({} bytes decoded approx)",
-        b64_data.len(),
-        b64_data.len() * 3 / 4
-    );
-    assert!(!b64_data.is_empty(), "screenshot should not be empty");
-
-    // 6. Decode and save to /tmp for manual inspection
-    let png_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&b64_data)
-        .expect("base64 decode failed");
-    let output_path = "/tmp/daytona_browser_screenshot.png";
-    std::fs::write(output_path, &png_bytes).expect("failed to write screenshot");
-    eprintln!(
-        "Screenshot saved to {output_path} ({} bytes)",
-        png_bytes.len()
+        .unwrap();
+    assert!(
+        listening.success(),
+        "noVNC should be reachable inside the sandbox"
     );
 
     // 7. Cleanup
-    cu.stop().await.ok();
-    env.cleanup().await.unwrap();
+    env.delete().await.unwrap();
 }
 
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"))]
 async fn daytona_playwright_mcp_sandbox_transport() {
-    use fabro_agent::Sandbox;
-
     // Create sandbox from daytona-medium (has Node.js + Chromium)
-    let config = DaytonaConfig {
-        snapshot: None,
-        skip_clone: true,
-        ..DaytonaConfig::default()
-    };
-    let sandbox = DaytonaSandbox::new(config, None, None, None, None, None, None, None)
-        .await
-        .expect("DAYTONA_API_KEY must be set");
+    let sandbox = provider_sandbox(
+        SandboxProviderKind::DAYTONA,
+        &daytona_access(live_daytona_credentials()),
+        SandboxSpec::new(SandboxSource::HostDirectory),
+        &CloneRequest::none(),
+        None,
+        None,
+    )
+    .await
+    .expect("DAYTONA_API_KEY must be set");
     sandbox.initialize().await.unwrap();
 
     // 1. Install Playwright MCP server and its browser
@@ -1770,7 +1792,7 @@ async fn daytona_playwright_mcp_sandbox_transport() {
         "Install exit_code={:?}, last_lines:\n{}",
         install.exit_code,
         install
-            .stdout
+            .stdout_lossy()
             .lines()
             .rev()
             .take(5)
@@ -1782,9 +1804,12 @@ async fn daytona_playwright_mcp_sandbox_transport() {
     );
     assert_eq!(install.exit_code, Some(0), "Playwright install failed");
 
-    // 2. Start the Playwright MCP server via the sandbox transport resolution path
+    // 2. The Playwright MCP server as an agent stage gets it: launched in the
+    //    sandbox by pebble and reached over SSE through Daytona's preview link,
+    //    token header included. A scripted model drives the tools, so the test is
+    //    about the sandbox transport and nothing else.
     let mcp_port = 3100u16;
-    let mcp_config = fabro_mcp::config::McpServerSettings {
+    let server = fabro_mcp::pebble::pebble_server(&fabro_mcp::config::McpServerSettings {
         name:                 "playwright".into(),
         transport:            fabro_mcp::config::McpTransport::Sandbox {
             protocol: fabro_mcp::config::McpHttpProtocol::Sse,
@@ -1802,172 +1827,107 @@ async fn daytona_playwright_mcp_sandbox_transport() {
         },
         current_dir:          None,
         clear_env:            false,
-        startup_timeout_secs: 30,
+        startup_timeout_secs: 60,
         tool_timeout_secs:    120,
-    };
+    });
+    let (client, _provider) = pebble_coding_agent::test_support::client_from(
+        pebble_coding_agent::test_support::ScriptedProvider::new(vec![
+            pebble_coding_agent::test_support::ScriptedCall::response(
+                pebble_coding_agent::test_support::tool_call_response(
+                    "mcp__playwright__browser_install",
+                    "install",
+                    serde_json::json!({}),
+                ),
+            ),
+            pebble_coding_agent::test_support::ScriptedCall::response(
+                pebble_coding_agent::test_support::tool_call_response(
+                    "mcp__playwright__browser_navigate",
+                    "navigate",
+                    serde_json::json!({"url": "https://example.com"}),
+                ),
+            ),
+            pebble_coding_agent::test_support::ScriptedCall::response(
+                pebble_coding_agent::test_support::tool_call_response(
+                    "mcp__playwright__browser_snapshot",
+                    "snapshot",
+                    serde_json::json!({}),
+                ),
+            ),
+            pebble_coding_agent::test_support::ScriptedCall::response(
+                pebble_coding_agent::test_support::text_response("browsed"),
+            ),
+        ]),
+    );
+    let sandbox = Arc::new(sandbox);
+    let routes = sandbox
+        .port_routes()
+        .expect("Daytona forwards ports through preview URLs");
+    let mut agent = pebble_coding_agent::CodingAgent::builder(
+        client,
+        Arc::clone(&sandbox) as Arc<dyn pebble_coding_agent::environment::Environment>,
+    )
+    .model("test/model")
+    .permission_level(pebble_coding_agent::events::PermissionLevel::Full)
+    .mcp_servers([server])
+    .port_routes(routes)
+    .build()
+    .await
+    .expect("the agent builds with the sandbox-hosted server");
 
-    // Resolve the sandbox transport: start the server, get preview URL, rewrite to
-    // HTTP
-    let resolved = match &mcp_config.transport {
-        fabro_mcp::config::McpTransport::Sandbox {
-            protocol,
-            command,
-            port,
+    // 3. The server started and its tools are registered.
+    let statuses = agent.snapshot().mcp_servers().to_vec();
+    assert_eq!(statuses.len(), 1, "{statuses:?}");
+    assert_eq!(
+        statuses[0].error, None,
+        "the Playwright server should start: {statuses:?}"
+    );
+    eprintln!("Discovered {} MCP tools:", statuses[0].tools.len());
+    for tool in &statuses[0].tools {
+        eprintln!("  - {}", tool.name);
+    }
+    assert!(
+        statuses[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "mcp__playwright__browser_navigate"),
+        "Should have discovered Playwright tools"
+    );
+
+    // 4. Install the browser, navigate, and snapshot through the agent.
+    let mut events = agent.subscribe();
+    let report = agent.prompt("browse example.com").await;
+    assert!(report.result.is_ok(), "{report:?}");
+    let mut completions = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let pebble_coding_agent::events::CodingEvent::ToolCallCompleted {
+            tool_name,
+            output,
+            is_error,
             ..
-        } => {
-            let (url, headers) = {
-                let cmd_str = shell::shell_join(command);
-                let inner =
-                    format!("{cmd_str} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log");
-                let launch_script = format!(
-                    "setsid \"$BASH\" -c {} </dev/null >/dev/null 2>&1 &\necho $!",
-                    shell::shell_quote(&inner)
-                );
-                let launch_result = sandbox
-                    .exec_command(&launch_script, 30_000, None, None, None)
-                    .await
-                    .unwrap();
-                eprintln!("MCP server PID: {}", launch_result.stdout.trim());
-
-                // Wait for server to listen
-                let poll_cmd = format!(
-                    "for i in $(seq 1 30); do ss -tln | grep -q ':{port} ' && echo ready && exit 0; sleep 1; done; echo timeout"
-                );
-                let poll_result = sandbox
-                    .exec_command(&poll_cmd, 60_000, None, None, None)
-                    .await
-                    .unwrap();
-                eprintln!("Server readiness: {}", poll_result.stdout.trim());
-
-                if poll_result.stdout.trim() != "ready" {
-                    let stderr = sandbox
-                        .exec_command(
-                            "cat /tmp/mcp_server_stderr.log 2>/dev/null | tail -20",
-                            10_000,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await
-                        .map(|r| r.stdout)
-                        .unwrap_or_default();
-                    panic!("MCP server did not start on port {port}. stderr:\n{stderr}");
-                }
-
-                sandbox
-                    .get_preview_url(*port)
-                    .await
-                    .unwrap()
-                    .expect("sandbox should support preview URLs")
-            };
-            eprintln!("Preview URL: {url}");
-
-            let url = fabro_mcp::http_transport::sandbox_mcp_http_url(*protocol, &url).unwrap();
-
-            fabro_mcp::config::McpServerSettings {
-                name:                 mcp_config.name.clone(),
-                transport:            fabro_mcp::config::McpTransport::Http {
-                    protocol: *protocol,
-                    url,
-                    headers,
-                },
-                current_dir:          mcp_config.current_dir.clone(),
-                clear_env:            mcp_config.clear_env,
-                startup_timeout_secs: mcp_config.startup_timeout_secs,
-                tool_timeout_secs:    mcp_config.tool_timeout_secs,
-            }
-        }
-        _ => unreachable!(),
-    };
-
-    // 3. Connect the MCP client to the resolved HTTP endpoint
-    let mut manager = fabro_mcp::connection_manager::McpConnectionManager::new();
-    let results = manager.start_servers(&[resolved]).await;
-    for (name, result) in &results {
-        match result {
-            Ok(count) => eprintln!("MCP server '{name}' ready with {count} tools"),
-            Err(e) => panic!("MCP server '{name}' failed: {e}"),
+        } = event.event
+        {
+            completions.push((tool_name, output, is_error));
         }
     }
-
-    // 4. List the tools to verify we got Playwright tools
-    let tools = manager.all_tools();
-    eprintln!("Discovered {} MCP tools:", tools.len());
-    for (name, info) in tools {
-        eprintln!(
-            "  - {name}: {}",
-            info.description.chars().take(80).collect::<String>()
-        );
-    }
-    assert!(!tools.is_empty(), "Should have discovered Playwright tools");
-
-    // 5. Install the browser via MCP tool (ensures correct version is available)
-    let install_tool = tools
-        .keys()
-        .find(|k| k.ends_with("browser_install"))
-        .expect("no browser_install tool found");
-    eprintln!("Calling tool: {install_tool}");
-    let install_result = manager.call_tool(install_tool, serde_json::json!({})).await;
-    match &install_result {
-        Ok(result) => eprintln!(
-            "Install result: {}",
-            result
-                .content
-                .first()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_default()
-        ),
-        Err(e) => eprintln!("Install error (non-fatal): {e}"),
-    }
-
-    // 6. Call the browser_navigate tool to load a page
-    let nav_tool = tools
-        .keys()
-        .find(|k| k.ends_with("browser_navigate"))
-        .expect("no browser_navigate tool found");
-    eprintln!("Calling tool: {nav_tool}");
-    let nav_result = manager
-        .call_tool(nav_tool, serde_json::json!({"url": "https://example.com"}))
-        .await;
-    match &nav_result {
-        Ok(result) => eprintln!(
-            "Navigate result: {}",
-            &result
-                .content
-                .first()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_default()
-        ),
-        Err(e) => eprintln!("Navigate error: {e}"),
-    }
-    assert!(nav_result.is_ok(), "Navigate should succeed");
-
-    // 7. Take a snapshot to verify the page loaded
-    let snap_tool = tools
-        .keys()
-        .find(|k| k.contains("snapshot"))
-        .expect("no snapshot tool found");
-    eprintln!("Calling tool: {snap_tool}");
-    let snap_result = manager.call_tool(snap_tool, serde_json::json!({})).await;
-    match &snap_result {
-        Ok(result) => {
-            let text = result
-                .content
-                .first()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_default();
-            eprintln!(
-                "Snapshot result (first 500 chars): {}",
-                &text[..text.len().min(500)]
-            );
-            assert!(
-                text.contains("Example Domain"),
-                "Snapshot should contain 'Example Domain'"
-            );
-        }
-        Err(e) => panic!("Snapshot failed: {e}"),
-    }
+    let navigate = completions
+        .iter()
+        .find(|(name, _, _)| name == "mcp__playwright__browser_navigate")
+        .expect("navigate ran");
+    assert!(!navigate.2, "Navigate should succeed: {navigate:?}");
+    let snapshot = completions
+        .iter()
+        .find(|(name, _, _)| name == "mcp__playwright__browser_snapshot")
+        .expect("snapshot ran");
+    assert!(!snapshot.2, "Snapshot should succeed: {snapshot:?}");
+    assert!(
+        snapshot.1.to_string().contains("Example Domain"),
+        "Snapshot should contain 'Example Domain'"
+    );
+    agent
+        .shutdown(pebble_coding_agent::ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
 
     // 8. Cleanup
-    sandbox.cleanup().await.unwrap();
+    sandbox.delete().await.unwrap();
 }

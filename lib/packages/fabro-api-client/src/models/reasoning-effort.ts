@@ -19,6 +19,7 @@
  */
 
 export const ReasoningEffort = {
+    MINIMAL: 'minimal',
     LOW: 'low',
     MEDIUM: 'medium',
     HIGH: 'high',

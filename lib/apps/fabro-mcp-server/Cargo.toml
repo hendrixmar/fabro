@@ -19,7 +19,6 @@ fabro-api = { path = "../../foundation/fabro-api" }
 fabro-client = { path = "../../foundation/fabro-client" }
 fabro-manifest = { path = "../../components/fabro-manifest" }
 fabro-config = { path = "../../foundation/fabro-config" }
-fabro-model = { path = "../../foundation/fabro-model" }
 fabro-server = { path = "../fabro-server" }
 fabro-tool = { path = "../../components/fabro-tool" }
 fabro-types = { path = "../../foundation/fabro-types" }

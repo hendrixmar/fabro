@@ -23,11 +23,10 @@ Which source files affect which doc pages. Use this as guidance — also apply j
 | `lib/components/fabro-workflow/src/interviewer/*.rs` | `docs/public/execution/interviews.mdx` |
 | `lib/components/fabro-workflow/src/hook/*.rs` | `docs/public/agents/hooks.mdx` |
 | `lib/components/fabro-workflow/src/daytona_sandbox.rs` | `docs/public/integrations/daytona.mdx`, `docs/public/execution/environments.mdx` |
-| `lib/components/fabro-agent/src/tools.rs`, `lib/components/fabro-agent/src/tool_registry.rs`, `lib/components/fabro-agent/src/tool_execution.rs` | `docs/public/agents/tools.mdx` |
-| `lib/components/fabro-agent/src/v4a_patch.rs` | `docs/public/agents/tools.mdx` |
-| `lib/components/fabro-agent/src/cli.rs` | `docs/public/agents/permissions.mdx` |
-| `lib/components/fabro-agent/src/subagent.rs` | `docs/public/agents/subagents.mdx` |
-| `lib/components/fabro-agent/src/mcp_integration.rs` | `docs/public/agents/mcp.mdx` |
+| `lib/components/fabro-sandbox/src/environment.rs`, pebble's `pebble-coding-agent` tools | `docs/public/agents/tools.mdx` |
+| `lib/apps/fabro-cli/src/commands/exec.rs` | `docs/public/agents/permissions.mdx` |
+| pebble's `pebble-coding-agent` subagents | `docs/public/agents/subagents.mdx` |
+| `lib/components/fabro-workflow/src/handler/llm/sandbox_mcp.rs`, `lib/components/fabro-mcp/src/connection_manager.rs` | `docs/public/agents/mcp.mdx` |
 | `lib/components/fabro-llm/src/catalog.rs`, `lib/components/fabro-llm/src/providers/*.rs` | `docs/public/core-concepts/models.mdx` |
 | `lib/components/fabro-slack/src/*.rs` | `docs/public/integrations/slack.mdx` |
 | `lib/components/fabro-mcp/src/*.rs` | `docs/public/agents/mcp.mdx` |

@@ -15,12 +15,13 @@
 
 
 /**
- * Optional provider-specific model speed tier used for cost estimates.
+ * lithos `Speed`: the requested latency or cost tier.
  */
 
 export const BillingSpeed = {
-    STANDARD: 'standard',
-    FAST: 'fast'
+    FAST: 'fast',
+    BALANCED: 'balanced',
+    ECONOMICAL: 'economical'
 } as const;
 
 export type BillingSpeed = typeof BillingSpeed[keyof typeof BillingSpeed];

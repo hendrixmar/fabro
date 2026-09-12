@@ -656,7 +656,7 @@ export const HumanInTheLoopApiAxiosParamCreator = function (configuration?: Conf
             };
         },
         /**
-         * Returns provider-neutral details about the sandbox owned by this run, including identity, normalized state, image/snapshot, resources, labels, and timestamps.
+         * Returns the sandbox owned by this run as fabro\'s record of it plus the sandbox driver\'s status (identity, state, image or snapshot, resources, network policy, labels, and timestamps).
          * @summary Retrieve Run Sandbox Details
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -1076,7 +1076,7 @@ export const HumanInTheLoopApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Returns provider-neutral details about the sandbox owned by this run, including identity, normalized state, image/snapshot, resources, labels, and timestamps.
+         * Returns the sandbox owned by this run as fabro\'s record of it plus the sandbox driver\'s status (identity, state, image or snapshot, resources, network policy, labels, and timestamps).
          * @summary Retrieve Run Sandbox Details
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -1300,7 +1300,7 @@ export const HumanInTheLoopApiFactory = function (configuration?: Configuration,
             return localVarFp.putSandboxFile(id, path, body, options).then((request) => request(axios, basePath));
         },
         /**
-         * Returns provider-neutral details about the sandbox owned by this run, including identity, normalized state, image/snapshot, resources, labels, and timestamps.
+         * Returns the sandbox owned by this run as fabro\'s record of it plus the sandbox driver\'s status (identity, state, image or snapshot, resources, network policy, labels, and timestamps).
          * @summary Retrieve Run Sandbox Details
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -1520,7 +1520,7 @@ export class HumanInTheLoopApi extends BaseAPI {
     }
 
     /**
-     * Returns provider-neutral details about the sandbox owned by this run, including identity, normalized state, image/snapshot, resources, labels, and timestamps.
+     * Returns the sandbox owned by this run as fabro\'s record of it plus the sandbox driver\'s status (identity, state, image or snapshot, resources, network policy, labels, and timestamps).
      * @summary Retrieve Run Sandbox Details
      * @param {string} id Unique run identifier (ULID).
      * @param {*} [options] Override http request option.

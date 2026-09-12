@@ -140,8 +140,6 @@ impl ProgressUI {
                 provider,
                 duration_ms,
                 name,
-                cpu,
-                memory,
                 url,
             } => {
                 self.setup.on_sandbox_ready(
@@ -149,8 +147,6 @@ impl ProgressUI {
                     &provider,
                     duration_ms,
                     name.as_deref(),
-                    cpu,
-                    memory,
                     url.as_deref(),
                 );
             }
@@ -457,16 +453,21 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use chrono::{DateTime, Utc};
-    use fabro_agent::{AgentEvent, SandboxEvent};
-    use fabro_llm::types::TokenCounts;
-    use fabro_model::{Catalog, ModelRef, ProviderId};
     use fabro_types::run_event::CliEnsureCompletedProps;
     use fabro_types::{
-        MetadataSnapshotFailureKind, MetadataSnapshotPhase, ParallelBranchId, SandboxProviderKind,
-        StageId, fixtures,
+        MetadataSnapshotFailureKind, MetadataSnapshotPhase, ModelRef, ParallelBranchId,
+        SandboxProviderKind, StageId, fixtures,
     };
-    use fabro_workflow::event::{Event, RunNoticeLevel, to_run_event, to_run_event_at};
+    use fabro_workflow::event::{
+        Event, RunNoticeLevel, SandboxLifecycle, to_run_event, to_run_event_at,
+    };
     use fabro_workflow::outcome::billed_model_usage_from_llm;
+    use lithos_llm::catalog::{ModelId, builtin};
+    use lithos_llm::types::TokenCounts;
+    use pebble_coding_agent::events::{
+        CodingAgentEvent, CodingEvent, CompactionReason, ErrorData as AgentErrorData,
+        ErrorKind as AgentErrorKind, TokenUsage,
+    };
 
     use super::*;
     use crate::commands::run::run_progress::stage_display::ToolCallStatus;
@@ -506,6 +507,55 @@ mod tests {
             .expect("valid utf-8")
     }
 
+    fn driver_event(value: serde_json::Value) -> Event {
+        Event::SandboxDriver {
+            event: serde_json::from_value(value).expect("a driver event"),
+        }
+    }
+
+    /// A snapshot build reported by the driver: started, or completed after
+    /// `secs`.
+    fn snapshot_build_event(name: &str, kind: &str, secs: Option<u64>) -> Event {
+        let mut value = serde_json::json!({
+            "id": {"source_id": "test", "sequence": 1},
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "provider": "daytona",
+            "subject": {"type": "snapshot", "name": name},
+            "type": kind,
+            "action": "create"
+        });
+        if let Some(secs) = secs {
+            value["duration"] = serde_json::json!({"secs": secs, "nanos": 0});
+        }
+        driver_event(value)
+    }
+
+    fn snapshot_build_failed_event(name: &str, error: &str) -> Event {
+        driver_event(serde_json::json!({
+            "id": {"source_id": "test", "sequence": 1},
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "provider": "docker",
+            "subject": {"type": "snapshot", "name": name},
+            "type": "operation_failed",
+            "action": "create",
+            "duration": {"secs": 1, "nanos": 0},
+            "error": {"kind": "provider", "message": error, "retryable": false, "causes": []}
+        }))
+    }
+
+    /// The Docker provider pulling the sandbox's image inside its create.
+    fn image_pull_event(image: &str) -> Event {
+        driver_event(serde_json::json!({
+            "id": {"source_id": "test", "sequence": 1},
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "provider": "docker",
+            "subject": {"type": "sandbox"},
+            "type": "operation_progress",
+            "action": "create",
+            "progress": {"code": "image.pull", "message": format!("pulling image {image}")}
+        }))
+    }
+
     fn emit(ui: &mut ProgressUI, event: Event) {
         let stored = to_run_event(&fixtures::RUN_1, &event);
         ui.handle_event(&stored);
@@ -534,25 +584,20 @@ mod tests {
         });
     }
 
-    fn agent_event(stage: &str, event: AgentEvent) -> Event {
+    fn agent_event(stage: &str, event: CodingEvent) -> Event {
         Event::Agent {
             stage: stage.into(),
             visit: 1,
-            event,
-            session_id: None,
-            parent_session_id: None,
-            tool_call_id: None,
+            event: CodingAgentEvent::new("ses_root", event, std::time::SystemTime::UNIX_EPOCH),
         }
     }
 
-    fn child_agent_event(stage: &str, event: AgentEvent) -> Event {
+    fn child_agent_event(stage: &str, event: CodingEvent) -> Event {
         Event::Agent {
             stage: stage.into(),
             visit: 1,
-            event,
-            session_id: Some("ses_child".into()),
-            parent_session_id: Some("ses_root".into()),
-            tool_call_id: None,
+            event: CodingAgentEvent::new("ses_child", event, std::time::SystemTime::UNIX_EPOCH)
+                .with_parent_session_id("ses_root"),
         }
     }
 
@@ -569,16 +614,12 @@ mod tests {
         }
     }
 
-    fn assistant_event(model: &str, text: &str) -> AgentEvent {
-        AgentEvent::AssistantMessage {
+    fn assistant_event(model: &str, text: &str) -> CodingEvent {
+        CodingEvent::AssistantMessage {
             text:            text.into(),
-            model:           ModelRef {
-                provider: ProviderId::openai(),
-                model_id: model.into(),
-                speed:    None,
-            },
-            usage:           TokenCounts::default(),
-            cost_usd:        None,
+            model:           model.into(),
+            usage:           TokenUsage::default(),
+            cost_usd_micros: None,
             cost_source:     None,
             tool_call_count: 0,
             context_window:  None,
@@ -595,12 +636,8 @@ mod tests {
     }
 
     fn llm_request_started(stage: &str, model: &str) -> Event {
-        agent_event(stage, AgentEvent::LlmRequestStarted {
-            requested_model: ModelRef {
-                provider: ProviderId::anthropic(),
-                model_id: model.into(),
-                speed:    None,
-            },
+        agent_event(stage, CodingEvent::LlmRequestStarted {
+            requested_model: model.into(),
         })
     }
 
@@ -615,15 +652,11 @@ mod tests {
             suggested_next_ids: Vec::new(),
             billing: Some(
                 billed_model_usage_from_llm(
-                    Catalog::builtin(),
-                    &ModelRef {
-                        provider: ProviderId::openai(),
-                        model_id: "gpt-5-mini".into(),
-                        speed:    None,
-                    },
-                    &TokenCounts {
-                        input_tokens: 1200,
-                        output_tokens: 300,
+                    &fabro_llm::test_support::test_catalog(),
+                    &ModelRef::new(builtin::openai(), ModelId::new("gpt-5.4")),
+                    TokenCounts {
+                        input: 1200,
+                        output: 300,
                         ..TokenCounts::default()
                     },
                 )
@@ -729,9 +762,10 @@ mod tests {
 
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::CompactionStarted {
+            agent_event("s1", CodingEvent::CompactionStarted {
                 estimated_tokens:    5000,
                 context_window_size: 8000,
+                reason:              CompactionReason::Threshold,
             }),
         );
         assert!(ui.stage.active_stages["s1"].compaction_bar.is_some());
@@ -740,11 +774,12 @@ mod tests {
 
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::CompactionCompleted {
+            agent_event("s1", CodingEvent::CompactionCompleted {
                 original_turn_count:    20,
                 preserved_turn_count:   6,
                 summary_token_estimate: 500,
                 tracked_file_count:     3,
+                reason:                 CompactionReason::Threshold,
             }),
         );
         assert!(ui.stage.active_stages["s1"].compaction_bar.is_none());
@@ -757,19 +792,22 @@ mod tests {
         emit(&mut ui, stage_started("s1", "Build"));
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::CompactionStarted {
+            agent_event("s1", CodingEvent::CompactionStarted {
                 estimated_tokens:    5000,
                 context_window_size: 8000,
+                reason:              CompactionReason::Threshold,
             }),
         );
         assert!(ui.stage.active_stages["s1"].compaction_bar.is_some());
 
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::Error {
-                error: fabro_agent::Error::Compaction(fabro_agent::CompactionError::EmptySummary {
-                    summarized_turn_count: 14,
-                }),
+            agent_event("s1", CodingEvent::Error {
+                error: AgentErrorData::new(
+                    AgentErrorKind::Compaction,
+                    "generated summary was empty after trimming; refused to replace 14 turns and \
+                     left history intact",
+                ),
             }),
         );
 
@@ -783,10 +821,12 @@ mod tests {
 
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::Error {
-                error: fabro_agent::Error::Compaction(fabro_agent::CompactionError::EmptySummary {
-                    summarized_turn_count: 14,
-                }),
+            agent_event("s1", CodingEvent::Error {
+                error: AgentErrorData::new(
+                    AgentErrorKind::Compaction,
+                    "generated summary was empty after trimming; refused to replace 14 turns and \
+                     left history intact",
+                ),
             }),
         );
 
@@ -813,7 +853,7 @@ mod tests {
 
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::LlmFirstOutput {
+            agent_event("s1", CodingEvent::LlmFirstOutput {
                 kind: fabro_types::LlmOutputKind::ToolCall,
             }),
         );
@@ -839,22 +879,19 @@ mod tests {
         emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::LlmFirstOutput {
+            agent_event("s1", CodingEvent::LlmFirstOutput {
                 kind: fabro_types::LlmOutputKind::Text,
             }),
         );
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::LlmRetry {
+            agent_event("s1", CodingEvent::LlmRetry {
                 provider:   "anthropic".into(),
                 model:      "claude-fable-5".into(),
                 attempt:    1,
                 delay_secs: 0.1,
                 phase:      fabro_types::LlmRetryPhase::Consume,
-                error:      fabro_llm::Error::Configuration {
-                    message: "retry".into(),
-                    source:  None,
-                },
+                error:      AgentErrorData::new(AgentErrorKind::Llm, "retry"),
             }),
         );
 
@@ -874,7 +911,7 @@ mod tests {
         emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
         emit(
             &mut ui,
-            agent_event("s1", AgentEvent::RoundInterrupted { generation: 1 }),
+            agent_event("s1", CodingEvent::RoundInterrupted { generation: 1 }),
         );
 
         assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
@@ -888,7 +925,7 @@ mod tests {
         emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
         emit(
             &mut ui,
-            child_agent_event("s1", AgentEvent::LlmFirstOutput {
+            child_agent_event("s1", CodingEvent::LlmFirstOutput {
                 kind: fabro_types::LlmOutputKind::ToolCall,
             }),
         );
@@ -920,7 +957,7 @@ mod tests {
             stage_started("code", "Code"),
             Event::SandboxInitialized {
                 working_directory: "/home/daytona/workspace".into(),
-                provider:          SandboxProviderKind::Daytona,
+                provider:          SandboxProviderKind::DAYTONA,
                 id:                "daytona:sandbox-id".into(),
                 repo_cloned:       None,
                 clone_origin_url:  None,
@@ -932,7 +969,7 @@ mod tests {
                 image:             None,
                 snapshot:          None,
             },
-            agent_event("code", AgentEvent::ToolCallStarted {
+            agent_event("code", CodingEvent::ToolCallStarted {
                 tool_name:    "read_file".into(),
                 tool_call_id: "tc1".into(),
                 arguments:    serde_json::json!({
@@ -959,29 +996,26 @@ mod tests {
                 max_attempts: 3,
                 delay_ms:     1500,
             },
-            agent_event("code", AgentEvent::Warning {
+            agent_event("code", CodingEvent::Warning {
                 kind:    "context_window".into(),
                 message: "high usage".into(),
                 details: serde_json::json!({"usage_percent": 92}),
             }),
-            agent_event("code", AgentEvent::LlmRetry {
+            agent_event("code", CodingEvent::LlmRetry {
                 provider:   "openai".into(),
                 model:      "gpt-5-mini".into(),
                 attempt:    2,
                 delay_secs: 1.5,
                 phase:      fabro_types::LlmRetryPhase::Open,
-                error:      fabro_llm::Error::Configuration {
-                    message: "busy".into(),
-                    source:  None,
-                },
+                error:      AgentErrorData::new(AgentErrorKind::Llm, "busy"),
             }),
-            agent_event("code", AgentEvent::SubAgentSpawned {
+            agent_event("code", CodingEvent::SubAgentSpawned {
                 agent_id:   "a1".into(),
                 depth:      1,
                 task:       "review recent changes".into(),
                 generation: 1,
             }),
-            agent_event("code", AgentEvent::SubAgentCompleted {
+            agent_event("code", CodingEvent::SubAgentCompleted {
                 agent_id:   "a1".into(),
                 depth:      1,
                 generation: 1,
@@ -1020,7 +1054,7 @@ mod tests {
         emit(&mut ui, assistant_message("plan", "gpt-5-mini"));
         emit(
             &mut ui,
-            agent_event("plan", AgentEvent::ToolCallStarted {
+            agent_event("plan", CodingEvent::ToolCallStarted {
                 tool_name:    "read_file".into(),
                 tool_call_id: "tc1".into(),
                 arguments:    serde_json::json!({"path": "src/main.rs"}),
@@ -1028,10 +1062,12 @@ mod tests {
         );
         emit(
             &mut ui,
-            agent_event("plan", AgentEvent::ToolCallCompleted {
+            agent_event("plan", CodingEvent::ToolCallCompleted {
                 tool_name:             "read_file".into(),
                 tool_call_id:          "tc1".into(),
                 output:                serde_json::json!({"ok": true}),
+                metadata:              pebble_agent::ToolOutputMetadata::default(),
+                error_kind:            None,
                 is_error:              false,
                 output_bytes_observed: 11,
                 output_bytes_retained: 11,
@@ -1040,7 +1076,7 @@ mod tests {
         );
         emit(&mut ui, stage_completed("plan", "Plan"));
 
-        insta::assert_snapshot!(rendered(&buffer), @"    ✓ Plan  5s");
+        insta::assert_snapshot!(rendered(&buffer), @"    ✓ Plan  $0.01   5s");
     }
 
     #[test]
@@ -1048,17 +1084,15 @@ mod tests {
         let (mut ui, buffer) = capture_ui(false);
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Initializing {
+            event: SandboxLifecycle::Initializing {
                 provider: "daytona".into(),
             },
         });
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Ready {
+            event: SandboxLifecycle::Ready {
                 provider:    "daytona".into(),
                 duration_ms: 2500,
                 name:        Some("sandbox-1".into()),
-                cpu:         Some(4.0),
-                memory:      Some(8.0),
                 url:         None,
             },
         });
@@ -1077,12 +1111,12 @@ mod tests {
                 duration_ms:       600,
             }),
         );
-        insta::assert_snapshot!(rendered(&buffer), @r"
-            Sandbox: daytona (ready in 2s)
-                     sandbox-1 (4 cpu, 8 GB)
-                     ssh daytona@example
-            Setup: 2 commands (8s)
-            CLI: gh (installed, 600ms)
+        insta::assert_snapshot!(rendered(&buffer), @"
+        Sandbox: daytona (ready in 2s)
+                 sandbox-1
+                 ssh daytona@example
+        Setup: 2 commands (8s)
+        CLI: gh (installed, 600ms)
         ");
     }
 
@@ -1091,36 +1125,31 @@ mod tests {
         let (mut ui, buffer) = capture_ui(false);
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Initializing {
+            event: SandboxLifecycle::Initializing {
                 provider: "daytona".into(),
             },
         });
+        emit(
+            &mut ui,
+            snapshot_build_event("fabro-v9-test", "operation_started", None),
+        );
+        emit(
+            &mut ui,
+            snapshot_build_event("fabro-v9-test", "operation_completed", Some(210)),
+        );
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::SnapshotCreating {
-                name: "fabro-v9-test".into(),
-            },
-        });
-        emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::SnapshotReady {
-                name:        "fabro-v9-test".into(),
-                duration_ms: 210_000,
-            },
-        });
-        emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Ready {
+            event: SandboxLifecycle::Ready {
                 provider:    "daytona".into(),
                 duration_ms: 212_000,
                 name:        Some("sandbox-1".into()),
-                cpu:         Some(4.0),
-                memory:      Some(8.0),
                 url:         None,
             },
         });
 
-        insta::assert_snapshot!(rendered(&buffer), @r"
-            Sandbox: building fabro-v9-test...
-            Sandbox: daytona (ready in 3m32s)
-                     sandbox-1 (4 cpu, 8 GB)
+        insta::assert_snapshot!(rendered(&buffer), @"
+        Sandbox: building fabro-v9-test...
+        Sandbox: daytona (ready in 3m32s)
+                 sandbox-1
         ");
     }
 
@@ -1129,28 +1158,16 @@ mod tests {
         let (mut ui, buffer) = capture_ui(false);
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Initializing {
+            event: SandboxLifecycle::Initializing {
                 provider: "docker".into(),
             },
         });
+        emit(&mut ui, image_pull_event("buildpack-deps:noble"));
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::SnapshotPulling {
-                name: "buildpack-deps:noble".into(),
-            },
-        });
-        emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::SnapshotReady {
-                name:        "buildpack-deps:noble".into(),
-                duration_ms: 8_200,
-            },
-        });
-        emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Ready {
+            event: SandboxLifecycle::Ready {
                 provider:    "docker".into(),
                 duration_ms: 9_000,
                 name:        None,
-                cpu:         None,
-                memory:      None,
                 url:         None,
             },
         });
@@ -1166,17 +1183,15 @@ mod tests {
         let (mut ui, buffer) = capture_ui(false);
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Initializing {
+            event: SandboxLifecycle::Initializing {
                 provider: "docker".into(),
             },
         });
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Ready {
+            event: SandboxLifecycle::Ready {
                 provider:    "docker".into(),
                 duration_ms: 20,
                 name:        None,
-                cpu:         None,
-                memory:      None,
                 url:         None,
             },
         });
@@ -1189,19 +1204,16 @@ mod tests {
         let (mut ui, buffer) = capture_ui(false);
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Initializing {
+            event: SandboxLifecycle::Initializing {
                 provider: "docker".into(),
             },
         });
+        emit(
+            &mut ui,
+            snapshot_build_failed_event("buildpack-deps:noble", "pull failed"),
+        );
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::SnapshotFailed {
-                name:   "buildpack-deps:noble".into(),
-                error:  "pull failed".into(),
-                causes: Vec::new(),
-            },
-        });
-        emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::InitializeFailed {
+            event: SandboxLifecycle::InitializeFailed {
                 provider:    "docker".into(),
                 error:       "pull failed".into(),
                 causes:      Vec::new(),
@@ -1220,27 +1232,23 @@ mod tests {
         let mut ui = ProgressUI::new(true, false);
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Initializing {
+            event: SandboxLifecycle::Initializing {
                 provider: "docker".into(),
             },
         });
         assert!(ui.setup.sandbox_bar.is_some());
 
-        emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::SnapshotReady {
-                name:        "buildpack-deps:noble".into(),
-                duration_ms: 10,
-            },
-        });
+        emit(
+            &mut ui,
+            snapshot_build_event("buildpack-deps:noble", "operation_completed", Some(0)),
+        );
         assert!(ui.setup.sandbox_bar.is_some());
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Ready {
+            event: SandboxLifecycle::Ready {
                 provider:    "docker".into(),
                 duration_ms: 20,
                 name:        None,
-                cpu:         None,
-                memory:      None,
                 url:         None,
             },
         });
@@ -1252,14 +1260,14 @@ mod tests {
         let mut ui = ProgressUI::new(true, false);
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::Initializing {
+            event: SandboxLifecycle::Initializing {
                 provider: "docker".into(),
             },
         });
         assert!(ui.setup.sandbox_bar.is_some());
 
         emit(&mut ui, Event::Sandbox {
-            event: SandboxEvent::InitializeFailed {
+            event: SandboxLifecycle::InitializeFailed {
                 provider:    "docker".into(),
                 error:       "pull failed".into(),
                 causes:      Vec::new(),
@@ -1276,7 +1284,7 @@ mod tests {
         emit(&mut ui, stage_started("code", "Code"));
         emit(&mut ui, Event::SandboxInitialized {
             working_directory: "/home/daytona/workspace".into(),
-            provider:          SandboxProviderKind::Daytona,
+            provider:          SandboxProviderKind::DAYTONA,
             id:                "daytona:sandbox-id".into(),
             repo_cloned:       None,
             clone_origin_url:  None,
@@ -1290,7 +1298,7 @@ mod tests {
         });
         emit(
             &mut ui,
-            agent_event("code", AgentEvent::ToolCallStarted {
+            agent_event("code", CodingEvent::ToolCallStarted {
                 tool_name:    "read_file".into(),
                 tool_call_id: "tc1".into(),
                 arguments:    serde_json::json!({
@@ -1320,7 +1328,7 @@ mod tests {
         });
         emit(
             &mut ui,
-            agent_event("code", AgentEvent::Warning {
+            agent_event("code", CodingEvent::Warning {
                 kind:    "context_window".into(),
                 message: "high usage".into(),
                 details: serde_json::json!({"usage_percent": 92}),
@@ -1328,21 +1336,18 @@ mod tests {
         );
         emit(
             &mut ui,
-            agent_event("code", AgentEvent::LlmRetry {
+            agent_event("code", CodingEvent::LlmRetry {
                 provider:   "openai".into(),
                 model:      "gpt-5-mini".into(),
                 attempt:    2,
                 delay_secs: 1.5,
                 phase:      fabro_types::LlmRetryPhase::Open,
-                error:      fabro_llm::Error::Configuration {
-                    message: "busy".into(),
-                    source:  None,
-                },
+                error:      AgentErrorData::new(AgentErrorKind::Llm, "busy"),
             }),
         );
         emit(
             &mut ui,
-            agent_event("code", AgentEvent::SubAgentSpawned {
+            agent_event("code", CodingEvent::SubAgentSpawned {
                 agent_id:   "a1".into(),
                 depth:      1,
                 task:       "review recent changes".into(),
@@ -1351,7 +1356,7 @@ mod tests {
         );
         emit(
             &mut ui,
-            agent_event("code", AgentEvent::SubAgentCompleted {
+            agent_event("code", CodingEvent::SubAgentCompleted {
                 agent_id:   "a1".into(),
                 depth:      1,
                 generation: 1,
@@ -1361,7 +1366,7 @@ mod tests {
         );
         emit(
             &mut ui,
-            agent_event("code", AgentEvent::SubAgentTurnStarted {
+            agent_event("code", CodingEvent::SubAgentTurnStarted {
                 agent_id:   "a1".into(),
                 depth:      1,
                 task:       "fix the review findings".into(),
@@ -1370,7 +1375,7 @@ mod tests {
         );
         emit(
             &mut ui,
-            agent_event("code", AgentEvent::SubAgentCompleted {
+            agent_event("code", CodingEvent::SubAgentCompleted {
                 agent_id:   "a1".into(),
                 depth:      1,
                 generation: 2,
@@ -1399,7 +1404,7 @@ mod tests {
             ✓ subagent[a1] (2 turns)
           ✓ [1/1] bun install  2s
         Setup: 1 command (2s)
-        ✓ Code  5s  (1 turns, 0 tools, 1.5k toks)
+        ✓ Code  $0.01   5s  (1 turns, 0 tools, 1.5k toks)
         "#);
     }
 
@@ -1561,7 +1566,7 @@ mod tests {
         .unwrap();
         let tool_started = serde_json::to_string(&to_run_event_at(
             &fixtures::RUN_1,
-            &agent_event("code", AgentEvent::ToolCallStarted {
+            &agent_event("code", CodingEvent::ToolCallStarted {
                 tool_name:    "read_file".into(),
                 tool_call_id: "tc1".into(),
                 arguments:    serde_json::json!({"path": "src/main.rs"}),
@@ -1572,10 +1577,12 @@ mod tests {
         .unwrap();
         let tool_completed = serde_json::to_string(&to_run_event_at(
             &fixtures::RUN_1,
-            &agent_event("code", AgentEvent::ToolCallCompleted {
+            &agent_event("code", CodingEvent::ToolCallCompleted {
                 tool_name:             "read_file".into(),
                 tool_call_id:          "tc1".into(),
                 output:                serde_json::json!({"ok": true}),
+                metadata:              pebble_agent::ToolOutputMetadata::default(),
+                error_kind:            None,
                 is_error:              false,
                 output_bytes_observed: 11,
                 output_bytes_retained: 11,

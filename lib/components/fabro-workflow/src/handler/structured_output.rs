@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock};
 
 use fabro_graphviz::graph::Node;
-use fabro_llm::types::{ResponseFormat, ResponseFormatType};
+use fabro_llm::types::ResponseFormat;
 use jsonschema::error::ValidationErrorKind;
 use jsonschema::paths::Location;
 use jsonschema::{ValidationError, Validator};
@@ -392,17 +392,16 @@ pub(crate) fn parse_node_output_schema(node: &Node) -> Result<Option<OutputSchem
 }
 
 #[must_use]
+/// The provider response format for a node's output schema.
+///
+/// Providers with native structured output enforce the JSON schema; every
+/// provider still gets validated locally afterwards.
 pub(crate) fn prompt_response_format(schema: &OutputSchemaKind) -> ResponseFormat {
     match schema {
-        OutputSchemaKind::Routing => ResponseFormat {
-            kind:        ResponseFormatType::JsonObject,
-            json_schema: None,
-            strict:      false,
-        },
-        OutputSchemaKind::JsonSchema { schema, .. } => ResponseFormat {
-            kind:        ResponseFormatType::JsonSchema,
-            json_schema: Some(schema.clone()),
-            strict:      true,
+        OutputSchemaKind::Routing => ResponseFormat::JsonObject,
+        OutputSchemaKind::JsonSchema { schema, .. } => ResponseFormat::JsonSchema {
+            name:   "output_schema".to_string(),
+            schema: schema.clone(),
         },
     }
 }
@@ -1119,12 +1118,10 @@ mod tests {
 
         let format = prompt_response_format(&schema);
 
-        assert_eq!(format.kind, ResponseFormatType::JsonSchema);
-        assert_eq!(
-            format.json_schema,
-            Some(serde_json::json!({"type": "object"}))
-        );
-        assert!(format.strict);
+        assert_eq!(format, ResponseFormat::JsonSchema {
+            name:   "output_schema".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        });
     }
 
     #[test]

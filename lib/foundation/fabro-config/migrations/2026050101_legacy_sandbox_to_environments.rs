@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-use fabro_types::settings::run::EnvironmentProvider;
+use fabro_types::{BundledProvider, SandboxProviderKind};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::{Error, Result};
@@ -91,14 +91,16 @@ fn migrate_document(doc: &mut DocumentMut) -> std::result::Result<(), MigrationF
     }
 
     let provider_str = sandbox.get("provider").and_then(Item::as_str);
-    let active_provider = provider_str.and_then(|provider| {
-        if let Ok(provider) = EnvironmentProvider::from_str(provider) {
-            Some(provider)
-        } else {
-            unsupported.push("run.sandbox.provider".to_string());
-            None
-        }
-    });
+    // Legacy `[run.sandbox]` only ever named a bundled provider; any other
+    // value is unsupported even if it is a well-formed plugin kind today.
+    let active_provider =
+        provider_str.and_then(|provider| match SandboxProviderKind::from_str(provider) {
+            Ok(provider) if provider.bundled().is_some() => Some(provider),
+            _ => {
+                unsupported.push("run.sandbox.provider".to_string());
+                None
+            }
+        });
     if provider_str.is_none() {
         unsupported.push("run.sandbox.provider".to_string());
     }
@@ -106,12 +108,12 @@ fn migrate_document(doc: &mut DocumentMut) -> std::result::Result<(), MigrationF
     // Inspect each provider's table once: if it's the active provider, capture
     // skip_clone; otherwise, report it as unsupported.
     let mut disable_clone = false;
-    for provider in [EnvironmentProvider::Daytona, EnvironmentProvider::Docker] {
-        let key: &'static str = provider.into();
+    for provider in [SandboxProviderKind::DAYTONA, SandboxProviderKind::DOCKER] {
+        let key = provider.as_str();
         let Some(item) = sandbox.get(key) else {
             continue;
         };
-        if Some(provider) == active_provider {
+        if active_provider.as_ref() == Some(&provider) {
             if item
                 .as_table()
                 .and_then(|table| table.get("skip_clone"))
@@ -129,9 +131,10 @@ fn migrate_document(doc: &mut DocumentMut) -> std::result::Result<(), MigrationF
         ensure_table(doc.as_table_mut(), &["run", "clone"])["enabled"] =
             Item::Value(Value::from(false));
     }
-    let environment_id = match active_provider {
-        Some(EnvironmentProvider::Daytona) => "daytona",
-        _ => "default",
+    let environment_id = if active_provider.as_ref() == Some(&SandboxProviderKind::DAYTONA) {
+        "daytona"
+    } else {
+        "default"
     };
     ensure_table(doc.as_table_mut(), &["run", "environment"])["id"] =
         Item::Value(Value::from(environment_id));
@@ -155,10 +158,13 @@ fn migrate_document(doc: &mut DocumentMut) -> std::result::Result<(), MigrationF
         }
     }
 
-    match active_provider {
-        Some(EnvironmentProvider::Daytona) => migrate_daytona(&sandbox, env, &mut unsupported),
-        Some(EnvironmentProvider::Docker) => migrate_docker(&sandbox, env, &mut unsupported),
-        _ => {}
+    match active_provider
+        .as_ref()
+        .and_then(SandboxProviderKind::bundled)
+    {
+        Some(BundledProvider::Daytona) => migrate_daytona(&sandbox, env, &mut unsupported),
+        Some(BundledProvider::Docker) => migrate_docker(&sandbox, env, &mut unsupported),
+        Some(BundledProvider::Local) | None => {}
     }
 
     if !unsupported.is_empty() {
@@ -358,7 +364,7 @@ provider = "daytona"
             .run;
 
         assert_eq!(resolved.environment.id, "daytona");
-        assert_eq!(resolved.environment.provider, EnvironmentProvider::Daytona);
+        assert_eq!(resolved.environment.provider, SandboxProviderKind::DAYTONA);
         assert!(migrated.contains("[run.environment]"));
         assert!(migrated.contains("[environments.daytona]"));
         assert!(!migrated.contains("[run.sandbox]"));
@@ -490,7 +496,7 @@ cpu_quota = 200000
             .run
             .environment;
 
-        assert_eq!(resolved.provider, EnvironmentProvider::Docker);
+        assert_eq!(resolved.provider, SandboxProviderKind::DOCKER);
         assert_eq!(
             resolved.image.docker.as_deref(),
             Some("buildpack-deps:noble")

@@ -50,19 +50,22 @@ fn help() {
     ");
 }
 
+/// Preview URLs come from whichever provider facet the run's sandbox
+/// exposes. The local provider runs on the server host, so its preview is
+/// the loopback address for the port.
 #[test]
-fn sandbox_preview_rejects_non_daytona_run() {
+fn sandbox_preview_uses_the_local_provider_loopback_url() {
     let context = test_context!();
     let setup = setup_local_sandbox_run(&context);
     let mut cmd = context.preview();
     cmd.args([&setup.run.run_id, "3000"]);
 
     fabro_snapshot!(context.filters(), cmd, @"
-    success: false
-    exit_code: 1
+    success: true
+    exit_code: 0
     ----- stdout -----
+    http://127.0.0.1:3000
     ----- stderr -----
-      × Sandbox provider does not support this capability.
     ");
 }
 

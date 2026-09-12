@@ -1,982 +1,126 @@
 //! `[llm]` settings layer.
 //!
-//! Holds the trusted, mergeable LLM provider/model catalog data:
+//! Operator model catalog overrides. The table uses the lithos-llm catalog
+//! schema verbatim, minus `schema_version`, and is applied as an overlay layer
+//! on top of the lithos built-in catalog:
 //!
 //! ```toml
-//! [llm.providers.moonshot]
-//! display_name = "Moonshot AI"
-//! adapter = "openai_compatible"
-//! base_url = "https://api.moonshot.ai/v1"
+//! [llm.providers.openrouter]
 //! priority = 60
 //! enabled = true
-//! aliases = ["moonshot-ai"]
 //!
-//! [llm.providers.moonshot.auth]
-//! credentials = [
-//!   "env:MOONSHOT_API_KEY",
-//!   "env:KIMI_API_KEY",
-//!   "vault:MOONSHOT_API_KEY",
-//!   "vault:KIMI_API_KEY",
-//! ]
-//!
-//! [llm.providers.moonshot.models."kimi-k2.5"]
-//! ...
+//! [llm.providers.openrouter.models."kimi-k2.5"]
+//! small_default = true
 //! ```
 //!
-//! Per-provider and per-model entries field-merge across layers (default →
-//! user → server → project → workflow/run). Inner arrays such as
-//! `auth.credentials`, `aliases`, `controls.reasoning_effort`, and
-//! `controls.speed` replace as whole arrays.
-//!
-//! Adapter keys (`adapter = "..."`) are parsed as plain strings here.
-//! Resolution against the static adapter registry happens in `fabro-model`
-//! when the resolved [`Catalog`](fabro_model::Catalog) is built.
+//! Layers merge the same way lithos merges overlays: tables merge key by key
+//! and every other value replaces. Fabro never interprets the table; lithos
+//! validates it when the catalog is built.
 
-use std::collections::{BTreeMap, HashMap};
-
-use fabro_model::catalog::deserialize_knowledge_cutoff;
-use fabro_model::{
-    AgentProfileKind, BillingPolicy, CodecKind, ModelId, ProviderAuthConfig, ProviderId, catalog,
-};
-pub use fabro_model::{CredentialRef, CredentialRefParseError, ReasoningEffortFeature};
-use fabro_types::settings::InterpString;
 use serde::{Deserialize, Serialize};
+use toml::Table;
 
-use super::maps::MergeMap;
+use super::combine::Combine;
 
-/// Top-level `[llm]` settings layer.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct LlmLayer {
-    /// Provider definitions keyed by provider ID.
-    #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
-    pub providers: MergeMap<ProviderSettings>,
-    /// Legacy top-level model definitions. New settings put models below
-    /// their provider; parsing normalizes this map before layers combine.
-    #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
-    pub models:    MergeMap<ModelSettings>,
-}
-
-/// One entry in `[llm.providers.<id>]`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderSettings {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name:   Option<String>,
-    /// Adapter registry key (e.g. `"openai_compatible"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adapter:        Option<String>,
-    /// Wire dialect for this provider's routes (e.g. `"anthropic_messages"`).
-    /// Defaults to the adapter's codec; only the default pairing is accepted
-    /// today — validated at catalog build.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codec:          Option<CodecKind>,
-    /// Agent profile used for routing/profile-specific behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_profile:  Option<AgentProfileKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth:           Option<ProviderAuthConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub billing_policy: Option<BillingPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_url:    Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url:       Option<String>,
-    /// Extra HTTP headers attached to every outgoing provider request after
-    /// credential resolution. Values are literal text or
-    /// `{{ secrets.NAME }}` interpolation strings. Put credentials in a secret
-    /// and reference them with a token, not a bare literal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra_headers:  Option<HashMap<String, InterpString>>,
-    /// Higher wins; missing → `0`; ties broken by canonical provider ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority:       Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled:        Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aliases:        Option<Vec<String>>,
-    /// Model offerings served by this provider, keyed by canonical model ID.
-    #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
-    pub models:         MergeMap<ModelSettings>,
-}
-
-/// One entry in `[llm.providers.<provider>.models.<id>]`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct ModelSettings {
-    /// Compatibility-only provider for legacy `[llm.models.<id>]` rows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider:             Option<String>,
-    /// Identifier sent to the provider API. Defaults to the catalog model ID
-    /// when omitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_id:               Option<String>,
-    /// Wire dialect for this model's route, overriding the provider's codec.
-    /// Only the adapter's default pairing is accepted today — validated at
-    /// catalog build.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codec:                Option<CodecKind>,
-    /// Billing family for this model, overriding the provider's policy
-    /// (e.g. Anthropic cache billing for a Claude model served through an
-    /// aggregator).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub billing_policy:       Option<BillingPolicy>,
-    /// Agent profile used for routing/profile-specific behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_profile:        Option<AgentProfileKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name:         Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub family:               Option<String>,
-    /// Training data cutoff label. Built-ins keep the exact public string
-    /// already exposed by the model API.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub training:             Option<String>,
-    /// Public knowledge cutoff label. Built-ins keep values such as
-    /// `"May 2025"` exactly; bare TOML dates are normalized to `YYYY-MM-DD`.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_knowledge_cutoff",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub knowledge_cutoff:     Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default:              Option<bool>,
-    /// Whether this model should be preferred for small/cheap utility tasks.
-    /// Missing or false falls back to the provider default model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub small_default:        Option<bool>,
-    /// Whether this model should be preferred for provider connectivity
-    /// probes. Missing or false falls back to the provider default model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe:                Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled:              Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aliases:              Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimated_output_tps: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limits:               Option<ModelLimits>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub features:             Option<ModelFeatures>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub controls:             Option<ModelControls>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub costs:                Option<ModelCostTable>,
-}
+/// Top-level `[llm]` settings layer: a raw lithos catalog overlay.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LlmLayer(pub Table);
 
 impl LlmLayer {
-    /// Normalize the temporary legacy model table before this source is
-    /// combined with any other settings source. Resolution runs against this
-    /// layer's own providers plus the built-in catalog, because a single
-    /// source may reference built-in offerings that merge in later.
-    pub(crate) fn normalize_legacy_models(&mut self) -> Result<(), catalog::LegacyModelError> {
-        for (provider, settings) in self.providers.iter() {
-            for (model, settings) in settings.models.iter() {
-                if settings.provider.is_some() {
-                    return Err(catalog::LegacyModelError::ScopedModelDeclaresProvider {
-                        provider: ProviderId::new(provider.clone()),
-                        model:    ModelId::new(model.clone()),
-                    });
-                }
-            }
-        }
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
-        let legacy_models = std::mem::take(&mut self.models.0);
-        if legacy_models.is_empty() {
-            return Ok(());
-        }
-        let mut legacy_models = legacy_models.into_iter().collect::<Vec<_>>();
-        legacy_models.sort_by(|(left, _), (right, _)| left.cmp(right));
-
-        let mut index = catalog::LegacyModelIndex::default();
-        let mut provider_ids = self.providers.keys().cloned().collect::<Vec<_>>();
-        provider_ids.sort_unstable();
-        for provider_id in &provider_ids {
-            let settings = self
-                .providers
-                .get(provider_id)
-                .expect("provider ID came from provider map keys");
-            let mut model_ids = settings.models.keys().cloned().collect::<Vec<_>>();
-            model_ids.sort_unstable();
-            index.add_provider(
-                ProviderId::new(provider_id.clone()),
-                settings.aliases.clone().unwrap_or_default(),
-                model_ids.into_iter().map(|model_id| {
-                    let model = settings
-                        .models
-                        .get(&model_id)
-                        .expect("model ID came from model map keys");
-                    let aliases = model.aliases.clone().unwrap_or_default();
-                    (ModelId::new(model_id), aliases)
-                }),
-            );
-        }
-        let index = index.with_builtin()?;
-
-        for (legacy_id, mut settings) in legacy_models {
-            let explicit_provider = settings.provider.take();
-            let (provider, model) = index.resolve(&legacy_id, explicit_provider.as_deref())?;
-
-            let provider_settings = self.providers.entry(provider.to_string()).or_default();
-            if provider_settings.models.contains_key(model.as_str()) {
-                return Err(catalog::LegacyModelError::DuplicateModel { provider, model });
-            }
-            provider_settings
-                .models
-                .insert(model.into_inner(), settings);
-        }
-        Ok(())
+    /// Render this layer as a lithos catalog overlay document.
+    #[must_use]
+    pub fn to_overlay_toml(&self) -> String {
+        toml::to_string(&self.0).expect("a TOML table always serializes")
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct ModelLimits {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output:     Option<i64>,
+impl Combine for LlmLayer {
+    fn combine(self, other: Self) -> Self {
+        let mut base = toml::Value::Table(other.0);
+        merge(&mut base, toml::Value::Table(self.0));
+        match base {
+            toml::Value::Table(table) => Self(table),
+            _ => unreachable!("merging two tables yields a table"),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct ModelFeatures {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools:                     Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vision:                    Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning:                 Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_by_default:      Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort:          Option<ReasoningEffortFeature>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_cache:              Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_control_breakpoints: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampling_params:           Option<bool>,
-}
-
-/// User-facing allow-list for native control values Fabro accepts on this
-/// model. Whole-array replacement on merge.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct ModelControls {
-    /// Allowed reasoning-effort values. Strings (e.g. `"low"`, `"high"`,
-    /// `"xhigh"`) — validated as `ReasoningEffort` at catalog build.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<Vec<String>>,
-    /// Additional speeds beyond `Speed::Standard`. Strings — validated as
-    /// `Speed` at catalog build. `Speed::Standard` is implicit and must not
-    /// appear here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speed:            Option<Vec<String>>,
-}
-
-/// Pricing table. Base [`CostRates`] always apply; per-speed overrides
-/// substitute when the request specifies a non-standard speed.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct ModelCostTable {
-    #[serde(flatten)]
-    pub base:  CostRates,
-    /// Per-speed cost overrides (e.g. `costs.speed.fast = { ... }`). Keys
-    /// must reference a speed declared in `controls.speed`. `standard` is
-    /// not a valid override key — base rates serve standard speed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speed: Option<BTreeMap<String, CostRates>>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct CostRates {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_cost_per_mtok:       Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_cost_per_mtok:      Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_input_cost_per_mtok: Option<f64>,
+fn merge(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use fabro_model::ApiKeyHeaderPolicy;
-
     use super::*;
-    use crate::layers::Combine;
 
-    // ---- CredentialRef ----------------------------------------------------
-
-    #[test]
-    fn credential_ref_parses_vault_form() {
-        let r = CredentialRef::from_str("vault:OPENAI_CODEX").unwrap();
-        assert_eq!(r, CredentialRef::Vault("OPENAI_CODEX".to_string()));
+    fn layer(source: &str) -> LlmLayer {
+        LlmLayer(toml::from_str(source).unwrap())
     }
 
     #[test]
-    fn credential_ref_parses_env_form() {
-        let r = CredentialRef::from_str("env:KIMI_API_KEY").unwrap();
-        assert_eq!(r, CredentialRef::Env("KIMI_API_KEY".to_string()));
-    }
-
-    #[test]
-    fn credential_ref_rejects_literal_secret() {
-        // A literal API key contains no `vault:` or `env:` prefix.
-        let err = CredentialRef::from_str("sk-ant-1234").unwrap_err();
-        assert!(err.to_string().contains("must be"));
-        assert!(
-            !err.to_string().contains("sk-ant-1234"),
-            "error must not echo the literal secret string back to the user",
+    fn higher_layer_wins_scalars_and_merges_tables() {
+        let higher = layer(
+            r"
+[providers.acme]
+priority = 10
+enabled = false
+",
         );
-    }
-
-    #[test]
-    fn credential_ref_rejects_empty_vault_name() {
-        let err = CredentialRef::from_str("vault:").unwrap_err();
-        assert!(err.to_string().contains("missing"));
-    }
-
-    #[test]
-    fn credential_ref_rejects_empty_env_name() {
-        let err = CredentialRef::from_str("env:").unwrap_err();
-        assert!(err.to_string().contains("missing"));
-    }
-
-    #[test]
-    fn credential_ref_round_trips_through_string() {
-        let r = CredentialRef::Vault("kimi".to_string());
-        assert_eq!(r.to_string(), "vault:kimi");
-        let back: CredentialRef = r.to_string().parse().unwrap();
-        assert_eq!(back, r);
-    }
-
-    #[test]
-    fn credential_ref_serializes_as_string_in_toml() {
-        let r = CredentialRef::Env("KIMI_API_KEY".to_string());
-        let s = toml::Value::try_from(&r).unwrap();
-        assert_eq!(s.as_str(), Some("env:KIMI_API_KEY"));
-    }
-
-    #[test]
-    fn credential_ref_deserializes_from_toml_string() {
-        let parsed: CredentialRef = toml::from_str(r#"v = "vault:foo""#)
-            .map(|v: toml::Value| {
-                v.as_table()
-                    .unwrap()
-                    .get("v")
-                    .unwrap()
-                    .clone()
-                    .try_into()
-                    .unwrap()
-            })
-            .unwrap();
-        assert_eq!(parsed, CredentialRef::Vault("foo".to_string()));
-    }
-
-    #[test]
-    fn credential_ref_in_array_rejects_literal_secret() {
-        // serde rejects literal secrets when parsed inside an array of
-        // CredentialRef. The error bubbles up as a TOML deserialization
-        // failure.
-        #[derive(Deserialize)]
-        #[expect(
-            dead_code,
-            reason = "field exists only to drive the deserializer; we assert on the parse error"
-        )]
-        struct Wrap {
-            v: Vec<CredentialRef>,
-        }
-        let err: Result<Wrap, _> = toml::from_str(r#"v = ["sk-literal-secret"]"#);
-        assert!(err.is_err(), "literal secret strings must fail to parse");
-    }
-
-    #[test]
-    fn provider_agent_profile_parses_from_toml() {
-        let parsed: LlmLayer = toml::from_str(
+        let lower = layer(
             r#"
 [providers.acme]
-adapter = "openai_compatible"
-agent_profile = "anthropic"
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            parsed.providers.get("acme").unwrap().agent_profile,
-            Some(fabro_model::AgentProfileKind::Anthropic)
-        );
-    }
-
-    #[test]
-    fn provider_codec_parses_from_toml() {
-        let parsed: LlmLayer = toml::from_str(
-            r#"
-[providers.acme]
-adapter = "openai_compatible"
-codec = "openai_compatible"
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            parsed.providers.get("acme").unwrap().codec,
-            Some(fabro_model::CodecKind::OpenAiCompatible)
-        );
-    }
-
-    #[test]
-    fn model_codec_parses_from_toml() {
-        let parsed: LlmLayer = toml::from_str(
-            r#"
-[models.acme_large]
-provider = "acme"
-codec = "anthropic_messages"
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            parsed.models.get("acme_large").unwrap().codec,
-            Some(fabro_model::CodecKind::AnthropicMessages)
-        );
-    }
-
-    #[test]
-    fn model_billing_policy_parses_from_toml() {
-        let parsed: LlmLayer = toml::from_str(
-            r#"
-[models.acme_claude]
-provider = "acme"
-billing_policy = "anthropic"
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            parsed.models.get("acme_claude").unwrap().billing_policy,
-            Some(fabro_model::BillingPolicy::Anthropic)
-        );
-    }
-
-    #[test]
-    fn model_agent_profile_parses_from_toml() {
-        let parsed: LlmLayer = toml::from_str(
-            r#"
-[models.acme_large]
-provider = "acme"
-agent_profile = "gemini"
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            parsed.models.get("acme_large").unwrap().agent_profile,
-            Some(fabro_model::AgentProfileKind::Gemini)
-        );
-    }
-
-    // ---- Provider extra headers ------------------------------------------
-
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "tests assert unresolved interpolation header source round-trips"
-    )]
-    fn interp_source(value: &InterpString) -> String {
-        value.as_source()
-    }
-
-    // ---- LlmLayer parsing -------------------------------------------------
-
-    #[test]
-    fn parses_minimal_provider_entry() {
-        let toml = r#"
-[providers.moonshot]
-display_name = "Moonshot AI"
-adapter = "openai_compatible"
-agent_profile = "openai"
-base_url = "https://api.moonshot.ai/v1"
-priority = 60
+priority = 5
+base_url = "https://acme.test"
 enabled = true
-aliases = ["moonshot-ai"]
-
-[providers.moonshot.auth]
-credentials = [
-  "env:MOONSHOT_API_KEY",
-  "env:KIMI_API_KEY",
-  "vault:MOONSHOT_API_KEY",
-  "vault:KIMI_API_KEY",
-]
-"#;
-        let layer: LlmLayer = toml::from_str(toml).unwrap();
-        let moonshot = layer.providers.get("moonshot").unwrap();
-        assert_eq!(moonshot.display_name.as_deref(), Some("Moonshot AI"));
-        assert_eq!(moonshot.adapter.as_deref(), Some("openai_compatible"));
-        assert_eq!(moonshot.agent_profile, Some(AgentProfileKind::OpenAi));
-        let auth = moonshot.auth.as_ref().expect("expected api_key auth");
-        assert_eq!(auth.header, ApiKeyHeaderPolicy::Bearer);
-        assert_eq!(auth.credentials, vec![
-            CredentialRef::Env("MOONSHOT_API_KEY".to_string()),
-            CredentialRef::Env("KIMI_API_KEY".to_string()),
-            CredentialRef::Vault("MOONSHOT_API_KEY".to_string()),
-            CredentialRef::Vault("KIMI_API_KEY".to_string()),
-        ]);
-        assert_eq!(
-            moonshot.base_url.as_deref(),
-            Some("https://api.moonshot.ai/v1")
+[providers.acme.metadata.agent]
+profile = "openai"
+"#,
         );
-        assert_eq!(moonshot.priority, Some(60));
-        assert_eq!(moonshot.enabled, Some(true));
+        let merged = higher.combine(lower).0;
+        let acme = &merged["providers"]["acme"];
+        assert_eq!(acme["priority"].as_integer(), Some(10));
+        assert_eq!(acme["base_url"].as_str(), Some("https://acme.test"));
+        assert_eq!(acme["enabled"].as_bool(), Some(false));
         assert_eq!(
-            moonshot.aliases.as_deref(),
-            Some(&["moonshot-ai".to_string()][..])
+            acme["metadata"]["agent"]["profile"].as_str(),
+            Some("openai")
         );
     }
 
     #[test]
-    fn provider_extra_headers_parse_interp_tokens() {
-        let toml = r#"
-[providers.portkey]
-display_name = "Portkey Bedrock"
-adapter = "anthropic"
-base_url = "https://api.portkey.ai/v1"
-
-[providers.portkey.extra_headers]
-x-title = "My App"
-x-portkey-api-key = "{{ env.PORTKEY_API_KEY }}"
-x-team-secret = "{{ secrets.gateway_team_secret }}"
-"#;
-
-        let layer: LlmLayer = toml::from_str(toml).unwrap();
-        let portkey = layer.providers.get("portkey").unwrap();
-
-        assert!(portkey.auth.is_none());
-        let headers = portkey.extra_headers.as_ref().unwrap();
+    fn arrays_replace_whole() {
+        let higher = layer("[providers.acme]\naliases = [\"a\"]\n");
+        let lower = layer("[providers.acme]\naliases = [\"b\", \"c\"]\n");
+        let merged = higher.combine(lower).0;
         assert_eq!(
-            interp_source(headers.get("x-title").expect("x-title header should parse")),
-            "My App",
-        );
-        assert_eq!(
-            interp_source(
-                headers
-                    .get("x-portkey-api-key")
-                    .expect("x-portkey-api-key header should parse")
-            ),
-            "{{ env.PORTKEY_API_KEY }}",
-        );
-        assert_eq!(
-            interp_source(
-                headers
-                    .get("x-team-secret")
-                    .expect("x-team-secret header should parse")
-            ),
-            "{{ secrets.gateway_team_secret }}",
+            merged["providers"]["acme"]["aliases"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
         );
     }
 
     #[test]
-    fn provider_extra_headers_accepts_bare_string_literal() {
-        let toml = r#"
-[providers.portkey.extra_headers]
-x-portkey-api-key = "sk-portkey-literal"
-"#;
-
-        let layer: LlmLayer = toml::from_str(toml).unwrap();
-        let headers = layer
-            .providers
-            .get("portkey")
-            .unwrap()
-            .extra_headers
-            .as_ref()
-            .unwrap();
-        let header = headers.get("x-portkey-api-key").unwrap();
-
-        assert!(header.is_literal());
-        assert_eq!(interp_source(header), "sk-portkey-literal");
-    }
-
-    #[test]
-    fn parses_full_model_entry() {
-        let toml = r#"
-[models."kimi-k2.5"]
-provider = "moonshot"
-api_id = "kimi-k2.5"
-display_name = "Kimi K2.5"
-family = "kimi"
-training = "2025-01-01"
-knowledge_cutoff = 2025-01-01
-default = true
-enabled = true
-aliases = ["kimi"]
-estimated_output_tps = 50
-
-[models."kimi-k2.5".limits]
-context_window = 262144
-max_output = 32768
-
-[models."kimi-k2.5".features]
-tools = true
-vision = false
-reasoning = true
-
-[models."kimi-k2.5".costs]
-input_cost_per_mtok = 0.60
-output_cost_per_mtok = 2.50
-cache_input_cost_per_mtok = 0.15
-"#;
-        let layer: LlmLayer = toml::from_str(toml).unwrap();
-        let m = layer.models.get("kimi-k2.5").unwrap();
-        assert_eq!(m.provider.as_deref(), Some("moonshot"));
-        assert_eq!(m.api_id.as_deref(), Some("kimi-k2.5"));
-        assert_eq!(m.display_name.as_deref(), Some("Kimi K2.5"));
-        assert_eq!(m.family.as_deref(), Some("kimi"));
-        assert_eq!(m.training.as_deref(), Some("2025-01-01"));
-        assert_eq!(m.knowledge_cutoff.as_deref(), Some("2025-01-01"));
-        assert_eq!(m.default, Some(true));
-        assert_eq!(m.enabled, Some(true));
-        assert_eq!(m.aliases.as_deref(), Some(&["kimi".to_string()][..]));
-        assert_eq!(m.estimated_output_tps, Some(50.0));
-
-        let limits = m.limits.as_ref().unwrap();
-        assert_eq!(limits.context_window, Some(262_144));
-        assert_eq!(limits.max_output, Some(32_768));
-
-        let features = m.features.as_ref().unwrap();
-        assert_eq!(features.tools, Some(true));
-        assert_eq!(features.vision, Some(false));
-        assert_eq!(features.reasoning, Some(true));
-
-        let costs = m.costs.as_ref().unwrap();
-        assert_eq!(costs.base.input_cost_per_mtok, Some(0.60));
-        assert_eq!(costs.base.output_cost_per_mtok, Some(2.50));
-        assert_eq!(costs.base.cache_input_cost_per_mtok, Some(0.15));
-        assert!(costs.speed.is_none());
-    }
-
-    #[test]
-    fn parses_model_reasoning_effort_and_prompt_cache_features() {
-        let toml = r#"
-[models."claude-bedrock"]
-provider = "bedrock"
-
-[models."claude-bedrock".features]
-tools = true
-vision = true
-reasoning = true
-reasoning_by_default = false
-reasoning_effort = "levels"
-prompt_cache = false
-"#;
-        let layer: LlmLayer = toml::from_str(toml).unwrap();
-        let features = layer
-            .models
-            .get("claude-bedrock")
-            .unwrap()
-            .features
-            .as_ref()
-            .unwrap();
-
-        assert_eq!(
-            features.reasoning_effort,
-            Some(fabro_model::ReasoningEffortFeature::Levels)
-        );
-        assert_eq!(features.reasoning_by_default, Some(false));
-        assert_eq!(features.prompt_cache, Some(false));
-    }
-
-    #[test]
-    fn parses_knowledge_cutoff_display_label() {
-        let toml = r#"
-[models."claude-opus-4-7"]
-provider = "anthropic"
-knowledge_cutoff = "May 2025"
-"#;
-        let layer: LlmLayer = toml::from_str(toml).unwrap();
-        let m = layer.models.get("claude-opus-4-7").unwrap();
-
-        assert_eq!(m.knowledge_cutoff.as_deref(), Some("May 2025"));
-    }
-
-    #[test]
-    fn parses_controls_and_per_speed_costs() {
-        let toml = r#"
-[models."claude-opus-4-6".controls]
-reasoning_effort = ["low", "medium", "high"]
-speed = ["fast"]
-
-[models."claude-opus-4-6".costs.speed.fast]
-input_cost_per_mtok = 90.0
-output_cost_per_mtok = 450.0
-cache_input_cost_per_mtok = 9.0
-"#;
-        let layer: LlmLayer = toml::from_str(toml).unwrap();
-        let m = layer.models.get("claude-opus-4-6").unwrap();
-
-        let controls = m.controls.as_ref().unwrap();
-        assert_eq!(
-            controls.reasoning_effort.as_deref(),
-            Some(&["low".to_string(), "medium".to_string(), "high".to_string()][..])
-        );
-        assert_eq!(controls.speed.as_deref(), Some(&["fast".to_string()][..]));
-
-        let costs = m.costs.as_ref().unwrap();
-        let fast = costs.speed.as_ref().unwrap().get("fast").unwrap();
-        assert_eq!(fast.input_cost_per_mtok, Some(90.0));
-        assert_eq!(fast.output_cost_per_mtok, Some(450.0));
-        assert_eq!(fast.cache_input_cost_per_mtok, Some(9.0));
-    }
-
-    #[test]
-    fn rejects_unknown_provider_field() {
-        let toml = r#"
-[providers.moonshot]
-adapter = "openai_compatible"
-unknown_field = true
-"#;
-        let err = toml::from_str::<LlmLayer>(toml).unwrap_err();
-        assert!(err.to_string().contains("unknown_field"));
-    }
-
-    #[test]
-    fn rejects_removed_provider_base_url_env_field() {
-        let toml = r#"
-[providers.moonshot]
-adapter = "openai_compatible"
-base_url_env = "KIMI_BASE_URL"
-"#;
-        let err = toml::from_str::<LlmLayer>(toml).unwrap_err();
-        assert!(err.to_string().contains("base_url_env"));
-    }
-
-    #[test]
-    fn rejects_unknown_model_field() {
-        let toml = r#"
-[models.foo]
-provider = "x"
-mystery = 1
-"#;
-        let err = toml::from_str::<LlmLayer>(toml).unwrap_err();
-        assert!(err.to_string().contains("mystery"));
-    }
-
-    // ---- Combine / merge --------------------------------------------------
-
-    #[test]
-    fn provider_field_merge_keeps_self_values_and_fills_holes() {
-        let high = ProviderSettings {
-            adapter: Some("openai_compatible".to_string()),
-            base_url: Some("https://override.example".to_string()),
-            agent_profile: Some(fabro_model::AgentProfileKind::Anthropic),
-            ..ProviderSettings::default()
-        };
-        let low = ProviderSettings {
-            adapter: Some("anthropic".to_string()),
-            base_url: Some("https://defaults.example".to_string()),
-            display_name: Some("Default".to_string()),
-            priority: Some(10),
-            agent_profile: Some(fabro_model::AgentProfileKind::OpenAi),
-            ..ProviderSettings::default()
-        };
-        let merged = high.combine(low);
-        assert_eq!(merged.adapter.as_deref(), Some("openai_compatible"));
-        assert_eq!(merged.base_url.as_deref(), Some("https://override.example"));
-        assert_eq!(merged.display_name.as_deref(), Some("Default"));
-        assert_eq!(merged.priority, Some(10));
-        assert_eq!(
-            merged.agent_profile,
-            Some(fabro_model::AgentProfileKind::Anthropic)
-        );
-    }
-
-    #[test]
-    fn provider_auth_replaces_wholesale() {
-        // Higher layer redeclares auth, so the low layer's auth table is
-        // dropped entirely (whole-value replacement).
-        let high = ProviderSettings {
-            auth: Some(ProviderAuthConfig {
-                credentials: vec![CredentialRef::Env("FOO".to_string())],
-                header:      ApiKeyHeaderPolicy::Bearer,
-            }),
-            ..ProviderSettings::default()
-        };
-        let low = ProviderSettings {
-            auth: Some(ProviderAuthConfig {
-                credentials: vec![
-                    CredentialRef::Vault("bar".to_string()),
-                    CredentialRef::Env("BAZ".to_string()),
-                ],
-                header:      ApiKeyHeaderPolicy::Custom {
-                    name: "x-api-key".to_string(),
-                },
-            }),
-            ..ProviderSettings::default()
-        };
-        let merged = high.combine(low);
-        assert_eq!(
-            merged.auth,
-            Some(ProviderAuthConfig {
-                credentials: vec![CredentialRef::Env("FOO".to_string())],
-                header:      ApiKeyHeaderPolicy::Bearer,
-            })
-        );
-    }
-
-    #[test]
-    fn provider_auth_inherits_when_unset_in_higher_layer() {
-        let high = ProviderSettings::default();
-        let low = ProviderSettings {
-            auth: Some(ProviderAuthConfig {
-                credentials: vec![CredentialRef::Env("FOO".to_string())],
-                header:      ApiKeyHeaderPolicy::Bearer,
-            }),
-            ..ProviderSettings::default()
-        };
-        let merged = high.combine(low);
-        assert_eq!(
-            merged.auth,
-            Some(ProviderAuthConfig {
-                credentials: vec![CredentialRef::Env("FOO".to_string())],
-                header:      ApiKeyHeaderPolicy::Bearer,
-            })
-        );
-    }
-
-    #[test]
-    fn provider_extra_headers_map_replaces_wholesale() {
-        let high = ProviderSettings {
-            extra_headers: Some(HashMap::from([(
-                "x-portkey-provider".to_string(),
-                InterpString::from("@bedrock-prod"),
-            )])),
-            ..ProviderSettings::default()
-        };
-        let low = ProviderSettings {
-            extra_headers: Some(HashMap::from([
-                (
-                    "x-portkey-api-key".to_string(),
-                    InterpString::from("{{ env.PORTKEY_API_KEY }}"),
-                ),
-                (
-                    "x-portkey-provider".to_string(),
-                    InterpString::from("@bedrock-default"),
-                ),
-            ])),
-            ..ProviderSettings::default()
-        };
-
-        let merged = high.combine(low);
-
-        let headers = merged.extra_headers.unwrap();
-        assert_eq!(headers.len(), 1);
-        assert_eq!(
-            headers.get("x-portkey-provider"),
-            Some(&InterpString::from("@bedrock-prod")),
-        );
-        assert!(!headers.contains_key("x-portkey-api-key"));
-    }
-
-    #[test]
-    fn provider_extra_headers_inherit_when_unset() {
-        let high = ProviderSettings::default();
-        let low = ProviderSettings {
-            extra_headers: Some(HashMap::from([(
-                "x-portkey-api-key".to_string(),
-                InterpString::from("{{ env.PORTKEY_API_KEY }}"),
-            )])),
-            ..ProviderSettings::default()
-        };
-
-        let merged = high.combine(low);
-
-        assert_eq!(
-            merged.extra_headers.unwrap().get("x-portkey-api-key"),
-            Some(&InterpString::from("{{ env.PORTKEY_API_KEY }}")),
-        );
-    }
-
-    #[test]
-    fn provider_extra_headers_empty_map_clears_lower_layer() {
-        let high = ProviderSettings {
-            extra_headers: Some(HashMap::new()),
-            ..ProviderSettings::default()
-        };
-        let low = ProviderSettings {
-            extra_headers: Some(HashMap::from([(
-                "x-portkey-api-key".to_string(),
-                InterpString::from("{{ env.PORTKEY_API_KEY }}"),
-            )])),
-            ..ProviderSettings::default()
-        };
-
-        let merged = high.combine(low);
-
-        assert!(merged.extra_headers.unwrap().is_empty());
-    }
-
-    #[test]
-    fn merge_map_field_merges_per_provider_id() {
-        let mut high_map: std::collections::HashMap<String, ProviderSettings> =
-            std::collections::HashMap::new();
-        high_map.insert("moonshot".to_string(), ProviderSettings {
-            base_url: Some("https://override".to_string()),
-            ..ProviderSettings::default()
-        });
-        let high: MergeMap<ProviderSettings> = MergeMap::from(high_map);
-
-        let mut low_map: std::collections::HashMap<String, ProviderSettings> =
-            std::collections::HashMap::new();
-        low_map.insert("moonshot".to_string(), ProviderSettings {
-            adapter: Some("openai_compatible".to_string()),
-            base_url: Some("https://defaults".to_string()),
-            ..ProviderSettings::default()
-        });
-        let low: MergeMap<ProviderSettings> = MergeMap::from(low_map);
-
-        let merged = high.combine(low);
-        let moonshot = merged.get("moonshot").unwrap();
-        assert_eq!(moonshot.adapter.as_deref(), Some("openai_compatible"));
-        assert_eq!(moonshot.base_url.as_deref(), Some("https://override"));
-    }
-
-    #[test]
-    fn model_controls_replace_wholesale() {
-        // Whole-array replacement: high layer's `reasoning_effort` shadows
-        // the low layer's list completely.
-        let high = ModelControls {
-            reasoning_effort: Some(vec!["high".to_string()]),
-            ..ModelControls::default()
-        };
-        let low = ModelControls {
-            reasoning_effort: Some(vec!["low".to_string(), "high".to_string()]),
-            speed:            Some(vec!["fast".to_string()]),
-        };
-        let merged = high.combine(low);
-        assert_eq!(
-            merged.reasoning_effort.as_deref(),
-            Some(&["high".to_string()][..])
-        );
-        assert_eq!(merged.speed.as_deref(), Some(&["fast".to_string()][..]));
-    }
-
-    #[test]
-    fn model_agent_profile_merges_as_scalar() {
-        let high = ModelSettings {
-            agent_profile: Some(fabro_model::AgentProfileKind::Gemini),
-            ..ModelSettings::default()
-        };
-        let low = ModelSettings {
-            agent_profile: Some(fabro_model::AgentProfileKind::Anthropic),
-            ..ModelSettings::default()
-        };
-
-        assert_eq!(
-            high.combine(low).agent_profile,
-            Some(fabro_model::AgentProfileKind::Gemini)
-        );
+    fn overlay_toml_round_trips() {
+        let source = layer("[providers.acme]\npriority = 3\n");
+        let rendered = source.to_overlay_toml();
+        assert_eq!(layer(&rendered), source);
     }
 }

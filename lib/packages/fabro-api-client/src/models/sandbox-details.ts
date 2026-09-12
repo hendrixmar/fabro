@@ -18,40 +18,12 @@
 import type { RunSandboxInstance } from './run-sandbox-instance';
 // May contain unused imports in some cases
 // @ts-ignore
-import type { SandboxNetwork } from './sandbox-network';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxResources } from './sandbox-resources';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxState } from './sandbox-state';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxTimestamps } from './sandbox-timestamps';
+import type { SandboxStatus } from './sandbox-status';
 
 /**
- * Provider-neutral details about the sandbox owned by a run.
+ * The sandbox owned by a run, as fabro\'s record of it and the sandbox driver\'s status.
  */
 export interface SandboxDetails {
     'sandbox': RunSandboxInstance;
-    'state': SandboxState;
-    /**
-     * Original provider state string before normalization. Display/debugging only; UI behavior keys off `state`.
-     */
-    'native_state'?: string | null;
-    /**
-     * Provider region or target. Null for local-style providers.
-     */
-    'region'?: string | null;
-    /**
-     * Provider dashboard URL for this sandbox when available.
-     */
-    'web_url'?: string | null;
-    'resources': SandboxResources;
-    'network': SandboxNetwork;
-    /**
-     * Provider-reported labels.
-     */
-    'labels': { [key: string]: string; };
-    'timestamps': SandboxTimestamps;
+    'status': SandboxStatus;
 }

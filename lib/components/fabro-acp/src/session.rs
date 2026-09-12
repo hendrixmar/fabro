@@ -9,9 +9,10 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{ActiveSession, Agent, Client, Error as ProtocolError, SessionMessage};
-use fabro_sandbox::Sandbox;
-use fabro_types::{Principal, SteeringMessage};
+use fabro_sandbox::RunSandbox;
 use fabro_util::time::elapsed_ms;
+use pebble_coding_agent::SteeringMessage;
+use pebble_coding_agent::events::Actor;
 use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
 use tokio::time::{sleep, timeout};
@@ -22,7 +23,7 @@ use crate::error::AcpError;
 use crate::transport::{SandboxAcpTransport, TransportState};
 
 pub type AcpNaturalCompletionCallback = Arc<dyn Fn() -> bool + Send + Sync>;
-pub type AcpSteerPromptCallback = Arc<dyn Fn(String, Option<Principal>) + Send + Sync>;
+pub type AcpSteerPromptCallback = Arc<dyn Fn(String, Option<Actor>) + Send + Sync>;
 
 const CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
@@ -49,7 +50,7 @@ impl AcpControlHandle {
         self.push_bounded(item, cap, false)
     }
 
-    pub fn interrupt(&self, _actor: Option<Principal>) {
+    pub fn interrupt(&self) {
         {
             let mut state = self.state.lock().expect("ACP control lock poisoned");
             if state.queue.is_empty() {
@@ -164,7 +165,7 @@ pub struct AcpRunRequest {
     pub cwd:          String,
     pub timeout_ms:   Option<u64>,
     pub env:          HashMap<String, String>,
-    pub sandbox:      Arc<dyn Sandbox>,
+    pub sandbox:      Arc<RunSandbox>,
     pub cancel_token: CancellationToken,
     pub on_activity:  Option<Arc<dyn Fn() + Send + Sync>>,
     pub live_control: Option<AcpLiveControl>,
@@ -352,9 +353,9 @@ async fn read_live_session(
         if !prompt_active {
             if let Some(message) = control_handle.pop_steer() {
                 if let Some(on_steer_prompt) = on_steer_prompt {
-                    on_steer_prompt(message.text.clone(), message.actor.clone());
+                    on_steer_prompt(message.text().to_string(), message.actor().cloned());
                 }
-                session.send_prompt(message.text)?;
+                session.send_prompt(message.text().to_string())?;
                 prompt_active = true;
                 cancel_sent = false;
                 continue;

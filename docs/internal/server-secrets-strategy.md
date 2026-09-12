@@ -43,11 +43,10 @@ the vault:
 
 `FABRO_JWT_PRIVATE_KEY` and `FABRO_JWT_PUBLIC_KEY` are removed. `SESSION_SECRET` is the single auth root.
 
-Provisioning into the vault is not the same as the resolver being vault-only. `CredentialResolver`
-owns a documented process-env fallback that runs after the vault lookup
-(`lib/foundation/fabro-auth/src/resolve.rs:198-204`), and `CredentialRef::Env(name)` is a
-first-class credential source (`resolve.rs:350`). Which paths that fallback is live on is a
-per-process question:
+Provisioning into the vault is not the same as the resolver being vault-only. `VaultCredentialSource`
+(`lib/foundation/fabro-auth/src/vault_source.rs`) reads each secret name lithos-llm asks for from
+the process environment first and the vault second, under the same conventional names. Which paths
+that environment lookup is live on is a per-process question:
 
 - **Server process** — inert. `lib/apps/fabro-server/src/server.rs:2453` builds
   `SqlVaultCredentialSource::vault_only(...)`, so the env lookup always returns `None`.
@@ -85,11 +84,12 @@ consumption time) and `vars` (non-sensitive run variables, substituted early at 
 `{{ env.NAME }}` tokens still parse but never resolve; they fail loudly with a migration message. A
 token whose namespace is unavailable in the resolution context also fails loudly.
 
-The reference implementation is LLM provider `extra_headers`, resolved against the vault at
-`lib/foundation/fabro-auth/src/resolve.rs:376-378`:
+The reference implementation is LLM provider `default_headers`, whose `{{ secrets.* }}` values are
+resolved against the vault in `lib/foundation/fabro-auth/src/vault_source.rs`
+(`interpolated_headers`) and re-sent as credential headers:
 
 ```toml
-[llm.providers.example.extra_headers]
+[llm.providers.example.default_headers]
 authorization = "Bearer {{ secrets.EXAMPLE_TOKEN }}"
 ```
 
@@ -119,7 +119,7 @@ Bootstrap secrets come from one of two sources:
 
 Optional integration secrets are provisioned into the vault, usually with `fabro secret set` or `fabro install`.
 
-There is no startup-time secret generation. A temporary startup migration moves recognized legacy optional secrets from process env or `server.env` into the vault, removes matching `server.env` entries after writing a backup, and logs conflicts by key name only. Runtime lookup remains vault-only after that migration step. See [migrations-strategy.md](migrations-strategy.md) for the migration pattern.
+There is no startup-time secret generation or import of optional integration secrets from process env or `server.env`. The compatibility migrations for those sources and pre-token/OAuth vault entries have been removed. The separate one-time import of current-format `secrets.json` entries into SQLite remains supported.
 
 ## Subprocess Boundaries
 

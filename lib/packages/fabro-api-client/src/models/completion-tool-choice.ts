@@ -15,24 +15,24 @@
 
 
 /**
- * Controls how the model selects tools.
+ * A lithos `ToolChoice`, discriminated by `type`.
  */
 export interface CompletionToolChoice {
     /**
      * Tool selection mode.
      */
-    'mode': CompletionToolChoiceModeEnum;
+    'type': CompletionToolChoiceTypeEnum;
     /**
-     * Required when mode is \"named\".
+     * Required when type is `tool`.
      */
-    'tool_name'?: string;
+    'name'?: string;
 }
 
-export const CompletionToolChoiceModeEnum = {
+export const CompletionToolChoiceTypeEnum = {
     AUTO: 'auto',
     NONE: 'none',
     REQUIRED: 'required',
-    NAMED: 'named'
+    TOOL: 'tool'
 } as const;
 
-export type CompletionToolChoiceModeEnum = typeof CompletionToolChoiceModeEnum[keyof typeof CompletionToolChoiceModeEnum];
+export type CompletionToolChoiceTypeEnum = typeof CompletionToolChoiceTypeEnum[keyof typeof CompletionToolChoiceTypeEnum];

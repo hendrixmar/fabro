@@ -1376,11 +1376,15 @@ async fn environments_schema_rejects_invalid_rows() -> anyhow::Result<()> {
     database.migrate().await?;
 
     insert_minimal_environment(database.pool(), "valid", "docker", "allow_all").await?;
+    // Any well-formed sandbox-driver kind name is a valid provider: plugins
+    // are configured by kind, not enumerated in the schema.
+    insert_minimal_environment(database.pool(), "plugin", "e2b-cloud", "allow_all").await?;
 
     for (id, provider, network_mode) in [
         ("Bad", "docker", "allow_all"),
         ("local", "docker", "allow_all"),
-        ("bad-provider", "bogus", "allow_all"),
+        ("bad-provider", "Bogus Provider", "allow_all"),
+        ("bad-provider-hyphen", "-e2b", "allow_all"),
         ("bad-network", "docker", "bogus"),
     ] {
         let result = insert_minimal_environment(database.pool(), id, provider, network_mode).await;

@@ -17,7 +17,7 @@ fn completion_request(stream: bool) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_string(&serde_json::json!({
-                "messages": [{"role": "user", "content": [{"kind": "text", "data": "Hello"}]}],
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
                 "stream": stream
             }))
             .expect("completion fixture should serialize"),
@@ -33,7 +33,7 @@ fn completion_request_with_model(stream: bool, model: &str) -> Request<Body> {
         .body(Body::from(
             serde_json::to_string(&serde_json::json!({
                 "model": model,
-                "messages": [{"role": "user", "content": [{"kind": "text", "data": "Hi"}]}],
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}],
                 "stream": stream
             }))
             .expect("model completion fixture should serialize"),
@@ -60,7 +60,7 @@ async fn test_model_known_but_unavailable_returns_bad_request() {
 
     let req = Request::builder()
         .method("POST")
-        .uri(api("/models/claude-opus-4-6/test"))
+        .uri(api("/models/claude-opus-4.6/test"))
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -69,7 +69,7 @@ async fn test_model_known_but_unavailable_returns_bad_request() {
     let body = response_json(
         response,
         StatusCode::BAD_REQUEST,
-        "POST /api/v1/models/claude-opus-4-6/test",
+        "POST /api/v1/models/claude-opus-4.6/test",
     )
     .await;
     assert!(
@@ -173,11 +173,12 @@ async fn completion_non_streaming_returns_valid_json() {
         .unwrap();
     let body = response_json(response, StatusCode::OK, "POST /api/v1/completions").await;
     assert!(body["id"].is_string());
-    assert_eq!(body["model"], "claude-sonnet-4-5");
-    assert_eq!(body["stop_reason"], "end_turn");
-    assert!(body["message"].is_object());
-    assert!(body["usage"]["input_tokens"].is_number());
-    assert!(body["usage"]["output_tokens"].is_number());
+    assert_eq!(body["model"]["provider"], "anthropic");
+    assert_eq!(body["model"]["model"], "claude-sonnet-4.5");
+    assert_eq!(body["finish_reason"], "stop");
+    assert!(body["content"].is_array());
+    assert!(body["usage"]["input"].is_number());
+    assert!(body["usage"]["output"].is_number());
 }
 
 #[tokio::test]

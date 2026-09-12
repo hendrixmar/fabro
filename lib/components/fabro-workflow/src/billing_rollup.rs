@@ -5,11 +5,11 @@ pub use fabro_types::billing_rollup::{
 
 #[cfg(test)]
 mod tests {
-    use fabro_model::{Catalog, ModelRef, ProviderId};
     use fabro_types::{
-        AttrValue, BilledTokenCounts, Graph, Node, RunProjection, RunSpec, StageCompletion,
-        StageOutcome, first_event_seq, test_support,
+        AttrValue, BilledTokenCounts, Graph, ModelRef, Node, RunProjection, RunSpec,
+        StageCompletion, StageOutcome, first_event_seq, test_support,
     };
+    use lithos_llm::catalog::{ModelId, builtin};
 
     use super::billing_rollup_from_projection;
     use crate::test_support::test_usage;
@@ -50,7 +50,7 @@ mod tests {
             timestamp:      chrono::Utc::now(),
         });
 
-        let rollup = billing_rollup_from_projection(&projection, None);
+        let rollup = billing_rollup_from_projection(&projection);
 
         assert_eq!(rollup.stages.len(), 1);
         assert_eq!(rollup.stages[0].node_id, "verify");
@@ -73,10 +73,10 @@ mod tests {
         assert_eq!(rollup.billed_visit_count, 2);
 
         assert_eq!(rollup.by_model.len(), 2);
-        assert_eq!(rollup.by_model[0].model.model_id, "gpt-new");
+        assert_eq!(rollup.by_model[0].model.model_id.as_str(), "gpt-new");
         assert_eq!(rollup.by_model[0].stages, 1);
         assert_eq!(rollup.by_model[0].billing.input_tokens, 200);
-        assert_eq!(rollup.by_model[1].model.model_id, "gpt-old");
+        assert_eq!(rollup.by_model[1].model.model_id.as_str(), "gpt-old");
         assert_eq!(rollup.by_model[1].stages, 1);
         assert_eq!(rollup.by_model[1].billing.input_tokens, 100);
     }
@@ -93,7 +93,7 @@ mod tests {
             timestamp:      chrono::Utc::now(),
         });
 
-        let rollup = billing_rollup_from_projection(&projection, None);
+        let rollup = billing_rollup_from_projection(&projection);
 
         assert_eq!(rollup.stages.len(), 1);
         assert_eq!(rollup.stages[0].node_id, "build");
@@ -126,20 +126,16 @@ mod tests {
             timestamp:      chrono::Utc::now(),
         });
 
-        let rollup = billing_rollup_from_projection(&projection, None);
+        let rollup = billing_rollup_from_projection(&projection);
 
         assert_eq!(rollup.stages.len(), 0);
         assert_eq!(rollup.timing.wall_time_ms, 0);
     }
 
     #[test]
-    fn rollup_prices_in_flight_stage_usage_using_catalog() {
+    fn rollup_keeps_in_flight_stage_usage_unpriced() {
         let mut projection = test_projection();
-        let model = ModelRef {
-            provider: ProviderId::openai(),
-            model_id: "gpt-5.4".into(),
-            speed:    None,
-        };
+        let model = ModelRef::new(builtin::openai(), ModelId::new("gpt-5.4"));
         let stage = projection.stage_entry("agent", 1, first_event_seq(1));
         stage.started_at = Some(chrono::Utc::now());
         stage.usage = BilledTokenCounts {
@@ -150,22 +146,18 @@ mod tests {
         };
         stage.model = Some(model.clone());
 
-        let priced = billing_rollup_from_projection(&projection, Some(Catalog::builtin()));
-        let unpriced = billing_rollup_from_projection(&projection, None);
+        let rollup = billing_rollup_from_projection(&projection);
 
-        assert_eq!(priced.stages.len(), 1);
-        assert_eq!(priced.stages[0].node_id, "agent");
-        let stage_cost = priced.stages[0].billing.total_usd_micros;
-        assert!(
-            stage_cost.is_some_and(|cost| cost > 0),
-            "expected priced stage cost, got {stage_cost:?}"
-        );
-        assert_eq!(priced.totals.total_usd_micros, stage_cost);
-        assert_eq!(priced.by_model.len(), 1);
-        assert_eq!(priced.by_model[0].billing.total_usd_micros, stage_cost);
-        assert_eq!(unpriced.stages.len(), 1);
-        assert_eq!(unpriced.stages[0].billing.total_usd_micros, None);
-        assert_eq!(unpriced.totals.total_usd_micros, None);
+        // The rollup keeps the shape of what the events recorded. Costs come
+        // from the events themselves; an in-flight stage that has recorded no
+        // cost yet stays unpriced rather than being re-estimated here.
+        assert_eq!(rollup.stages.len(), 1);
+        assert_eq!(rollup.stages[0].node_id, "agent");
+        assert_eq!(rollup.stages[0].billing.total_usd_micros, None);
+        assert_eq!(rollup.stages[0].billing.input_tokens, 500_000);
+        assert_eq!(rollup.totals.total_usd_micros, None);
+        assert_eq!(rollup.by_model.len(), 1);
+        assert_eq!(rollup.by_model[0].billing.input_tokens, 500_000);
     }
 
     fn run_spec_with_boundary_nodes() -> RunSpec {

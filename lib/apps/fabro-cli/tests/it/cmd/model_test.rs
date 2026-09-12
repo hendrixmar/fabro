@@ -41,7 +41,9 @@ fn model_json(id: &str, provider: &str, configured: bool) -> serde_json::Value {
         "features": {
             "tools": true,
             "vision": false,
-            "reasoning": false
+            "reasoning": false,
+            "prompt_cache": false,
+            "sampling": true
         },
         "controls": {
             "reasoning_effort": []
@@ -107,7 +109,7 @@ fn help() {
           --verbose
               Enable verbose output [env: FABRO_VERBOSE=]
           --reasoning-effort <REASONING_EFFORT>
-              Request a reasoning-effort level [possible values: low, medium, high, xhigh, max]
+              Request a reasoning-effort level (minimal, low, medium, high, xhigh, max)
       -h, --help
               Print help
     ----- stderr -----

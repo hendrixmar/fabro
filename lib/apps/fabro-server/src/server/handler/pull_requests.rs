@@ -344,10 +344,13 @@ async fn create_run_pull_request(
     } else {
         let catalog = state.catalog();
         let configured = state.ready_llm_provider_ids().await;
-        catalog
-            .default_for_configured_ids(&configured)
-            .id
-            .to_string()
+        match catalog.default_offering_for(&configured) {
+            Some(entry) => entry.model.id().to_string(),
+            None => {
+                return ApiError::bad_request("no LLM model is available for PR generation")
+                    .into_response();
+            }
+        }
     };
     let _create_guard = state.pull_request_create_locks.lock(id).await;
     let creation_id = fabro_types::PullRequestCreationId::new();

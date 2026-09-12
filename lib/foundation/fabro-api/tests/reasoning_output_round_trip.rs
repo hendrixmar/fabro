@@ -1,9 +1,10 @@
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::{
-    AgentMessageProps as ApiAgentMessageProps, ReasoningOutput as ApiReasoningOutput,
+    AgentEventProps as ApiAgentEventProps, ReasoningOutput as ApiReasoningOutput,
 };
-use fabro_types::ReasoningOutput;
+use fabro_types::AgentEventProps;
+use lithos_llm::types::ReasoningOutput;
 use serde_json::json;
 
 #[test]
@@ -53,32 +54,47 @@ fn reasoning_output_rejects_an_empty_object() {
 }
 
 #[test]
-fn agent_message_props_reasoning_is_optional_on_the_wire() {
+fn agent_event_props_reuse_the_canonical_type() {
+    assert_same_type::<ApiAgentEventProps, AgentEventProps>();
+}
+
+/// An `agent.message` event carries the coding agent's own envelope; the
+/// assistant message inside it keeps reasoning optional on the wire.
+#[test]
+fn agent_event_props_round_trip_an_assistant_message_with_reasoning() {
     let without = json!({
-        "text": "ok",
-        "model": {"provider": "openai", "model_id": "gpt-5.4"},
-        "billing": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        "tool_call_count": 0,
+        "stage": "code",
         "visit": 1,
+        "seq": 7,
+        "stream_id": "ses_root",
+        "session_id": "ses_root",
+        "timestamp": "2026-05-23T12:34:56.000Z",
+        "event": {
+            "AssistantMessage": {
+                "text": "ok",
+                "model": "gpt-5.4",
+                "usage": {"input": 1, "output": 1},
+                "tool_call_count": 0
+            }
+        }
     });
-    let props: ApiAgentMessageProps = serde_json::from_value(without.clone()).unwrap();
-    assert!(props.reasoning.is_none());
+    let props: ApiAgentEventProps = serde_json::from_value(without.clone()).unwrap();
+    assert_eq!(props.stage, "code");
+    assert_eq!(props.event.session_id, "ses_root");
+    let value = serde_json::to_value(&props).unwrap();
     assert!(
-        !serde_json::to_value(&props)
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .contains_key("reasoning")
+        value["event"]["AssistantMessage"]
+            .get("reasoning")
+            .is_none()
     );
 
     let mut with = without;
-    with["reasoning"] = json!({"summary": "checked the parser", "trace": "step one"});
-    let props: ApiAgentMessageProps = serde_json::from_value(with).unwrap();
-    let reasoning = props.reasoning.as_ref().unwrap();
-    assert_eq!(reasoning.summary(), Some("checked the parser"));
-    assert_eq!(reasoning.trace(), Some("step one"));
+    with["event"]["AssistantMessage"]["reasoning"] =
+        json!({"summary": "checked the parser", "trace": "step one"});
+    let props: ApiAgentEventProps = serde_json::from_value(with).unwrap();
+    let value = serde_json::to_value(&props).unwrap();
     assert_eq!(
-        serde_json::to_value(&props).unwrap()["reasoning"],
+        value["event"]["AssistantMessage"]["reasoning"],
         json!({"summary": "checked the parser", "trace": "step one"})
     );
 }

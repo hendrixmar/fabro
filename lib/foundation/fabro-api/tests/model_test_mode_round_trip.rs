@@ -1,7 +1,7 @@
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::ModelTestMode as ApiModelTestMode;
-use fabro_model::ModelTestMode;
+use fabro_types::ModelTestMode;
 use serde_json::json;
 
 #[test]

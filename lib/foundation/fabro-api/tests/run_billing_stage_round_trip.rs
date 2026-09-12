@@ -1,8 +1,8 @@
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::{BillingByModel, BillingModelRef, BillingSpeed, RunBillingStage};
-use fabro_model::{ModelRef, Speed};
-use fabro_types::StageState;
+use fabro_types::{ModelRef, StageState};
+use lithos_llm::types::Speed;
 use serde_json::json;
 
 #[test]

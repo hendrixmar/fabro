@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use fabro_model::{Catalog, ProviderId};
-use fabro_types::settings::run::EnvironmentProvider;
+use fabro_llm::lithos_catalog::CatalogProvider;
+use fabro_types::SandboxProviderKind;
 use tower::ServiceExt;
 
 use crate::helpers::{
@@ -78,7 +78,7 @@ fn daytona_disabled_app() -> (axum::Router, tempfile::TempDir) {
     let state = fabro_server::test_support::TestAppStateBuilder::new()
         .runtime_settings(settings.server_settings, settings.manifest_run_defaults)
         .active_config_path(active_config_path)
-        .default_environment_provider(Some(EnvironmentProvider::Daytona))
+        .default_environment_provider(Some(SandboxProviderKind::DAYTONA))
         .build();
     (
         fabro_server::test_support::build_test_router(state),
@@ -161,12 +161,14 @@ _version = 1
         created["ask_fabro"]["unavailable_reason"],
         "sandbox_not_ready"
     );
-    let default_openai_model = Catalog::builtin()
-        .default_for_provider(&ProviderId::openai())
+    let catalog = fabro_llm::test_support::test_catalog();
+    let default_openai_model = catalog
+        .enabled_provider("openai")
+        .and_then(CatalogProvider::default_offering)
         .expect("the built-in OpenAI provider should have a default model");
     assert_eq!(
         created["ask_fabro"]["default_model"].as_str(),
-        Some(default_openai_model.id())
+        Some(default_openai_model.model.id().as_str())
     );
 
     let get_request = Request::builder()

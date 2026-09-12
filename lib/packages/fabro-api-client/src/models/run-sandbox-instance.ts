@@ -16,15 +16,15 @@
 // May contain unused imports in some cases
 // @ts-ignore
 import type { RunSandboxRuntime } from './run-sandbox-runtime';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxProviderKind } from './sandbox-provider-kind';
 
 /**
  * Initialized sandbox provider and runtime metadata.
  */
 export interface RunSandboxInstance {
-    'provider': SandboxProviderKind;
+    /**
+     * Sandbox provider kind. `local`, `docker`, and `daytona` are bundled with the server; any other value names a sandbox-driver plugin configured under `server.sandbox.providers.<kind>`.
+     */
+    'provider': string;
     'image'?: string | null;
     'snapshot'?: string | null;
     'runtime': RunSandboxRuntime;

@@ -34,7 +34,6 @@ fn server_settings(
     let user_settings = connection_ctx.user_settings().clone();
     let storage_dir = connection_ctx.storage_dir().to_path_buf();
     let base_config_path = connection_ctx.base_config_path().to_path_buf();
-    let config_path = base_config_path.clone();
     let client_factory: fabro_mcp_server::FabroClientFactory = std::sync::Arc::new(move || {
         let target = target.clone();
         let user_settings = user_settings.clone();
@@ -51,11 +50,7 @@ fn server_settings(
         });
         future
     });
-    Ok(fabro_mcp_server::FabroMcpServerSettings {
-        client_factory,
-        config_path,
-        cwd: base_ctx.cwd().to_path_buf(),
-    })
+    Ok(fabro_mcp_server::FabroMcpServerSettings { client_factory })
 }
 
 fn init_settings(args: &McpInitArgs) -> Result<fabro_mcp_server::McpInitSettings> {

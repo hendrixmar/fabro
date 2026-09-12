@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -48,13 +47,15 @@ pub type ToolResult<T> = Result<T, ToolError>;
 
 #[async_trait]
 pub trait FabroToolBackend: Send + Sync {
-    async fn create_run_from_spec(
+    async fn create_workflow_version(
         &self,
-        spec: &crate::ValidatedCreateRunSpec,
-        cwd: &Path,
-        user_settings_path: &Path,
-        parent_id: Option<RunId>,
-    ) -> anyhow::Result<RunId>;
+        _source: crate::ValidatedWorkflowVersionCreate,
+    ) -> anyhow::Result<fabro_types::WorkflowVersionId> {
+        Err(workflow_version_tool_unavailable_error())
+    }
+
+    async fn create_run_from_intent(&self, intent: fabro_types::RunIntent)
+    -> anyhow::Result<RunId>;
 
     async fn resolve_run(&self, selector: &str) -> anyhow::Result<Run>;
     async fn retrieve_run(&self, run_id: &RunId) -> anyhow::Result<Run>;
@@ -135,13 +136,11 @@ fn pair_tool_unavailable_error() -> anyhow::Error {
     ToolError::message(format!("{FABRO_RUN_PAIR_TOOL_NAME} is not available")).into()
 }
 
-pub trait RunManifestBuilder: Send + Sync {
-    fn build_run_manifest(
-        &self,
-        spec: &crate::ValidatedCreateRunSpec,
-        cwd: &Path,
-        user_settings_path: &Path,
-    ) -> ToolResult<types::RunManifest>;
+pub(crate) fn workflow_version_tool_unavailable_error() -> anyhow::Error {
+    ToolError::message(format!(
+        "{FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME} is not available"
+    ))
+    .into()
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -170,6 +169,7 @@ pub struct ToolDefinition {
     pub parameters:  Value,
 }
 
+pub const FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME: &str = "fabro_workflow_version_create";
 pub const FABRO_RUN_CREATE_TOOL_NAME: &str = "fabro_run_create";
 pub const FABRO_RUN_SEARCH_TOOL_NAME: &str = "fabro_run_search";
 pub const FABRO_RUN_GET_TOOL_NAME: &str = "fabro_run_get";
@@ -180,9 +180,13 @@ pub const FABRO_RUN_PAIR_TOOL_NAME: &str = "fabro_run_pair";
 
 static TOOL_DEFINITIONS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
     vec![
+        tool_definition::<crate::FabroWorkflowVersionCreateParams>(
+            FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME,
+            "Register supplied workflow file contents and all local dependencies as a reusable immutable workflow version ID. Obtain files with shell/read tools first; this does not create or start a run.",
+        ),
         tool_definition::<crate::FabroRunCreateParams>(
             FABRO_RUN_CREATE_TOOL_NAME,
-            "Create one or more Fabro workflow runs, optionally under a parent run, starting them by default.",
+            "Create runs from registered workflow_version_id values and canonical RunIntent settings. Register contents with fabro_workflow_version_create first. Standalone calls require an explicit target; native workers may inherit the parent target. Starts runs by default.",
         ),
         tool_definition::<crate::FabroRunSearchParams>(
             FABRO_RUN_SEARCH_TOOL_NAME,
@@ -323,6 +327,7 @@ mod tests {
     #[test]
     fn shared_tool_definitions_include_run_management_catalog() {
         assert_eq!(shared_tool_names(), vec![
+            FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME,
             FABRO_RUN_CREATE_TOOL_NAME,
             FABRO_RUN_SEARCH_TOOL_NAME,
             FABRO_RUN_GET_TOOL_NAME,
@@ -331,6 +336,21 @@ mod tests {
             FABRO_RUN_PAIR_TOOL_NAME,
             FABRO_RUN_EVENTS_TOOL_NAME,
         ]);
+    }
+
+    #[test]
+    fn workflow_version_create_has_strict_content_schema() {
+        let definition = tool_definitions()
+            .iter()
+            .find(|definition| definition.name == FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME)
+            .expect("workflow version creation should be in the shared catalog");
+        let schema = &definition.parameters;
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["entrypoint", "files"])
+        );
     }
 
     #[test]

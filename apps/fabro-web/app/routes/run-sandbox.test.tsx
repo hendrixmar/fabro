@@ -103,14 +103,15 @@ mock.restore();
 const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];
 
 function sandboxDetails(
-  overrides: Partial<SandboxDetails> & {
+  overrides: {
     sandbox?: Partial<SandboxDetails["sandbox"]> & {
       runtime?: Partial<NonNullable<SandboxDetails["sandbox"]["runtime"]>>;
     };
+    status?: Partial<SandboxDetails["status"]>;
   } = {},
 ): SandboxDetails {
   const sandbox = overrides.sandbox ?? {};
-  const { sandbox: _sandboxOverride, ...detailOverrides } = overrides;
+  const status = overrides.status ?? {};
   return {
     sandbox: {
       provider: "docker",
@@ -126,32 +127,25 @@ function sandboxDetails(
       },
       ...sandbox,
     },
-    state:        "running",
-    native_state: null,
-    region:       null,
-    resources:    { cpu_cores: null, memory_bytes: null, disk_bytes: null },
-    network:      networkDetails(),
-    labels:       {},
-    timestamps:   { created_at: null, last_activity_at: null },
-    ...detailOverrides,
+    status: {
+      id:                  sandbox.runtime?.id ?? "",
+      state:               "running",
+      provider_state:      "",
+      error_reason:        null,
+      resources:           null,
+      sandbox_kind:        null,
+      region:              null,
+      labels:              {},
+      image:               null,
+      snapshot:            null,
+      network:             null,
+      workspace_ownership: null,
+      web_url:             null,
+      created_at:          null,
+      updated_at:          null,
+      ...status,
+    },
   };
-}
-
-function networkDetails(
-  overrides: Partial<SandboxDetails["network"]> = {},
-): SandboxDetails["network"] {
-  return {
-    egress:  networkPolicy("unknown"),
-    ingress: networkPolicy("unknown"),
-    ...overrides,
-  };
-}
-
-function networkPolicy(
-  mode: SandboxDetails["network"]["egress"]["mode"],
-  cidrs: string[] = [],
-): SandboxDetails["network"]["egress"] {
-  return { mode, cidrs };
 }
 
 function textContent(renderer: TestRenderer.ReactTestRenderer): string {
@@ -230,22 +224,18 @@ describe("RunSandbox route", () => {
           working_directory: "/workspace",
         },
       },
-      state:             "running",
-      native_state:      "running",
-      region:            undefined,
-      resources:         {
-        cpu_cores:    2,
-        memory_bytes: 4 * 1024 * 1024 * 1024,
-        disk_bytes:   undefined,
-      },
-      network:           networkDetails({
-        egress:  networkPolicy("open"),
-        ingress: networkPolicy("blocked"),
-      }),
-      labels:            { run: "abc" },
-      timestamps:        {
-        created_at:       "2026-05-09T12:00:00Z",
-        last_activity_at: undefined,
+      status:            {
+        state:          "running",
+        provider_state: "running",
+        resources:      {
+          cpu_cores: 2,
+          memory_mb: 4 * 1024,
+          disk_mb:   null,
+          gpus:      null,
+        },
+        network:        "allow_all",
+        labels:         { run: "abc" },
+        created_at:     "2026-05-09T12:00:00Z",
       },
     });
     const renderer = renderRoute();
@@ -256,8 +246,8 @@ describe("RunSandbox route", () => {
       .filter((text): text is string => typeof text === "string");
     expect(panelHeadings).toEqual(["Overview", "Resources", "Network", "Labels", "Timestamps"]);
     const copy = textContent(renderer);
-    expect(copy).toContain("Open");
-    expect(copy).toContain("Blocked");
+    expect(copy).toContain("Allow all");
+    expect(copy).toContain("4 GiB");
   });
 
   test("links to the provider dashboard when a sandbox web URL is present", () => {
@@ -269,8 +259,10 @@ describe("RunSandbox route", () => {
           working_directory: "/workspace",
         },
       },
-      web_url:
-        "https://app.daytona.io/dashboard/sandboxes?sandboxId=ad65029a-2d01-421e-8936-49451653fcd9",
+      status: {
+        web_url:
+          "https://app.daytona.io/dashboard/sandboxes?sandboxId=ad65029a-2d01-421e-8936-49451653fcd9",
+      },
     });
     const renderer = renderRoute();
 
@@ -296,18 +288,12 @@ describe("RunSandbox route", () => {
           working_directory: "/tmp/project",
         },
       },
-      state:             "unknown",
-      native_state:      undefined,
-      region:            undefined,
-      resources:         {
-        cpu_cores:    undefined,
-        memory_bytes: undefined,
-        disk_bytes:   undefined,
-      },
-      labels:            {},
-      timestamps:        {
-        created_at:       undefined,
-        last_activity_at: undefined,
+      status:            {
+        state:      "unknown",
+        resources:  { cpu_cores: null, memory_mb: null, disk_mb: null, gpus: null },
+        labels:     {},
+        created_at: null,
+        updated_at: null,
       },
     });
     const renderer = renderRoute();
@@ -328,35 +314,29 @@ describe("RunSandbox route", () => {
     expect(noLabelsCopy).toHaveLength(1);
   });
 
-  test("renders unknown network policies", () => {
-    currentDetails = sandboxDetails({
-      network: networkDetails({
-        egress:  networkPolicy("unknown"),
-        ingress: networkPolicy("unknown"),
-      }),
-    });
+  test("renders an unknown network policy", () => {
+    currentDetails = sandboxDetails({ status: { network: null } });
     const renderer = renderRoute();
 
     const copy = textContent(renderer);
     expect(copy).toContain("Network");
-    expect(copy).toContain("Egress");
-    expect(copy).toContain("Ingress");
+    expect(copy).toContain("Policy");
     expect(copy).toContain("Unknown");
   });
 
-  test("renders blocked, essentials, and CIDR network policies", () => {
+  test("renders blocked and CIDR allow list network policies", () => {
     currentDetails = sandboxDetails({
-      network: networkDetails({
-        egress:  networkPolicy("cidr_allow_list", ["10.0.0.0/8", "192.168.0.0/16"]),
-        ingress: networkPolicy("essentials_only"),
-      }),
+      status: { network: { cidr_allow_list: { cidrs: ["10.0.0.0/8", "192.168.0.0/16"] } } },
     });
     const renderer = renderRoute();
 
     const copy = textContent(renderer);
     expect(copy).toContain("CIDR allow list");
     expect(copy).toContain("10.0.0.0/8, 192.168.0.0/16");
-    expect(copy).toContain("Essentials only");
+
+    currentDetails = sandboxDetails({ status: { network: "block" } });
+    const blocked = renderRoute();
+    expect(textContent(blocked)).toContain("Blocked");
   });
 
   test("shows the empty state when no sandbox is reported", () => {

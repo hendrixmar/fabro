@@ -1,26 +1,22 @@
 /**
  * Stricter discriminated-union view over @qltysh/fabro-api-client's
- * `CompletionContentPart` ({ kind: string; data: any }). Each variant in our
- * union is assignable to the API client type at the boundary, but inside the
- * chat code we get exhaustive switch checking.
+ * `CompletionContentPart`, the lithos `ContentPart` wire shape discriminated
+ * by `type`. Each variant in our union is assignable to the API client type
+ * at the boundary, but inside the chat code we get exhaustive switch checking.
  */
 export type ChatContentPart =
-  | { kind: "text"; data: { text: string } }
+  | { type: "text"; text: string }
   | {
-      kind: "tool_call";
-      data: {
-        tool_call_id: string;
-        name: string;
-        arguments: { [key: string]: JsonValue };
-      };
+      type: "tool_call";
+      id: string;
+      name: string;
+      input: { type: "function"; arguments: { [key: string]: JsonValue } };
     }
   | {
-      kind: "tool_result";
-      data: {
-        tool_call_id: string;
-        content: JsonValue;
-        is_error?: boolean;
-      };
+      type: "tool_result";
+      tool_call_id: string;
+      content: ChatContentPart[];
+      is_error?: boolean;
     };
 
 export type JsonValue =

@@ -24,6 +24,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use lithos_llm::catalog::Catalog;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -228,14 +229,14 @@ impl ModelRef {
     }
 }
 
-impl ModelRegistry for fabro_model::Catalog {
+impl ModelRegistry for Catalog {
     fn is_provider(&self, token: &str) -> bool {
-        self.provider(&fabro_model::ProviderId::from(token))
-            .is_some()
+        self.provider(token).is_ok()
     }
 
     fn is_model(&self, token: &str) -> bool {
-        self.is_model_selector(token)
+        self.providers()
+            .any(|provider| provider.model(token).is_some())
     }
 }
 

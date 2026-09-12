@@ -11,6 +11,7 @@ use super::agent::{
 };
 use super::llm::routing;
 use super::{EngineServices, Handler, structured_output};
+use crate::agent_memory;
 use crate::context::{Context, WorkflowContext, keys};
 use crate::error::Error;
 use crate::event::{Emitter, Event};
@@ -66,7 +67,6 @@ impl Handler for PromptHandler {
 
         // 1b. Discover project docs for system prompt when project_memory is enabled
         let system_prompt = if node.project_memory() {
-            let working_dir = services.run.sandbox.working_directory();
             let profile_kind = routing::resolve_node_provider_context(
                 services.run.catalog.as_ref(),
                 &services.run.provider_id,
@@ -74,32 +74,12 @@ impl Handler for PromptHandler {
                 node,
             )?
             .profile_kind;
-            let docs = match fabro_agent::discover_memory(
-                &*services.run.sandbox,
-                working_dir,
-                working_dir,
+            agent_memory::load_memory_text(
+                &services.run.sandbox,
                 profile_kind,
                 &services.run.cancel_token(),
             )
-            .await
-            {
-                Ok(docs) => docs,
-                Err(fabro_agent::Error::Interrupted(fabro_agent::InterruptReason::Cancelled)) => {
-                    return Err(Error::Cancelled);
-                }
-                Err(_) => Vec::new(),
-            };
-
-            if docs.is_empty() {
-                None
-            } else {
-                Some(
-                    docs.into_iter()
-                        .map(|doc| doc.content)
-                        .collect::<Vec<_>>()
-                        .join("\n\n"),
-                )
-            }
+            .await?
         } else {
             None
         };
@@ -220,9 +200,10 @@ mod tests {
     use std::time::Duration;
 
     use fabro_graphviz::graph::AttrValue;
-    use fabro_model::{ReasoningEffort, Speed};
     use fabro_store::{Database, RunDatabase, StageId};
     use fabro_types::{fixtures, test_support};
+    use lithos_llm::catalog::ProviderId;
+    use lithos_llm::types::{ReasoningEffort, Speed};
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
@@ -354,8 +335,8 @@ mod tests {
             fn effective_request_controls(
                 &self,
                 _node: &Node,
-            ) -> Result<crate::handler::llm::api::EffectiveRequestControls, Error> {
-                Ok(crate::handler::llm::api::EffectiveRequestControls {
+            ) -> Result<crate::handler::llm::EffectiveRequestControls, Error> {
+                Ok(crate::handler::llm::EffectiveRequestControls {
                     reasoning_effort: Some(ReasoningEffort::High),
                     speed:            Some(Speed::Fast),
                 })
@@ -548,8 +529,8 @@ mod tests {
             fn effective_request_controls(
                 &self,
                 _node: &Node,
-            ) -> Result<crate::handler::llm::api::EffectiveRequestControls, Error> {
-                Ok(crate::handler::llm::api::EffectiveRequestControls {
+            ) -> Result<crate::handler::llm::EffectiveRequestControls, Error> {
+                Ok(crate::handler::llm::EffectiveRequestControls {
                     reasoning_effort: Some(ReasoningEffort::High),
                     speed:            Some(Speed::Fast),
                 })
@@ -690,42 +671,42 @@ mod tests {
         tokio::fs::write(workspace.path().join("CLAUDE.md"), "anthropic memory")
             .await
             .unwrap();
-        let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+        let catalog = Arc::new(fabro_llm::test_support::test_catalog_with_overlay(
             r#"
-[providers.acme]
-adapter = "openai_compatible"
-agent_profile = "openai"
-base_url = "https://api.acme.test/v1"
-
-[models.acme-claude]
-provider = "acme"
-display_name = "Acme Claude"
-family = "claude"
-default = true
-agent_profile = "anthropic"
-aliases = ["ac"]
-
-[models.acme-claude.limits]
-context_window = 1000
-
-[models.acme-claude.features]
-tools = true
-vision = false
-reasoning = false
-"#,
-        )
-        .unwrap();
-        let catalog =
-            Arc::new(fabro_model::Catalog::from_builtin_with_overrides(&overrides).unwrap());
+            [providers.acme]
+            display_name = "Acme"
+            adapter = "openai-compatible"
+            codec = "openai-chat"
+            base_url = "https://api.acme.test/v1"
+            auth = { type = "bearer" }
+            default_model = "acme-claude"
+            
+            [providers.acme.metadata.agent]
+            profile = "openai"
+            
+            [providers.acme.models.acme-claude]
+            display_name = "Acme Claude"
+            aliases = ["ac"]
+            api_model = "acme-claude"
+            limits = { context_tokens = 1000, max_output_tokens = 500 }
+            capabilities = { text = true, tools = true }
+            family = "claude"
+            
+            [providers.acme.models.acme-claude.metadata.agent]
+            profile = "anthropic"
+            "#,
+        ));
         let mut services = make_services();
         services.run = services
             .run
-            .with_sandbox(Arc::new(fabro_agent::LocalSandbox::new(
-                workspace.path().to_path_buf(),
-            )))
+            .with_sandbox(Arc::new(
+                fabro_sandbox::local_sandbox(workspace.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            ))
             .with_catalog_context(
                 Arc::clone(&catalog),
-                fabro_model::ProviderId::new("acme"),
+                ProviderId::new("acme"),
                 "acme-claude".to_string(),
             );
 
@@ -766,41 +747,42 @@ reasoning = false
         tokio::fs::write(workspace.path().join("CLAUDE.md"), "anthropic memory")
             .await
             .unwrap();
-        let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+        let catalog = Arc::new(fabro_llm::test_support::test_catalog_with_overlay(
             r#"
-[providers.acme]
-adapter = "openai_compatible"
-agent_profile = "openai"
-base_url = "https://api.acme.test/v1"
-
-[models.acme-claude]
-provider = "acme"
-display_name = "Acme Claude"
-family = "claude"
-default = true
-agent_profile = "anthropic"
-
-[models.acme-claude.limits]
-context_window = 1000
-
-[models.acme-claude.features]
-tools = true
-vision = false
-reasoning = false
-"#,
-        )
-        .unwrap();
-        let catalog =
-            Arc::new(fabro_model::Catalog::from_builtin_with_overrides(&overrides).unwrap());
+            [providers.acme]
+            display_name = "Acme"
+            adapter = "openai-compatible"
+            codec = "openai-chat"
+            base_url = "https://api.acme.test/v1"
+            auth = { type = "bearer" }
+            default_model = "acme-claude"
+            
+            [providers.acme.metadata.agent]
+            profile = "openai"
+            
+            [providers.acme.models.acme-claude]
+            display_name = "Acme Claude"
+            aliases = ["ac"]
+            api_model = "acme-claude"
+            limits = { context_tokens = 1000, max_output_tokens = 500 }
+            capabilities = { text = true, tools = true }
+            family = "claude"
+            
+            [providers.acme.models.acme-claude.metadata.agent]
+            profile = "anthropic"
+            "#,
+        ));
         let mut services = make_services();
         services.run = services
             .run
-            .with_sandbox(Arc::new(fabro_agent::LocalSandbox::new(
-                workspace.path().to_path_buf(),
-            )))
+            .with_sandbox(Arc::new(
+                fabro_sandbox::local_sandbox(workspace.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            ))
             .with_catalog_context(
                 Arc::clone(&catalog),
-                fabro_model::ProviderId::new("acme"),
+                ProviderId::new("acme"),
                 "acme-claude".to_string(),
             );
 

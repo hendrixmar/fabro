@@ -9,6 +9,7 @@ mod legacy_blob_import;
 mod legacy_run_history_import;
 #[cfg(test)]
 mod record;
+mod run_session_record_store;
 mod run_sessions;
 mod run_state;
 mod run_summary_store;
@@ -42,10 +43,8 @@ pub use legacy_run_history_import::{
     LegacyRunHistorySourceIdentity, LegacyRunHistorySourceIdentityError,
     LegacyRunHistoryVerificationError, LegacyRunHistoryVerificationReport,
 };
-pub use run_sessions::{
-    ProjectedRunSession, project_run_session, project_run_session_with_context,
-    project_run_sessions,
-};
+pub use run_session_record_store::{RunSessionRecordStore, StoredSessionRecord};
+pub use run_sessions::{ProjectedRunSession, project_run_session, project_run_sessions};
 pub use run_state::RunProjectionReducer;
 pub use run_summary_store::{
     RunSummaryIdentity, RunSummaryListQuery, RunSummaryPage, RunSummarySort,

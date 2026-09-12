@@ -18,12 +18,12 @@
 import type { ActivatedSkill } from './activated-skill';
 // May contain unused imports in some cases
 // @ts-ignore
-import type { AgentSkillSummary } from './agent-skill-summary';
+import type { SkillSummary } from './skill-summary';
 
 /**
  * Agent skills discovered and activated during a stage.
  */
 export interface SkillsProjection {
-    'available': Array<AgentSkillSummary>;
+    'available': Array<SkillSummary>;
     'activated': Array<ActivatedSkill>;
 }

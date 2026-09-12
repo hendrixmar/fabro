@@ -1,4 +1,4 @@
-use fabro_model::ReasoningEffort;
+use lithos_llm::types::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
 use super::ExecOutputTail;
@@ -136,30 +136,6 @@ pub enum GitTokenProvenance {
     Static,
 }
 
-/// What credential preparation changed before a git push attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum GitCredentialAction {
-    /// Fabro wrote a token generation into the remote URL.
-    Embedded,
-    /// The remote already tracked the selected token generation.
-    Unchanged,
-    /// No managed credential was available.
-    None,
-}
-
-/// Which credential preparation step failed before a git push attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum GitCredentialRefreshError {
-    /// Token resolution or minting failed.
-    Mint,
-    /// Rewriting the remote URL failed.
-    SetUrl,
-}
-
 /// One attempt of a retried git push, nested inside [`GitPushProps`].
 ///
 /// The durable projection of the sandbox layer's runtime attempt record.
@@ -188,13 +164,6 @@ pub struct GitPushAttemptProps {
     /// Token age at the attempt; absent for static credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_age_ms:      Option<u64>,
-    /// What the credential refresh did to the remote this attempt:
-    /// `embedded`, `unchanged`, or `none`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_action: Option<GitCredentialAction>,
-    /// A credential `mint` or `set_url` failure this attempt pushed through.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_error:     Option<GitCredentialRefreshError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

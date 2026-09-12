@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use fabro_client::{AuthEntry, AuthStore, DevTokenEntry, OAuthEntry, StoredSubject};
-use fabro_mcp::client::McpClient;
 use fabro_mcp::config::{McpServerSettings, McpTransport};
+use fabro_mcp::test_support::McpStdioTestClient as McpClient;
 use fabro_test::{fabro_json_snapshot, fabro_snapshot, test_context};
 use fabro_types::{Graph, RunId, WorkflowSettings, test_support};
 use httpmock::Method::{GET, POST};
@@ -38,6 +38,7 @@ const MCP_RUN_TOOL_NAMES: &[&str] = &[
     "fabro_run_interact",
     "fabro_run_pair",
     "fabro_run_search",
+    "fabro_workflow_version_create",
 ];
 
 async fn assert_mcp_run_tool_count(client: &McpClient) {
@@ -644,7 +645,7 @@ async fn stdio_server_initializes_and_lists_run_tools() {
         .find(|(name, _, _)| name == "fabro_run_create")
         .map(|(_, _, schema)| schema)
         .expect("fabro_run_create tool should be listed");
-    assert_create_schema_accepts_string_and_object_specs(create_schema);
+    assert_create_schema_requires_version_ids(create_schema);
     client
         .shutdown()
         .await
@@ -736,15 +737,15 @@ async fn mcp_create_and_search_manage_real_runs_with_cli_auth() {
 
     let client = spawn_mcp_client(&context, &["--server", &target_url]).await;
 
+    let workflow_version_id = register_mcp_workflow(&client, &workflow).await;
     let create = call_tool_json(
         &client,
         "fabro_run_create",
         serde_json::json!({
             "runs": [{
-                "workflow": workflow,
-                "dry_run": true,
-                "auto_approve": true,
-                "labels": { "source": "mcp-test" }
+                "workflow_version_id": workflow_version_id,
+                "target": { "kind": "none" },
+                "args": {"dry_run": true, "auto_approve": true, "labels": { "source": "mcp-test" }}
             }]
         }),
     )
@@ -780,7 +781,7 @@ async fn mcp_create_and_search_manage_real_runs_with_cli_auth() {
           "labels": {
             "source": "mcp-test"
           },
-          "source_directory": "[SOURCE_DIRECTORY]",
+          "source_directory": null,
           "repo_origin_url": null,
           "goal_preview": "Run tests and report results",
           "goal_truncated": false
@@ -803,15 +804,15 @@ async fn mcp_run_tools_use_default_local_server_without_server_flag() {
     let workflow = context.install_fixture("simple.fabro");
     let client = spawn_mcp_client(&context, &[]).await;
 
+    let workflow_version_id = register_mcp_workflow(&client, &workflow).await;
     let create = call_tool_json(
         &client,
         "fabro_run_create",
         serde_json::json!({
             "runs": [{
-                "workflow": workflow,
-                "dry_run": true,
-                "auto_approve": true,
-                "labels": { "source": "mcp-default-server-test" },
+                "workflow_version_id": workflow_version_id,
+                "target": { "kind": "none" },
+                "args": {"dry_run": true, "auto_approve": true, "labels": { "source": "mcp-default-server-test" }},
                 "start": false
             }]
         }),
@@ -1387,7 +1388,7 @@ async fn mcp_lifecycle_tools_manage_real_run() {
             "labels": {
               "source": "mcp-test"
             },
-            "source_directory": "[SOURCE_DIRECTORY]",
+            "source_directory": null,
             "repo_origin_url": null,
             "goal": "Run tests and report results"
           }
@@ -1848,11 +1849,34 @@ async fn mcp_get_rejects_blank_run_id_before_auth_or_network() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mcp_workflow_version_validation_happens_before_auth_or_network() {
+    let context = test_context!();
+    let client = spawn_mcp_client(&context, &["--server", "http://127.0.0.1:9"]).await;
+    let error = call_tool_error_text(
+        &client,
+        "fabro_workflow_version_create",
+        serde_json::json!({"entrypoint":"workflow","files":{}}),
+    )
+    .await;
+    assert_eq!(
+        error,
+        "entrypoint `workflow` is not present in workflow files"
+    );
+    assert_mcp_run_tool_count(&client).await;
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mcp_create_validation_errors_happen_before_auth_or_network() {
     let context = test_context!();
     let client = spawn_mcp_client(&context, &["--server", "http://127.0.0.1:9"]).await;
     let too_many = (0..51)
-        .map(|index| serde_json::json!({ "workflow": format!("wf-{index}.fabro") }))
+        .map(
+            |_| serde_json::json!({"workflow_version_id":"a".repeat(64), "target":{"kind":"none"}}),
+        )
         .collect::<Vec<_>>();
 
     let empty = call_tool_error_text(
@@ -1872,13 +1896,14 @@ async fn mcp_create_validation_errors_happen_before_auth_or_network() {
         "fabro_run_create",
         serde_json::json!({
             "runs": [{
-                "workflow": "simple.fabro",
-                "inputs": { "decision": null }
+                "workflow_version_id": "a".repeat(64),
+                "target": {"kind":"none"},
+                "args": {"inputs": { "decision": null }}
             }]
         }),
     )
     .await;
-    let conflicting_goal_sources = call_tool_error_text(
+    let conflicting_goal_sources = call_tool_parameter_error(
         &client,
         "fabro_run_create",
         serde_json::json!({
@@ -1895,7 +1920,7 @@ async fn mcp_create_validation_errors_happen_before_auth_or_network() {
     assert!(many.contains("runs"), "{many}");
     assert!(null.contains("decision"), "{null}");
     assert!(
-        conflicting_goal_sources.contains("goal and goal_file are mutually exclusive"),
+        conflicting_goal_sources.contains("fabro_workflow_version_create"),
         "{conflicting_goal_sources}"
     );
     assert_mcp_run_tool_count(&client).await;
@@ -1906,41 +1931,24 @@ async fn mcp_create_validation_errors_happen_before_auth_or_network() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mcp_create_string_shorthand_deserializes_before_auth() {
+async fn mcp_create_requires_explicit_target_and_rejects_old_shorthand_before_auth() {
     let context = test_context!();
-    let harness =
-        RealAuthHarness::start_with_dev_token(fabro_test::GitHubAppState::default()).await;
-    let target_url = harness.api_target();
-    let workflow = context.install_fixture("simple.fabro");
-    let client = spawn_mcp_client(&context, &["--server", &target_url]).await;
-
-    let result = client
-        .call_tool(
-            "fabro_run_create",
-            serde_json::json!({ "runs": [workflow] }),
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .expect("string shorthand should deserialize and return a tool-level auth error");
-    assert_eq!(result.is_error, Some(true), "tool should return error");
-    let error = result
-        .content
-        .first()
-        .and_then(|content| serde_json::to_value(content).ok())
-        .and_then(|content| content["text"].as_str().map(ToOwned::to_owned))
-        .expect("tool error should include text");
-    assert!(!error.contains("CreateRunSpec"), "{error}");
-    assert!(
-        error.contains("Run `fabro auth login` to authenticate."),
-        "{error}"
-    );
-    assert_mcp_run_tool_count(&client).await;
-
-    client
-        .shutdown()
-        .await
-        .expect("MCP client should shut down");
-    harness.shutdown().await;
+    let client = spawn_mcp_client(&context, &["--server", "http://127.0.0.1:9"]).await;
+    let error = call_tool_parameter_error(
+        &client,
+        "fabro_run_create",
+        serde_json::json!({"runs":["simple.fabro"]}),
+    )
+    .await;
+    assert!(error.contains("fabro_workflow_version_create"), "{error}");
+    let error = call_tool_error_text(
+        &client,
+        "fabro_run_create",
+        serde_json::json!({"runs":[{"workflow_version_id":"a".repeat(64)}]}),
+    )
+    .await;
+    assert!(error.contains("explicit target"), "{error}");
+    client.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2748,6 +2756,18 @@ async fn call_tool_json(
         .expect("tool result should include structured content")
 }
 
+async fn call_tool_parameter_error(
+    client: &McpClient,
+    name: &str,
+    arguments: serde_json::Value,
+) -> String {
+    let error = client
+        .call_tool(name, arguments, std::time::Duration::from_secs(30))
+        .await
+        .expect_err("invalid parameters should produce an MCP protocol error");
+    error.to_string()
+}
+
 async fn call_tool_error_text(
     client: &McpClient,
     name: &str,
@@ -2766,49 +2786,62 @@ async fn call_tool_error_text(
         .expect("tool error should include text")
 }
 
-fn assert_create_schema_accepts_string_and_object_specs(schema: &serde_json::Value) {
-    let variants = schema
-        .pointer("/properties/runs/items/anyOf")
-        .and_then(serde_json::Value::as_array)
-        .expect("fabro_run_create runs items should use anyOf");
-
-    assert!(
-        variants.iter().any(|variant| variant["type"] == "string"),
-        "fabro_run_create should advertise workflow string shorthand: {schema}"
-    );
-    let object_variant = variants
-        .iter()
-        .find(|variant| variant["type"] == "object")
-        .unwrap_or_else(|| {
-            panic!("fabro_run_create should advertise object create specs: {schema}")
+fn assert_create_schema_requires_version_ids(schema: &serde_json::Value) {
+    let item = &schema["properties"]["runs"]["items"];
+    let item = item
+        .get("$ref")
+        .and_then(serde_json::Value::as_str)
+        .map_or(item, |reference| {
+            schema
+                .pointer(
+                    reference
+                        .strip_prefix('#')
+                        .expect("schema reference should be local"),
+                )
+                .expect("schema reference should resolve")
         });
+    assert_eq!(item["type"], "object");
+    assert_eq!(item["additionalProperties"], false);
     assert!(
-        object_variant.pointer("/properties/workflow").is_some(),
-        "object create spec should include workflow property: {schema}"
+        item["required"]
+            .as_array()
+            .expect("create schema should require fields")
+            .iter()
+            .any(|field| field == "workflow_version_id")
     );
-    assert!(
-        object_variant.pointer("/properties/goal_file").is_some(),
-        "object create spec should include goal_file property: {schema}"
-    );
-    assert!(
-        object_variant
-            .get("required")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|required| required.iter().any(|field| field == "workflow")),
-        "object create spec should require workflow: {schema}"
-    );
+    assert!(item["properties"].get("args").is_some());
+    assert!(item["properties"].get("workflow").is_none());
+    assert!(item["properties"].get("goal_file").is_none());
+}
+
+async fn register_mcp_workflow(client: &McpClient, workflow: &Path) -> serde_json::Value {
+    let entrypoint = workflow
+        .file_name()
+        .expect("fixture should have a filename")
+        .to_str()
+        .expect("fixture filename should be UTF-8");
+    let content = fs::read_to_string(workflow).expect("workflow fixture should be readable");
+    let result = call_tool_json(
+        client,
+        "fabro_workflow_version_create",
+        serde_json::json!({
+            "entrypoint": entrypoint, "files": {entrypoint: content}
+        }),
+    )
+    .await;
+    result["workflow_version_id"].clone()
 }
 
 async fn create_mcp_run(client: &McpClient, workflow: PathBuf, start: bool) -> String {
+    let workflow_version_id = register_mcp_workflow(client, &workflow).await;
     let create = call_tool_json(
         client,
         "fabro_run_create",
         serde_json::json!({
             "runs": [{
-                "workflow": workflow,
-                "dry_run": true,
-                "auto_approve": true,
-                "labels": { "source": "mcp-test" },
+                "workflow_version_id": workflow_version_id,
+                "target": { "kind": "none" },
+                "args": {"dry_run": true, "auto_approve": true, "labels": { "source": "mcp-test" }},
                 "start": start
             }]
         }),

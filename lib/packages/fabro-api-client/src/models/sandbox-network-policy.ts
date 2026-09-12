@@ -15,15 +15,19 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { SandboxNetworkPolicyMode } from './sandbox-network-policy-mode';
+import type { SandboxNetworkPolicyOneOf } from './sandbox-network-policy-one-of';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { SandboxNetworkPolicyOneOf1 } from './sandbox-network-policy-one-of1';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { SandboxNetworkPolicyOneOf1DomainAllowList } from './sandbox-network-policy-one-of1-domain-allow-list';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { SandboxNetworkPolicyOneOfCidrAllowList } from './sandbox-network-policy-one-of-cidr-allow-list';
 
 /**
- * Public-network policy for one direction.
+ * @type SandboxNetworkPolicy
+ * The network policy in force for a sandbox. A policy without parameters is its name; an allow list carries its entries.
  */
-export interface SandboxNetworkPolicy {
-    'mode': SandboxNetworkPolicyMode;
-    /**
-     * CIDR entries when `mode` is `cidr_allow_list`; empty for other modes.
-     */
-    'cidrs': Array<string>;
-}
+export type SandboxNetworkPolicy = SandboxNetworkPolicyOneOf | SandboxNetworkPolicyOneOf1 | string;

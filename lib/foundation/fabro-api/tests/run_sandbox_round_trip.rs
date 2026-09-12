@@ -21,12 +21,12 @@ fn run_sandbox_reuses_domain_types() {
 fn run_sandbox_json_matches_openapi_shape() {
     let sandbox = RunSandbox::ready(
         RunSandboxPlan {
-            provider: SandboxProviderKind::Docker,
+            provider: SandboxProviderKind::DOCKER,
             image:    Some("ghcr.io/fabro/sandbox:latest".to_string()),
             snapshot: None,
         },
         RunSandboxInstance {
-            provider: SandboxProviderKind::Docker,
+            provider: SandboxProviderKind::DOCKER,
             image:    None,
             snapshot: None,
             runtime:  RunSandboxRuntime {

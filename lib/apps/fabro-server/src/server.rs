@@ -28,10 +28,10 @@ pub use fabro_api::types::{
     BatchDeleteRunsResultOutcome, BatchDeleteRunsSummary, BatchRunLifecycleRequest,
     BatchRunLifecycleResponse, BatchRunLifecycleResult, BatchRunLifecycleResultOutcome,
     BatchRunLifecycleSummary, BillingByModel, BillingStageRef, CloseRunPullRequestResponse,
-    CompletionResponse, CompletionToolChoiceMode, CompletionUsage, CreateCompletionRequest,
-    CreateRunPullRequestRequest, CreateSecretRequest, CreateVariableRequest, DeleteRunResponse,
-    DeleteRunSandbox, DeleteSecretRequest, DenyRunRequest, DiskUsageResponse, DiskUsageRunRow,
-    DiskUsageSummaryRow, ErrorResponseEntry, ForkRequest, ForkResponse, IntegrationConnectionKind,
+    CompletionResponse, CompletionUsage, CreateCompletionRequest, CreateRunPullRequestRequest,
+    CreateSecretRequest, CreateVariableRequest, DeleteRunResponse, DeleteRunSandbox,
+    DeleteSecretRequest, DenyRunRequest, DiskUsageResponse, DiskUsageRunRow, DiskUsageSummaryRow,
+    ErrorResponseEntry, ForkRequest, ForkResponse, IntegrationConnectionKind,
     IntegrationConnectionState, IntegrationConnectionStatus, IntegrationProvider,
     IntegrationStatus, LinkRunPullRequestRequest, MergeRunPullRequestRequest,
     MergeRunPullRequestResponse, ModelReference, PaginatedEventList, PaginatedRunList,
@@ -48,32 +48,24 @@ pub use fabro_api::types::{
     SystemRepairRunsResponse, SystemResourcesResponse, SystemRunCounts, TimelineEntryResponse,
     UpdateVariableRequest, VariableListResponse, VncPreviewResponse, WriteBlobResponse,
 };
-use fabro_auth::{CredentialSource, SqlVaultCredentialSource, auth_issue_message};
+use fabro_auth::SqlVaultCredentialSource;
 use fabro_automation::{self, AutomationStore};
 use fabro_config::daemon::ServerDaemon;
-use fabro_config::{RunLayer, Storage, WorkflowSettingsBuilder};
+use fabro_config::{LlmLayer, RunLayer, Storage, WorkflowSettingsBuilder};
 use fabro_db::DbPool;
 use fabro_environment::EnvironmentStore;
 use fabro_interview::{
     Answer, AnswerSubmission, ControlInterviewer, Interviewer, Question, WorkerControlEnvelope,
 };
-use fabro_llm::client::Client as LlmClient;
-use fabro_llm::generate::{GenerateParams, generate_object};
-use fabro_llm::model_test::run_model_test;
-use fabro_llm::types::{
-    FinishReason, Message as LlmMessage, Request as LlmRequest, ToolChoice, ToolDefinition,
-};
+use fabro_llm::credentials::CredentialProvider;
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::{ClientOptions, FabroClient};
 use fabro_mcp_store::McpServerStore;
-use fabro_model::catalog::LlmCatalogSettings;
-use fabro_model::{BilledTokenCounts, Catalog, ModelRef, ModelTestMode, ProviderId};
 use fabro_redact::redact_jsonl_line;
-use fabro_sandbox::daytona::{self, DaytonaSandbox};
 use fabro_sandbox::details::sandbox_details;
+use fabro_sandbox::driver::{DaytonaCredentials, ProviderAccess, ProviderConnectOptions};
 use fabro_sandbox::reconnect::reconnect_for_run;
-use fabro_sandbox::{
-    DaytonaSandboxProvider, DockerSandboxProvider, LocalSandboxProvider, Sandbox, SandboxProvider,
-    SandboxProviderRegistry,
-};
+use fabro_sandbox::{SandboxInventory, daytona};
 use fabro_slack::client::{PostedMessage as SlackPostedMessage, SlackClient};
 use fabro_slack::config::{
     SlackCredentialResolution,
@@ -85,8 +77,8 @@ use fabro_slack::{blocks as slack_blocks, connection as slack_connection};
 use fabro_static::EnvVars;
 use fabro_store::{
     ArtifactKey, ArtifactStore, AuthCodeStore, AuthSessionStore, Database, EventEnvelope,
-    EventPayload, KeyedMutex, NodeArtifact, PendingInterviewRecord, RunSummaryStore,
-    StageArtifactEntry, StageId,
+    EventPayload, KeyedMutex, NodeArtifact, PendingInterviewRecord, RunSessionRecordStore,
+    RunSummaryStore, StageArtifactEntry, StageId,
 };
 #[cfg(test)]
 use fabro_types::BlockedReason;
@@ -96,10 +88,10 @@ use fabro_types::settings::server::{
     GithubIntegrationSettings, GithubIntegrationStrategy, LogDestination,
 };
 use fabro_types::{
-    AgentBackend, AskFabro, AskFabroUnavailableReason, BlobHash, EventBody,
-    InterviewQuestionRecord, PairId, PairMessageId, PairTarget, PendingReason, Principal,
-    PullRequestLink, QuestionType, RunControlAction, RunEvent, RunId, RunRunnableSource,
-    RunStatusKind, SandboxProviderKind, ServerSettings, SessionCapability,
+    AgentBackend, AskFabro, AskFabroUnavailableReason, BilledTokenCounts, BlobHash, EventBody,
+    InterviewQuestionRecord, ModelRef, ModelTestMode, PairId, PairMessageId, PairTarget,
+    PendingReason, Principal, PullRequestLink, QuestionType, RunControlAction, RunEvent, RunId,
+    RunRunnableSource, RunStatusKind, SandboxProviderKind, ServerSettings, SessionCapability,
 };
 use fabro_util::error::{
     SharedError, collect_causes, render_compact_with_causes, render_with_causes,
@@ -120,6 +112,7 @@ use fabro_workflow::run_lookup::{
 use fabro_workflow::run_status::{FailureReason, RunStatus, SuccessReason};
 use fabro_workflow::{Error as WorkflowError, operations, pull_request};
 use futures_util::future::join_all;
+use lithos_llm::catalog::ProviderId;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tokio::fs;
@@ -139,7 +132,6 @@ use tower::{ServiceExt, service_fn};
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tracing::{Instrument, debug, error, info, warn};
-use ulid::Ulid;
 
 use crate::auth::{self, GithubEndpoints, auth_translation_middleware, demo_routing_middleware};
 use crate::automation_materializer::{
@@ -160,7 +152,7 @@ use crate::principal_middleware::{
 };
 use crate::request_id::{self, RequestId};
 use crate::run_files::{FilesInFlight, new_files_in_flight};
-use crate::server_secrets::{LlmClientResult, ServerSecrets};
+use crate::server_secrets::ServerSecrets;
 use crate::spawn_env::apply_render_graph_env;
 use crate::worker_control::{LocalWorkerControlBus, WorkerControlBus, WorkerControlBusError};
 use crate::worker_runtime::{
@@ -1132,7 +1124,7 @@ pub struct AppState {
     parent_link_lock: AsyncMutex<()>,
 
     pub(super) server_secrets: ServerSecrets,
-    pub(crate) llm_source: Arc<dyn CredentialSource>,
+    pub(crate) llm_source: Arc<dyn CredentialProvider>,
     manifest_run_defaults: RwLock<Arc<RunLayer>>,
     manifest_run_settings: RwLock<std::result::Result<RunNamespace, SharedError>>,
     pub(crate) server_settings: RwLock<Arc<ServerSettings>>,
@@ -1142,7 +1134,7 @@ pub struct AppState {
     pub(crate) github_api_base_url: String,
     active_config_path: PathBuf,
     http_client: Option<fabro_http::HttpClient>,
-    sandbox_provider_registry: SandboxProviderRegistry,
+    sandbox_inventory: SandboxInventory,
     shutdown: CancellationToken,
     shutting_down: AtomicBool,
     registry_factory_override: Option<Box<RegistryFactoryOverride>>,
@@ -1152,15 +1144,17 @@ pub struct AppState {
 }
 
 pub(crate) struct AppStores {
-    pub(crate) runs:          Arc<Database>,
-    pub(crate) run_summaries: Arc<RunSummaryStore>,
-    pub(crate) auth_codes:    Arc<AuthCodeStore>,
-    pub(crate) auth_sessions: Arc<AuthSessionStore>,
-    pub(crate) automations:   Arc<AutomationStore>,
-    pub(crate) environments:  Arc<EnvironmentStore>,
-    pub(crate) mcp_servers:   Arc<McpServerStore>,
-    pub(crate) vault:         Arc<SecretStore>,
-    pub(crate) variables:     Arc<VariableStore>,
+    pub(crate) runs:            Arc<Database>,
+    pub(crate) run_summaries:   Arc<RunSummaryStore>,
+    /// Ask Fabro conversations, keyed by session id.
+    pub(crate) session_records: Arc<RunSessionRecordStore>,
+    pub(crate) auth_codes:      Arc<AuthCodeStore>,
+    pub(crate) auth_sessions:   Arc<AuthSessionStore>,
+    pub(crate) automations:     Arc<AutomationStore>,
+    pub(crate) environments:    Arc<EnvironmentStore>,
+    pub(crate) mcp_servers:     Arc<McpServerStore>,
+    pub(crate) vault:           Arc<SecretStore>,
+    pub(crate) variables:       Arc<VariableStore>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1285,7 +1279,7 @@ pub(crate) struct AppStateConfig {
     pub(crate) github_api_base_url: Option<String>,
     pub(crate) active_config_path: PathBuf,
     pub(crate) http_client: Option<fabro_http::HttpClient>,
-    pub(crate) sandbox_provider_registry: Option<SandboxProviderRegistry>,
+    pub(crate) sandbox_inventory: Option<SandboxInventory>,
     pub(crate) shutdown: CancellationToken,
     #[cfg(test)]
     pub(crate) worker_control_bus: Option<Arc<dyn WorkerControlBus>>,
@@ -1299,7 +1293,7 @@ pub(crate) struct AppStateConfig {
 pub(crate) struct ResolvedAppStateSettings {
     pub(crate) server_settings:       ServerSettings,
     pub(crate) manifest_run_defaults: RunLayer,
-    pub(crate) llm_catalog_settings:  LlmCatalogSettings,
+    pub(crate) llm_overlay:           LlmLayer,
 }
 
 fn accumulate_billing_rollup(
@@ -1396,13 +1390,18 @@ impl AppState {
         Some(format!("{}/runs/{run_id}", base.trim_end_matches('/')))
     }
 
-    pub(crate) async fn resolve_llm_client(&self) -> anyhow::Result<LlmClientResult> {
-        resolve_llm_client_from_source(self.llm_source.as_ref(), self.catalog()).await
+    pub(crate) async fn resolve_llm_client(&self) -> anyhow::Result<FabroClient> {
+        resolve_llm_client_from_source(
+            Arc::clone(&self.llm_source),
+            self.catalog(),
+            self.http_client.clone(),
+        )
+        .await
     }
 
     pub(crate) async fn configured_llm_provider_ids(&self) -> Vec<ProviderId> {
         let catalog = self.catalog();
-        self.llm_source.configured_providers(catalog.as_ref()).await
+        fabro_llm::configured_providers(catalog.as_ref(), self.llm_source.as_ref()).await
     }
 
     /// Resolve the LLM client once and derive the ready provider IDs from it,
@@ -1411,14 +1410,14 @@ impl AppState {
     /// resolved twice.
     pub(crate) async fn resolve_llm_client_with_ready_ids(
         &self,
-    ) -> (anyhow::Result<LlmClientResult>, Vec<ProviderId>) {
+    ) -> (anyhow::Result<FabroClient>, Vec<ProviderId>) {
         let llm_result = self.resolve_llm_client().await;
         if let Err(err) = &llm_result {
             warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
         }
         let ready_provider_ids = llm_result
             .as_ref()
-            .map(LlmClientResult::provider_ids)
+            .map(FabroClient::provider_ids)
             .unwrap_or_default();
         (llm_result, ready_provider_ids)
     }
@@ -1446,12 +1445,9 @@ impl AppState {
         let default_model = if provider_ids.is_empty() {
             None
         } else {
-            Some(
-                self.catalog()
-                    .default_for_configured_ids(&provider_ids)
-                    .id
-                    .to_string(),
-            )
+            self.catalog()
+                .default_offering_for(&provider_ids)
+                .map(|entry| entry.model.id().to_string())
         };
         AskFabroReadiness { default_model }
     }
@@ -1471,6 +1467,28 @@ impl AppState {
         (self.env_lookup)(name)
     }
 
+    /// Daytona credentials for `api_key`: the key from the vault, the
+    /// control-plane URL and organization from server configuration, and
+    /// the server's HTTP client. The process environment is consulted only
+    /// through the configured lookup.
+    pub(crate) fn daytona_credentials(&self, api_key: String) -> DaytonaCredentials {
+        DaytonaCredentials::from_api_key(api_key, |name| self.config_env_lookup(name))
+            .with_http_client(self.http_client().ok())
+    }
+
+    /// Everything a reconnect needs to reach a run's provider: the server's
+    /// provider settings and the Daytona credentials from the vault (`None`
+    /// when no key is stored).
+    pub(crate) async fn provider_access(&self) -> Result<ProviderAccess, SecretStoreError> {
+        Ok(ProviderAccess {
+            providers: self.server_settings().server.sandbox.providers.clone(),
+            daytona:   self
+                .vault_secret(EnvVars::DAYTONA_API_KEY)
+                .await?
+                .map(|api_key| self.daytona_credentials(api_key)),
+        })
+    }
+
     pub(crate) async fn check_daytona_api_key(
         &self,
         api_key: String,
@@ -1484,21 +1502,7 @@ impl AppState {
         api_key: String,
         probe_timeout: Duration,
     ) -> anyhow::Result<daytona::DaytonaKeyCheck> {
-        let base_url = self
-            .config_env_lookup(EnvVars::DAYTONA_API_URL)
-            .or_else(|| self.config_env_lookup(EnvVars::DAYTONA_SERVER_URL))
-            .unwrap_or_else(|| daytona::DEFAULT_DAYTONA_API_URL.to_string());
-        let org_id = self.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
-
-        let http_client = fabro_http::http_client().context("failed to build HTTP client")?;
-        daytona::check_daytona_api_key_with_timeout(
-            &base_url,
-            org_id.as_deref(),
-            api_key,
-            http_client,
-            probe_timeout,
-        )
-        .await
+        daytona::check_daytona_api_key(&self.daytona_credentials(api_key), probe_timeout).await
     }
 
     /// Borrow the persistent store so sibling modules can open run readers
@@ -1526,8 +1530,8 @@ impl AppState {
         &self.session_runtimes
     }
 
-    pub(crate) fn sandbox_provider_registry(&self) -> &SandboxProviderRegistry {
-        &self.sandbox_provider_registry
+    pub(crate) fn sandbox_inventory(&self) -> &SandboxInventory {
+        &self.sandbox_inventory
     }
 
     pub(crate) fn server_secret(&self, name: &str) -> Option<String> {
@@ -1642,7 +1646,7 @@ impl AppState {
         let ResolvedAppStateSettings {
             server_settings,
             manifest_run_defaults,
-            llm_catalog_settings,
+            llm_overlay,
         } = resolved_settings;
         let server_settings = Arc::new(server_settings);
         let manifest_run_defaults = Arc::new(manifest_run_defaults);
@@ -1654,7 +1658,7 @@ impl AppState {
             &self.stores.mcp_servers,
         );
         let catalog = Arc::new(
-            Catalog::from_builtin_with_overrides(&llm_catalog_settings)
+            fabro_llm::build_catalog(&llm_overlay, &|name| (self.env_lookup)(name))
                 .context("building LLM model catalog")?,
         );
         canonical_origin_from_effective_web_url(&effective_web_url).map_err(anyhow::Error::msg)?;
@@ -1680,21 +1684,18 @@ impl AppState {
     }
 }
 
+/// Builds the server's LLM client: retries and attachment inlining on, the
+/// server's HTTP client for provider requests when one is configured.
 async fn resolve_llm_client_from_source(
-    source: &dyn CredentialSource,
+    source: Arc<dyn CredentialProvider>,
     catalog: Arc<Catalog>,
-) -> anyhow::Result<LlmClientResult> {
-    let resolved = source
-        .resolve(catalog.as_ref())
+    http_client: Option<fabro_http::HttpClient>,
+) -> anyhow::Result<FabroClient> {
+    let mut options = ClientOptions::standard();
+    options.http = http_client;
+    fabro_llm::build_client(Catalog::clone(&catalog), source, options)
         .await
-        .context("resolving LLM credentials")?;
-    let report = LlmClient::from_credentials_report(resolved.credentials, catalog).await;
-
-    Ok(LlmClientResult {
-        client:              report.client,
-        auth_issues:         resolved.auth_issues,
-        registration_issues: report.registration_issues,
-    })
+        .context("building the LLM client")
 }
 
 fn decode_secret_pem(name: &str, raw: &str) -> Result<String, String> {
@@ -2327,36 +2328,45 @@ fn worker_token_keys_from_server_secrets(
         .map_err(|err| jwt_auth::session_secret_key_error(&err))
 }
 
-fn build_sandbox_provider_registry(
+fn build_sandbox_inventory(
     server_settings: &ServerSettings,
     daytona_api_key: Option<String>,
     env_lookup: &EnvLookup,
     http_client: Option<fabro_http::HttpClient>,
-) -> SandboxProviderRegistry {
+) -> SandboxInventory {
     let provider_settings = &server_settings.server.sandbox.providers;
-    let mut providers: Vec<Arc<dyn SandboxProvider>> = Vec::new();
+    let mut inventory = SandboxInventory::empty();
 
-    if provider_settings.local.enabled {
-        providers.push(Arc::new(LocalSandboxProvider));
+    if provider_settings.is_enabled(&SandboxProviderKind::LOCAL) {
+        inventory = inventory.with_host_directories(SandboxProviderKind::LOCAL);
     }
 
-    if provider_settings.docker.enabled {
-        providers.push(Arc::new(DockerSandboxProvider::new()));
+    if let Some(docker) = provider_settings.get(&SandboxProviderKind::DOCKER) {
+        if docker.enabled {
+            inventory = inventory.with_lazy(
+                SandboxProviderKind::DOCKER,
+                docker.clone(),
+                ProviderConnectOptions::default(),
+            );
+        }
     }
 
-    if provider_settings.daytona.enabled && daytona_api_key.is_some() {
-        let api_url = env_lookup(EnvVars::DAYTONA_API_URL)
-            .or_else(|| env_lookup(EnvVars::DAYTONA_SERVER_URL));
-        let organization_id = env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
-        providers.push(Arc::new(DaytonaSandboxProvider::new(
-            daytona_api_key,
-            api_url,
-            organization_id,
-            http_client,
-        )));
+    if let Some(daytona) = provider_settings.get(&SandboxProviderKind::DAYTONA) {
+        if let Some(api_key) = daytona_api_key.filter(|_| daytona.enabled) {
+            let credentials = DaytonaCredentials::from_api_key(api_key, |name| env_lookup(name))
+                .with_http_client(http_client);
+            inventory = inventory.with_lazy(
+                SandboxProviderKind::DAYTONA,
+                daytona.clone(),
+                ProviderConnectOptions {
+                    host_registry_root: None,
+                    daytona:            Some(credentials),
+                },
+            );
+        }
     }
 
-    SandboxProviderRegistry::new(providers)
+    inventory
 }
 
 pub(crate) fn automation_dir_for_active_config(active_config_path: &std::path::Path) -> PathBuf {
@@ -2409,7 +2419,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         github_api_base_url,
         active_config_path,
         http_client,
-        sandbox_provider_registry,
+        sandbox_inventory,
         shutdown,
         #[cfg(test)]
         worker_control_bus,
@@ -2432,8 +2442,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         .server
         .sandbox
         .providers
-        .local
-        .enabled;
+        .is_enabled(&SandboxProviderKind::LOCAL);
     let environment_pool = db_pool.clone();
     let environment_store = Arc::new(
         load_store_blocking("environment store", move || async move {
@@ -2457,12 +2466,13 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         .context("load mcp servers")?,
     );
     let variables = Arc::new(VariableStore::new(db_pool.clone()));
+    let session_records = Arc::new(RunSessionRecordStore::new(db_pool.clone()));
     let secret_store = Arc::new(SecretStore::new(db_pool));
     let vault = preloaded_vault;
     // Read vault secrets needed for synchronous setup before we wrap the vault in
     // an async lock for the rest of AppState.
     let daytona_api_key = vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string);
-    let llm_source: Arc<dyn CredentialSource> = Arc::new(SqlVaultCredentialSource::vault_only(
+    let llm_source: Arc<dyn CredentialProvider> = Arc::new(SqlVaultCredentialSource::vault_only(
         Arc::clone(&secret_store),
     ));
     let (global_event_tx, _) = broadcast::channel(4096);
@@ -2476,11 +2486,11 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         &mcp_server_store,
     );
     let current_catalog = Arc::new(
-        Catalog::from_builtin_with_overrides(&resolved_settings.llm_catalog_settings)
+        fabro_llm::build_catalog(&resolved_settings.llm_overlay, &|name| env_lookup(name))
             .context("building LLM model catalog")?,
     );
-    let sandbox_provider_registry = sandbox_provider_registry.unwrap_or_else(|| {
-        build_sandbox_provider_registry(
+    let sandbox_inventory = sandbox_inventory.unwrap_or_else(|| {
+        build_sandbox_inventory(
             current_server_settings.as_ref(),
             daytona_api_key,
             &env_lookup,
@@ -2552,6 +2562,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         stores: AppStores {
             runs: store,
             run_summaries,
+            session_records,
             auth_codes,
             auth_sessions,
             automations: automation_store,
@@ -2592,7 +2603,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         github_api_base_url,
         active_config_path,
         http_client,
-        sandbox_provider_registry,
+        sandbox_inventory,
         shutdown,
         shutting_down: AtomicBool::new(false),
         registry_factory_override,
@@ -2764,11 +2775,11 @@ async fn delete_run_sandbox_resource(
         }));
     }
 
-    let daytona_api_key = state
-        .vault_secret(EnvVars::DAYTONA_API_KEY)
+    let access = state
+        .provider_access()
         .await
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let sandbox = match reconnect_for_run(&record, daytona_api_key, Some(id)).await {
+    let sandbox = match reconnect_for_run(&record, &access, Some(id), None).await {
         Ok(sandbox) => sandbox,
         Err(err) if force || delete_started => {
             tracing::warn!(
@@ -3291,7 +3302,8 @@ async fn reject_run_if_sandbox_provider_disabled(
     settings: &RunNamespace,
 ) -> bool {
     let provider = run_manifest::effective_sandbox_provider(settings);
-    let Some(error) = run_manifest::sandbox_provider_policy_error(server_settings, provider) else {
+    let Some(error) = run_manifest::sandbox_provider_policy_error(server_settings, &provider)
+    else {
         return false;
     };
     tracing::warn!(run_id = %run_id, error = %error, "Sandbox provider disabled by server policy");
@@ -4081,7 +4093,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         let run_spec = persisted.run_spec();
         let settings = &run_spec.settings.run;
         let clone_can_use_github_credentials = settings.execution.mode != RunMode::DryRun
-            && settings.environment.provider.is_clone_based()
+            && settings.environment.provider.clones_workspace()
             && run_spec
                 .repo_origin_url()
                 .is_some_and(|origin| !origin.trim().is_empty());
@@ -4175,6 +4187,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         github_app,
         github_integration,
         vault: Arc::new(AsyncRwLock::new(vault.into_vault())),
+        sandbox_providers: state.server_settings().server.sandbox.providers.clone(),
         catalog: state.catalog(),
         on_node: None,
         registry_override,
@@ -4220,7 +4233,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
                 .expect("aggregate_billing lock poisoned");
             accumulate_billing_rollup(
                 &mut agg,
-                &fabro_workflow::billing_rollup_from_projection(projection, None),
+                &fabro_workflow::billing_rollup_from_projection(projection),
             );
         }
     }
@@ -4465,7 +4478,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             .expect("aggregate_billing lock poisoned");
         accumulate_billing_rollup(
             &mut agg,
-            &fabro_workflow::billing_rollup_from_projection(&final_state, None),
+            &fabro_workflow::billing_rollup_from_projection(&final_state),
         );
     }
 

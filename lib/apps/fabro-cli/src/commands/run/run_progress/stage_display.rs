@@ -557,6 +557,9 @@ impl StageDisplay {
             LlmOutputKind::Reasoning => "reasoning",
             LlmOutputKind::Text => "writing",
             LlmOutputKind::ToolCall => "calling tools",
+            // `LlmOutputKind` is non-exhaustive; a kind this build does not
+            // know is still output.
+            _ => "responding",
         };
         bar.set_message(format!("\u{27f3} model request: {activity}\u{2026}"));
     }

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use fabro_agent::Session;
 use fabro_types::{SessionId, TurnId};
+use pebble_coding_agent::CodingAgent;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -86,45 +86,33 @@ impl SessionRuntimeManager {
     }
 }
 
+/// The live coding agent behind one Ask Fabro session, when this process has
+/// one. A process that has none resumes the agent from its stored record.
 pub(crate) struct SessionRuntimeEntry {
-    session:     AsyncMutex<Option<Session>>,
-    initialized: Mutex<bool>,
+    agent:       AsyncMutex<Option<CodingAgent>>,
     active_turn: Mutex<Option<ActiveTurn>>,
 }
 
 impl SessionRuntimeEntry {
     fn new() -> Self {
         Self {
-            session:     AsyncMutex::new(None),
-            initialized: Mutex::new(false),
+            agent:       AsyncMutex::new(None),
             active_turn: Mutex::new(None),
         }
     }
 
-    pub(crate) async fn lock_session(&self) -> AsyncMutexGuard<'_, Option<Session>> {
-        self.session.lock().await
+    pub(crate) async fn lock_agent(&self) -> AsyncMutexGuard<'_, Option<CodingAgent>> {
+        self.agent.lock().await
     }
 
-    pub(crate) fn is_initialized(&self) -> bool {
-        *self
-            .initialized
-            .lock()
-            .expect("session initialized lock poisoned")
-    }
-
-    pub(crate) fn mark_initialized(&self) {
-        *self
-            .initialized
-            .lock()
-            .expect("session initialized lock poisoned") = true;
-    }
-
-    pub(crate) async fn clear_session(&self) {
-        *self.session.lock().await = None;
-        *self
-            .initialized
-            .lock()
-            .expect("session initialized lock poisoned") = false;
+    /// Drop the live agent so the next turn resumes from the stored record.
+    pub(crate) async fn clear_agent(&self) {
+        let mut slot = self.agent.lock().await;
+        if let Some(mut agent) = slot.take() {
+            let _ = agent
+                .shutdown(pebble_coding_agent::ShutdownReason::Error)
+                .await;
+        }
     }
 }
 

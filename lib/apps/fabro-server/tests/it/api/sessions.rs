@@ -104,7 +104,10 @@ async fn run_bound_session_is_created_as_run_event_and_resolves_by_flat_id() {
     assert_eq!(fetched["id"], session_id);
     assert_eq!(fetched["run_id"], run_id);
     assert_session_metadata_only(&fetched);
-    assert_eq!(fetched["messages"].as_array().unwrap().len(), 0);
+    assert!(
+        fetched.get("messages").is_none(),
+        "the conversation is held by the server's session record, not the API"
+    );
     assert!(fetched["active_turn"].is_null());
 
     let events_request = Request::builder()
@@ -305,16 +308,8 @@ async fn invalid_session_model_refs_are_rejected_at_creation() {
 
 #[tokio::test]
 async fn ambiguous_session_model_refs_are_rejected_at_creation() {
-    let mut catalog_settings = fabro_model::catalog::LlmCatalogSettings::default();
-    catalog_settings.providers.insert(
-        "openai".to_string(),
-        fabro_model::catalog::ProviderCatalogSettings {
-            aliases: Some(vec!["gpt54".to_string()]),
-            ..fabro_model::catalog::ProviderCatalogSettings::default()
-        },
-    );
     let state = fabro_server::test_support::TestAppStateBuilder::new()
-        .llm_catalog_settings(catalog_settings)
+        .llm_overlay_toml("[providers.openai]\naliases = [\"gpt54\"]\n")
         .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
         .build();
     let app = fabro_server::test_support::build_test_router(state);

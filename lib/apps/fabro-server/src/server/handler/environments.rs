@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use fabro_environment::{Environment, EnvironmentDraft, EnvironmentId, EnvironmentStoreError};
+use fabro_types::SandboxProviderKind;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
-    EnvironmentNetworkSettings, EnvironmentProvider, EnvironmentResourcesSettings,
-    EnvironmentSettings,
+    EnvironmentNetworkSettings, EnvironmentResourcesSettings, EnvironmentSettings,
 };
+use fabro_util::error::{collect_chain, render_with_causes};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +34,7 @@ struct EnvironmentListMeta {
 #[serde(deny_unknown_fields)]
 struct CreateEnvironmentRequest {
     id:        EnvironmentId,
-    provider:  EnvironmentProvider,
+    provider:  SandboxProviderKind,
     cwd:       Option<String>,
     image:     ApiEnvironmentImageSettings,
     resources: EnvironmentResourcesSettings,
@@ -46,7 +47,7 @@ struct CreateEnvironmentRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplaceEnvironmentRequest {
-    provider:  EnvironmentProvider,
+    provider:  SandboxProviderKind,
     cwd:       Option<String>,
     image:     ApiEnvironmentImageSettings,
     resources: EnvironmentResourcesSettings,
@@ -267,10 +268,17 @@ impl From<EnvironmentStoreError> for ApiError {
             | EnvironmentStoreError::JsonDecode { .. }
             | EnvironmentStoreError::Db { .. }
             | EnvironmentStoreError::RowCountOverflow { .. }
-            | EnvironmentStoreError::Io { .. } => Self::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "environment store operation failed",
-            ),
+            | EnvironmentStoreError::Io { .. } => {
+                // The response hides the cause; the log keeps it.
+                tracing::error!(
+                    error = %render_with_causes(&err.to_string(), &collect_chain(&err)),
+                    "environment store operation failed"
+                );
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "environment store operation failed",
+                )
+            }
         }
     }
 }

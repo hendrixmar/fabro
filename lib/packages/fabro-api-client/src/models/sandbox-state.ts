@@ -15,23 +15,28 @@
 
 
 /**
- * Normalized sandbox lifecycle state used by the control plane and UI. The original provider-specific state string is preserved in `native_state`.
+ * The sandbox driver\'s lifecycle state for a sandbox. The provider\'s own state string is preserved in `SandboxStatus.provider_state`. A reader must treat a value it does not know as `unknown`.
  */
 
 export const SandboxState = {
-    UNKNOWN: 'unknown',
-    PROVISIONING: 'provisioning',
+    CREATING: 'creating',
     STARTING: 'starting',
     RUNNING: 'running',
     STOPPING: 'stopping',
     STOPPED: 'stopped',
+    PAUSING: 'pausing',
     PAUSED: 'paused',
-    DELETING: 'deleting',
-    DELETED: 'deleted',
+    RESUMING: 'resuming',
+    ARCHIVING: 'archiving',
     ARCHIVED: 'archived',
     RESTORING: 'restoring',
     RESIZING: 'resizing',
-    ERROR: 'error'
+    FORKING: 'forking',
+    SNAPSHOTTING: 'snapshotting',
+    DELETING: 'deleting',
+    DELETED: 'deleted',
+    ERROR: 'error',
+    UNKNOWN: 'unknown'
 } as const;
 
 export type SandboxState = typeof SandboxState[keyof typeof SandboxState];

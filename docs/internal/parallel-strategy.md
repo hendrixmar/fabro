@@ -14,7 +14,7 @@ target node on that edge; parallel branches are not subgraph walks.
 Every branch:
 
 - receives an independent fork of the parent workflow context;
-- receives the same `Arc<dyn Sandbox>` as the parent run;
+- receives the same `Arc<RunSandbox>` as the parent run;
 - inherits the same sandbox working directory and `internal.work_dir`;
 - runs through the normal handler dispatch path, including dry-run behavior;
 - retains its branch identity, lifecycle events, and hook scope.

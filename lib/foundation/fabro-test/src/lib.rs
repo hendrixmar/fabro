@@ -74,6 +74,18 @@ static INSTA_FILTERS: &[(&str, &str)] = &[
         "Duration:  [DURATION]",
     ),
     (r"Base: [^\n]+ \([0-9a-f]{7,40}\)", "Base: [BASE]"),
+    // The sandbox driver's events: per-process event source ids, operation
+    // ids, sub-second durations, and a local sandbox's path-derived id.
+    (
+        r#""source_id"(\s*:\s*)"[0-9a-f]{32}""#,
+        r#""source_id"$1"[HEX]""#,
+    ),
+    (
+        r#""operation_id"(\s*:\s*)"[0-9a-f]{32}""#,
+        r#""operation_id"$1"[HEX]""#,
+    ),
+    (r#""nanos"(\s*:\s*)\d+"#, r#""nanos"$1"[NANOS]""#),
+    (r"host-dir-[0-9a-f]+", "host-dir-[HEX]"),
     (r"\\([\w\d])", "/$1"),
 ];
 
@@ -2340,6 +2352,7 @@ pub struct TwinToolCall {
     name:          String,
     arguments:     Value,
     raw_arguments: Option<String>,
+    custom:        bool,
 }
 
 impl TwinToolCall {
@@ -2349,6 +2362,7 @@ impl TwinToolCall {
             name: name.into(),
             arguments,
             raw_arguments: None,
+            custom: false,
         }
     }
 
@@ -2362,6 +2376,7 @@ impl TwinToolCall {
             name: name.into(),
             arguments,
             raw_arguments: Some(raw_arguments.into()),
+            custom: false,
         }
     }
 
@@ -2417,6 +2432,19 @@ impl TwinToolCall {
         Self::new_raw_arguments("apply_patch", Value::Null, patch.into())
     }
 
+    /// A free-form `custom_tool_call` on the Responses API, carrying `input`
+    /// as text rather than JSON arguments. This is how the codex harness's
+    /// `apply_patch` reaches the model.
+    #[must_use]
+    pub fn custom(name: impl Into<String>, input: impl Into<String>) -> Self {
+        Self {
+            name:          name.into(),
+            arguments:     Value::String(input.into()),
+            raw_arguments: None,
+            custom:        true,
+        }
+    }
+
     fn into_json(self) -> Value {
         let mut value = json!({
             "name": self.name,
@@ -2424,6 +2452,9 @@ impl TwinToolCall {
         });
         if let Some(raw_arguments) = self.raw_arguments {
             value["raw_arguments"] = Value::String(raw_arguments);
+        }
+        if self.custom {
+            value["kind"] = Value::String("custom".to_string());
         }
         value
     }
@@ -2446,11 +2477,13 @@ pub async fn twin_openai() -> &'static TwinOpenAi {
             let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
 
             let config = TwinConfig {
-                bind_addr:    addr,
+                bind_addr: addr,
                 require_auth: true,
                 enable_admin: true,
+                ..TwinConfig::from_lookup(&|_| None).expect("twin-openai defaults should load")
             };
-            let app = twin_openai::build_app_with_config(config);
+            let app =
+                twin_openai::build_app_with_config(config).expect("twin-openai app should build");
 
             tokio::spawn(async move {
                 axum::serve(listener, app).await.expect("twin-openai serve");

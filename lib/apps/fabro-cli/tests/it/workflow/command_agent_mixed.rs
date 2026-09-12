@@ -3,7 +3,7 @@
     reason = "integration tests stage fixtures with sync std::fs; test infrastructure, not Tokio-hot path"
 )]
 
-use fabro_test::test_context;
+use fabro_test::TestContext;
 
 use super::{
     completed_nodes, dump_export, find_run_dir, fixture, read_conclusion, run_id_for,
@@ -12,9 +12,7 @@ use super::{
 
 sandbox_tests!(command_agent_mixed, keys = ["ANTHROPIC_API_KEY"]);
 
-fn scenario_command_agent_mixed(sandbox: &str) {
-    let context = test_context!();
-
+fn scenario_command_agent_mixed(context: &TestContext, sandbox: &str) {
     context
         .run_cmd()
         .args([
@@ -29,7 +27,7 @@ fn scenario_command_agent_mixed(sandbox: &str) {
         .assert()
         .success();
 
-    let run_dir = find_run_dir(&context);
+    let run_dir = find_run_dir(context);
     let conclusion = read_conclusion(&run_dir);
     assert_eq!(conclusion["status"].as_str(), Some("succeeded"));
 
@@ -47,7 +45,7 @@ fn scenario_command_agent_mixed(sandbox: &str) {
         "verify should be completed"
     );
 
-    let export_dir = dump_export(&context, &run_id_for(&run_dir));
+    let export_dir = dump_export(context, &run_id_for(&run_dir));
     let stdout =
         std::fs::read_to_string(stage_dump_dir(&export_dir, "verify@1").join("output.log"))
             .expect("verify output.log should exist");

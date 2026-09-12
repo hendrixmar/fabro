@@ -66,8 +66,8 @@ describe("createScriptedAdapter", () => {
       .map((p) => p.text ?? "")
       .join("");
     const expectedText = SCRIPTED_REPLIES[0]!.content
-      .filter((p) => p.kind === "text")
-      .map((p) => p.data.text)
+      .filter((p) => p.type === "text")
+      .map((p) => (p.type === "text" ? p.text : ""))
       .join("");
     expect(finalText).toBe(expectedText);
   });
@@ -89,7 +89,7 @@ describe("createScriptedAdapter", () => {
 describe("toThreadMessages", () => {
   test("converts a user text message", () => {
     const out = toThreadMessages([
-      { role: "user", content: [{ kind: "text", data: { text: "hi" } }] },
+      { role: "user", content: [{ type: "text", text: "hi" }] },
     ]);
     expect(out).toEqual([
       { role: "user", content: [{ type: "text", text: "hi" }] },
@@ -102,16 +102,15 @@ describe("toThreadMessages", () => {
         role: "assistant",
         content: [
           {
-            kind: "tool_call",
-            data: {
-              tool_call_id: "t1",
-              name: "search",
-              arguments: { q: "hello" },
-            },
+            type: "tool_call",
+            id: "t1",
+            name: "search",
+            input: { type: "function", arguments: { q: "hello" } },
           },
           {
-            kind: "tool_result",
-            data: { tool_call_id: "t1", content: { ok: true } },
+            type: "tool_result",
+            tool_call_id: "t1",
+            content: [{ type: "text", text: "{\"ok\":true}" }],
           },
         ],
       },
@@ -126,6 +125,6 @@ describe("toThreadMessages", () => {
     expect(first?.type).toBe("tool-call");
     if (first?.type !== "tool-call") throw new Error("expected tool-call part");
     expect(first.toolCallId).toBe("t1");
-    expect(first.result).toEqual({ ok: true });
+    expect(first.result).toEqual('{"ok":true}');
   });
 });

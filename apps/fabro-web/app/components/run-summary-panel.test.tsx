@@ -174,7 +174,7 @@ describe("RunSummaryPanelView", () => {
     const tree = render({
       run:              makeRun(),
       sandboxState:     "running",
-      sandboxResources: { cpu_cores: 4, memory_bytes: 8 * 1024 * 1024 * 1024 } as any,
+      sandboxResources: { cpu_cores: 4, memory_mb: 8 * 1024 },
     });
     expect(instanceText(cellAfterLabel(tree, "Sandbox"))).toBe("4 CPU · 8 GiB");
   });

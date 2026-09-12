@@ -46,19 +46,19 @@ pub(crate) struct PushResult {
 /// checkpoint pushes (the next checkpoint re-pushes the same branch anyway),
 /// generous for the terminal publish push.
 pub(crate) async fn push_run_branch(
-    sandbox: &dyn fabro_sandbox::Sandbox,
+    sandbox: &fabro_sandbox::RunSandbox,
     branch: &str,
-    plan: &fabro_sandbox::RetryPlan,
+    policy: &fabro_sandbox::GitRetryPolicy,
 ) -> Result<fabro_sandbox::PushReport, fabro_sandbox::PushError> {
     sandbox
-        .git_push_ref(&format!("refs/heads/{branch}:refs/heads/{branch}"), plan)
+        .git_push_ref(&format!("refs/heads/{branch}:refs/heads/{branch}"), policy)
         .await
 }
 
 /// Sub-lifecycle responsible for git operations (checkpoint commits, pushes,
 /// diffs).
 pub(crate) struct GitLifecycle {
-    pub sandbox:               Arc<dyn fabro_sandbox::Sandbox>,
+    pub sandbox:               Arc<fabro_sandbox::RunSandbox>,
     pub emitter:               Arc<Emitter>,
     pub run_id:                RunId,
     pub run_options:           Arc<RunOptions>,
@@ -106,7 +106,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
         let git_author = self.run_options.git_author();
         let commit_result = checked_git_checkpoint(
             &self.sandbox_git,
-            &*self.sandbox,
+            &self.sandbox,
             &self.run_id.to_string(),
             node_id,
             &result.outcome.status.to_string(),
@@ -135,9 +135,9 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                         .as_ref()
                         .and_then(|g| g.run_branch.as_ref())
                     {
-                        let plan = fabro_sandbox::RetryPlan::checkpoint_push();
+                        let policy = fabro_sandbox::checkpoint_push_policy();
                         let (push_ok, exec_output_tail, attempts) =
-                            match push_run_branch(self.sandbox.as_ref(), branch, &plan).await {
+                            match push_run_branch(self.sandbox.as_ref(), branch, &policy).await {
                                 Ok(report) => {
                                     self.sandbox_git.record_successful_push();
                                     (true, None, report.attempts)
@@ -190,10 +190,10 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                         .as_ref()
                         .and_then(|git| git.base_sha.clone());
                     let (patch_result, numstat_result) =
-                        tokio::join!(git_diff(&*self.sandbox, &prev), async {
+                        tokio::join!(git_diff(&self.sandbox, &prev), async {
                             match summary_base.as_deref() {
                                 Some(base) if base != sha => {
-                                    Some(list_diff_numstat(&*self.sandbox, base, &sha).await)
+                                    Some(list_diff_numstat(&self.sandbox, base, &sha).await)
                                 }
                                 _ => None,
                             }
@@ -375,6 +375,7 @@ mod tests {
             fork_source_ref:  None,
             base_branch:      None,
             display_base_sha: None,
+            git_identity:     None,
             git:              Some(GitCheckpointOptions {
                 base_sha:   None,
                 run_branch: None,
@@ -382,14 +383,18 @@ mod tests {
         })
     }
 
-    fn git_lifecycle(
+    async fn git_lifecycle(
         repo: &Path,
         emitter: Arc<Emitter>,
         run_options: Arc<RunOptions>,
     ) -> GitLifecycle {
         GitLifecycle {
             stage_executions: StageExecutionTracker::default(),
-            sandbox: Arc::new(fabro_agent::LocalSandbox::new(repo.to_path_buf())),
+            sandbox: Arc::new(
+                fabro_sandbox::local_sandbox(repo.to_path_buf())
+                    .await
+                    .unwrap(),
+            ),
             emitter,
             run_id: fixtures::RUN_1,
             run_options,
@@ -422,7 +427,8 @@ mod tests {
             repo,
             Arc::new(Emitter::new(fixtures::RUN_1)),
             Arc::new(options),
-        );
+        )
+        .await;
         let graph = workflow_graph();
         let node = graph.get_node("build").unwrap();
         let mut state = ExecutionState::new(&graph).unwrap();
@@ -492,7 +498,8 @@ mod tests {
             repo,
             Arc::new(Emitter::new(fixtures::RUN_1)),
             Arc::new(options),
-        );
+        )
+        .await;
         let graph = workflow_graph();
         let node = graph.get_node("build").unwrap();
         let mut state = ExecutionState::new(&graph).unwrap();

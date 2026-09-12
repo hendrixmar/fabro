@@ -38,7 +38,7 @@ function deriveTitle(text: string): string {
 function userMessage(text: string): ChatMessage {
   return {
     role: "user",
-    content: [{ kind: "text", data: { text } }],
+    content: [{ type: "text", text }],
   };
 }
 

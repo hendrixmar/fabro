@@ -2,8 +2,8 @@
 //!
 //! `POST /api/v1/completions` forwards every `StreamEvent` to the browser as a
 //! `stream_event` SSE frame. Serialization failures and stream errors are
-//! shaped into the same `{"type": "error", ...}` frame vocabulary, the stream
-//! ends when the LLM stream ends or the server shuts down, and a `ping`
+//! shaped into a `{"type": "error", "error": <lithos ErrorData>}` frame, the
+//! stream ends when the LLM stream ends or the server shuts down, and a `ping`
 //! keep-alive frame goes out every 15 seconds.
 
 use std::convert::Infallible;
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use fabro_llm::types::StreamEvent;
+use fabro_llm::StreamEvent;
 use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -29,8 +29,10 @@ pub(super) fn stream_response(
             Err(e) => Ok(Event::default().event("stream_event").data(
                 json!({
                     "type": "error",
-                    "error": {"Stream": {"message": format!("failed to serialize event: {e}")}},
-                    "raw": null
+                    "error": {
+                        "kind": "stream_decode",
+                        "message": format!("failed to serialize event: {e}"),
+                    },
                 })
                 .to_string(),
             )),
@@ -40,8 +42,7 @@ pub(super) fn stream_response(
             Ok(Event::default().event("stream_event").data(
                 json!({
                     "type": "error",
-                    "error": {"Stream": {"message": e.to_string()}},
-                    "raw": null
+                    "error": e.data(),
                 })
                 .to_string(),
             ))
@@ -76,24 +77,25 @@ mod tests {
     #[tokio::test]
     async fn forwards_events_as_stream_event_frames() {
         let stream = futures_util::stream::iter(vec![
-            Ok(StreamEvent::StreamStart),
+            Ok(StreamEvent::Started { id: None }),
             Ok(StreamEvent::TextDelta {
-                delta:   "hi".to_string(),
-                text_id: None,
+                id:   fabro_llm::types::ContentBlockId::new("0"),
+                text: "hi".to_string(),
             }),
         ]);
         let body = body_text(stream_response(stream, CancellationToken::new())).await;
 
         assert!(body.contains("event: stream_event"), "body: {body}");
-        assert!(body.contains(r#""type":"stream_start""#), "body: {body}");
-        assert!(body.contains(r#""delta":"hi""#), "body: {body}");
+        assert!(body.contains(r#""type":"started""#), "body: {body}");
+        assert!(body.contains(r#""text":"hi""#), "body: {body}");
     }
 
     #[tokio::test]
     async fn shapes_stream_errors_into_error_frames() {
-        let stream = futures_util::stream::iter(vec![Err(fabro_llm::Error::Interrupt {
-            message: "boom".to_string(),
-        })]);
+        let stream = futures_util::stream::iter(vec![Err(fabro_llm::Error::new(
+            fabro_llm::ErrorKind::Cancelled,
+            "boom",
+        ))]);
         let body = body_text(stream_response(stream, CancellationToken::new())).await;
 
         assert!(body.contains("event: stream_event"), "body: {body}");

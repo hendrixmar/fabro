@@ -3,12 +3,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use fabro_agent::{
-    AgentQuestion, AgentQuestionAnswer, AgentQuestionAnswerStatus, AgentQuestionRuntime,
-};
 use fabro_interview::{Answer, AnswerSubmission, AnswerValue, Interviewer, Question};
-use fabro_types::{BlockedReason, InterviewOption, Principal, StageId, SystemActorKind};
+use fabro_types::{
+    BlockedReason, InterviewOption, Principal, QuestionType, StageId, SystemActorKind,
+};
 use futures::future;
+use pebble_coding_agent::extensions::{
+    Answer as AgentAnswer, AnswerStatus, HumanInputError, HumanInputProvider,
+    Question as AgentQuestion, QuestionKind,
+};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -148,7 +151,10 @@ impl Drop for RunInterviewGuard {
     }
 }
 
-pub(crate) struct WorkflowAgentQuestionRuntime {
+/// Pebble's human-input provider for a workflow stage: the `ask_user`
+/// tool's questions go to the run's interviewer and are recorded as
+/// interview events, blocking the run's timeout budgets while they wait.
+pub(crate) struct WorkflowHumanInput {
     interviewer: Arc<dyn Interviewer>,
     emitter:     Arc<Emitter>,
     stage_scope: StageScope,
@@ -159,7 +165,7 @@ pub(crate) struct WorkflowAgentQuestionRuntime {
     blocker:     Arc<RunInterviewBlocker>,
 }
 
-impl WorkflowAgentQuestionRuntime {
+impl WorkflowHumanInput {
     #[must_use]
     pub(crate) fn new(
         interviewer: Arc<dyn Interviewer>,
@@ -254,13 +260,13 @@ impl Drop for PendingAgentQuestionBatch {
 }
 
 #[async_trait]
-impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
+impl HumanInputProvider for WorkflowHumanInput {
     async fn ask_questions(
         &self,
         tool_call_id: &str,
         questions: Vec<AgentQuestion>,
         cancel_token: CancellationToken,
-    ) -> Result<Vec<AgentQuestionAnswer>, String> {
+    ) -> Result<Vec<AgentAnswer>, HumanInputError> {
         if questions.is_empty() {
             return Ok(Vec::new());
         }
@@ -335,15 +341,10 @@ impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
                         "interrupted",
                         millis_u64(interview_start.elapsed()),
                     );
-                    AgentQuestionAnswer {
-                        original_id:       prepared_question.agent_question.original_id.clone(),
-                        original_question: prepared_question
-                            .agent_question
-                            .original_question
-                            .clone(),
-                        answers:           Vec::new(),
-                        status:            AgentQuestionAnswerStatus::Interrupted,
-                    }
+                    AgentAnswer::unanswered(
+                        &prepared_question.agent_question,
+                        AnswerStatus::Interrupted,
+                    )
                 })
                 .collect::<Vec<_>>(),
         };
@@ -353,16 +354,30 @@ impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
     }
 }
 
-impl WorkflowAgentQuestionRuntime {
+impl WorkflowHumanInput {
     fn prepare_question(
         &self,
         tool_call_id: &str,
         index: usize,
         agent_question: AgentQuestion,
     ) -> PreparedQuestion {
-        let mut question = Question::new(agent_question.text.clone(), agent_question.question_type);
+        let question_type = match agent_question.kind {
+            QuestionKind::MultiSelect => QuestionType::MultiSelect,
+            // Pebble may add kinds; anything else is one choice from a list.
+            QuestionKind::MultipleChoice | _ => QuestionType::MultipleChoice,
+        };
+        let mut question = Question::new(agent_question.text.clone(), question_type);
         question.id = internal_question_id(&self.stage_scope, tool_call_id, index);
-        question.options.clone_from(&agent_question.options);
+        question.options = agent_question
+            .options
+            .iter()
+            .map(|option| InterviewOption {
+                key:         option.key.clone(),
+                label:       option.label.clone(),
+                description: option.description.clone(),
+                preview:     option.preview.clone(),
+            })
+            .collect();
         question.allow_freeform = agent_question.allow_freeform;
         question.stage.clone_from(&self.node_id);
         question.metadata.insert(
@@ -459,25 +474,34 @@ impl WorkflowAgentQuestionRuntime {
 fn answer_from_submission(
     agent_question: &AgentQuestion,
     submission: &AnswerSubmission,
-) -> AgentQuestionAnswer {
+) -> AgentAnswer {
     let status = match &submission.answer.value {
-        AnswerValue::Cancelled => AgentQuestionAnswerStatus::Cancelled,
-        AnswerValue::Interrupted => AgentQuestionAnswerStatus::Interrupted,
-        AnswerValue::Skipped => AgentQuestionAnswerStatus::Skipped,
-        AnswerValue::Timeout => AgentQuestionAnswerStatus::Timeout,
-        _ => AgentQuestionAnswerStatus::Answered,
+        AnswerValue::Cancelled => Some(AnswerStatus::Cancelled),
+        AnswerValue::Interrupted => Some(AnswerStatus::Interrupted),
+        AnswerValue::Skipped => Some(AnswerStatus::Skipped),
+        AnswerValue::Timeout => Some(AnswerStatus::Timeout),
+        _ => None,
     };
-    let answers = if status == AgentQuestionAnswerStatus::Answered {
-        answer_labels(&agent_question.options, &submission.answer)
-    } else {
-        Vec::new()
-    };
-    AgentQuestionAnswer {
-        original_id: agent_question.original_id.clone(),
-        original_question: agent_question.original_question.clone(),
-        answers,
-        status,
+    match status {
+        Some(status) => AgentAnswer::unanswered(agent_question, status),
+        None => AgentAnswer::answered(
+            agent_question,
+            answer_labels(&interview_options(agent_question), &submission.answer),
+        ),
     }
+}
+
+fn interview_options(agent_question: &AgentQuestion) -> Vec<InterviewOption> {
+    agent_question
+        .options
+        .iter()
+        .map(|option| InterviewOption {
+            key:         option.key.clone(),
+            label:       option.label.clone(),
+            description: option.description.clone(),
+            preview:     option.preview.clone(),
+        })
+        .collect()
 }
 
 fn answer_labels(options: &[InterviewOption], answer: &Answer) -> Vec<String> {
@@ -538,6 +562,7 @@ fn slug(value: &str) -> String {
 mod tests {
     use fabro_interview::ControlInterviewer;
     use fabro_types::{EventBody, RunId};
+    use pebble_coding_agent::extensions::QuestionOption;
 
     use super::*;
 
@@ -597,14 +622,14 @@ mod tests {
         let stage_id = stage_scope.stage_id();
         let blocker = Arc::new(RunInterviewBlocker::new());
         let block_state = blocker.subscribe();
-        let runtime = WorkflowAgentQuestionRuntime::new(
+        let runtime = WorkflowHumanInput::new(
             interviewer.clone(),
             Arc::clone(&emitter),
             stage_scope,
             "ask",
             blocker,
         );
-        let option = InterviewOption {
+        let option = QuestionOption {
             key:         "ship".to_string(),
             label:       "Ship it".to_string(),
             description: Some("Deploy".to_string()),
@@ -621,7 +646,7 @@ mod tests {
                             original_question: "First?".to_string(),
                             header:            None,
                             text:              "First?".to_string(),
-                            question_type:     fabro_types::QuestionType::MultipleChoice,
+                            kind:              QuestionKind::MultipleChoice,
                             options:           vec![option.clone()],
                             allow_freeform:    true,
                         },
@@ -630,7 +655,7 @@ mod tests {
                             original_question: "Second?".to_string(),
                             header:            None,
                             text:              "Second?".to_string(),
-                            question_type:     fabro_types::QuestionType::MultipleChoice,
+                            kind:              QuestionKind::MultipleChoice,
                             options:           vec![option.clone()],
                             allow_freeform:    true,
                         },
@@ -705,7 +730,7 @@ mod tests {
         let stage_id = stage_scope.stage_id();
         let blocker = Arc::new(RunInterviewBlocker::new());
         let block_state = blocker.subscribe();
-        let runtime = WorkflowAgentQuestionRuntime::new(
+        let runtime = WorkflowHumanInput::new(
             interviewer,
             emitter,
             stage_scope,
@@ -723,7 +748,7 @@ mod tests {
                         original_question: "Continue?".to_string(),
                         header:            None,
                         text:              "Continue?".to_string(),
-                        question_type:     fabro_types::QuestionType::Freeform,
+                        kind:              QuestionKind::MultipleChoice,
                         options:           Vec::new(),
                         allow_freeform:    true,
                     }],
@@ -740,7 +765,7 @@ mod tests {
         cancel_token.cancel();
         let answers = ask.await.unwrap();
 
-        assert_eq!(answers[0].status, AgentQuestionAnswerStatus::Interrupted);
+        assert_eq!(answers[0].status, AnswerStatus::Interrupted);
         assert!(!block_state.borrow().is_run_blocked());
         assert!(!block_state.borrow().is_stage_blocked(&stage_id));
     }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{RunSandboxFailure, SandboxProviderKind};
+use super::ExecOutputTail;
+use crate::{GitIdentity, RunSandboxFailure, SandboxProviderKind};
 
 #[derive(
     Debug,
@@ -27,6 +28,7 @@ pub enum RunNoticeCode {
     CheckpointMetadataWriteFailed,
     DirtyWorktree,
     GitDiffFailed,
+    GitIdentityFallback,
     GitPushFailed,
     GithubTokenFailed,
     GithubTokenRefreshLimited,
@@ -89,65 +91,6 @@ pub enum MetadataSnapshotFailureKind {
     Push,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecOutputTail {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stdout:           Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stderr:           Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub stdout_truncated: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub stderr_truncated: bool,
-}
-
-#[allow(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde skip_serializing_if predicates receive fields by reference"
-)]
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-impl ExecOutputTail {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.stdout.as_deref().unwrap_or("").is_empty()
-            && self.stderr.as_deref().unwrap_or("").is_empty()
-    }
-
-    #[must_use]
-    pub fn stdout_len(&self) -> usize {
-        self.stdout.as_deref().map_or(0, str::len)
-    }
-
-    #[must_use]
-    pub fn stderr_len(&self) -> usize {
-        self.stderr.as_deref().map_or(0, str::len)
-    }
-
-    #[must_use]
-    pub fn trace_summary(tail: Option<&Self>) -> ExecOutputTailTrace {
-        ExecOutputTailTrace {
-            present:          tail.is_some(),
-            stdout_bytes:     tail.map_or(0, Self::stdout_len),
-            stderr_bytes:     tail.map_or(0, Self::stderr_len),
-            stdout_truncated: tail.is_some_and(|t| t.stdout_truncated),
-            stderr_truncated: tail.is_some_and(|t| t.stderr_truncated),
-        }
-    }
-}
-
-/// Flat view of an `ExecOutputTail` for tracing field expansion.
-#[derive(Debug, Clone, Copy)]
-pub struct ExecOutputTailTrace {
-    pub present:          bool,
-    pub stdout_bytes:     usize,
-    pub stderr_bytes:     usize,
-    pub stdout_truncated: bool,
-    pub stderr_truncated: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetadataSnapshotStartedProps {
     pub phase:  MetadataSnapshotPhase,
@@ -195,130 +138,10 @@ pub struct SandboxReadyProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name:        Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu:         Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory:      Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url:         Option<String>,
 }
 
 pub type SandboxFailedProps = RunSandboxFailure;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxCleanupStartedProps {
-    pub provider: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxCleanupCompletedProps {
-    pub provider:    String,
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxCleanupFailedProps {
-    pub provider: String,
-    pub error:    String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causes:   Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxStartStartedProps {
-    pub provider: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxStartCompletedProps {
-    pub provider:    String,
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxStartFailedProps {
-    pub provider: String,
-    pub error:    String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causes:   Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxStopStartedProps {
-    pub provider: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxStopCompletedProps {
-    pub provider:    String,
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxStopFailedProps {
-    pub provider: String,
-    pub error:    String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causes:   Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxDeleteStartedProps {
-    pub provider: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxDeleteCompletedProps {
-    pub provider:    String,
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxDeleteFailedProps {
-    pub provider: String,
-    pub error:    String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causes:   Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotNameProps {
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotCompletedProps {
-    pub name:        String,
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotFailedProps {
-    pub name:   String,
-    pub error:  String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causes: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GitCloneStartedProps {
-    pub url:    String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GitCloneCompletedProps {
-    pub url:         String,
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GitCloneFailedProps {
-    pub url:    String,
-    pub error:  String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causes: Vec<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxInitializedProps {
@@ -367,6 +190,14 @@ pub struct SetupCommandCompletedProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetupCompletedProps {
     pub duration_ms: u64,
+}
+
+/// The Git author/committer identity the run resolved for every commit it
+/// creates, with the credential it was derived from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitIdentityResolvedProps {
+    #[serde(flatten)]
+    pub identity: GitIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

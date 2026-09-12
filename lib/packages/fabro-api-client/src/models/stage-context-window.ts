@@ -15,19 +15,19 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { StageContextWindowBreakdownItem } from './stage-context-window-breakdown-item';
+import type { ContextWindowBreakdownItem } from './context-window-breakdown-item';
 // May contain unused imports in some cases
 // @ts-ignore
-import type { StageContextWindowCountMethod } from './stage-context-window-count-method';
+import type { ContextWindowCountMethod } from './context-window-count-method';
 // May contain unused imports in some cases
 // @ts-ignore
-import type { StageContextWindowStaleness } from './stage-context-window-staleness';
+import type { ContextWindowStaleness } from './context-window-staleness';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ContextWindowWarning } from './context-window-warning';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { StageContextWindowUnavailableReason } from './stage-context-window-unavailable-reason';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { StageContextWindowWarning } from './stage-context-window-warning';
 
 /**
  * Best-effort context-window usage for one agent stage.
@@ -47,10 +47,10 @@ export interface StageContextWindow {
     'context_window_tokens': number | null;
     'input_tokens': number | null;
     'usage_percent': number | null;
-    'count_method': StageContextWindowCountMethod | null;
-    'staleness': StageContextWindowStaleness;
+    'count_method': ContextWindowCountMethod | null;
+    'staleness': ContextWindowStaleness;
     'generated_at': string | null;
     'event_seq': number | null;
-    'breakdown': Array<StageContextWindowBreakdownItem>;
-    'warnings': Array<StageContextWindowWarning>;
+    'breakdown': Array<ContextWindowBreakdownItem>;
+    'warnings': Array<ContextWindowWarning>;
 }

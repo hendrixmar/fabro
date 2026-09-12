@@ -1,7 +1,7 @@
 pub mod rules;
 
 use fabro_graphviz::graph::Graph;
-use fabro_model::Catalog;
+use fabro_llm::lithos_catalog::Catalog;
 use serde::{Deserialize, Serialize};
 
 /// Severity level for validation diagnostics.
@@ -153,8 +153,8 @@ pub fn validate_with_catalog_or_raise(
 mod tests {
     use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
     use fabro_graphviz::parser;
-    use fabro_model::catalog::LlmCatalogSettings;
-    use fabro_model::{Catalog, ProviderId};
+    use fabro_llm::lithos_catalog::Catalog;
+    use fabro_llm::test_support::test_catalog_with_overlay;
 
     use super::*;
 
@@ -208,35 +208,29 @@ mod tests {
         g
     }
 
+    /// An operator-defined provider layered over the built-ins, the shape an
+    /// `[llm]` overlay produces.
     fn custom_catalog() -> Catalog {
-        let settings: LlmCatalogSettings = toml::from_str(
+        test_catalog_with_overlay(
             r#"
-[providers.venice]
-display_name = "Venice"
-adapter = "openai_compatible"
-agent_profile = "openai"
+[providers.acme-venice]
+display_name = "Acme Venice"
+adapter = "openai-compatible"
+codec = "openai-chat"
 base_url = "https://api.venice.ai/api/v1"
+auth = { type = "bearer" }
+default_model = "venice-large"
 
-[providers.venice.auth]
-credentials = ["env:VENICE_API_KEY"]
+[providers.acme-venice.metadata.agent]
+profile = "openai"
 
-[models."venice-large"]
-provider = "venice"
+[providers.acme-venice.models.venice-large]
 display_name = "Venice Large"
-family = "venice"
-default = true
-
-[models."venice-large".limits]
-context_window = 128000
-
-[models."venice-large".features]
-tools = true
-vision = false
-reasoning = false
+api_model = "venice-large"
+limits = { context_tokens = 128000, max_output_tokens = 8192 }
+capabilities = { text = true, tools = true }
 "#,
         )
-        .unwrap();
-        Catalog::from_settings(&settings).unwrap()
     }
 
     #[test]
@@ -377,7 +371,7 @@ reasoning = false
 
     #[test]
     fn validate_with_catalog_accepts_custom_catalog_entries() {
-        let g = graph_with_model_and_provider("venice-large", "venice");
+        let g = graph_with_model_and_provider("venice-large", "acme-venice");
         let catalog = custom_catalog();
 
         let diagnostics = validate_with_catalog(&g, &catalog, &[]);
@@ -406,7 +400,7 @@ reasoning = false
         assert!(
             diagnostics.iter().any(|d| d.rule == "node_model_known"
                 && d.message.contains("missing-provider")
-                && d.message.contains(ProviderId::new("venice").as_str())),
+                && d.message.contains("acme-venice")),
             "missing provider diagnostic not found: {diagnostics:?}"
         );
     }

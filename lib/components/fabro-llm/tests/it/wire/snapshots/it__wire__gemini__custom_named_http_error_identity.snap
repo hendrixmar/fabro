@@ -1,9 +1,0 @@
----
-source: lib/components/fabro-llm/tests/it/wire/gemini.rs
-expression: rendered
----
-{
-  "error": "Server error from gemini-proxy: backend exploded",
-  "retryable": true,
-  "failover_eligible": true
-}

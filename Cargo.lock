@@ -235,9 +235,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arc-swap"
@@ -658,17 +658,6 @@ dependencies = [
  "futures-util",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "aws-smithy-eventstream"
-version = "0.60.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78d8391e65fcea47c586a22e1a41f173b38615b112b2c6b7a44e80cec3e6b706"
-dependencies = [
- "aws-smithy-types",
- "bytes",
- "crc32fast",
 ]
 
 [[package]]
@@ -1870,9 +1859,9 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 [[package]]
 name = "daytona-api-client"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=be2c7b7272740d47c023cac8abc9f63c1a51a511#be2c7b7272740d47c023cac8abc9f63c1a51a511"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=5e86990418e21f4288ce537c9852dfdf78768abc#5e86990418e21f4288ce537c9852dfdf78768abc"
 dependencies = [
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "reqwest-middleware",
  "serde",
  "serde_json",
@@ -1884,12 +1873,12 @@ dependencies = [
 [[package]]
 name = "daytona-sdk"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=be2c7b7272740d47c023cac8abc9f63c1a51a511#be2c7b7272740d47c023cac8abc9f63c1a51a511"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=5e86990418e21f4288ce537c9852dfdf78768abc#5e86990418e21f4288ce537c9852dfdf78768abc"
 dependencies = [
  "daytona-api-client",
  "daytona-toolbox-client",
  "futures-util",
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "reqwest-middleware",
  "rustls",
  "serde",
@@ -1904,9 +1893,9 @@ dependencies = [
 [[package]]
 name = "daytona-toolbox-client"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=be2c7b7272740d47c023cac8abc9f63c1a51a511#be2c7b7272740d47c023cac8abc9f63c1a51a511"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=5e86990418e21f4288ce537c9852dfdf78768abc#5e86990418e21f4288ce537c9852dfdf78768abc"
 dependencies = [
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "reqwest-middleware",
  "serde",
  "serde_json",
@@ -2257,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-acp"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-tokio",
@@ -2265,6 +2254,7 @@ dependencies = [
  "fabro-types",
  "fabro-util",
  "futures",
+ "pebble-coding-agent",
  "serde_json",
  "shlex",
  "tempfile",
@@ -2272,71 +2262,25 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "fabro-agent"
-version = "0.347.0-nightly.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "clap",
- "dirs",
- "fabro-auth",
- "fabro-config",
- "fabro-http",
- "fabro-llm",
- "fabro-macros",
- "fabro-mcp",
- "fabro-model",
- "fabro-sandbox",
- "fabro-static",
- "fabro-template",
- "fabro-test",
- "fabro-types",
- "fabro-util",
- "fabro-vault",
- "futures",
- "glob",
- "htmd",
- "httpmock",
- "insta",
- "jsonschema",
- "libc",
- "paste",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "shell-escape",
- "shlex",
- "strum 0.28.0",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
 name = "fabro-api"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "chrono",
  "fabro-automation",
  "fabro-config",
  "fabro-environment",
- "fabro-model",
  "fabro-types",
+ "lithos-llm",
  "openapiv3",
  "prettyplease",
  "progenitor",
  "progenitor-client",
  "regress",
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
+ "sandbox-driver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2346,20 +2290,20 @@ dependencies = [
 
 [[package]]
 name = "fabro-auth"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64",
  "chrono",
  "fabro-http",
- "fabro-model",
  "fabro-oauth",
  "fabro-redact",
  "fabro-static",
  "fabro-types",
  "fabro-vault",
  "httpmock",
+ "lithos-llm",
  "serde",
  "serde_json",
  "tempfile",
@@ -2371,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-automation"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2392,11 +2336,11 @@ dependencies = [
 
 [[package]]
 name = "fabro-build-support"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 
 [[package]]
 name = "fabro-checkpoint"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "fabro-config",
  "fabro-types",
@@ -2404,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-cli"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2418,12 +2362,10 @@ dependencies = [
  "cli-table",
  "console 0.15.11",
  "core-foundation 0.9.4",
- "daytona-sdk",
  "dialoguer",
  "dirs",
  "dotenvy",
  "fabro-acp",
- "fabro-agent",
  "fabro-api",
  "fabro-auth",
  "fabro-build-support",
@@ -2443,7 +2385,6 @@ dependencies = [
  "fabro-manifest",
  "fabro-mcp",
  "fabro-mcp-server",
- "fabro-model",
  "fabro-oauth",
  "fabro-proc",
  "fabro-redact",
@@ -2469,18 +2410,23 @@ dependencies = [
  "insta",
  "jsonwebtoken",
  "libc",
+ "lithos-llm",
  "miette",
  "nix 0.30.1",
  "object_store",
  "openssl",
  "paste",
+ "pebble-agent",
+ "pebble-cli-core",
+ "pebble-coding-agent",
  "predicates",
  "progenitor-client",
  "rand 0.9.4",
  "regex",
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "ring",
  "rustls",
+ "sandbox-driver",
  "scopeguard",
  "semver",
  "serde",
@@ -2506,14 +2452,13 @@ dependencies = [
 
 [[package]]
 name = "fabro-client"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "bytes",
  "chrono",
  "fabro-api",
  "fabro-http",
- "fabro-model",
  "fabro-static",
  "fabro-types",
  "fabro-util",
@@ -2521,6 +2466,7 @@ dependencies = [
  "futures",
  "httpmock",
  "libc",
+ "lithos-llm",
  "progenitor-client",
  "rand 0.9.4",
  "serde",
@@ -2535,14 +2481,13 @@ dependencies = [
 
 [[package]]
 name = "fabro-config"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
  "dirs",
  "fabro-macros",
- "fabro-model",
  "fabro-options-metadata",
  "fabro-proc",
  "fabro-static",
@@ -2565,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-core"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "async-trait",
  "fabro-types",
@@ -2581,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-db"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2594,7 +2539,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-dev"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2613,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-dump"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2627,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-environment"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2649,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-github"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2674,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-graphviz"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "fabro-types",
@@ -2689,18 +2634,20 @@ dependencies = [
 
 [[package]]
 name = "fabro-hooks"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "async-trait",
- "fabro-agent",
  "fabro-auth",
  "fabro-http",
  "fabro-llm",
- "fabro-model",
  "fabro-redact",
+ "fabro-sandbox",
  "fabro-types",
  "fabro-util",
  "httpmock",
+ "lithos-llm",
+ "pebble-agent",
+ "pebble-coding-agent",
  "regex",
  "serde",
  "serde_json",
@@ -2712,17 +2659,17 @@ dependencies = [
 
 [[package]]
 name = "fabro-http"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "fabro-static",
  "http 1.4.0",
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "fabro-install"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2741,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-interview"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "async-trait",
  "dialoguer",
@@ -2756,49 +2703,36 @@ dependencies = [
 
 [[package]]
 name = "fabro-llm"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sigv4",
- "aws-smithy-eventstream",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "base64",
  "bytes",
  "fabro-auth",
+ "fabro-config",
  "fabro-http",
+ "fabro-llm",
  "fabro-macros",
- "fabro-model",
  "fabro-redact",
  "fabro-static",
  "fabro-test",
  "fabro-types",
- "fabro-util",
  "futures",
- "http 1.4.0",
  "httpmock",
- "insta",
- "rand 0.9.4",
+ "lithos-llm",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "strum 0.28.0",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "toml 0.8.23",
  "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
 name = "fabro-macros"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "clap",
  "fabro-options-metadata",
@@ -2809,15 +2743,17 @@ dependencies = [
 
 [[package]]
 name = "fabro-manifest"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "fabro-api",
  "fabro-config",
  "fabro-github",
  "fabro-graphviz",
  "fabro-template",
  "fabro-test",
+ "fabro-tool",
  "fabro-types",
  "fabro-util",
  "fabro-workflow",
@@ -2828,32 +2764,28 @@ dependencies = [
  "temp-env",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "fabro-mcp"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
- "axum",
- "fabro-config",
- "fabro-http",
  "fabro-types",
- "futures",
+ "pebble-coding-agent",
  "rmcp",
- "serde",
  "serde_json",
- "sse-stream",
- "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 
 [[package]]
 name = "fabro-mcp-server"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2861,7 +2793,6 @@ dependencies = [
  "fabro-client",
  "fabro-config",
  "fabro-manifest",
- "fabro-model",
  "fabro-server",
  "fabro-tool",
  "fabro-types",
@@ -2881,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-mcp-store"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "chrono",
  "fabro-db",
@@ -2898,25 +2829,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "fabro-model"
-version = "0.347.0-nightly.0"
-dependencies = [
- "clap",
- "fabro-static",
- "http 1.4.0",
- "insta",
- "rust-embed",
- "serde",
- "serde_json",
- "strum 0.28.0",
- "thiserror 2.0.18",
- "toml 0.8.23",
- "tracing",
-]
-
-[[package]]
 name = "fabro-oauth"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2938,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-options-metadata"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2946,16 +2860,20 @@ dependencies = [
 
 [[package]]
 name = "fabro-proc"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "cc",
  "libc",
  "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
 name = "fabro-redact"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "aho-corasick",
  "ref-cast",
@@ -2971,18 +2889,13 @@ dependencies = [
 
 [[package]]
 name = "fabro-sandbox"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64",
- "bollard",
  "chrono",
- "daytona-api-client",
- "daytona-sdk",
- "fabro-config",
  "fabro-github",
- "fabro-http",
  "fabro-proc",
  "fabro-redact",
  "fabro-static",
@@ -2990,23 +2903,22 @@ dependencies = [
  "fabro-types",
  "fabro-util",
  "futures",
- "futures-util",
- "git2",
- "hex",
- "hmac 0.12.1",
- "httpmock",
- "rand 0.9.4",
- "reqwest-middleware",
- "rustls",
+ "pebble-coding-agent",
+ "reqwest 0.13.4",
+ "sandbox-driver",
+ "sandbox-driver-daytona",
+ "sandbox-driver-daytona-config",
+ "sandbox-driver-docker",
+ "sandbox-driver-docker-config",
+ "sandbox-driver-host",
+ "sandbox-driver-protocol",
+ "sandbox-driver-testing",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "strum 0.28.0",
- "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-tungstenite 0.26.2",
  "tokio-util",
  "toml 0.8.23",
  "tracing",
@@ -3015,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-server"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3029,7 +2941,6 @@ dependencies = [
  "cookie",
  "croner",
  "dirs",
- "fabro-agent",
  "fabro-api",
  "fabro-auth",
  "fabro-automation",
@@ -3048,7 +2959,6 @@ dependencies = [
  "fabro-macros",
  "fabro-manifest",
  "fabro-mcp-store",
- "fabro-model",
  "fabro-proc",
  "fabro-redact",
  "fabro-sandbox",
@@ -3075,13 +2985,17 @@ dependencies = [
  "http-body-util",
  "httpmock",
  "jsonwebtoken",
+ "lithos-llm",
  "mime_guess",
  "multer",
  "object_store",
+ "pebble-agent",
+ "pebble-coding-agent",
  "percent-encoding",
  "rand 0.9.4",
  "regex",
  "reqwest 0.12.28",
+ "sandbox-driver",
  "semver",
  "serde",
  "serde_json",
@@ -3111,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-slack"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "fabro-http",
  "fabro-interview",
@@ -3133,18 +3047,18 @@ dependencies = [
 
 [[package]]
 name = "fabro-spa"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "rust-embed",
 ]
 
 [[package]]
 name = "fabro-static"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 
 [[package]]
 name = "fabro-store"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3156,7 +3070,9 @@ dependencies = [
  "futures",
  "hex",
  "insta",
+ "lithos-llm",
  "object_store",
+ "pebble-coding-agent",
  "percent-encoding",
  "serde",
  "serde_json",
@@ -3175,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-telemetry"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3201,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-template"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "fabro-types",
@@ -3215,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-test"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3240,7 +3156,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-tool"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3249,7 +3165,10 @@ dependencies = [
  "fabro-client",
  "fabro-types",
  "fabro-util",
+ "fabro-workflow-version",
  "futures",
+ "httpmock",
+ "jsonschema",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -3261,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-tracker"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3275,15 +3194,17 @@ dependencies = [
 
 [[package]]
 name = "fabro-types"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "chrono",
  "clap",
  "dirs",
- "fabro-model",
  "fabro-types",
  "fabro-util",
  "hex",
+ "lithos-llm",
+ "pebble-coding-agent",
+ "sandbox-driver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3293,12 +3214,14 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.8.23",
  "ulid",
+ "unicase",
+ "unicode-normalization",
  "url",
 ]
 
 [[package]]
 name = "fabro-util"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "console 0.15.11",
@@ -3321,11 +3244,11 @@ dependencies = [
 
 [[package]]
 name = "fabro-validate"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "fabro-acp",
  "fabro-graphviz",
- "fabro-model",
+ "fabro-llm",
  "fabro-types",
  "serde",
  "thiserror 2.0.18",
@@ -3334,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-variable"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3351,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-vault"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3370,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-workflow"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3380,10 +3303,10 @@ dependencies = [
  "chrono",
  "dirs",
  "fabro-acp",
- "fabro-agent",
  "fabro-api",
  "fabro-auth",
  "fabro-checkpoint",
+ "fabro-client",
  "fabro-config",
  "fabro-core",
  "fabro-dump",
@@ -3396,7 +3319,6 @@ dependencies = [
  "fabro-llm",
  "fabro-macros",
  "fabro-mcp",
- "fabro-model",
  "fabro-redact",
  "fabro-sandbox",
  "fabro-static",
@@ -3409,18 +3331,23 @@ dependencies = [
  "fabro-validate",
  "fabro-vault",
  "fabro-workflow",
+ "fabro-workflow-version",
  "futures",
  "git2",
  "hex",
  "httpmock",
  "jsonschema",
+ "lithos-llm",
  "md5",
  "miette",
  "mime_guess",
  "object_store",
+ "pebble-agent",
+ "pebble-coding-agent",
  "predicates",
  "rand 0.9.4",
  "regex",
+ "sandbox-driver",
  "scopeguard",
  "serde",
  "serde_json",
@@ -3440,7 +3367,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-workflow-version"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "fabro-config",
  "fabro-graphviz",
@@ -3776,16 +3703,6 @@ name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
-
-[[package]]
-name = "futf"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df420e2e84819663797d1ec6544b13c5be84629e7bb00dc960d6917db2987843"
-dependencies = [
- "mac",
- "new_debug_unreachable",
-]
 
 [[package]]
 name = "futures"
@@ -4200,28 +4117,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "htmd"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60ae59466542f2346e43d4a5e9b4432a1fc915b279c9fc0484e9ed7379121454"
-dependencies = [
- "html5ever",
- "markup5ever_rcdom",
- "phf 0.13.1",
-]
-
-[[package]]
-name = "html5ever"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55d958c2f74b664487a2035fe1dadb032c48718a03b63f3ab0b8537db8549ed4"
-dependencies = [
- "log",
- "markup5ever",
- "match_token",
-]
-
-[[package]]
 name = "http"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4461,7 +4356,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4989,6 +4884,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
+name = "lithos-llm"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/lithos-llm?rev=a1e3fd37b7153870411701327ac117606753fe90#a1e3fd37b7153870411701327ac117606753fe90"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "base64",
+ "crc32fast",
+ "futures-core",
+ "futures-util",
+ "mime_guess",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5033,12 +4954,6 @@ dependencies = [
  "cc",
  "libc",
 ]
-
-[[package]]
-name = "mac"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "mac_address"
@@ -5103,40 +5018,6 @@ dependencies = [
  "madsim",
  "spin",
  "tokio",
-]
-
-[[package]]
-name = "markup5ever"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "311fe69c934650f8f19652b3946075f0fc41ad8757dbb68f1ca14e7900ecc1c3"
-dependencies = [
- "log",
- "tendril",
- "web_atoms",
-]
-
-[[package]]
-name = "markup5ever_rcdom"
-version = "0.35.0+unofficial"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8bcd53df4748257345b8bc156d620340ce0f015ec1c7ef1cff475543888a31d"
-dependencies = [
- "html5ever",
- "markup5ever",
- "tendril",
- "xml5ever",
-]
-
-[[package]]
-name = "match_token"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac84fd3f360fcc43dc5f5d186f02a94192761a080e8bc58621ad4d12296a58cf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -5352,12 +5233,6 @@ dependencies = [
  "security-framework-sys",
  "tempfile",
 ]
-
-[[package]]
-name = "new_debug_unreachable"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nix"
@@ -5990,6 +5865,77 @@ dependencies = [
 ]
 
 [[package]]
+name = "pebble-agent"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/pebble?rev=4c0063327394cd0f1e9fee2c24541b829b93a8f7#4c0063327394cd0f1e9fee2c24541b829b93a8f7"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "lithos-llm",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "pebble-cli-core"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/pebble?rev=4c0063327394cd0f1e9fee2c24541b829b93a8f7#4c0063327394cd0f1e9fee2c24541b829b93a8f7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "clap",
+ "crossterm",
+ "fs2",
+ "futures-util",
+ "humantime",
+ "lithos-llm",
+ "pebble-agent",
+ "pebble-coding-agent",
+ "rustix",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "termimad",
+ "tokio",
+ "tokio-util",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+ "uuid",
+]
+
+[[package]]
+name = "pebble-coding-agent"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/pebble?rev=4c0063327394cd0f1e9fee2c24541b829b93a8f7#4c0063327394cd0f1e9fee2c24541b829b93a8f7"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "lithos-llm",
+ "pebble-agent",
+ "reqwest 0.13.4",
+ "rmcp",
+ "rustix",
+ "sandbox-driver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sse-stream",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6004,87 +5950,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "phf"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
-dependencies = [
- "phf_shared 0.11.3",
-]
-
-[[package]]
-name = "phf"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
-dependencies = [
- "phf_macros",
- "phf_shared 0.13.1",
- "serde",
-]
-
-[[package]]
-name = "phf_codegen"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
-dependencies = [
- "phf_generator 0.11.3",
- "phf_shared 0.11.3",
-]
-
-[[package]]
-name = "phf_generator"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
-dependencies = [
- "phf_shared 0.11.3",
- "rand 0.8.6",
-]
-
-[[package]]
-name = "phf_generator"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135ace3a761e564ec88c03a77317a7c6b80bb7f7135ef2544dbe054243b89737"
-dependencies = [
- "fastrand",
- "phf_shared 0.13.1",
-]
-
-[[package]]
-name = "phf_macros"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef"
-dependencies = [
- "phf_generator 0.13.1",
- "phf_shared 0.13.1",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
-dependencies = [
- "siphasher",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
-dependencies = [
- "siphasher",
-]
 
 [[package]]
 name = "pin-project"
@@ -6165,12 +6030,6 @@ checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
 ]
-
-[[package]]
-name = "precomputed-hash"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "predicates"
@@ -6290,7 +6149,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "percent-encoding",
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -6691,9 +6550,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.2"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab3f43e3283ab1488b624b44b0e988d0acea0b3214e694730a055cb6b2efa801"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
@@ -6749,7 +6608,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "http 1.4.0",
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "serde",
  "thiserror 2.0.18",
  "tower-service",
@@ -6789,7 +6648,7 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "process-wrap",
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "rmcp-macros",
  "schemars 1.2.1",
  "serde",
@@ -7000,6 +6859,135 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sandbox-driver"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
+dependencies = [
+ "async-trait",
+ "globset",
+ "humantime",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "sandbox-driver-daytona"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "daytona-api-client",
+ "daytona-sdk",
+ "hmac 0.12.1",
+ "rand 0.10.1",
+ "reqwest 0.13.4",
+ "sandbox-driver",
+ "sandbox-driver-daytona-config",
+ "sandbox-driver-docker",
+ "sandbox-driver-docker-config",
+ "sandbox-driver-protocol",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sandbox-driver-daytona-config"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
+dependencies = [
+ "sandbox-driver-docker-config",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sandbox-driver-docker"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bollard",
+ "futures-util",
+ "sandbox-driver",
+ "sandbox-driver-docker-config",
+ "sandbox-driver-protocol",
+ "serde",
+ "serde_json",
+ "tar",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sandbox-driver-docker-config"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sandbox-driver-host"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nix 0.30.1",
+ "sandbox-driver",
+ "sandbox-driver-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sandbox-driver-protocol"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
+dependencies = [
+ "async-trait",
+ "base64",
+ "rand 0.10.1",
+ "sandbox-driver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "sandbox-driver-testing"
+version = "0.1.0"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
+dependencies = [
+ "async-trait",
+ "sandbox-driver",
+ "tokio",
 ]
 
 [[package]]
@@ -7440,12 +7428,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shell-escape"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45bb67a18fa91266cc7807181f62f9178a6873bfad7dc788c42e6430db40184f"
-
-[[package]]
 name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7484,7 +7466,7 @@ version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
- "errno 0.2.8",
+ "errno 0.3.14",
  "libc",
 ]
 
@@ -7806,9 +7788,9 @@ dependencies = [
 
 [[package]]
 name = "sse-stream"
-version = "0.2.1"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb4dc4d33c68ec1f27d386b5610a351922656e1fdf5c05bbaad930cd1519479a"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
 dependencies = [
  "bytes",
  "futures-util",
@@ -7834,31 +7816,6 @@ name = "strict"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f42444fea5b87a39db4218d9422087e66a85d0e7a0963a439b07bcdf91804006"
-
-[[package]]
-name = "string_cache"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
-dependencies = [
- "new_debug_unreachable",
- "parking_lot",
- "phf_shared 0.11.3",
- "precomputed-hash",
- "serde",
-]
-
-[[package]]
-name = "string_cache_codegen"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c711928715f1fe0fe509c53b43e993a9a557babc2d0a3567d0a3006f1ac931a0"
-dependencies = [
- "phf_generator 0.11.3",
- "phf_shared 0.11.3",
- "proc-macro2",
- "quote",
-]
 
 [[package]]
 name = "stringmetrics"
@@ -8066,26 +8023,15 @@ dependencies = [
 
 [[package]]
 name = "tempfile"
-version = "3.26.0"
+version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "tendril"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d24a120c5fc464a3458240ee02c299ebcb9d67b5249c8848b09d639dca8d7bb0"
-dependencies = [
- "futf",
- "mac",
- "utf-8",
 ]
 
 [[package]]
@@ -8334,9 +8280,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.18"
+version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
@@ -8344,6 +8290,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "hashbrown 0.15.5",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
@@ -8537,9 +8484,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.3.22"
+version = "0.3.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
+checksum = "2054a14f5307d601f88daf0553e1cbf472acc4f2c51afab632431cdcd72124d5"
 dependencies = [
  "matchers",
  "nu-ansi-term",
@@ -8596,15 +8543,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "twin-core"
+version = "0.1.5"
+source = "git+https://github.com/lithoscomputer/twins?rev=ca45f0e50a6716d716aa2f638ca3cf767e88f613#ca45f0e50a6716d716aa2f638ca3cf767e88f613"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "twin-github"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 dependencies = [
  "axum",
  "base64",
  "chrono",
  "fabro-http",
  "jsonwebtoken",
- "reqwest 0.13.2",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tempfile",
@@ -8616,21 +8578,21 @@ dependencies = [
 
 [[package]]
 name = "twin-openai"
-version = "0.347.0-nightly.0"
+version = "0.1.5"
+source = "git+https://github.com/lithoscomputer/twins?rev=ca45f0e50a6716d716aa2f638ca3cf767e88f613#ca45f0e50a6716d716aa2f638ca3cf767e88f613"
 dependencies = [
  "anyhow",
  "async-stream",
  "axum",
- "fabro-http",
- "fabro-static",
  "futures-util",
  "http 1.4.0",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tokio",
- "tower",
  "tracing",
  "tracing-subscriber",
+ "twin-core",
 ]
 
 [[package]]
@@ -8881,13 +8843,13 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.21.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
+checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
 dependencies = [
- "getrandom 0.4.1",
+ "getrandom 0.3.4",
  "js-sys",
- "serde_core",
+ "serde",
  "wasm-bindgen",
 ]
 
@@ -9114,18 +9076,6 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "web_atoms"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57ffde1dc01240bdf9992e3205668b235e59421fd085e8a317ed98da0178d414"
-dependencies = [
- "phf 0.11.3",
- "phf_codegen",
- "string_cache",
- "string_cache_codegen",
 ]
 
 [[package]]
@@ -9770,16 +9720,6 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
-]
-
-[[package]]
-name = "xml5ever"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee3f1e41afb31a75aef076563b0ad3ecc24f5bd9d12a72b132222664eb76b494"
-dependencies = [
- "log",
- "markup5ever",
 ]
 
 [[package]]

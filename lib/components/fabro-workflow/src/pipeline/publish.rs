@@ -100,9 +100,6 @@ fn push_attempt_cause(attempt: &fabro_sandbox::PushAttempt) -> String {
     {
         let _ = write!(line, " (token age {age_ms}ms)");
     }
-    if let Some(refresh_error) = attempt.refresh_error {
-        let _ = write!(line, ", refresh error: {refresh_error}");
-    }
     line
 }
 
@@ -179,7 +176,7 @@ impl Concluded {
                 merge_strategy: pr_config.merge_strategy,
             }),
             run_store: &self.services.run_store,
-            llm_source: self.services.llm_source.as_ref(),
+            llm_source: Arc::clone(&self.services.llm_source),
             catalog: Arc::clone(&self.services.catalog),
             conclusion: Some(&self.conclusion),
             run_state: None,
@@ -232,8 +229,8 @@ impl Concluded {
     async fn push_final_commit(&self, run_branch: &str) -> Result<(), Error> {
         // The terminal push guards the whole run's value, so it gets a real
         // retry budget; attempts are nearly free at this point.
-        let plan = fabro_sandbox::RetryPlan::publish_push();
-        match push_run_branch(self.services.sandbox.as_ref(), run_branch, &plan).await {
+        let policy = fabro_sandbox::publish_push_policy();
+        match push_run_branch(self.services.sandbox.as_ref(), run_branch, &policy).await {
             Ok(report) => {
                 self.services.sandbox_git.record_successful_push();
                 self.services.emitter.emit(&Event::GitPush {
@@ -285,7 +282,6 @@ mod tests {
         attempt: u32,
         retry_reason: Option<fabro_sandbox::GitRetryReason>,
         token_age_ms: Option<u64>,
-        refresh_error: Option<fabro_sandbox::RefreshErrorKind>,
     ) -> fabro_sandbox::PushAttempt {
         let started_at = Utc::now();
         fabro_sandbox::PushAttempt {
@@ -302,8 +298,6 @@ mod tests {
                     expires_at: started_at + chrono::Duration::hours(1),
                 },
             }),
-            credential_action: Some(fabro_sandbox::RemoteCredentialAction::Unchanged),
-            refresh_error,
         }
     }
 
@@ -314,14 +308,12 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, reason)| fabro_sandbox::PushAttempt {
-                attempt:           u32::try_from(index).unwrap() + 1,
-                started_at:        Utc::now(),
-                success:           false,
-                retry_reason:      *reason,
-                exec_output_tail:  None,
-                token:             None,
-                credential_action: None,
-                refresh_error:     None,
+                attempt:          u32::try_from(index).unwrap() + 1,
+                started_at:       Utc::now(),
+                success:          false,
+                retry_reason:     *reason,
+                exec_output_tail: None,
+                token:            None,
             })
             .collect()
     }
@@ -362,13 +354,11 @@ mod tests {
                 1,
                 Some(fabro_sandbox::GitRetryReason::TokenReplication),
                 Some(180),
-                None,
             ),
             push_attempt(
                 2,
                 Some(fabro_sandbox::GitRetryReason::TokenReplication),
                 Some(3320),
-                Some(fabro_sandbox::RefreshErrorKind::SetUrl),
             ),
         ];
         let last_push = Utc::now() - chrono::Duration::seconds(67);
@@ -401,7 +391,7 @@ mod tests {
             "{attempt_lines:?}"
         );
         assert!(
-            attempt_lines[1].contains("refresh error: set_url"),
+            attempt_lines[1].contains("(token age 3320ms)"),
             "{attempt_lines:?}"
         );
         assert_eq!(

@@ -4,10 +4,16 @@ edition.workspace = true
 version.workspace = true
 publish = false
 license.workspace = true
-description = "Safe wrappers for process management primitives (signals, pre-exec hooks, title rewriting)"
+description = "Local subprocess ownership, capture, and OS process primitives"
 
 [lints]
 workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

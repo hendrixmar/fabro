@@ -1,110 +1,52 @@
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use fabro_types::{RunId, RunSandboxInstance};
+use sandbox_driver::{EventContext, PtySession, PtySize};
 
-#[allow(
-    unused_imports,
-    reason = "Feature-gated branches consume these imports when optional backends are enabled."
-)]
-use anyhow::{Context, Result, bail};
-use fabro_types::{RunId, RunSandboxInstance, SandboxProviderKind};
+use crate::driver::ProviderAccess;
+use crate::driver_sandbox::RunSandbox;
+use crate::provider_sandbox;
 
-use crate::SandboxEventCallback;
-#[cfg(feature = "daytona")]
-use crate::daytona::DaytonaSandbox;
-#[cfg(feature = "docker")]
-use crate::docker::DockerSandbox;
-use crate::local::LocalSandbox;
-
-/// Reconnect to a sandbox from a saved record.
+/// Reconnect to a run's sandbox from its saved record.
 ///
-/// `daytona_api_key` is forwarded to the Daytona SDK when the provider is
-/// `"daytona"`. Pass `None` to fall back to the `DAYTONA_API_KEY` env var.
-#[allow(
-    clippy::unused_async,
-    unused_variables,
-    reason = "Feature-gated sandbox backends leave some parameters unused on partial builds."
-)]
-pub async fn reconnect(
-    record: &RunSandboxInstance,
-    daytona_api_key: Option<String>,
-) -> Result<Box<dyn crate::Sandbox>> {
-    reconnect_for_run(record, daytona_api_key, None).await
-}
-
-#[allow(
-    unused_variables,
-    reason = "Feature-gated sandbox backends leave parameters unused on partial builds."
-)]
+/// `access` carries the provider settings and vault credentials the record's
+/// provider needs; the process environment is never consulted. `run_id`
+/// narrows the ownership scope to the run when known, and the driver reports
+/// the sandbox's lifecycle from here on through `events`.
 pub async fn reconnect_for_run(
     record: &RunSandboxInstance,
-    daytona_api_key: Option<String>,
+    access: &ProviderAccess,
     run_id: Option<RunId>,
-) -> Result<Box<dyn crate::Sandbox>> {
-    reconnect_for_run_with_callback(record, daytona_api_key, run_id, None).await
+    events: Option<EventContext>,
+) -> Result<RunSandbox> {
+    let runtime = &record.runtime;
+    provider_sandbox::attach_provider_sandbox(
+        record.provider.clone(),
+        access,
+        &runtime.id,
+        // A record without the flag was written for a sandbox fabro never
+        // cloned into.
+        runtime.repo_cloned.unwrap_or(false),
+        runtime.working_directory.clone(),
+        runtime.clone_origin_url.clone(),
+        run_id,
+        events,
+    )
+    .await
+    .with_context(|| format!("Failed to reconnect {} sandbox", record.provider))
 }
 
-#[allow(
-    unused_variables,
-    reason = "Feature-gated sandbox backends leave parameters unused on partial builds."
-)]
-pub async fn reconnect_for_run_with_callback(
+/// Opens an interactive shell in a run's sandbox over the driver's Pty
+/// facet, reconnecting from the run record first. The session is the
+/// driver's own; it is closed by the caller.
+pub async fn open_terminal_for_run(
     record: &RunSandboxInstance,
-    daytona_api_key: Option<String>,
+    access: &ProviderAccess,
     run_id: Option<RunId>,
-    event_callback: Option<SandboxEventCallback>,
-) -> Result<Box<dyn crate::Sandbox>> {
-    let runtime = &record.runtime;
-    match record.provider {
-        SandboxProviderKind::Local => {
-            let mut sandbox = LocalSandbox::new(PathBuf::from(&runtime.working_directory));
-            if let Some(callback) = event_callback {
-                sandbox.set_event_callback(callback);
-            }
-            Ok(Box::new(sandbox))
-        }
-        #[cfg(feature = "docker")]
-        SandboxProviderKind::Docker => {
-            let repo_cloned = runtime
-                .repo_cloned
-                .context("Docker run sandbox missing repo_cloned metadata")?;
-            let mut sandbox = DockerSandbox::reconnect(
-                &runtime.id,
-                repo_cloned,
-                runtime.working_directory.clone(),
-                runtime.clone_origin_url.clone(),
-                runtime.clone_branch.clone(),
-                run_id,
-            )
-            .await
-            .context("Failed to reconnect Docker sandbox")?;
-            if let Some(callback) = event_callback {
-                sandbox.set_event_callback(callback);
-            }
-            Ok(Box::new(sandbox))
-        }
-        #[cfg(not(feature = "docker"))]
-        SandboxProviderKind::Docker => bail!("Docker sandbox support is not enabled"),
-        #[cfg(feature = "daytona")]
-        SandboxProviderKind::Daytona => {
-            let repo_cloned = runtime
-                .repo_cloned
-                .context("Daytona run sandbox missing repo_cloned metadata")?;
-
-            let mut sandbox = DaytonaSandbox::reconnect(
-                &runtime.id,
-                daytona_api_key,
-                repo_cloned,
-                runtime.working_directory.clone(),
-                runtime.clone_origin_url.clone(),
-                runtime.clone_branch.clone(),
-            )
-            .await
-            .map_err(anyhow::Error::new)?;
-            if let Some(callback) = event_callback {
-                sandbox.set_event_callback(callback);
-            }
-            Ok(Box::new(sandbox))
-        }
-        #[cfg(not(feature = "daytona"))]
-        SandboxProviderKind::Daytona => bail!("Daytona sandbox support is not enabled"),
-    }
+    size: PtySize,
+) -> crate::Result<Box<dyn PtySession>> {
+    let sandbox = reconnect_for_run(record, access, run_id, None)
+        .await
+        .map_err(|err| crate::Error::context_anyhow("Failed to reconnect sandbox", err))?;
+    sandbox.activate().await?;
+    sandbox.open_terminal(size).await
 }

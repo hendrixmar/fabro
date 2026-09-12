@@ -18,7 +18,7 @@
 import type { CompletionContentPart } from './completion-content-part';
 
 /**
- * A message in the conversation.
+ * A lithos `Message`. `content` parts are discriminated by `type`.
  */
 export interface CompletionMessage {
     /**
@@ -41,10 +41,10 @@ export interface CompletionMessage {
 
 export const CompletionMessageRoleEnum = {
     SYSTEM: 'system',
+    DEVELOPER: 'developer',
     USER: 'user',
     ASSISTANT: 'assistant',
-    TOOL: 'tool',
-    DEVELOPER: 'developer'
+    TOOL: 'tool'
 } as const;
 
 export type CompletionMessageRoleEnum = typeof CompletionMessageRoleEnum[keyof typeof CompletionMessageRoleEnum];

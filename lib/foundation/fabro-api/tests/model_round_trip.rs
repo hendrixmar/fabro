@@ -1,10 +1,9 @@
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::{Model as ApiModel, ModelControls as ApiModelControls};
-use fabro_model::{
-    Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits, ProviderId, ReasoningEffort,
-    ReasoningEffortFeature,
-};
+use fabro_types::{Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits};
+use lithos_llm::catalog::builtin;
+use lithos_llm::types::ReasoningEffort;
 
 #[test]
 fn model_reuses_canonical_type() {
@@ -15,8 +14,8 @@ fn model_reuses_canonical_type() {
 #[test]
 fn model_json_matches_openapi_shape() {
     let model = Model {
-        id:                   "claude-opus-4-7".into(),
-        provider:             ProviderId::anthropic(),
+        id:                   "claude-opus-4.7".into(),
+        provider:             builtin::anthropic(),
         family:               "claude-4".to_string(),
         display_name:         "Claude Opus 4.7".to_string(),
         limits:               ModelLimits {
@@ -26,13 +25,11 @@ fn model_json_matches_openapi_shape() {
         training:             Some("2025-08-01".to_string()),
         knowledge_cutoff:     Some("May 2025".to_string()),
         features:             ModelFeatures {
-            tools:                     true,
-            vision:                    true,
-            reasoning:                 true,
-            reasoning_effort:          ReasoningEffortFeature::Levels,
-            prompt_cache:              true,
-            cache_control_breakpoints: false,
-            sampling_params:           true,
+            tools:        true,
+            vision:       true,
+            reasoning:    true,
+            prompt_cache: true,
+            sampling:     true,
         },
         controls:             ModelControls {
             reasoning_effort: vec![
@@ -54,11 +51,11 @@ fn model_json_matches_openapi_shape() {
     };
 
     let json = serde_json::to_value(&model).unwrap();
-    assert_eq!(json["id"], "claude-opus-4-7");
+    assert_eq!(json["id"], "claude-opus-4.7");
     assert_eq!(json["provider"], "anthropic");
     assert_eq!(json["knowledge_cutoff"], "May 2025");
-    assert_eq!(json["features"]["reasoning_effort"], "levels");
     assert_eq!(json["features"]["prompt_cache"], true);
+    assert_eq!(json["features"]["sampling"], true);
     assert_eq!(
         json["controls"]["reasoning_effort"],
         serde_json::json!(["low", "high", "max"])

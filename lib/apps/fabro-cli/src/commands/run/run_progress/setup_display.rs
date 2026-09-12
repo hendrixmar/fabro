@@ -56,20 +56,10 @@ impl SetupDisplay {
         provider: &str,
         duration_ms: u64,
         name: Option<&str>,
-        cpu: Option<f64>,
-        memory: Option<f64>,
         url: Option<&str>,
     ) {
         let dur = format_duration_ms(duration_ms);
-        let detail = match (name, cpu, memory) {
-            (Some(name), Some(cpu), Some(memory)) => Some(format!(
-                "{name} ({} cpu, {} GB)",
-                styles::format_number(cpu),
-                styles::format_number(memory)
-            )),
-            (Some(name), _, _) => Some(name.to_string()),
-            _ => None,
-        };
+        let detail = name.map(str::to_string);
 
         if renderer.is_tty() {
             let display_provider = match url {

@@ -89,6 +89,12 @@ impl DisplaySafeUrl {
         self.0.to_string()
     }
 
+    /// Replace every occurrence of this URL's raw form in `text` with its
+    /// redacted display form, for output that may echo a credentialed URL.
+    pub fn redact_in(&self, text: &str) -> String {
+        text.replace(&self.raw_string(), &self.redacted_string())
+    }
+
     /// Remove credentials from this URL, preserving the SSH `git` username.
     #[inline]
     pub fn remove_credentials(&mut self) {
@@ -510,5 +516,16 @@ mod tests {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.debug_struct("CapturedTraceWriter").finish()
         }
+    }
+
+    #[test]
+    fn redact_in_replaces_the_raw_url_with_its_display_form() {
+        let url = DisplaySafeUrl::parse("https://x-access-token:ghs_secret@github.com/o/r.git")
+            .expect("valid url");
+        let text = format!("fatal: unable to access '{}': 403", url.raw_string());
+        let redacted = url.redact_in(&text);
+        assert!(!redacted.contains("ghs_secret"), "{redacted}");
+        assert!(redacted.contains("github.com/o/r.git"), "{redacted}");
+        assert_eq!(url.redact_in("nothing to see"), "nothing to see");
     }
 }

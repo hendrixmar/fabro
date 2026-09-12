@@ -1,10 +1,8 @@
-use std::convert::TryFrom;
-
 use chrono::{DateTime, Utc};
-use fabro_agent::Error as AgentError;
-use fabro_types::{BilledModelUsage, EventBody, LlmOutputKind, RunEvent};
+use fabro_types::{BilledModelUsage, EventBody, RunEvent};
 use fabro_util::{error, text};
 use fabro_workflow::event::RunNoticeLevel;
+use pebble_coding_agent::events::{CodingEvent, ErrorKind as AgentErrorKind, LlmOutputKind};
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -15,13 +13,13 @@ pub(super) struct ProgressUsage {
 }
 
 impl ProgressUsage {
-    pub(super) fn from_stage_usage(usage: &BilledModelUsage) -> Option<Self> {
+    pub(super) fn from_stage_usage(usage: &BilledModelUsage) -> Self {
         let tokens = usage.tokens();
-        Some(Self {
-            input_tokens:  u64::try_from(tokens.input_tokens).ok()?,
-            output_tokens: u64::try_from(tokens.billable_output_tokens()).ok()?,
+        Self {
+            input_tokens:  tokens.input,
+            output_tokens: tokens.billable_output(),
             cost:          usage.total_usd_micros.map(|cost| cost as f64 / 1_000_000.0),
-        })
+        }
     }
 
     pub(super) fn total_tokens(&self) -> u64 {
@@ -53,8 +51,6 @@ pub(super) enum ProgressEvent {
         provider:    String,
         duration_ms: u64,
         name:        Option<String>,
-        cpu:         Option<f64>,
-        memory:      Option<f64>,
         url:         Option<String>,
     },
     SandboxFailed {
@@ -255,28 +251,13 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             provider:    props.provider.clone(),
             duration_ms: props.duration_ms,
             name:        props.name.clone(),
-            cpu:         props.cpu,
-            memory:      props.memory,
             url:         props.url.clone(),
         }),
         EventBody::SandboxFailed(props) => Some(ProgressEvent::SandboxFailed {
             provider: props.provider.clone(),
             error:    props.error.clone(),
         }),
-        EventBody::SnapshotPulling(props) => Some(ProgressEvent::SnapshotPulling {
-            name: props.name.clone(),
-        }),
-        EventBody::SnapshotCreating(props) => Some(ProgressEvent::SnapshotCreating {
-            name: props.name.clone(),
-        }),
-        EventBody::SnapshotReady(props) => Some(ProgressEvent::SnapshotReady {
-            name:        props.name.clone(),
-            duration_ms: props.duration_ms,
-        }),
-        EventBody::SnapshotFailed(props) => Some(ProgressEvent::SnapshotFailed {
-            name:  props.name.clone(),
-            error: props.error.clone(),
-        }),
+        EventBody::SandboxDriver { event, .. } => driver_progress_event(event),
         EventBody::SshAccessReady(props) => Some(ProgressEvent::SshAccessReady {
             ssh_command: props.ssh_command.clone(),
         }),
@@ -313,10 +294,7 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             name: node_label,
             timing: props.timing,
             status: props.status.to_string(),
-            usage: props
-                .billing
-                .as_ref()
-                .and_then(ProgressUsage::from_stage_usage),
+            usage: props.billing.as_ref().map(ProgressUsage::from_stage_usage),
         }),
         EventBody::StageFailed(props) => Some(ProgressEvent::StageFailed {
             node_id,
@@ -346,107 +324,7 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             status:      props.status,
         }),
         EventBody::ParallelCompleted(_) => Some(ProgressEvent::ParallelCompleted),
-        EventBody::AgentMessage(props) => Some(ProgressEvent::AssistantMessage {
-            stage_node_id: node_id,
-            model:         props.model.model_id.to_string(),
-            root_session:  stored.parent_session_id.is_none(),
-        }),
-        EventBody::AgentToolStarted(props) => Some(ProgressEvent::ToolCallStarted {
-            stage_node_id: node_id,
-            tool_name:     props.tool_name.clone(),
-            tool_call_id:  props.tool_call_id.clone(),
-            arguments:     props.arguments.clone(),
-            timestamp:     Some(stored.ts),
-        }),
-        EventBody::AgentToolCompleted(props) => Some(ProgressEvent::ToolCallCompleted {
-            stage_node_id: node_id,
-            tool_call_id:  props.tool_call_id.clone(),
-            is_error:      props.is_error,
-            duration_ms:   None,
-            timestamp:     Some(stored.ts),
-        }),
-        EventBody::AgentWarning(props) if props.kind == "context_window" => {
-            let usage_percent = props
-                .details
-                .as_object()
-                .and_then(|details| details.get("usage_percent"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            Some(ProgressEvent::ContextWindowWarning {
-                stage_node_id: node_id,
-                usage_percent,
-            })
-        }
-        EventBody::AgentCompactionStarted(_) => Some(ProgressEvent::CompactionStarted {
-            stage_node_id: node_id,
-        }),
-        EventBody::AgentCompactionCompleted(props) => Some(ProgressEvent::CompactionCompleted {
-            stage_node_id:        node_id,
-            original_turn_count:  props.original_turn_count as u64,
-            preserved_turn_count: props.preserved_turn_count as u64,
-            tracked_file_count:   props.tracked_file_count as u64,
-        }),
-        EventBody::AgentError(props) => match display_compaction_error(&props.error) {
-            Some(error) => Some(ProgressEvent::CompactionFailed {
-                stage_node_id: node_id,
-                error,
-                root_session: stored.parent_session_id.is_none(),
-            }),
-            None if stored.parent_session_id.is_none() => Some(ProgressEvent::LlmRequestFinished {
-                stage_node_id: node_id,
-            }),
-            None => None,
-        },
-        EventBody::AgentLlmStarted(props) if stored.parent_session_id.is_none() => {
-            Some(ProgressEvent::LlmRequestStarted {
-                stage_node_id: node_id,
-                model:         props.requested_model.model_id.to_string(),
-            })
-        }
-        EventBody::AgentLlmFirstOutput(props) if stored.parent_session_id.is_none() => {
-            Some(ProgressEvent::LlmFirstOutput {
-                stage_node_id: node_id,
-                kind:          props.kind,
-            })
-        }
-        EventBody::AgentLlmRetry(props) if stored.parent_session_id.is_none() => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "Retry delays are represented as small non-negative millisecond values."
-            )]
-            let delay_ms = (props.delay_secs * 1000.0) as u64;
-            Some(ProgressEvent::LlmRetry {
-                stage_node_id: node_id,
-                model: props.model.clone(),
-                attempt: props.attempt as u64,
-                delay_ms,
-                error: display_value(&props.error).unwrap_or_else(|| "unknown error".to_string()),
-            })
-        }
-        EventBody::AgentRoundInterrupted(_) if stored.parent_session_id.is_none() => {
-            Some(ProgressEvent::LlmRequestFinished {
-                stage_node_id: node_id,
-            })
-        }
-        EventBody::AgentSubSpawned(props) => Some(ProgressEvent::SubagentStarted {
-            stage_node_id: node_id,
-            agent_id:      props.agent_id.clone(),
-            task:          props.task.clone(),
-            generation:    props.generation,
-        }),
-        EventBody::AgentSubTurnStarted(props) => Some(ProgressEvent::SubagentStarted {
-            stage_node_id: node_id,
-            agent_id:      props.agent_id.clone(),
-            task:          props.task.clone(),
-            generation:    props.generation,
-        }),
-        EventBody::AgentSubCompleted(props) => Some(ProgressEvent::SubagentCompleted {
-            stage_node_id: node_id,
-            agent_id:      props.agent_id.clone(),
-            success:       props.success,
-            turns_used:    props.turns_used as u64,
-        }),
+        EventBody::Agent(props) => agent_progress_event(node_id, stored, props.coding_event()),
         EventBody::EdgeSelected(props) => Some(ProgressEvent::EdgeSelected {
             from_node: props.from_node.clone(),
             to_node:   props.to_node.clone(),
@@ -498,47 +376,218 @@ pub(super) fn from_json_line(line: &str) -> Option<ProgressEvent> {
     from_run_event(&stored)
 }
 
-fn display_compaction_error(value: &Value) -> Option<String> {
-    let error = serde_json::from_value::<AgentError>(value.clone()).ok()?;
-    match error {
-        AgentError::Compaction(error) => Some(error.to_string()),
+/// The progress line for one coding agent event, if the terminal shows it.
+///
+/// Inference brackets and interrupts are tracked for the root session only:
+/// a subagent's rounds must not move the stage's live line.
+fn agent_progress_event(
+    node_id: String,
+    stored: &RunEvent,
+    event: &CodingEvent,
+) -> Option<ProgressEvent> {
+    let root_session = stored.parent_session_id.is_none();
+    match event {
+        CodingEvent::AssistantMessage { model, .. } => Some(ProgressEvent::AssistantMessage {
+            stage_node_id: node_id,
+            model: model.clone(),
+            root_session,
+        }),
+        CodingEvent::ToolCallStarted {
+            tool_name,
+            tool_call_id,
+            arguments,
+        } => Some(ProgressEvent::ToolCallStarted {
+            stage_node_id: node_id,
+            tool_name:     tool_name.clone(),
+            tool_call_id:  tool_call_id.clone(),
+            arguments:     arguments.clone(),
+            timestamp:     Some(stored.ts),
+        }),
+        CodingEvent::ToolCallCompleted {
+            tool_call_id,
+            is_error,
+            ..
+        } => Some(ProgressEvent::ToolCallCompleted {
+            stage_node_id: node_id,
+            tool_call_id:  tool_call_id.clone(),
+            is_error:      *is_error,
+            duration_ms:   None,
+            timestamp:     Some(stored.ts),
+        }),
+        CodingEvent::Warning { kind, details, .. } if kind == "context_window" => {
+            let usage_percent = details
+                .as_object()
+                .and_then(|details| details.get("usage_percent"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some(ProgressEvent::ContextWindowWarning {
+                stage_node_id: node_id,
+                usage_percent,
+            })
+        }
+        CodingEvent::CompactionStarted { .. } => Some(ProgressEvent::CompactionStarted {
+            stage_node_id: node_id,
+        }),
+        CodingEvent::CompactionCompleted {
+            original_turn_count,
+            preserved_turn_count,
+            tracked_file_count,
+            ..
+        } => Some(ProgressEvent::CompactionCompleted {
+            stage_node_id:        node_id,
+            original_turn_count:  *original_turn_count as u64,
+            preserved_turn_count: *preserved_turn_count as u64,
+            tracked_file_count:   *tracked_file_count as u64,
+        }),
+        CodingEvent::CompactionFailed { error, .. } => Some(ProgressEvent::CompactionFailed {
+            stage_node_id: node_id,
+            error: error.message.clone(),
+            root_session,
+        }),
+        CodingEvent::Error { error } if error.kind == AgentErrorKind::Compaction => {
+            Some(ProgressEvent::CompactionFailed {
+                stage_node_id: node_id,
+                error: error.message.clone(),
+                root_session,
+            })
+        }
+        CodingEvent::Error { .. } if root_session => Some(ProgressEvent::LlmRequestFinished {
+            stage_node_id: node_id,
+        }),
+        CodingEvent::LlmRequestStarted { requested_model } if root_session => {
+            Some(ProgressEvent::LlmRequestStarted {
+                stage_node_id: node_id,
+                model:         requested_model.clone(),
+            })
+        }
+        CodingEvent::LlmFirstOutput { kind } if root_session => {
+            Some(ProgressEvent::LlmFirstOutput {
+                stage_node_id: node_id,
+                kind:          *kind,
+            })
+        }
+        CodingEvent::LlmRetry {
+            model,
+            attempt,
+            delay_secs,
+            error,
+            ..
+        } if root_session => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "Retry delays are represented as small non-negative millisecond values."
+            )]
+            let delay_ms = (delay_secs * 1000.0) as u64;
+            Some(ProgressEvent::LlmRetry {
+                stage_node_id: node_id,
+                model: model.clone(),
+                attempt: *attempt as u64,
+                delay_ms,
+                error: error.message.clone(),
+            })
+        }
+        CodingEvent::RoundInterrupted { .. } if root_session => {
+            Some(ProgressEvent::LlmRequestFinished {
+                stage_node_id: node_id,
+            })
+        }
+        CodingEvent::SubAgentSpawned {
+            agent_id,
+            task,
+            generation,
+            ..
+        }
+        | CodingEvent::SubAgentTurnStarted {
+            agent_id,
+            task,
+            generation,
+            ..
+        } => Some(ProgressEvent::SubagentStarted {
+            stage_node_id: node_id,
+            agent_id:      agent_id.clone(),
+            task:          task.clone(),
+            generation:    *generation,
+        }),
+        CodingEvent::SubAgentCompleted {
+            agent_id,
+            success,
+            turns_used,
+            ..
+        } => Some(ProgressEvent::SubagentCompleted {
+            stage_node_id: node_id,
+            agent_id:      agent_id.clone(),
+            success:       *success,
+            turns_used:    *turns_used as u64,
+        }),
         _ => None,
     }
 }
 
-fn display_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(value) => Some(value.clone()),
-        Value::Object(map) => map
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                map.get("detail")
-                    .and_then(Value::as_object)
-                    .and_then(|detail| detail.get("message"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
+/// The setup progress a sandbox driver event stands for: the image pull
+/// inside the sandbox's create, or a snapshot build. Every other driver
+/// event is stored on the run but renders nothing here.
+fn driver_progress_event(event: &sandbox_driver::Event) -> Option<ProgressEvent> {
+    use sandbox_driver::{Action, EventBody as Body, EventSubject, ProgressCode};
+
+    match (&event.subject, &event.body) {
+        (
+            EventSubject::Sandbox { .. },
+            Body::OperationProgress {
+                action: Action::Create,
+                progress,
+            },
+        ) if progress.code.as_str() == ProgressCode::IMAGE_PULL => {
+            Some(ProgressEvent::SnapshotPulling {
+                name: pulled_image_name(progress.message.as_deref()),
             })
-            .or_else(|| {
-                map.get("data")
-                    .and_then(Value::as_object)
-                    .and_then(|detail| detail.get("message"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .or_else(|| map.get("data").and_then(Value::as_str).map(str::to_owned))
-            .or_else(|| Some(value.to_string())),
-        _ => Some(value.to_string()),
+        }
+        (EventSubject::Snapshot { id, name }, body) => {
+            let name = name
+                .clone()
+                .or_else(|| id.as_ref().map(ToString::to_string))
+                .unwrap_or_default();
+            match body {
+                Body::OperationStarted {
+                    action: Action::Create,
+                } => Some(ProgressEvent::SnapshotCreating { name }),
+                Body::OperationCompleted {
+                    action: Action::Create,
+                    duration,
+                } => Some(ProgressEvent::SnapshotReady {
+                    name,
+                    duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                }),
+                Body::OperationFailed {
+                    action: Action::Create,
+                    error,
+                    ..
+                } => Some(ProgressEvent::SnapshotFailed {
+                    name,
+                    error: error.message.clone(),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
     }
+}
+
+/// The image an image pull progress report names. The Docker provider
+/// says `pulling image <reference>`; the reference alone reads better.
+fn pulled_image_name(message: Option<&str>) -> String {
+    let message = message.unwrap_or("image");
+    message
+        .strip_prefix("pulling image ")
+        .unwrap_or(message)
+        .to_owned()
 }
 
 #[cfg(test)]
 mod tests {
-    use fabro_agent::AgentEvent;
     use fabro_types::{MetadataSnapshotFailureKind, MetadataSnapshotPhase, fixtures};
-    use fabro_workflow::event::{Event, RunNoticeCode, to_run_event};
+    use fabro_workflow::event::{Event, RunNoticeCode, SandboxLifecycle, to_run_event};
+    use pebble_coding_agent::events::CodingAgentEvent;
 
     use super::*;
 
@@ -633,16 +682,17 @@ mod tests {
     #[test]
     fn round_trip_agent_tool_call() {
         let event = Event::Agent {
-            stage:             "code".into(),
-            visit:             1,
-            event:             AgentEvent::ToolCallStarted {
-                tool_name:    "read_file".into(),
-                tool_call_id: "tc1".into(),
-                arguments:    serde_json::json!({"path": "src/main.rs"}),
-            },
-            session_id:        None,
-            parent_session_id: None,
-            tool_call_id:      None,
+            stage: "code".into(),
+            visit: 1,
+            event: CodingAgentEvent::new(
+                "ses_root",
+                CodingEvent::ToolCallStarted {
+                    tool_name:    "read_file".into(),
+                    tool_call_id: "tc1".into(),
+                    arguments:    serde_json::json!({"path": "src/main.rs"}),
+                },
+                std::time::SystemTime::UNIX_EPOCH,
+            ),
         };
 
         let stored = to_run_event(&fixtures::RUN_1, &event);
@@ -695,10 +745,17 @@ mod tests {
                 "node_id": "code",
                 "node_label": "code",
                 "properties": {
-                    "tool_name": "read_file",
-                    "tool_call_id": "tc1",
-                    "arguments": {"path": "src/main.rs"},
-                    "visit": 1
+                    "stage": "code",
+                    "visit": 1,
+                    "session_id": "ses_root",
+                    "timestamp": "2026-03-30T12:00:00.000Z",
+                    "event": {
+                        "ToolCallStarted": {
+                            "tool_name": "read_file",
+                            "tool_call_id": "tc1",
+                            "arguments": {"path": "src/main.rs"}
+                        }
+                    }
                 }
             })
             .to_string(),
@@ -713,11 +770,21 @@ mod tests {
                 "node_id": "code",
                 "node_label": "code",
                 "properties": {
-                    "tool_name": "read_file",
-                    "tool_call_id": "tc1",
-                    "output": {"ok": true},
-                    "is_error": false,
-                    "visit": 1
+                    "stage": "code",
+                    "visit": 1,
+                    "session_id": "ses_root",
+                    "timestamp": "2026-03-30T12:00:00.500Z",
+                    "event": {
+                        "ToolCallCompleted": {
+                            "tool_name": "read_file",
+                            "tool_call_id": "tc1",
+                            "output": {"ok": true},
+                            "is_error": false,
+                            "output_bytes_observed": 11,
+                            "output_bytes_retained": 11,
+                            "output_bytes_omitted": 0
+                        }
+                    }
                 }
             })
             .to_string(),
@@ -748,12 +815,10 @@ mod tests {
     #[test]
     fn round_trip_sandbox_ready() {
         let event = Event::Sandbox {
-            event: fabro_agent::SandboxEvent::Ready {
+            event: SandboxLifecycle::Ready {
                 provider:    "daytona".into(),
                 duration_ms: 2500,
                 name:        Some("sandbox-1".into()),
-                cpu:         Some(4.0),
-                memory:      Some(8.0),
                 url:         Some("https://example.test".into()),
             },
         };
@@ -774,7 +839,7 @@ mod tests {
     #[test]
     fn round_trip_sandbox_failed() {
         let event = Event::Sandbox {
-            event: fabro_agent::SandboxEvent::InitializeFailed {
+            event: SandboxLifecycle::InitializeFailed {
                 provider:    "docker".into(),
                 error:       "pull failed".into(),
                 causes:      Vec::new(),
@@ -791,32 +856,76 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn round_trip_snapshot_lifecycle_events() {
-        let pulling = to_run_event(&fixtures::RUN_1, &Event::Sandbox {
-            event: fabro_agent::SandboxEvent::SnapshotPulling {
-                name: "buildpack-deps:noble".into(),
-            },
-        });
-        let creating = to_run_event(&fixtures::RUN_1, &Event::Sandbox {
-            event: fabro_agent::SandboxEvent::SnapshotCreating {
-                name: "fabro-v9".into(),
-            },
-        });
-        let ready = to_run_event(&fixtures::RUN_1, &Event::Sandbox {
-            event: fabro_agent::SandboxEvent::SnapshotReady {
-                name:        "buildpack-deps:noble".into(),
-                duration_ms: 1200,
-            },
-        });
-        let failed = to_run_event(&fixtures::RUN_1, &Event::Sandbox {
-            event: fabro_agent::SandboxEvent::SnapshotFailed {
-                name:   "fabro-v9".into(),
-                error:  "build failed".into(),
-                causes: Vec::new(),
-            },
-        });
+    fn driver_event(value: serde_json::Value) -> Event {
+        Event::SandboxDriver {
+            event: serde_json::from_value(value).expect("a driver event"),
+        }
+    }
 
+    #[test]
+    fn round_trip_driver_events_that_render_setup_progress() {
+        let pulling = to_run_event(
+            &fixtures::RUN_1,
+            &driver_event(serde_json::json!({
+                "id": {"source_id": "test", "sequence": 1},
+                "occurred_at": "2026-01-01T00:00:00Z",
+                "provider": "docker",
+                "subject": {"type": "sandbox"},
+                "type": "operation_progress",
+                "action": "create",
+                "progress": {"code": "image.pull", "message": "pulling image buildpack-deps:noble"}
+            })),
+        );
+        let creating = to_run_event(
+            &fixtures::RUN_1,
+            &driver_event(serde_json::json!({
+                "id": {"source_id": "test", "sequence": 2},
+                "occurred_at": "2026-01-01T00:00:00Z",
+                "provider": "daytona",
+                "subject": {"type": "snapshot", "name": "fabro-v9"},
+                "type": "operation_started",
+                "action": "create"
+            })),
+        );
+        let ready = to_run_event(
+            &fixtures::RUN_1,
+            &driver_event(serde_json::json!({
+                "id": {"source_id": "test", "sequence": 3},
+                "occurred_at": "2026-01-01T00:00:01Z",
+                "provider": "daytona",
+                "subject": {"type": "snapshot", "name": "fabro-v9"},
+                "type": "operation_completed",
+                "action": "create",
+                "duration": {"secs": 1, "nanos": 200_000_000}
+            })),
+        );
+        let failed = to_run_event(
+            &fixtures::RUN_1,
+            &driver_event(serde_json::json!({
+                "id": {"source_id": "test", "sequence": 4},
+                "occurred_at": "2026-01-01T00:00:02Z",
+                "provider": "daytona",
+                "subject": {"type": "snapshot", "name": "fabro-v9"},
+                "type": "operation_failed",
+                "action": "create",
+                "duration": {"secs": 2, "nanos": 0},
+                "error": {"kind": "provider", "message": "build failed", "retryable": false, "causes": []}
+            })),
+        );
+        let stopped = to_run_event(
+            &fixtures::RUN_1,
+            &driver_event(serde_json::json!({
+                "id": {"source_id": "test", "sequence": 5},
+                "occurred_at": "2026-01-01T00:00:03Z",
+                "provider": "docker",
+                "subject": {"type": "sandbox", "id": "c1"},
+                "type": "operation_completed",
+                "action": "stop",
+                "duration": {"secs": 0, "nanos": 0}
+            })),
+        );
+
+        assert_eq!(pulling.event_name(), "sandbox.create.progress");
         assert!(matches!(
             from_run_event(&pulling).unwrap(),
             ProgressEvent::SnapshotPulling { name } if name == "buildpack-deps:noble"
@@ -828,13 +937,18 @@ mod tests {
         assert!(matches!(
             from_run_event(&ready).unwrap(),
             ProgressEvent::SnapshotReady { name, duration_ms }
-                if name == "buildpack-deps:noble" && duration_ms == 1200
+                if name == "fabro-v9" && duration_ms == 1200
         ));
         assert!(matches!(
             from_run_event(&failed).unwrap(),
             ProgressEvent::SnapshotFailed { name, error }
                 if name == "fabro-v9" && error == "build failed"
         ));
+        assert_eq!(stopped.event_name(), "sandbox.stop.completed");
+        assert!(
+            from_run_event(&stopped).is_none(),
+            "a stop is stored on the run but renders no setup progress"
+        );
     }
 
     #[test]

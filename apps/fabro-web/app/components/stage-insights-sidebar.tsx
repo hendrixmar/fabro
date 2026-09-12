@@ -7,6 +7,7 @@ import {
 import {
   ArrowPathIcon,
   CheckCircleIcon,
+  ExclamationTriangleIcon,
   XCircleIcon,
 } from "@heroicons/react/24/solid";
 import {
@@ -19,21 +20,21 @@ import {
   WrenchScrewdriverIcon,
 } from "@heroicons/react/24/outline";
 import {
-  AgentSkillActivationSource,
-  StageContextWindowCategory,
-  StageContextWindowStaleness,
+  ContextWindowCategory,
+  ContextWindowStaleness,
+  SkillActivationSource,
   TodoStatus,
 } from "@qltysh/fabro-api-client";
 import type {
   ActivatedSkill,
-  AgentSkillSummary,
-  AgentToolSummary,
+  ContextWindowBreakdownItem,
   McpServerProjection,
+  SkillSummary,
   StageContextWindow,
-  StageContextWindowBreakdownItem,
   StageProjection,
   TodoListProjection,
   TodoProjection,
+  ToolSummary,
 } from "@qltysh/fabro-api-client";
 import { formatTokenCount } from "../lib/format";
 
@@ -388,7 +389,7 @@ function ContextBreakdown({ snapshot }: { snapshot: StageContextWindow | null })
   if (!snapshot) {
     return <p className="mt-2 px-2 text-xs text-fg-muted">Context usage not yet available.</p>;
   }
-  if (snapshot.staleness === StageContextWindowStaleness.UNAVAILABLE) {
+  if (snapshot.staleness === ContextWindowStaleness.UNAVAILABLE) {
     return <p className="mt-2 px-2 text-xs text-fg-muted">Context usage unavailable for this stage.</p>;
   }
   const totalTokens = snapshot.input_tokens ?? 0;
@@ -431,7 +432,7 @@ function ContextBreakdown({ snapshot }: { snapshot: StageContextWindow | null })
   );
 }
 
-function nonZeroBreakdown(items: StageContextWindowBreakdownItem[]): StageContextWindowBreakdownItem[] {
+function nonZeroBreakdown(items: ContextWindowBreakdownItem[]): ContextWindowBreakdownItem[] {
   return items.filter((i) => i.usage_percent > 0);
 }
 
@@ -443,41 +444,41 @@ function nonZeroBreakdown(items: StageContextWindowBreakdownItem[]): StageContex
  * Palette is chosen so the typical chunks (Conversation big + System +
  * Tools) read as three distinct hues rather than three adjacent teals.
  */
-function categoryColor(category: StageContextWindowCategory): string {
+function categoryColor(category: ContextWindowCategory): string {
   switch (category) {
-    case StageContextWindowCategory.SYSTEM_PROMPT:
+    case ContextWindowCategory.SYSTEM_PROMPT:
       return "var(--color-teal-700)";
-    case StageContextWindowCategory.TOOLS:
+    case ContextWindowCategory.TOOLS:
       return "var(--color-amber)";
-    case StageContextWindowCategory.MCP_TOOLS:
+    case ContextWindowCategory.MCP_TOOLS:
       return "var(--color-mint)";
-    case StageContextWindowCategory.SKILLS:
+    case ContextWindowCategory.SKILLS:
       return "var(--color-teal-500)";
-    case StageContextWindowCategory.MEMORY:
+    case ContextWindowCategory.MEMORY:
       return "var(--color-coral)";
-    case StageContextWindowCategory.CONVERSATION:
+    case ContextWindowCategory.CONVERSATION:
       return "var(--color-teal-300)";
-    case StageContextWindowCategory.OTHER:
+    case ContextWindowCategory.OTHER:
     default:
       return "var(--color-fg-muted)";
   }
 }
 
-function categoryLabel(category: StageContextWindowCategory): string {
+function categoryLabel(category: ContextWindowCategory): string {
   switch (category) {
-    case StageContextWindowCategory.SYSTEM_PROMPT:
+    case ContextWindowCategory.SYSTEM_PROMPT:
       return "System prompt";
-    case StageContextWindowCategory.TOOLS:
+    case ContextWindowCategory.TOOLS:
       return "Tools";
-    case StageContextWindowCategory.MCP_TOOLS:
+    case ContextWindowCategory.MCP_TOOLS:
       return "MCP tools";
-    case StageContextWindowCategory.SKILLS:
+    case ContextWindowCategory.SKILLS:
       return "Skills";
-    case StageContextWindowCategory.MEMORY:
+    case ContextWindowCategory.MEMORY:
       return "Memory";
-    case StageContextWindowCategory.CONVERSATION:
+    case ContextWindowCategory.CONVERSATION:
       return "Conversation";
-    case StageContextWindowCategory.OTHER:
+    case ContextWindowCategory.OTHER:
     default:
       return "Other";
   }
@@ -487,7 +488,7 @@ function categoryLabel(category: StageContextWindowCategory): string {
 
 interface SkillsSectionProps {
   activated: ActivatedSkill[];
-  available: AgentSkillSummary[];
+  available: SkillSummary[];
   activatedNames: Set<string>;
 }
 
@@ -517,13 +518,13 @@ function SkillsSection({ activated, available, activatedNames }: SkillsSectionPr
 }
 
 function SkillSourceIcon({ source }: { source: ActivatedSkill["source"] }) {
-  const Icon = source === AgentSkillActivationSource.SLASH ? CommandLineIcon : PuzzlePieceIcon;
+  const Icon = source === SkillActivationSource.SLASH ? CommandLineIcon : PuzzlePieceIcon;
   return <Icon className="size-3.5 shrink-0 text-fg-muted" />;
 }
 
 // ---------- Tools ----------
 
-function AgentToolsSection({ tools }: { tools: AgentToolSummary[] }) {
+function AgentToolsSection({ tools }: { tools: ToolSummary[] }) {
   if (tools.length === 0) return <p className="text-xs text-fg-muted">No tools reported.</p>;
   return (
     <ul className="space-y-1.5">
@@ -554,32 +555,55 @@ function McpSection({ servers }: { servers: McpServerProjection[] }) {
     <ul className="space-y-1">
       {servers.map((server) => {
         // Dim unused servers so the eye lands on the invoked ones first;
-        // failed servers stay coral regardless.
+        // failed and disconnected servers keep their tone regardless.
         const nameClass = server.status.kind === "ready" && !server.invoked
           ? "min-w-0 flex-1 truncate text-xs text-fg-muted"
           : "min-w-0 flex-1 truncate text-xs text-fg-2";
         return (
           <li key={server.server_name} className="flex items-center gap-1.5">
-            {server.status.kind === "ready" ? (
-              <CheckCircleIcon className="size-3.5 shrink-0 text-mint" aria-label="Ready" />
-            ) : (
-              <XCircleIcon className="size-3.5 shrink-0 text-coral" aria-label="Failed" />
-            )}
+            <McpStatusIcon status={server.status} />
             <span className={nameClass}>{server.server_name}</span>
-            {server.status.kind === "ready" ? (
-              <span className="font-mono text-[10px] tabular-nums text-fg-muted">
-                {server.invoked
-                  ? "used"
-                  : `${server.tool_count} ${server.tool_count === 1 ? "tool" : "tools"}`}
-              </span>
-            ) : (
-              <span className="text-[10px] uppercase tracking-wider text-coral">Failed</span>
-            )}
+            <McpStatusBadge server={server} />
           </li>
         );
       })}
     </ul>
   );
+}
+
+function McpStatusIcon({ status }: { status: McpServerProjection["status"] }) {
+  switch (status.kind) {
+    case "ready":
+      return <CheckCircleIcon className="size-3.5 shrink-0 text-mint" aria-label="Ready" />;
+    case "disconnected":
+      return (
+        <ExclamationTriangleIcon
+          className="size-3.5 shrink-0 text-amber"
+          aria-label="Disconnected"
+        />
+      );
+    case "failed":
+      return <XCircleIcon className="size-3.5 shrink-0 text-coral" aria-label="Failed" />;
+  }
+}
+
+function McpStatusBadge({ server }: { server: McpServerProjection }) {
+  switch (server.status.kind) {
+    case "ready":
+      return (
+        <span className="font-mono text-[10px] tabular-nums text-fg-muted">
+          {server.invoked
+            ? "used"
+            : `${server.tool_count} ${server.tool_count === 1 ? "tool" : "tools"}`}
+        </span>
+      );
+    case "disconnected":
+      return (
+        <span className="text-[10px] uppercase tracking-wider text-amber">Disconnected</span>
+      );
+    case "failed":
+      return <span className="text-[10px] uppercase tracking-wider text-coral">Failed</span>;
+  }
 }
 
 // ---------- helpers ----------

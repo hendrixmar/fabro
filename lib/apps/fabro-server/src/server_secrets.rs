@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use fabro_auth::ResolveError;
 use fabro_config::envfile;
-use fabro_llm::client::{Client, ProviderRegistrationIssue};
-use fabro_model::ProviderId;
 
 #[expect(
     clippy::disallowed_methods,
@@ -53,22 +50,6 @@ impl std::fmt::Debug for ServerSecrets {
                 &self.file_entries.keys().collect::<Vec<_>>(),
             )
             .finish_non_exhaustive()
-    }
-}
-
-pub(crate) struct LlmClientResult {
-    pub client:              Client,
-    pub auth_issues:         Vec<(ProviderId, ResolveError)>,
-    pub registration_issues: Vec<ProviderRegistrationIssue>,
-}
-
-impl LlmClientResult {
-    pub(crate) fn provider_ids(&self) -> Vec<ProviderId> {
-        self.client
-            .provider_names()
-            .into_iter()
-            .map(ProviderId::new)
-            .collect()
     }
 }
 

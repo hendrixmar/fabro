@@ -9,10 +9,10 @@ use agent_client_protocol::{
     Agent, Client, ConnectTo, Error as ProtocolError, Lines, Result as AcpProtocolResult,
 };
 use fabro_sandbox::{
-    DEFAULT_EXEC_OUTPUT_TAIL_BYTES, Error as SandboxError, Result as SandboxResult, Sandbox,
-    StderrCollector, StdioProcessHandle, StdioProcessTermination,
+    DEFAULT_EXEC_OUTPUT_TAIL_BYTES, Error as SandboxError, Result as SandboxResult, RunSandbox,
+    StderrTail, StdioProcessHandle, Termination, command_termination, program_exit_code,
 };
-use fabro_types::{CommandTermination, ExecOutputTail};
+use fabro_types::ExecOutputTail;
 use futures::io::BufReader;
 use futures::sink::unfold;
 use futures::{AsyncBufReadExt, AsyncWriteExt, Stream};
@@ -27,8 +27,8 @@ const CLEAN_EXIT_PROTOCOL_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub(crate) struct TransportState {
-    handle:        Arc<TokioMutex<Option<StdioProcessHandle>>>,
-    stderr:        Arc<TokioMutex<Option<StderrCollector>>>,
+    handle:        Arc<TokioMutex<Option<Arc<dyn StdioProcessHandle>>>>,
+    stderr:        Arc<TokioMutex<Option<StderrTail>>>,
     startup_error: Arc<TokioMutex<Option<SandboxError>>>,
     process_exit:  Arc<TokioMutex<Option<AcpProcessExit>>>,
 }
@@ -43,7 +43,7 @@ impl TransportState {
         }
     }
 
-    async fn set_process(&self, handle: StdioProcessHandle, stderr: StderrCollector) {
+    async fn set_process(&self, handle: Arc<dyn StdioProcessHandle>, stderr: StderrTail) {
         *self.handle.lock().await = Some(handle);
         *self.stderr.lock().await = Some(stderr);
     }
@@ -52,10 +52,15 @@ impl TransportState {
         *self.startup_error.lock().await = Some(error);
     }
 
-    async fn set_process_exit(&self, termination: StdioProcessTermination, stderr: &str) {
+    async fn set_process_exit(
+        &self,
+        termination: Termination,
+        exit_code: Option<i32>,
+        stderr: &str,
+    ) {
         *self.process_exit.lock().await = Some(AcpProcessExit {
-            termination:      termination.termination,
-            exit_code:        termination.exit_code,
+            termination:      command_termination(termination),
+            exit_code:        program_exit_code(termination, exit_code),
             exec_output_tail: redacted_stderr_tail(stderr),
         });
     }
@@ -70,14 +75,14 @@ impl TransportState {
 
     pub(crate) async fn terminate(&self) -> SandboxResult<()> {
         if let Some(handle) = self.handle.lock().await.as_ref().cloned() {
-            handle.terminate().await?;
+            handle.terminate().await;
         }
         Ok(())
     }
 
     pub(crate) async fn stderr_tail(&self) -> String {
         if let Some(stderr) = self.stderr.lock().await.as_ref().cloned() {
-            return stderr.tail_string().await;
+            return stderr.to_string_lossy();
         }
         String::new()
     }
@@ -92,7 +97,7 @@ pub(crate) struct SandboxAcpTransport {
     command: AcpProcessSpec,
     cwd:     String,
     env:     HashMap<String, String>,
-    sandbox: Arc<dyn Sandbox>,
+    sandbox: Arc<RunSandbox>,
     state:   TransportState,
 }
 
@@ -101,7 +106,7 @@ impl SandboxAcpTransport {
         command: AcpProcessSpec,
         cwd: String,
         env: HashMap<String, String>,
-        sandbox: Arc<dyn Sandbox>,
+        sandbox: Arc<RunSandbox>,
         state: TransportState,
     ) -> Self {
         Self {
@@ -125,7 +130,6 @@ impl ConnectTo<Client> for SandboxAcpTransport {
                 &self.command.to_shell_command(),
                 Some(&self.cwd),
                 Some(&env),
-                None,
             )
             .await
         {
@@ -136,9 +140,11 @@ impl ConnectTo<Client> for SandboxAcpTransport {
             }
         };
 
-        let handle = process.handle.clone();
-        let stderr = process.stderr.clone();
-        self.state.set_process(handle.clone(), stderr.clone()).await;
+        let handle: Arc<dyn StdioProcessHandle> = Arc::from(process.handle);
+        let stderr = process.stderr_tail.clone();
+        self.state
+            .set_process(Arc::clone(&handle), stderr.clone())
+            .await;
 
         let incoming_lines = Box::pin(BufReader::new(process.stdout.compat()).lines())
             as Pin<Box<dyn Stream<Item = IoResult<String>> + Send>>;
@@ -158,25 +164,20 @@ impl ConnectTo<Client> for SandboxAcpTransport {
         ));
         tokio::select! {
             result = &mut protocol => {
-                if let Err(err) = handle.terminate().await {
-                    tracing::warn!(error = %err, "Failed to terminate ACP process after protocol completion");
-                }
+                handle.terminate().await;
                 let _ = timeout(Duration::from_millis(500), handle.wait()).await;
                 result
             }
-            termination = handle.wait() => {
-                let termination = termination.map_err(ProtocolError::into_internal_error)?;
-                let stderr = stderr.tail_string().await;
-                if termination.termination == CommandTermination::Exited
-                    && termination.exit_code == Some(0)
-                {
+            (termination, exit_code) = handle.wait() => {
+                let stderr = stderr.to_string_lossy();
+                if termination == Termination::Exited && exit_code == Some(0) {
                     // Stdio agents commonly exit immediately after writing their final response.
                     // Process wait can observe that exit before the line reader drains stdout.
                     if let Ok(result) = timeout(CLEAN_EXIT_PROTOCOL_GRACE, &mut protocol).await {
                         return result;
                     }
                 }
-                self.state.set_process_exit(termination, &stderr).await;
+                self.state.set_process_exit(termination, exit_code, &stderr).await;
                 Err(process_exited_before_protocol_completed())
             }
         }

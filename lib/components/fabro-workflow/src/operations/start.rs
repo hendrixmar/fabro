@@ -4,17 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fabro_auth::{CredentialSource, VaultCredentialSource};
+use fabro_auth::VaultCredentialSource;
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
-use fabro_llm::client::Client as LlmClient;
+use fabro_llm::credentials::readiness;
+use fabro_llm::lithos_catalog::Catalog;
 use fabro_mcp::config::McpServerSettings;
-use fabro_model::{Catalog, ProviderId};
-use fabro_sandbox::daytona::DaytonaConfig;
-use fabro_sandbox::from_environment::{
-    daytona_config_from_environment, docker_config_from_environment_with_secrets,
-    local_working_directory_from_environment,
+use fabro_sandbox::{
+    CloneRequest, DaytonaCredentials, ProviderAccess, SandboxSpec, sandbox_spec_for_environment,
 };
-use fabro_sandbox::{DockerSandboxOptions, SandboxSpec};
 use fabro_static::EnvVars;
 #[cfg(test)]
 use fabro_types::GitRunTarget;
@@ -23,12 +20,14 @@ use fabro_types::settings::run::{
     ResolvedGithubIntegration, ResolvedMcpEntry, RunMode, RunNamespace as ResolvedRunSettings,
     RunPrepareSettings as ResolvedRunPrepareSettings,
 };
+use fabro_types::settings::server::ServerSandboxProvidersSettings;
 use fabro_types::{
-    ManifestPath, RunId, RunRunnableSource, RunSpec, RunTarget, SandboxProviderKind,
-    TargetValidationError,
+    BundledProvider, ManifestPath, RunId, RunRunnableSource, RunSpec, RunTarget,
+    SandboxProviderKind, TargetValidationError,
 };
 use fabro_util::error::collect_chain;
 use fabro_vault::Vault;
+use lithos_llm::catalog::ProviderId;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock as AsyncRwLock;
 use tokio::{fs, time};
@@ -90,6 +89,7 @@ struct RunSession {
     workflow_bundle:   Option<Arc<WorkflowBundle>>,
     run_control:       Option<Arc<RunControlState>>,
     vault:             Arc<AsyncRwLock<Vault>>,
+    sandbox_providers: ServerSandboxProvidersSettings,
     catalog:           Arc<Catalog>,
     fabro_run_tools:   Option<FabroRunToolServices>,
 }
@@ -116,6 +116,10 @@ pub struct StartServices {
     /// env. Empty when the github integration requests no token.
     pub github_integration: ResolvedGithubIntegration,
     pub vault:              Arc<AsyncRwLock<Vault>>,
+    /// The server's sandbox provider settings: which kinds are enabled and
+    /// which run as plugins. The worker builds and reattaches sandboxes
+    /// with them.
+    pub sandbox_providers:  ServerSandboxProvidersSettings,
     pub catalog:            Arc<Catalog>,
     pub on_node:            crate::OnNodeCallback,
     pub registry_override:  Option<Arc<HandlerRegistry>>,
@@ -484,14 +488,14 @@ impl RunSession {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        if configured_sandbox_provider != SandboxProviderKind::Local
+        if configured_sandbox_provider != SandboxProviderKind::LOCAL
             && matches!(record.target, Some(RunTarget::Folder { .. }))
         {
             return Err(Error::engine(
                 "persisted folder run targets require the Local sandbox provider",
             ));
         }
-        if configured_sandbox_provider == SandboxProviderKind::Local {
+        if configured_sandbox_provider == SandboxProviderKind::LOCAL {
             if let Some(target @ (RunTarget::Git(_) | RunTarget::None {})) = record.target.as_ref()
             {
                 return Err(Error::engine(format!(
@@ -500,62 +504,56 @@ impl RunSession {
                 )));
             }
         }
-        let sandbox = match sandbox_provider {
-            SandboxProviderKind::Local if dry_run_clone_target => SandboxSpec::Local {
-                working_directory: dry_run_workspace_for_target(persisted).await?,
-            },
-            SandboxProviderKind::Local => match record.target.as_ref() {
+        let daytona = vault_guard
+            .get(EnvVars::DAYTONA_API_KEY)
+            .map(|api_key| DaytonaCredentials::from_api_key(api_key.to_string(), process_env_var));
+        let access = ProviderAccess {
+            providers: services.sandbox_providers.clone(),
+            daytona,
+        };
+        let sandbox = match sandbox_provider.bundled() {
+            Some(BundledProvider::Local) if dry_run_clone_target => {
+                SandboxSpec::local(dry_run_workspace_for_target(persisted).await?, access)
+            }
+            Some(BundledProvider::Local) => match record.target.as_ref() {
                 Some(target @ (RunTarget::Git(_) | RunTarget::None {})) => {
                     return Err(Error::engine(format!(
                         "persisted {} run targets require a clone-based sandbox provider",
                         target.kind_name()
                     )));
                 }
-                Some(RunTarget::Folder { path }) => SandboxSpec::Local {
-                    working_directory: folder_working_directory_from_record(record, path).await?,
-                },
+                Some(RunTarget::Folder { path }) => SandboxSpec::local(
+                    folder_working_directory_from_record(record, path).await?,
+                    access,
+                ),
                 None => {
-                    let working_directory = local_working_directory_from_environment(
-                        &resolved.environment,
-                        record.source_directory.as_deref().map(Path::new),
-                    )
-                    .map_err(|err| {
-                        Error::engine_with_source(
-                            "Failed to resolve local environment working directory",
-                            err,
-                        )
-                    })?;
-                    SandboxSpec::Local { working_directory }
+                    let working_directory = resolved
+                        .environment
+                        .local_working_directory(record.source_directory.as_deref().map(Path::new))
+                        .map_err(|err| {
+                            Error::engine_with_source(
+                                "Failed to resolve local environment working directory",
+                                err,
+                            )
+                        })?;
+                    SandboxSpec::local(working_directory, access)
                 }
             },
-            SandboxProviderKind::Docker => {
-                let mut config = resolve_docker_config(resolved, secret_lookup)?;
-                config.skip_clone |= clone_source.skip_clone;
-                SandboxSpec::Docker {
-                    config,
+            _ => {
+                let spec = resolve_sandbox_spec(resolved, secret_lookup)?;
+                let mut clone = CloneRequest::from_settings(&resolved.clone);
+                clone.skip |= clone_source.skip_clone;
+                clone.origin_url = clone_source.origin_url;
+                clone.branch = clone_source.branch;
+                clone.tag = clone_source.tag;
+                clone.commit_sha = clone_source.commit_sha;
+                SandboxSpec {
+                    kind: sandbox_provider.clone(),
+                    access,
+                    spec,
+                    clone,
                     github_app: services.github_app.clone(),
                     run_id: Some(record.run_id),
-                    clone_origin_url: clone_source.origin_url,
-                    clone_branch: clone_source.branch,
-                    clone_tag: clone_source.tag,
-                    clone_commit_sha: clone_source.commit_sha,
-                }
-            }
-            SandboxProviderKind::Daytona => {
-                let api_key = vault_guard
-                    .get(EnvVars::DAYTONA_API_KEY)
-                    .map(str::to_string);
-                let mut config = resolve_daytona_config(resolved);
-                config.skip_clone |= clone_source.skip_clone;
-                SandboxSpec::Daytona {
-                    config: Box::new(config),
-                    github_app: services.github_app.clone(),
-                    run_id: Some(record.run_id),
-                    clone_origin_url: clone_source.origin_url,
-                    clone_branch: clone_source.branch,
-                    clone_tag: clone_source.tag,
-                    clone_commit_sha: clone_source.commit_sha,
-                    api_key,
                 }
             }
         };
@@ -626,6 +624,7 @@ impl RunSession {
             workflow_path,
             workflow_bundle,
             vault: services.vault,
+            sandbox_providers: services.sandbox_providers,
             catalog,
             fabro_run_tools: services.fabro_run_tools,
         })
@@ -746,19 +745,8 @@ async fn configured_providers_for_start(
     vault: &Arc<AsyncRwLock<Vault>>,
     catalog: Arc<Catalog>,
 ) -> Vec<ProviderId> {
-    let source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::with_env_lookup(
-        Arc::clone(vault),
-        process_env_var,
-    ));
-    match LlmClient::from_source_report(source.as_ref(), catalog).await {
-        Ok(report) => report
-            .client
-            .provider_names()
-            .into_iter()
-            .map(ProviderId::new)
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+    let source = VaultCredentialSource::with_env_lookup(Arc::clone(vault), process_env_var);
+    readiness(catalog.enabled_providers(), &source).await.ready
 }
 
 fn git_checkpoint_options_from_start(
@@ -805,23 +793,23 @@ async fn load_accepted_run_definition(
 }
 
 fn resolve_sandbox_provider(settings: &ResolvedRunSettings) -> SandboxProviderKind {
-    SandboxProviderKind::from(settings.environment.provider)
+    settings.environment.provider.clone()
 }
 
-fn resolve_daytona_config(settings: &ResolvedRunSettings) -> DaytonaConfig {
-    daytona_config_from_environment(&settings.environment, &settings.clone)
-}
-
-fn resolve_docker_config(
+/// The environment's sandbox spec with its variables resolved through the
+/// vault.
+fn resolve_sandbox_spec(
     settings: &ResolvedRunSettings,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
-) -> Result<DockerSandboxOptions, Error> {
-    docker_config_from_environment_with_secrets(
-        &settings.environment,
-        &settings.clone,
-        secrets_lookup,
-    )
-    .map_err(|err| Error::engine_with_source("failed to resolve Docker environment config", err))
+) -> Result<sandbox_driver::SandboxSpec, Error> {
+    let env = settings
+        .environment
+        .resolve_env(secrets_lookup)
+        .map_err(|err| Error::engine_with_source("failed to resolve environment variables", err))?
+        .into_iter()
+        .collect();
+    sandbox_spec_for_environment(&settings.environment, env)
+        .map_err(|err| Error::engine_with_source("failed to resolve sandbox spec", err))
 }
 
 fn resolve_start_llm(
@@ -924,6 +912,7 @@ impl RunSession {
             fork_source_ref:  record.fork_source_ref.clone(),
             base_branch:      record.base_branch().map(str::to_string),
             display_base_sha: None,
+            git_identity:     None,
             git:              self.git.clone(),
         };
 
@@ -990,6 +979,7 @@ impl RunSession {
             hooks: self.hooks,
             sandbox_env: self.sandbox_env,
             vault: self.vault,
+            sandbox_providers: self.sandbox_providers,
             git: self.git,
             registry_override: self.registry_override,
             artifact_sink: self.artifact_sink,
@@ -1309,14 +1299,15 @@ mod tests {
     use fabro_store::Database;
     use fabro_types::settings::InterpString;
     use fabro_types::settings::run::{
-        EnvironmentProvider, McpTransport as ResolvedMcpTransport, PreparedStep, PreparedStepRun,
-        RunMode, RunPrepareSettings,
+        McpTransport as ResolvedMcpTransport, PreparedStep, PreparedStepRun, RunMode,
+        RunPrepareSettings,
     };
     use fabro_types::{
         BilledModelUsage, GitContext, ManifestPath, RunTarget, StageTiming, WorkflowSettings,
         fixtures, test_support,
     };
     use fabro_vault::SecretType;
+    use lithos_llm::catalog::builtin;
     use object_store::memory::InMemory;
 
     use super::*;
@@ -1435,73 +1426,32 @@ mod tests {
     }
 
     fn test_catalog() -> Arc<Catalog> {
-        Arc::new(Catalog::from_builtin().expect("default catalog should build"))
+        Arc::new(fabro_llm::test_support::test_catalog())
     }
 
     fn test_provider_ids() -> Vec<ProviderId> {
-        Catalog::builtin().all_provider_ids().into_iter().collect()
+        fabro_llm::test_support::test_catalog()
+            .enabled_provider_ids()
+            .into_iter()
+            .collect()
     }
 
+    /// OpenAI and OpenRouter both offering GPT-5.6 Sol as their default, so a
+    /// portable selector resolves to whichever provider is ready.
     fn portable_model_catalog() -> Catalog {
-        let settings: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+        fabro_llm::test_support::test_catalog_with_overlay(
             r#"
-[providers.openai]
-display_name = "OpenAI"
-adapter = "openai"
-agent_profile = "openai"
-priority = 90
-
-[providers.openai.models."gpt-5.6-sol"]
-display_name = "GPT-5.6 Sol"
-family = "gpt-5"
-aliases = ["gpt-56-sol"]
-default = true
-
-[providers.openai.models."gpt-5.6-sol".limits]
-context_window = 1000
-
-[providers.openai.models."gpt-5.6-sol".features]
-tools = true
-vision = false
-reasoning = false
-
-[providers.openai.models."gpt-5.4-mini"]
-display_name = "GPT-5.4 Mini"
-family = "gpt-5"
-aliases = ["mini"]
-
-[providers.openai.models."gpt-5.4-mini".limits]
-context_window = 1000
-
-[providers.openai.models."gpt-5.4-mini".features]
-tools = true
-vision = false
-reasoning = false
-
-[providers.openrouter]
-display_name = "OpenRouter"
-adapter = "openai_compatible"
-agent_profile = "openai"
-priority = 25
-
-[providers.openrouter.models."gpt-5.6-sol"]
-api_id = "openai/gpt-5.6-sol"
-display_name = "GPT-5.6 Sol (via OpenRouter)"
-family = "gpt-5"
-aliases = ["gpt-56-sol"]
-default = true
-
-[providers.openrouter.models."gpt-5.6-sol".limits]
-context_window = 1000
-
-[providers.openrouter.models."gpt-5.6-sol".features]
-tools = true
-vision = false
-reasoning = false
-"#,
+            [providers.openai]
+            priority = 90
+            default_model = "gpt-5.6-sol"
+            
+            [providers.openrouter]
+            priority = 25
+            default_model = "gpt-5.6-sol"
+            enabled = true
+            
+            "#,
         )
-        .unwrap();
-        Catalog::from_settings(&settings).unwrap()
     }
 
     #[test]
@@ -1518,40 +1468,39 @@ reasoning = false
 
         assert!(matches!(
             error,
-            Error::ModelSelection(fabro_model::ModelSelectionError::ProviderUnavailable {
+            Error::ModelSelection(fabro_llm::ModelSelectionError::ProviderUnavailable {
                 provider
-            }) if provider == ProviderId::openai()
+            }) if provider == builtin::openai()
         ));
     }
 
     #[test]
     fn resolve_start_llm_infers_provider_from_model_alias() {
-        let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+        let catalog = fabro_llm::test_support::test_catalog_with_overlay(
             r#"
-[providers.acme]
-adapter = "openai_compatible"
-agent_profile = "openai"
-base_url = "https://api.acme.test/v1"
-
-[models.acme-claude]
-provider = "acme"
-display_name = "Acme Claude"
-family = "claude"
-default = true
-agent_profile = "anthropic"
-aliases = ["ac"]
-
-[models.acme-claude.limits]
-context_window = 1000
-
-[models.acme-claude.features]
-tools = true
-vision = false
-reasoning = false
-"#,
-        )
-        .unwrap();
-        let catalog = Catalog::from_builtin_with_overrides(&overrides).unwrap();
+            [providers.acme]
+            display_name = "Acme"
+            adapter = "openai-compatible"
+            codec = "openai-chat"
+            base_url = "https://api.acme.test/v1"
+            auth = { type = "bearer" }
+            default_model = "acme-claude"
+            
+            [providers.acme.metadata.agent]
+            profile = "openai"
+            
+            [providers.acme.models.acme-claude]
+            display_name = "Acme Claude"
+            aliases = ["ac"]
+            api_model = "acme-claude"
+            limits = { context_tokens = 1000, max_output_tokens = 500 }
+            capabilities = { text = true, tools = true }
+            family = "claude"
+            
+            [providers.acme.models.acme-claude.metadata.agent]
+            profile = "anthropic"
+            "#,
+        );
         let mut settings = ResolvedRunSettings::default();
         settings.model.name = Some("ac".to_string());
 
@@ -1571,19 +1520,9 @@ reasoning = false
             ..RunLayer::default()
         });
 
-        assert!(
-            resolve_docker_config(&settings.run, |_| None)
-                .unwrap()
-                .skip_clone
-        );
-        assert!(resolve_daytona_config(&settings.run).skip_clone);
-        assert_eq!(resolve_daytona_config(&settings.run).clone_depth, Some(1));
-        assert_eq!(
-            resolve_docker_config(&settings.run, |_| None)
-                .unwrap()
-                .clone_depth,
-            Some(1)
-        );
+        let clone = CloneRequest::from_settings(&settings.run.clone);
+        assert!(clone.skip);
+        assert_eq!(clone.depth, Some(1));
     }
 
     #[test]
@@ -1596,26 +1535,16 @@ reasoning = false
             ..RunLayer::default()
         });
 
-        assert_eq!(resolve_daytona_config(&settings.run).clone_depth, None);
-        assert_eq!(
-            resolve_docker_config(&settings.run, |_| None)
-                .unwrap()
-                .clone_depth,
-            None
-        );
+        let clone = CloneRequest::from_settings(&settings.run.clone);
+        assert_eq!(clone.depth, None);
     }
 
     #[test]
     fn clone_providers_default_to_depth_100() {
         let settings = settings_from_run_layer(RunLayer::default());
 
-        assert_eq!(resolve_daytona_config(&settings.run).clone_depth, Some(100));
-        assert_eq!(
-            resolve_docker_config(&settings.run, |_| None)
-                .unwrap()
-                .clone_depth,
-            Some(100)
-        );
+        let clone = CloneRequest::from_settings(&settings.run.clone);
+        assert_eq!(clone.depth, Some(100));
     }
 
     #[test]
@@ -1907,7 +1836,7 @@ reasoning = false
             }),
             ..RunLayer::default()
         });
-        settings.run.environment.provider = EnvironmentProvider::Docker;
+        settings.run.environment.provider = SandboxProviderKind::DOCKER;
         settings.run.environment.image.docker = Some("buildpack-deps:noble".to_string());
         let (persisted, store) = persisted_workflow_with_settings_and_target(
             MINIMAL_DOT,
@@ -1933,27 +1862,19 @@ reasoning = false
             ..
         } = session;
         let runtime = sandbox
-            .to_run_sandbox_instance(&MockSandbox::linux(), fixtures::RUN_1)
+            .to_run_sandbox_instance(&MockSandbox::linux().sandbox())
             .runtime;
         assert_eq!(runtime.repo_cloned, Some(false));
         assert_eq!(runtime.clone_origin_url, None);
         assert_eq!(runtime.clone_branch, None);
         assert_eq!(runtime.primary_repo_path, None);
         assert_eq!(runtime.primary_repo_link, None);
-        let SandboxSpec::Docker {
-            config,
-            clone_origin_url,
-            clone_branch,
-            clone_commit_sha,
-            ..
-        } = sandbox
-        else {
-            panic!("none target should retain the selected Docker provider");
-        };
-        assert!(config.skip_clone);
-        assert_eq!(clone_origin_url, None);
-        assert_eq!(clone_branch, None);
-        assert_eq!(clone_commit_sha, None);
+        let SandboxSpec { kind, clone, .. } = sandbox;
+        assert_eq!(kind, SandboxProviderKind::DOCKER);
+        assert!(clone.skip);
+        assert_eq!(clone.origin_url, None);
+        assert_eq!(clone.branch, None);
+        assert_eq!(clone.commit_sha, None);
         assert_eq!(sandbox_env.origin_url, None);
         assert_eq!(pr_origin_url, None);
     }
@@ -1969,7 +1890,7 @@ reasoning = false
             }),
             ..RunLayer::default()
         });
-        settings.run.environment.provider = EnvironmentProvider::Daytona;
+        settings.run.environment.provider = SandboxProviderKind::DAYTONA;
         settings.run.environment.image.docker = None;
         let (persisted, store) = persisted_workflow_with_settings_and_target(
             MINIMAL_DOT,
@@ -2000,27 +1921,25 @@ reasoning = false
             ..
         } = session;
         let runtime = sandbox
-            .to_run_sandbox_instance(&MockSandbox::linux(), fixtures::RUN_1)
+            .to_run_sandbox_instance(&MockSandbox::linux().sandbox())
             .runtime;
         assert_eq!(runtime.repo_cloned, Some(false));
         assert_eq!(runtime.clone_origin_url, None);
         assert_eq!(runtime.clone_branch, None);
         assert_eq!(runtime.primary_repo_path, None);
         assert_eq!(runtime.primary_repo_link, None);
-        let SandboxSpec::Daytona {
-            config,
-            clone_origin_url,
-            clone_branch,
-            clone_commit_sha,
+        let SandboxSpec {
+            kind,
+            access,
+            clone,
             ..
-        } = sandbox
-        else {
-            panic!("none target should retain the selected Daytona provider");
-        };
-        assert!(config.skip_clone);
-        assert_eq!(clone_origin_url, None);
-        assert_eq!(clone_branch, None);
-        assert_eq!(clone_commit_sha, None);
+        } = sandbox;
+        assert_eq!(kind, SandboxProviderKind::DAYTONA);
+        assert!(access.daytona.is_some(), "the vault key reaches the spec");
+        assert!(clone.skip);
+        assert_eq!(clone.origin_url, None);
+        assert_eq!(clone.branch, None);
+        assert_eq!(clone.commit_sha, None);
         assert_eq!(sandbox_env.origin_url, None);
         assert_eq!(pr_origin_url, None);
     }
@@ -2030,7 +1949,7 @@ reasoning = false
         let temp = tempfile::tempdir().unwrap();
         let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
         let mut settings = settings_from_run_layer(RunLayer::default());
-        settings.run.environment.provider = EnvironmentProvider::Local;
+        settings.run.environment.provider = SandboxProviderKind::LOCAL;
         let (persisted, store) = persisted_workflow_with_settings_and_target(
             MINIMAL_DOT,
             &storage_root,
@@ -2073,7 +1992,7 @@ reasoning = false
                 }),
                 ..RunLayer::default()
             });
-            settings.run.environment.provider = EnvironmentProvider::Docker;
+            settings.run.environment.provider = SandboxProviderKind::DOCKER;
             settings.run.environment.image.docker = Some("buildpack-deps:noble".to_string());
             let (persisted, store) = persisted_workflow_with_settings_and_target(
                 MINIMAL_DOT,
@@ -2093,12 +2012,20 @@ reasoning = false
             .await
             .unwrap();
 
-            let SandboxSpec::Local { working_directory } = session.sandbox else {
-                panic!("clone target dry-run should execute in a Local scratch sandbox");
-            };
             assert_eq!(
-                working_directory,
-                run_dir.join("dry-run-workspace").canonicalize().unwrap()
+                session.sandbox.kind,
+                SandboxProviderKind::LOCAL,
+                "clone target dry-run should execute in a Local scratch sandbox"
+            );
+            assert_eq!(
+                session.sandbox.working_directory().map(Path::new),
+                Some(
+                    run_dir
+                        .join("dry-run-workspace")
+                        .canonicalize()
+                        .unwrap()
+                        .as_path()
+                )
             );
             assert_eq!(session.sandbox_env.origin_url, None);
             assert_eq!(session.pr_origin_url, None);
@@ -2118,7 +2045,7 @@ reasoning = false
             }),
             ..RunLayer::default()
         });
-        local_settings.run.environment.provider = EnvironmentProvider::Local;
+        local_settings.run.environment.provider = SandboxProviderKind::LOCAL;
         let (persisted, store) = persisted_workflow_with_settings_and_target(
             MINIMAL_DOT,
             &storage_root,
@@ -2148,7 +2075,7 @@ reasoning = false
             }),
             ..RunLayer::default()
         });
-        docker_settings.run.environment.provider = EnvironmentProvider::Docker;
+        docker_settings.run.environment.provider = SandboxProviderKind::DOCKER;
         let (persisted, store) =
             persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, docker_settings).await;
         let persisted = persisted_with_target_projection(
@@ -2179,7 +2106,7 @@ reasoning = false
         let environment_cwd = temp.path().join("environment-cwd");
         std::fs::create_dir_all(&environment_cwd).unwrap();
         let mut settings = settings_from_run_layer(RunLayer::default());
-        settings.run.environment.provider = EnvironmentProvider::Local;
+        settings.run.environment.provider = SandboxProviderKind::LOCAL;
         settings.run.environment.cwd = Some(environment_cwd.to_string_lossy().into_owned());
         let (persisted, store) =
             persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
@@ -2207,27 +2134,28 @@ reasoning = false
         .await
         .unwrap();
 
-        let SandboxSpec::Local { working_directory } = session.sandbox else {
-            panic!("folder target should retain the selected Local provider");
-        };
-        assert_eq!(working_directory, canonical_folder);
-        assert_ne!(working_directory, environment_cwd);
+        assert_eq!(
+            session.sandbox.kind,
+            SandboxProviderKind::LOCAL,
+            "folder target should retain the selected Local provider"
+        );
+        let working_directory = session.sandbox.working_directory().map(Path::new);
+        assert_eq!(working_directory, Some(canonical_folder.as_path()));
+        assert_ne!(working_directory, Some(environment_cwd.as_path()));
         assert_eq!(session.sandbox_env.origin_url.as_deref(), Some(origin_url));
         assert_eq!(session.pr_origin_url.as_deref(), Some(origin_url));
     }
 
     #[tokio::test]
     async fn run_session_new_folder_target_rejects_clone_based_providers() {
-        for provider in [EnvironmentProvider::Docker, EnvironmentProvider::Daytona] {
+        for provider in [SandboxProviderKind::DOCKER, SandboxProviderKind::DAYTONA] {
             let temp = tempfile::tempdir().unwrap();
             let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
             let (_, canonical_text) = canonical_folder(&temp);
             let mut settings = settings_from_run_layer(RunLayer::default());
+            settings.run.environment.image.docker = (provider == SandboxProviderKind::DOCKER)
+                .then(|| "buildpack-deps:noble".to_string());
             settings.run.environment.provider = provider;
-            settings.run.environment.image.docker = match provider {
-                EnvironmentProvider::Docker => Some("buildpack-deps:noble".to_string()),
-                EnvironmentProvider::Daytona | EnvironmentProvider::Local => None,
-            };
             let (persisted, store) =
                 persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
             let persisted = persisted_with_target_projection(
@@ -2264,7 +2192,7 @@ reasoning = false
         let environment_cwd = temp.path().join("environment-cwd");
         std::fs::create_dir_all(&environment_cwd).unwrap();
         let mut settings = settings_from_run_layer(RunLayer::default());
-        settings.run.environment.provider = EnvironmentProvider::Local;
+        settings.run.environment.provider = SandboxProviderKind::LOCAL;
         settings.run.environment.cwd = Some(environment_cwd.to_string_lossy().into_owned());
         let (persisted, store) =
             persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
@@ -2278,10 +2206,15 @@ reasoning = false
         .await
         .unwrap();
 
-        let SandboxSpec::Local { working_directory } = session.sandbox else {
-            panic!("legacy Local run should retain the selected Local provider");
-        };
-        assert_eq!(working_directory, environment_cwd);
+        assert_eq!(
+            session.sandbox.kind,
+            SandboxProviderKind::LOCAL,
+            "legacy Local run should retain the selected Local provider"
+        );
+        assert_eq!(
+            session.sandbox.working_directory().map(Path::new),
+            Some(environment_cwd.as_path())
+        );
     }
 
     #[tokio::test]
@@ -2400,13 +2333,23 @@ reasoning = false
             ..RunLayer::default()
         });
 
-        let config = resolve_docker_config(&settings.run, |_| None).unwrap();
+        let spec = resolve_sandbox_spec(&settings.run, |_| None).unwrap();
 
-        assert_eq!(config.image, "ubuntu:24.04");
-        assert_eq!(config.cpu_quota, Some(400_000));
-        assert_eq!(config.memory_limit, Some(2_000_000_000));
-        assert_eq!(config.network_mode.as_deref(), Some("none"));
-        assert_eq!(config.env_vars, vec!["NODE_ENV=test"]);
+        assert!(matches!(
+            &spec.source,
+            fabro_sandbox::SandboxSource::Image { reference } if reference == "ubuntu:24.04"
+        ));
+        assert_eq!(spec.resources.cpu_cores, Some(4));
+        assert_eq!(
+            spec.resources.memory_mb,
+            Some(1908),
+            "2 GB rounds up to whole mebibytes"
+        );
+        assert!(matches!(spec.network, fabro_sandbox::NetworkPolicy::Block));
+        assert_eq!(
+            spec.env,
+            std::collections::BTreeMap::from([("NODE_ENV".to_string(), "test".to_string())])
+        );
     }
 
     #[test]
@@ -2552,6 +2495,7 @@ reasoning = false
             github_app: None,
             github_integration: ResolvedGithubIntegration::default(),
             vault: Arc::new(AsyncRwLock::new(start_vault(&[]))),
+            sandbox_providers: ServerSandboxProvidersSettings::default(),
             catalog: test_catalog(),
             on_node: None,
             registry_override: Some(registry),

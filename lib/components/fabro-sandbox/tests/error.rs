@@ -11,24 +11,3 @@ fn context_error_preserves_source_cause() {
         "Failed to read file\n  caused by: permission denied"
     );
 }
-
-#[cfg(feature = "docker")]
-#[test]
-fn docker_image_inspect_error_preserves_source_cause() {
-    use bollard::errors::Error as BollardError;
-
-    let source = BollardError::DockerResponseServerError {
-        status_code: 500,
-        message:     "daemon unavailable".to_string(),
-    };
-
-    let error = fabro_sandbox::Error::docker_image_inspect("buildpack-deps:noble", source);
-
-    assert_eq!(
-        error.to_string(),
-        "Failed to inspect Docker image buildpack-deps:noble"
-    );
-    assert_eq!(error.causes(), vec![
-        "Docker responded with status code 500: daemon unavailable"
-    ]);
-}

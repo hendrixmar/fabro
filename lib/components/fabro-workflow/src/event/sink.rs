@@ -172,6 +172,11 @@ impl RunEventSink {
 )]
 enum RunEventCommand {
     Event(RunEvent),
+    /// An event whose writer waits for the store to accept it.
+    Acknowledged(
+        RunEvent,
+        oneshot::Sender<Result<(), RunEventPersistenceError>>,
+    ),
     Flush(oneshot::Sender<Result<(), RunEventPersistenceError>>),
 }
 
@@ -186,6 +191,29 @@ pub enum RunEventPersistenceError {
     },
     #[error("run event persistence task stopped")]
     TaskStopped,
+}
+
+async fn write_event(
+    sink: &RunEventSink,
+    event: &RunEvent,
+) -> Result<(), RunEventPersistenceError> {
+    match sink.write_run_event(event).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let rendered_error = collect_chain(err.as_ref()).join(": ");
+            tracing::error!(
+                run_id = %event.run_id,
+                event = %event.body.event_name(),
+                error = %rendered_error,
+                "Failed to persist run event; stopping workflow",
+            );
+            Err(RunEventPersistenceError::Write {
+                run_id: event.run_id,
+                event:  event.body.event_name().to_string(),
+                source: SharedError::new(err),
+            })
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -209,20 +237,23 @@ impl RunEventLogger {
                         if failure_tx.borrow().is_some() {
                             continue;
                         }
-                        if let Err(err) = sink.write_run_event(&event).await {
-                            let rendered_error = collect_chain(err.as_ref()).join(": ");
-                            tracing::error!(
-                                run_id = %event.run_id,
-                                event = %event.body.event_name(),
-                                error = %rendered_error,
-                                "Failed to persist run event; stopping workflow",
-                            );
-                            failure_tx.send_replace(Some(RunEventPersistenceError::Write {
-                                run_id: event.run_id,
-                                event:  event.body.event_name().to_string(),
-                                source: SharedError::new(err),
-                            }));
+                        if let Err(failure) = write_event(&sink, &event).await {
+                            failure_tx.send_replace(Some(failure));
                         }
+                    }
+                    RunEventCommand::Acknowledged(event, tx) => {
+                        let latched = failure_tx.borrow().clone();
+                        let result = match latched {
+                            Some(failure) => Err(failure),
+                            None => match write_event(&sink, &event).await {
+                                Ok(()) => Ok(()),
+                                Err(failure) => {
+                                    failure_tx.send_replace(Some(failure.clone()));
+                                    Err(failure)
+                                }
+                            },
+                        };
+                        let _ = tx.send(result);
                     }
                     RunEventCommand::Flush(tx) => {
                         let result = failure_tx.borrow().clone().map_or(Ok(()), Err);
@@ -235,17 +266,42 @@ impl RunEventLogger {
         Self { tx, failure_rx }
     }
 
+    /// Makes this logger the emitter's persistence path: every emitted event
+    /// is queued here, and [`Emitter::emit_durable`] waits for this logger's
+    /// acknowledgement.
     pub fn register(&self, emitter: &Emitter) {
-        let tx = self.tx.clone();
-        emitter.on_event(move |event| {
-            if tx.send(RunEventCommand::Event(event.clone())).is_err() {
-                tracing::error!(
-                    run_id = %event.run_id,
-                    event = %event.body.event_name(),
-                    "Run event persistence task stopped while forwarding event",
-                );
-            }
-        });
+        emitter.attach_persistence(self.clone());
+    }
+
+    pub(super) fn enqueue(&self, event: &RunEvent) {
+        if self.tx.send(RunEventCommand::Event(event.clone())).is_err() {
+            tracing::error!(
+                run_id = %event.run_id,
+                event = %event.body.event_name(),
+                "Run event persistence task stopped while forwarding event",
+            );
+        }
+    }
+
+    /// Writes `event` and returns once the sink has accepted it, or with the
+    /// failure that stopped persistence.
+    ///
+    /// Ordering with events queued through the emitter is preserved: the
+    /// write goes through the same queue.
+    pub async fn write_acknowledged(
+        &self,
+        event: &RunEvent,
+    ) -> Result<(), RunEventPersistenceError> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(RunEventCommand::Acknowledged(event.clone(), tx))
+            .is_err()
+        {
+            return Err(RunEventPersistenceError::TaskStopped);
+        }
+        rx.await
+            .unwrap_or(Err(RunEventPersistenceError::TaskStopped))
     }
 
     pub async fn wait_for_failure(&self) -> RunEventPersistenceError {
@@ -298,6 +354,8 @@ mod tests {
 
     use ::fabro_types::{Graph, RunNoticeLevel, WorkflowSettings, fixtures};
     use fabro_types::test_support;
+    use lithos_llm::types::ReasoningOutput;
+    use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, TokenUsage};
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::*;
@@ -385,28 +443,25 @@ mod tests {
         let (writer, reader) = tokio::io::duplex(4096);
         let sink = RunEventSink::json_lines(writer);
         let event = to_run_event(&fixtures::RUN_7, &Event::Agent {
-            stage:             "code".to_string(),
-            visit:             1,
-            event:             fabro_agent::AgentEvent::AssistantMessage {
-                text:            String::new(),
-                model:           fabro_model::ModelRef {
-                    provider: fabro_model::ProviderId::openai(),
-                    model_id: "gpt-5.4".into(),
-                    speed:    None,
+            stage: "code".to_string(),
+            visit: 1,
+            event: CodingAgentEvent::new(
+                "ses_agent".to_string(),
+                CodingEvent::AssistantMessage {
+                    text:            String::new(),
+                    model:           "gpt-5.4".to_string(),
+                    usage:           TokenUsage::default(),
+                    cost_usd_micros: None,
+                    cost_source:     None,
+                    tool_call_count: 1,
+                    context_window:  None,
+                    reasoning:       Some(ReasoningOutput::new(
+                        "inspect the sink first",
+                        "write the line, then read it back",
+                    )),
                 },
-                usage:           fabro_llm::types::TokenCounts::default(),
-                cost_usd:        None,
-                cost_source:     None,
-                tool_call_count: 1,
-                context_window:  None,
-                reasoning:       Some(::fabro_types::ReasoningOutput::new(
-                    "inspect the sink first",
-                    "write the line, then read it back",
-                )),
-            },
-            session_id:        Some("ses_agent".to_string()),
-            parent_session_id: None,
-            tool_call_id:      None,
+                std::time::SystemTime::UNIX_EPOCH,
+            ),
         });
 
         sink.write_run_event(&event).await.unwrap();
@@ -417,12 +472,10 @@ mod tests {
 
         let payload = event_payload_from_redacted_json(line.trim_end(), &fixtures::RUN_7).unwrap();
         assert_eq!(payload.as_value()["event"], "agent.message");
+        let message = &payload.as_value()["properties"]["event"]["AssistantMessage"];
+        assert_eq!(message["reasoning"]["summary"], "inspect the sink first");
         assert_eq!(
-            payload.as_value()["properties"]["reasoning"]["summary"],
-            "inspect the sink first"
-        );
-        assert_eq!(
-            payload.as_value()["properties"]["reasoning"]["trace"],
+            message["reasoning"]["trace"],
             "write the line, then read it back"
         );
     }

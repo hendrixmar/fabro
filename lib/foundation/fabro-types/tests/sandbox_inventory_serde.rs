@@ -1,49 +1,41 @@
-use std::collections::BTreeMap;
+use std::time::SystemTime;
 
-use chrono::{TimeZone, Utc};
+use chrono::DateTime;
 use fabro_types::{
-    SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxNetwork, SandboxNetworkPolicy,
-    SandboxProviderKind, SandboxProviderLookupError, SandboxResources, SandboxState,
-    SandboxTimestamps,
+    SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxProviderKind,
+    SandboxProviderLookupError,
 };
+use sandbox_driver::{NetworkPolicy, Resources, SandboxId, SandboxState, SandboxStatus};
 use serde_json::json;
 
 #[test]
-fn sandbox_inventory_serializes_provider_backed_shape() {
-    let created_at = Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 0).unwrap();
+fn sandbox_inventory_serializes_the_provider_and_the_drivers_status() {
+    let mut status = SandboxStatus::new(
+        SandboxId::try_new("container-abc123").unwrap(),
+        SandboxState::Running,
+    );
+    status.name = Some("fabro-run-abc".to_string());
+    status.provider_state = "running".to_string();
+    status.image = Some("buildpack-deps:noble".to_string());
+    let mut resources = Resources::default();
+    resources.cpu_cores = Some(2);
+    resources.memory_mb = Some(4096);
+    status.resources = Some(resources);
+    status.network = Some(NetworkPolicy::AllowAll);
+    status
+        .labels
+        .insert("sh.fabro.managed".to_string(), "true".to_string());
+    status.created_at = Some(SystemTime::from(
+        DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z").unwrap(),
+    ));
     let response = SandboxListResponse {
         data: vec![SandboxInfo {
-            provider:          SandboxProviderKind::Docker,
-            id:                "container-abc123".to_string(),
-            display_name:      Some("fabro-run-abc".to_string()),
-            state:             SandboxState::Running,
-            native_state:      Some("running".to_string()),
-            image:             Some("buildpack-deps:noble".to_string()),
-            snapshot:          None,
-            region:            None,
-            web_url:           None,
-            working_directory: Some("/workspace".to_string()),
-            resources:         SandboxResources {
-                cpu_cores:    Some(2.0),
-                memory_bytes: Some(4 * 1024 * 1024 * 1024),
-                disk_bytes:   None,
-            },
-            network:           SandboxNetwork {
-                egress:  SandboxNetworkPolicy::open(),
-                ingress: SandboxNetworkPolicy::blocked(),
-            },
-            labels:            BTreeMap::from([(
-                "sh.fabro.managed".to_string(),
-                "true".to_string(),
-            )]),
-            timestamps:        SandboxTimestamps {
-                created_at:       Some(created_at),
-                last_activity_at: None,
-            },
+            provider: SandboxProviderKind::DOCKER,
+            status,
         }],
         meta: SandboxListMeta {
             provider_errors: vec![SandboxProviderLookupError {
-                provider: SandboxProviderKind::Daytona,
+                provider: SandboxProviderKind::DAYTONA,
                 message:  "Daytona API key is not configured".to_string(),
             }],
         },
@@ -54,31 +46,28 @@ fn sandbox_inventory_serializes_provider_backed_shape() {
         json!({
             "data": [{
                 "provider": "docker",
-                "id": "container-abc123",
-                "display_name": "fabro-run-abc",
-                "state": "running",
-                "native_state": "running",
-                "image": "buildpack-deps:noble",
-                "working_directory": "/workspace",
-                "resources": {
-                    "cpu_cores": 2.0,
-                    "memory_bytes": 4_294_967_296_u64
-                },
-                "network": {
-                    "egress": {
-                        "mode": "open",
-                        "cidrs": []
+                "status": {
+                    "id": "container-abc123",
+                    "name": "fabro-run-abc",
+                    "state": "running",
+                    "provider_state": "running",
+                    "error_reason": null,
+                    "resources": {
+                        "cpu_cores": 2,
+                        "memory_mb": 4096,
+                        "disk_mb": null,
+                        "gpus": null
                     },
-                    "ingress": {
-                        "mode": "blocked",
-                        "cidrs": []
-                    }
-                },
-                "labels": {
-                    "sh.fabro.managed": "true"
-                },
-                "timestamps": {
-                    "created_at": "2026-05-25T12:00:00Z"
+                    "sandbox_kind": null,
+                    "region": null,
+                    "labels": { "sh.fabro.managed": "true" },
+                    "image": "buildpack-deps:noble",
+                    "snapshot": null,
+                    "network": "allow_all",
+                    "workspace_ownership": null,
+                    "web_url": null,
+                    "created_at": "2026-05-25T12:00:00Z",
+                    "updated_at": null
                 }
             }],
             "meta": {
@@ -92,28 +81,18 @@ fn sandbox_inventory_serializes_provider_backed_shape() {
 }
 
 #[test]
-fn sandbox_inventory_deserializes_when_optional_fields_are_absent() {
+fn sandbox_inventory_deserializes_a_status_with_only_its_required_fields() {
     let info: SandboxInfo = serde_json::from_value(json!({
         "provider": "local",
-        "id": "local:01KSGHGMCFM8W2FHXNMJ7MVY65",
-        "state": "unknown",
-        "resources": {},
-        "timestamps": {}
+        "status": { "id": "host-dir-2f746d70", "state": "unknown" }
     }))
     .unwrap();
 
-    assert_eq!(info.provider, SandboxProviderKind::Local);
-    assert_eq!(info.id, "local:01KSGHGMCFM8W2FHXNMJ7MVY65");
-    assert_eq!(info.state, SandboxState::Unknown);
-    assert!(info.display_name.is_none());
-    assert!(info.native_state.is_none());
-    assert!(info.image.is_none());
-    assert!(info.snapshot.is_none());
-    assert!(info.region.is_none());
-    assert!(info.web_url.is_none());
-    assert!(info.working_directory.is_none());
-    assert_eq!(info.resources, SandboxResources::default());
-    assert_eq!(info.network, SandboxNetwork::unknown());
-    assert!(info.labels.is_empty());
-    assert_eq!(info.timestamps, SandboxTimestamps::default());
+    assert_eq!(info.provider, SandboxProviderKind::LOCAL);
+    assert_eq!(info.status.id.as_str(), "host-dir-2f746d70");
+    assert_eq!(info.status.state, SandboxState::Unknown);
+    assert!(info.status.name.is_none());
+    assert!(info.status.resources.is_none());
+    assert!(info.status.network.is_none());
+    assert!(info.status.labels.is_empty());
 }

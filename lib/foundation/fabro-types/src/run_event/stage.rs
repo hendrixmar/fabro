@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use fabro_model::{ReasoningEffort, Speed};
+use lithos_llm::types::{ReasoningEffort, Speed};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

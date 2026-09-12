@@ -8,48 +8,6 @@ use walkdir::WalkDir;
 
 use crate::workspace_root;
 
-/// `fabro_model::bootstrap_catalog` (and its module) is the install/API-key
-/// validation hatch from the settings-driven LLM catalog plan. It must
-/// **not** appear in request-serving paths — server handlers, workflow
-/// operations, agent runtime, hooks, or completion handlers — because those
-/// must use the resolved `Arc<Catalog>` threaded through their state.
-///
-/// The allowed-callers list below is the policy boundary. Adding a new
-/// caller is intentional and requires updating this list.
-///
-/// The walker only descends into `lib/`, so non-`lib/` paths (docs, top-level
-/// markdown) are not part of the allowlist.
-const BOOTSTRAP_CATALOG_ALLOWED_PATH_FRAGMENTS: &[&str] = &[
-    // The bootstrap module itself.
-    "lib/foundation/fabro-model/src/bootstrap_catalog",
-    // Public module declaration for the bootstrap hatch.
-    "lib/foundation/fabro-model/src/lib.rs",
-    // Install / first-run / API-key validation flows that legitimately need
-    // a built-in catalog before any project settings have been loaded.
-    "lib/components/fabro-install/",
-    "lib/apps/fabro-cli/src/commands/install/",
-    "lib/apps/fabro-cli/src/shared/install_",
-    "lib/apps/fabro-cli/src/shared/api_key_validation",
-    // Test support modules.
-    "tests/",
-    "test_support",
-    "/tests/it/",
-    "/tests/policy.rs",
-];
-
-/// Production runtime code should build catalogs from resolved settings and
-/// thread the resulting `Arc<Catalog>` through state. Direct use of
-/// `Catalog::builtin()` is reserved for `fabro-model` internals and tests.
-const CATALOG_BUILTIN_ALLOWED_PATH_FRAGMENTS: &[&str] = &[
-    // The catalog owner may define and test the built-in/default catalog.
-    "lib/foundation/fabro-model/",
-    // Tests and test support may use built-ins as fixtures.
-    "/tests/",
-    "/tests/it/",
-    "test_support",
-    "/tests/policy.rs",
-];
-
 const TEMPLATE_RENDER_ALLOWED_PATH_FRAGMENTS: &[&str] = &[
     // The template crate owns the rendering API and its tests.
     "lib/foundation/fabro-template/src/lib.rs",
@@ -69,32 +27,6 @@ const TEMPLATE_RENDER_FORBIDDEN_PATTERNS: &[&str] = &[
     "render_lenient as",
     "fabro_template::{",
 ];
-
-#[test]
-fn bootstrap_catalog_references_stay_in_allowlist() {
-    let violations = source_symbol_violations(
-        "bootstrap_catalog",
-        BOOTSTRAP_CATALOG_ALLOWED_PATH_FRAGMENTS,
-    );
-
-    assert!(
-        violations.is_empty(),
-        "bootstrap_catalog (install-only) referenced from non-allowlisted source files:\n{}\n\nIf this is intentional, add the path fragment to BOOTSTRAP_CATALOG_ALLOWED_PATH_FRAGMENTS in lib/foundation/fabro-dev/tests/it/policy.rs.",
-        format_violations(violations),
-    );
-}
-
-#[test]
-fn catalog_builtin_references_stay_in_allowlist() {
-    let violations =
-        source_symbol_violations("Catalog::builtin()", CATALOG_BUILTIN_ALLOWED_PATH_FRAGMENTS);
-
-    assert!(
-        violations.is_empty(),
-        "Catalog::builtin() referenced from non-allowlisted production source files:\n{}\n\nRuntime code should use a resolved settings catalog via `Catalog::from_builtin_with_overrides(...)` or an injected `Arc<Catalog>`. If this is intentional test/bootstrap code, add the path fragment to CATALOG_BUILTIN_ALLOWED_PATH_FRAGMENTS in lib/foundation/fabro-dev/tests/it/policy.rs.",
-        format_violations(violations),
-    );
-}
 
 #[test]
 fn workflow_template_rendering_call_sites_stay_in_allowlist() {

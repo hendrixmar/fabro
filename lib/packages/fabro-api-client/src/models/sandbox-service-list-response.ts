@@ -16,14 +16,10 @@
 // May contain unused imports in some cases
 // @ts-ignore
 import type { SandboxService } from './sandbox-service';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxServiceListMeta } from './sandbox-service-list-meta';
 
 /**
  * Non-paginated list of listening TCP services in a run sandbox.
  */
 export interface SandboxServiceListResponse {
     'data': Array<SandboxService>;
-    'meta': SandboxServiceListMeta;
 }

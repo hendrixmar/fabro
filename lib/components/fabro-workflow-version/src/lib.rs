@@ -23,8 +23,9 @@ use fabro_types::settings::InterpString;
 use fabro_types::{ManifestPath, WorkflowPath, WorkflowPathParseError, WorkflowVersion};
 use thiserror::Error;
 
+mod closure;
 mod store;
-
+pub use closure::CollectedWorkflowClosure;
 pub use store::{LoadedWorkflowVersionClosure, WorkflowVersionStore, WorkflowVersionStoreError};
 
 #[derive(Debug, Error)]

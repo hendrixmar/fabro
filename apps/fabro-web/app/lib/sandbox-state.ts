@@ -11,29 +11,31 @@ export interface SandboxStateDisplay {
   text: string;
 }
 
+const PENDING = { dot: "bg-amber", text: "text-amber" } as const;
+const QUIET = { dot: "bg-fg-muted", text: "text-fg-muted" } as const;
+const GONE = { dot: "bg-coral", text: "text-coral" } as const;
+
 /**
- * Display metadata for every normalized sandbox lifecycle state. Shared by the
+ * Display metadata for every sandbox driver lifecycle state. Shared by the
  * run overview summary panel and the dedicated sandbox page so the dot color,
- * label, and hover copy stay consistent.
+ * label, and hover copy stay consistent. A state this build does not know
+ * renders as `unknown`.
  */
 export const SANDBOX_STATE_DISPLAY: Record<SandboxState, SandboxStateDisplay> = {
   unknown: {
     label: "Unknown",
     description: "The sandbox state could not be determined.",
-    dot: "bg-fg-muted",
-    text: "text-fg-muted",
+    ...QUIET,
   },
-  provisioning: {
-    label: "Provisioning",
-    description: "The sandbox is being provisioned.",
-    dot: "bg-amber",
-    text: "text-amber",
+  creating: {
+    label: "Creating",
+    description: "The sandbox is being created.",
+    ...PENDING,
   },
   starting: {
     label: "Starting",
     description: "The sandbox is starting up.",
-    dot: "bg-amber",
-    text: "text-amber",
+    ...PENDING,
   },
   running: {
     label: "Running",
@@ -44,55 +46,71 @@ export const SANDBOX_STATE_DISPLAY: Record<SandboxState, SandboxStateDisplay> = 
   stopping: {
     label: "Stopping",
     description: "The sandbox is shutting down.",
-    dot: "bg-amber",
-    text: "text-amber",
+    ...PENDING,
   },
   stopped: {
     label: "Stopped",
     description: "The sandbox is stopped.",
-    dot: "bg-fg-muted",
-    text: "text-fg-muted",
+    ...QUIET,
+  },
+  pausing: {
+    label: "Pausing",
+    description: "The sandbox is being paused.",
+    ...PENDING,
   },
   paused: {
     label: "Paused",
     description: "The sandbox is paused.",
-    dot: "bg-amber",
-    text: "text-amber",
+    ...PENDING,
   },
-  deleting: {
-    label: "Deleting",
-    description: "The sandbox is being deleted.",
-    dot: "bg-amber",
-    text: "text-amber",
+  resuming: {
+    label: "Resuming",
+    description: "The sandbox is resuming.",
+    ...PENDING,
   },
-  deleted: {
-    label: "Deleted",
-    description: "The sandbox has been deleted.",
-    dot: "bg-coral",
-    text: "text-coral",
+  archiving: {
+    label: "Archiving",
+    description: "The sandbox is being archived.",
+    ...PENDING,
   },
   archived: {
     label: "Archived",
     description: "The sandbox has been archived.",
-    dot: "bg-fg-muted",
-    text: "text-fg-muted",
+    ...QUIET,
   },
   restoring: {
     label: "Restoring",
     description: "The sandbox is being restored.",
-    dot: "bg-amber",
-    text: "text-amber",
+    ...PENDING,
   },
   resizing: {
     label: "Resizing",
     description: "The sandbox resources are being resized.",
-    dot: "bg-amber",
-    text: "text-amber",
+    ...PENDING,
+  },
+  forking: {
+    label: "Forking",
+    description: "The sandbox is being forked.",
+    ...PENDING,
+  },
+  snapshotting: {
+    label: "Snapshotting",
+    description: "A snapshot of the sandbox is being taken.",
+    ...PENDING,
+  },
+  deleting: {
+    label: "Deleting",
+    description: "The sandbox is being deleted.",
+    ...PENDING,
+  },
+  deleted: {
+    label: "Deleted",
+    description: "The sandbox has been deleted.",
+    ...GONE,
   },
   error: {
     label: "Error",
     description: "The sandbox encountered an error.",
-    dot: "bg-coral",
-    text: "text-coral",
+    ...GONE,
   },
 };

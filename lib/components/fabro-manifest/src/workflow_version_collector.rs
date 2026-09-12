@@ -7,34 +7,34 @@ use fabro_types::{
     WorkflowPath, WorkflowPathParseError, WorkflowVersion, WorkflowVersionId,
     WorkflowVersionShapeError,
 };
-use fabro_workflow_version::{ValidatedWorkflowVersion, WorkflowVersionError};
+use fabro_workflow_version::{
+    CollectedWorkflowClosure, ValidatedWorkflowVersion, WorkflowVersionError,
+};
 use thiserror::Error;
 
 use crate::workflow_bundler::{CollectedWorkflowSource, CollectedWorkflowSources, WorkflowBundler};
 
-/// One locally packaged workflow-version closure in dependency-first order.
-#[derive(Debug)]
-pub struct CollectedWorkflowClosure {
-    root_id:  WorkflowVersionId,
-    versions: Vec<(WorkflowVersionId, ValidatedWorkflowVersion)>,
-}
+/// Maximum active graph nesting while collecting or assembling a version.
+/// Bounds native stack use independently of file-count and byte budgets.
+pub const MAX_WORKFLOW_VERSION_DEPTH: usize = 64;
 
-impl CollectedWorkflowClosure {
-    #[must_use]
-    pub fn root_id(&self) -> WorkflowVersionId {
-        self.root_id
+pub(super) fn check_workflow_depth(
+    depth: usize,
+    path: &str,
+) -> Result<(), WorkflowVersionCollectError> {
+    if depth > MAX_WORKFLOW_VERSION_DEPTH {
+        return Err(WorkflowVersionCollectError::DepthExceeded {
+            path:    path.to_owned(),
+            maximum: MAX_WORKFLOW_VERSION_DEPTH,
+        });
     }
-
-    /// Iterate over every unique version with dependencies before parents.
-    pub fn versions(
-        &self,
-    ) -> impl Iterator<Item = (WorkflowVersionId, &ValidatedWorkflowVersion)> + '_ {
-        self.versions.iter().map(|(id, version)| (*id, version))
-    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
 pub enum WorkflowVersionCollectError {
+    #[error("workflow dependency nesting at `{path}` exceeds {maximum} levels")]
+    DepthExceeded { path: String, maximum: usize },
     #[error("workflow `{path}` was not found")]
     WorkflowNotFound { path: PathBuf },
     #[error("failed to collect workflow `{path}`")]
@@ -70,6 +70,34 @@ pub enum WorkflowVersionCollectError {
     DependencyCycle { path: WorkflowPath },
     #[error("collected workflow dependency `{path}` is missing")]
     MissingWorkflow { path: String },
+    /// A referenced file is absent from the package root. Surfaced separately
+    /// from [`Self::Collect`] because the path is the whole message.
+    #[error("referenced file `{path}` is missing from the workflow source")]
+    MissingPackageFile { path: String },
+    /// Supplied-content packaging: the collector read a file whose exact key
+    /// the caller did not supply (a case-insensitive host satisfied a
+    /// reference that differs from the supplied key).
+    #[error("collected file `{path}` was not supplied")]
+    NotSupplied { path: WorkflowPath },
+    /// Supplied-content packaging: a supplied key differs from the implicit
+    /// sibling config name `{config_path}` only by case or normalization, so
+    /// hosts with different filesystem rules would package different trees.
+    #[error("supplied file `{alias}` aliases the workflow config name `{config_path}`")]
+    ConfigAlias {
+        config_path: WorkflowPath,
+        alias:       WorkflowPath,
+    },
+    #[error("supplied workflow configuration `{path}` is invalid")]
+    InvalidSuppliedConfig {
+        path:   WorkflowPath,
+        #[source]
+        source: Box<fabro_config::Error>,
+    },
+    #[error("failed to stage supplied workflow files")]
+    Stage {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Package one workflow and every separately runnable dependency from a local
@@ -83,17 +111,6 @@ pub fn collect_workflow_versions(
     checkout_root: &Path,
 ) -> Result<CollectedWorkflowClosure, WorkflowVersionCollectError> {
     let repository_workflow = repository_workflow_path(workflow);
-    let location = crate::resolve_existing_workflow_location(&repository_workflow, checkout_root)
-        .map_err(|source| match source {
-        fabro_config::Error::WorkflowNotFound(_) => WorkflowVersionCollectError::WorkflowNotFound {
-            path: workflow.to_path_buf(),
-        },
-        source => WorkflowVersionCollectError::Collect {
-            path:   workflow.to_path_buf(),
-            source: source.into(),
-        },
-    })?;
-
     let package_root =
         checkout_root
             .canonicalize()
@@ -104,6 +121,21 @@ pub fn collect_workflow_versions(
                     checkout_root.display()
                 )),
             })?;
+    ensure_selection_contained(
+        &checkout_root.join(&repository_workflow),
+        &package_root,
+        workflow,
+    )?;
+    let location = crate::resolve_existing_workflow_location(&repository_workflow, checkout_root)
+        .map_err(|source| match source {
+        fabro_config::Error::WorkflowNotFound(_) => WorkflowVersionCollectError::WorkflowNotFound {
+            path: workflow.to_path_buf(),
+        },
+        source => WorkflowVersionCollectError::Collect {
+            path:   workflow.to_path_buf(),
+            source: source.into(),
+        },
+    })?;
     let location = canonicalize_location(location, |path, source| {
         WorkflowVersionCollectError::Collect {
             path:   workflow.to_path_buf(),
@@ -137,7 +169,9 @@ pub(super) fn canonicalize_location<E>(
     })
 }
 
-pub(super) fn collect_workflow_versions_at_location(
+/// Collect an already resolved exact location inside a canonical package root.
+/// Every dependency is validated before this returns; no registration occurs.
+pub fn collect_workflow_versions_at_location(
     location: &WorkflowLocation,
     package_root: &Path,
     workflow: &Path,
@@ -145,11 +179,60 @@ pub(super) fn collect_workflow_versions_at_location(
     let inputs = HashMap::new();
     let collected = WorkflowBundler::new(package_root, &inputs)
         .collect_versions(location)
-        .map_err(|source| WorkflowVersionCollectError::Collect {
-            path: workflow.to_path_buf(),
-            source,
+        .map_err(|source| {
+            source
+                .downcast::<WorkflowVersionCollectError>()
+                .unwrap_or_else(|source| WorkflowVersionCollectError::Collect {
+                    path: workflow.to_path_buf(),
+                    source,
+                })
         })?;
     VersionAssembler::new(collected).assemble()
+}
+
+/// Location resolution reads the selected TOML, or a selected graph's sibling
+/// `workflow.toml`, before the bundler's root-checked reads begin. Refuse a
+/// selection whose file resolves outside the package first, so a symlink in an
+/// untrusted checkout never reads host content. Missing files are left for
+/// resolution to report; symlinks elsewhere in the checkout are irrelevant
+/// because every file the bundler reads is checked when it is opened.
+fn ensure_selection_contained(
+    selected: &Path,
+    package_root: &Path,
+    workflow: &Path,
+) -> Result<(), WorkflowVersionCollectError> {
+    let mut candidates = vec![selected.to_path_buf()];
+    if selected
+        .extension()
+        .is_none_or(|extension| extension != "toml")
+    {
+        candidates.push(selected.with_file_name("workflow.toml"));
+    }
+    for path in candidates {
+        if path.symlink_metadata().is_err() {
+            continue;
+        }
+        let canonical =
+            path.canonicalize()
+                .map_err(|source| WorkflowVersionCollectError::Collect {
+                    path:   workflow.to_path_buf(),
+                    source: anyhow::Error::new(source).context(format!(
+                        "failed to canonicalize workflow file {}",
+                        path.display()
+                    )),
+                })?;
+        if !canonical.starts_with(package_root) {
+            return Err(WorkflowVersionCollectError::Collect {
+                path:   workflow.to_path_buf(),
+                source: anyhow::anyhow!(
+                    "workflow file `{}` resolves outside its source root `{}`",
+                    path.display(),
+                    package_root.display()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn repository_workflow_path(workflow: &Path) -> PathBuf {
@@ -185,10 +268,10 @@ impl VersionAssembler {
     fn assemble(mut self) -> Result<CollectedWorkflowClosure, WorkflowVersionCollectError> {
         let root_key = std::mem::take(&mut self.root_key);
         let root_id = self.assemble_one(&root_key)?;
-        Ok(CollectedWorkflowClosure {
+        Ok(CollectedWorkflowClosure::from_dependency_order(
             root_id,
-            versions: self.versions,
-        })
+            self.versions,
+        ))
     }
 
     fn assemble_one(
@@ -198,6 +281,7 @@ impl VersionAssembler {
         if let Some(id) = self.ids.get(key) {
             return Ok(*id);
         }
+        check_workflow_depth(self.visiting.len() + 1, key)?;
         if !self.visiting.insert(key.to_owned()) {
             return Err(WorkflowVersionCollectError::DependencyCycle {
                 path: workflow_path(key)?,
@@ -303,6 +387,44 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn version_assembly_bounds_its_own_dependency_traversal() {
+        // Collection and assembly visit shared dependencies in different orders.
+        // Assembly must bound its stack even if collection already cached nodes.
+        for count in [MAX_WORKFLOW_VERSION_DEPTH, MAX_WORKFLOW_VERSION_DEPTH + 1] {
+            let workflows = (0..count)
+                .map(|index| {
+                    let child = (index + 1 < count).then(|| format!("f{}.fabro", index + 1));
+                    let source = child.as_ref().map_or_else(
+                        || "digraph W {}".to_owned(),
+                        |child| format!("digraph W {{ child [stack.child_workflow=\"{child}\"] }}"),
+                    );
+                    (format!("f{index}.fabro"), CollectedWorkflowSource {
+                        workflow:        types::ManifestWorkflow {
+                            config: None,
+                            files: HashMap::new(),
+                            source,
+                        },
+                        dependency_keys: child.into_iter().collect(),
+                    })
+                })
+                .collect();
+            let result = VersionAssembler::new(CollectedWorkflowSources {
+                root_key: "f0.fabro".to_owned(),
+                workflows,
+            })
+            .assemble();
+            if count == MAX_WORKFLOW_VERSION_DEPTH {
+                assert_eq!(result.unwrap().versions().count(), count);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(WorkflowVersionCollectError::DepthExceeded { .. })
+                ));
+            }
+        }
+    }
+
     fn write(root: &Path, path: &str, content: &str) {
         let path = root.join(path);
         fs::create_dir_all(path.parent().expect("fixture path should have a parent")).unwrap();
@@ -350,6 +472,50 @@ dockerfile = { path = "Dockerfile" }
             ".fabro/workflows/child/workflow.fabro",
             "digraph Child {}",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_selected_files_that_resolve_outside_the_package_root() {
+        let host = tempfile::tempdir().unwrap();
+        write(host.path(), "workflow.toml", "_version = 1\n");
+        for selector in ["root", ".fabro/workflows/root/workflow.fabro"] {
+            let temp = tempfile::tempdir().unwrap();
+            write_complete_fixture(temp.path());
+            let toml = temp.path().join(".fabro/workflows/root/workflow.toml");
+            fs::remove_file(&toml).unwrap();
+            std::os::unix::fs::symlink(host.path().join("workflow.toml"), &toml).unwrap();
+            let error = collect_workflow_versions(Path::new(selector), temp.path()).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("outside its source root"),
+                "{selector}: {error:?}"
+            );
+            // A dangling selection is refused rather than reported as missing.
+            fs::remove_file(&toml).unwrap();
+            std::os::unix::fs::symlink(host.path().join("missing.toml"), &toml).unwrap();
+            let error = collect_workflow_versions(Path::new(selector), temp.path()).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("failed to canonicalize workflow file"),
+                "{selector}: {error:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_symlinks_the_selected_workflow_never_reads() {
+        let host = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        write_complete_fixture(temp.path());
+        std::os::unix::fs::symlink(host.path(), temp.path().join("tools")).unwrap();
+        std::os::unix::fs::symlink("../missing", temp.path().join("vendor")).unwrap();
+        std::os::unix::fs::symlink(
+            "/nonexistent/module",
+            temp.path().join(".fabro/workflows/root/unrelated"),
+        )
+        .unwrap();
+        let closure = collect_workflow_versions(Path::new("root"), temp.path()).unwrap();
+        assert_eq!(closure.versions().count(), 2);
     }
 
     #[test]

@@ -196,7 +196,7 @@ async fn attempt_pull_request_creation(
         draft: true,
         auto_merge: None,
         run_store: &run_store_handle,
-        llm_source: state.llm_source.as_ref(),
+        llm_source: Arc::clone(&state.llm_source),
         catalog,
         conclusion: Some(inputs.conclusion),
         run_state: Some(run_state),

@@ -68,19 +68,6 @@ pub(super) fn terminal_hyperlink(url: &str, text: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
-pub(super) fn format_number(n: f64) -> String {
-    if (n - n.round()).abs() < f64::EPSILON {
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "Whole-number display intentionally narrows to i64 for formatting."
-        )]
-        let i = n as i64;
-        format!("{i}")
-    } else {
-        format!("{n:.1}")
-    }
-}
-
 pub(super) fn truncate(s: &str, max: usize) -> String {
     let single_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if single_line.len() > max {

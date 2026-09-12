@@ -3,29 +3,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use fabro_agent::{Sandbox, ToolSecrets};
-use fabro_auth::{
-    CredentialSource, ExtraHeadersCredentialSource, VaultCredentialSource, auth_issue_message,
-};
+use fabro_auth::{ExtraHeadersCredentialSource, VaultCredentialSource};
 use fabro_github::token_source::InstallationTokenSource;
 use fabro_graphviz::graph;
 use fabro_hooks::{HookContext, HookDecision, HookEvent, HookExecutionContext, HookRunner};
-use fabro_model::Catalog;
+use fabro_llm::credentials::{CredentialProvider, readiness};
+use fabro_llm::lithos_catalog::Catalog;
 use fabro_sandbox::{
-    GitSetupIntent, SandboxEventCallback, SandboxSpec, reconnect_for_run_with_callback, shell_quote,
+    DaytonaCredentials, ExecResultExt, GitSetupIntent, ProviderAccess, RunSandbox,
+    reconnect_for_run,
 };
 use fabro_static::EnvVars;
 use fabro_types::RunSandboxKind;
+use fabro_util::time::elapsed_ms;
 use fabro_vault::Vault;
+use sandbox_driver::{CorrelationId, EventContext};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock as AsyncRwLock;
 
 use super::types::{InitOptions, Initialized, LlmSpec, Persisted, SandboxEnvSpec};
 use crate::error::Error;
-use crate::event::{Event, RunNoticeCode, RunNoticeLevel};
-use crate::git::GitAuthor;
-use crate::git_bridge;
-use crate::handler::llm::{AgentAcpBackend, AgentApiBackend, BackendRouter, routing};
+use crate::event::{DriverEventRecorder, Event, RunNoticeCode, RunNoticeLevel, SandboxLifecycle};
+use crate::handler::llm::{AgentAcpBackend, BackendRouter, PebbleBackend, routing};
 use crate::handler::{HandlerRegistry, default_registry};
 #[cfg(test)]
 use crate::model_fallback::ModelFallbackPolicy;
@@ -36,6 +35,8 @@ use crate::services::{
 };
 use crate::stage_execution::{StageExecutionSeed, StageExecutionTracker};
 use crate::steering_hub::SteeringHub;
+use crate::web_search::SearchSecrets;
+use crate::{git_bridge, git_identity};
 
 struct BuiltSandboxEnv {
     env:           HashMap<String, String>,
@@ -49,7 +50,7 @@ struct BuiltSandboxEnv {
 async fn run_hooks(
     hook_runner: Option<&HookRunner>,
     hook_context: &HookContext,
-    sandbox: Arc<dyn Sandbox>,
+    sandbox: Arc<RunSandbox>,
     execution_context: HookExecutionContext,
 ) -> HookDecision {
     let Some(runner) = hook_runner else {
@@ -72,23 +73,47 @@ fn git_setup_intent(run_options: &RunOptions) -> GitSetupIntent {
     }
 }
 
-async fn configure_sandbox_git_identity(
-    sandbox: &dyn Sandbox,
-    author: &GitAuthor,
-) -> Result<(), Error> {
-    let command = format!(
-        "git config --local user.name {} && git config --local user.email {}",
-        shell_quote(&author.name),
-        shell_quote(&author.email)
-    );
-    sandbox
-        .exec_command(&command, 10_000, None, None, None)
-        .await
-        .map_err(|err| Error::engine_with_source("Sandbox git identity setup failed", err))?
-        .into_result("git config user identity")
-        .map_err(|err| Error::engine_with_source("Sandbox git identity setup failed", err))?;
-
-    Ok(())
+/// Resolve the run's Git identity once, before anything can commit.
+///
+/// A resumed run reuses the identity it recorded at first initialization so
+/// a token refresh or credential rotation never changes authorship mid-run;
+/// runs recorded before identity tracking resolve on their next execution.
+async fn resolve_run_git_identity(
+    options: &InitOptions,
+    is_resume: bool,
+    github_token: Option<&Arc<InstallationTokenSource>>,
+) -> Result<fabro_types::GitIdentity, Error> {
+    if let Some(identity) = options.run_options.git_identity.clone() {
+        return Ok(identity);
+    }
+    if is_resume {
+        let recorded = options
+            .run_store
+            .state()
+            .await
+            .map_err(|err| Error::engine_with_anyhow("Failed to load run state", err))?
+            .git_identity;
+        if let Some(identity) = recorded {
+            return Ok(identity);
+        }
+    }
+    let resolved = git_identity::resolve_git_identity(
+        &options.run_options.settings,
+        options.run_options.github_app.as_ref(),
+        github_token,
+    )
+    .await?;
+    if let Some(warning) = resolved.warning {
+        options.emitter.notice(
+            RunNoticeLevel::Warn,
+            RunNoticeCode::GitIdentityFallback,
+            warning,
+        );
+    }
+    options.emitter.emit(&Event::GitIdentityResolved {
+        identity: resolved.identity.clone(),
+    });
+    Ok(resolved.identity)
 }
 
 fn build_sandbox_env(
@@ -211,9 +236,9 @@ async fn build_registry(
     tool_env_provider: Arc<WorkflowToolEnvProvider>,
     github_token_refresh_managed: bool,
     graph: &graph::Graph,
-    llm_source: Arc<dyn CredentialSource>,
+    llm_source: Arc<dyn CredentialProvider>,
     catalog: Arc<Catalog>,
-    tool_secrets: ToolSecrets,
+    search_secrets: SearchSecrets,
     fabro_run_tools: Option<FabroRunToolServices>,
 ) -> Result<(Arc<HandlerRegistry>, bool), Error> {
     let no_backend_interviewer = Arc::clone(&interviewer);
@@ -243,7 +268,7 @@ async fn build_registry(
         let fallbacks = spec.fallbacks.clone();
         let mcp_servers = spec.mcp_servers.clone();
         let model_controls = spec.model_controls.clone();
-        let tool_secrets_for_api = tool_secrets.clone();
+        let search_secrets_for_api = search_secrets.clone();
         let llm_source_for_api = Arc::clone(&llm_source);
         let catalog_for_api = Arc::clone(&catalog);
         let steering_hub_for_api = Arc::clone(&steering_hub);
@@ -251,7 +276,7 @@ async fn build_registry(
         let fabro_run_tools_for_api = fabro_run_tools.clone();
         Arc::new(default_registry(interviewer, move || {
             let tool_env_provider = Arc::clone(&tool_env_provider_for_backend);
-            let mut api = AgentApiBackend::new_with_catalog(
+            let mut api = PebbleBackend::new_with_catalog(
                 model.clone(),
                 provider_id.clone(),
                 fallbacks.clone(),
@@ -261,7 +286,7 @@ async fn build_registry(
             )
             .with_run_model_controls(model_controls.clone())
             .with_tool_env_provider(tool_env_provider.clone())
-            .with_tool_secrets(tool_secrets_for_api.clone())
+            .with_search_secrets(search_secrets_for_api.clone())
             .with_mcp_servers(mcp_servers.clone());
             if let Some(services) = fabro_run_tools_for_api.clone() {
                 api = api.with_fabro_run_tools(services);
@@ -277,42 +302,33 @@ async fn build_registry(
         return Ok((build_llm_registry(), false));
     }
 
-    match llm_source.resolve(catalog.as_ref()).await {
-        Ok(result) if result.credentials.is_empty() => {
-            if graph_needs_llm {
-                let detail = (!result.auth_issues.is_empty()).then(|| {
-                    result
-                        .auth_issues
-                        .iter()
-                        .map(|(provider, issue)| auth_issue_message(provider, issue))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                });
-                let prefix = detail.map_or_else(
-                    || "No LLM providers configured".to_string(),
-                    |detail| format!("No usable LLM providers configured: {detail}"),
-                );
-                return Err(Error::Precondition(format!(
-                    "{prefix}. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or pass --dry-run to simulate."
-                )));
-            }
-            Ok((build_no_backend(), false))
+    let result = readiness(catalog.enabled_providers(), llm_source.as_ref()).await;
+    if result.ready.is_empty() {
+        if graph_needs_llm {
+            let detail = (!result.issues.is_empty()).then(|| {
+                result
+                    .issues
+                    .iter()
+                    .map(|(_, issue)| issue.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            });
+            let prefix = detail.map_or_else(
+                || "No LLM providers configured".to_string(),
+                |detail| format!("No usable LLM providers configured: {detail}"),
+            );
+            return Err(Error::Precondition(format!(
+                "{prefix}. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or pass --dry-run to simulate."
+            )));
         }
-        Ok(_result) => Ok((build_llm_registry(), false)),
-        Err(e) => {
-            if graph_needs_llm {
-                return Err(Error::Precondition(format!(
-                    "Failed to initialize LLM client: {e}. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or pass --dry-run to simulate.",
-                )));
-            }
-            Ok((build_no_backend(), false))
-        }
+        return Ok((build_no_backend(), false));
     }
+    Ok((build_llm_registry(), false))
 }
 
-async fn tool_secrets_from_configured_sources(vault: &Arc<AsyncRwLock<Vault>>) -> ToolSecrets {
+async fn search_secrets_from_configured_sources(vault: &Arc<AsyncRwLock<Vault>>) -> SearchSecrets {
     let vault = vault.read().await;
-    ToolSecrets {
+    SearchSecrets {
         brave_search_api_key: vault.get(EnvVars::BRAVE_SEARCH_API_KEY).map(str::to_string),
         venice_api_key:       vault.get(EnvVars::VENICE_API_KEY).map(str::to_string),
     }
@@ -330,7 +346,7 @@ const SESSION_ID_HEADER: &str = "x-session-id";
 fn build_llm_source(
     vault: Arc<AsyncRwLock<Vault>>,
     run_id: fabro_types::RunId,
-) -> Arc<dyn CredentialSource> {
+) -> Arc<dyn CredentialProvider> {
     Arc::new(ExtraHeadersCredentialSource::new(
         Arc::new(VaultCredentialSource::new(vault)),
         HashMap::from([(SESSION_ID_HEADER.to_string(), run_id.to_string())]),
@@ -355,7 +371,7 @@ pub async fn initialize(
     options.run_options.git = options.git.clone();
 
     let llm_source = build_llm_source(options.vault.clone(), options.run_options.run_id);
-    let tool_secrets = tool_secrets_from_configured_sources(&options.vault).await;
+    let search_secrets = search_secrets_from_configured_sources(&options.vault).await;
     let catalog = Arc::clone(&options.catalog);
     let sandbox_git = Arc::new(SandboxGitRuntime::new());
 
@@ -376,7 +392,7 @@ pub async fn initialize(
         .as_ref()
         .and_then(|git| git.sha.clone());
     if !is_resume
-        && !matches!(options.sandbox, SandboxSpec::Local { .. })
+        && !options.sandbox.kind.is_local()
         && matches!(
             options
                 .run_options
@@ -393,12 +409,13 @@ pub async fn initialize(
         );
     }
 
-    let sandbox_event_callback: SandboxEventCallback = {
-        let emitter = Arc::clone(&options.emitter);
-        Arc::new(move |event| {
-            emitter.emit(&Event::Sandbox { event });
-        })
-    };
+    // The driver reports what it does to the run's sandbox; every event is
+    // kept as a run event.
+    let provider_name = options.sandbox.provider_name();
+    let sandbox_events = EventContext::new(Arc::new(DriverEventRecorder::new(Arc::clone(
+        &options.emitter,
+    ))))
+    .correlation_id(CorrelationId::new(options.run_options.run_id.to_string()));
     let attach_instance = if is_resume {
         let record = options
             .run_store
@@ -428,18 +445,23 @@ pub async fn initialize(
         None
     };
     let attach_existing = attach_instance.is_some();
-    let sandbox: Arc<dyn Sandbox> = if let Some(instance) = attach_instance {
-        let daytona_api_key = options
-            .vault
-            .read()
-            .await
-            .get(EnvVars::DAYTONA_API_KEY)
-            .map(str::to_string);
-        let sandbox = reconnect_for_run_with_callback(
+    let sandbox: Arc<RunSandbox> = if let Some(instance) = attach_instance {
+        let access = ProviderAccess {
+            providers: options.sandbox_providers.clone(),
+            daytona:   options
+                .vault
+                .read()
+                .await
+                .get(EnvVars::DAYTONA_API_KEY)
+                .map(|api_key| {
+                    DaytonaCredentials::from_api_key(api_key.to_string(), process_env_var)
+                }),
+        };
+        let sandbox = reconnect_for_run(
             &instance,
-            daytona_api_key,
+            &access,
             Some(options.run_options.run_id),
-            Some(Arc::clone(&sandbox_event_callback)),
+            Some(sandbox_events.clone()),
         )
         .await
         .map_err(|err| Error::engine_with_anyhow("Failed to reconnect sandbox for resume", err))?;
@@ -447,7 +469,7 @@ pub async fn initialize(
     } else {
         options
             .sandbox
-            .build(Some(Arc::clone(&sandbox_event_callback)))
+            .build(Some(sandbox_events.clone()))
             .await
             .map_err(|e| Error::engine_with_anyhow("Failed to build sandbox", e))?
     };
@@ -462,17 +484,43 @@ pub async fn initialize(
     });
 
     if attach_existing {
-        // Resume needs the full provider health check. `activate()` is the
-        // lighter access-time operation used after a run is already active.
         sandbox
-            .start()
+            .activate()
             .await
             .map_err(|e| Error::engine_with_source("Failed to start sandbox", e))?;
     } else {
-        sandbox
-            .initialize()
-            .await
-            .map_err(|e| Error::engine_with_source("Failed to initialize sandbox", e))?;
+        options.emitter.emit(&Event::Sandbox {
+            event: SandboxLifecycle::Initializing {
+                provider: provider_name.clone(),
+            },
+        });
+        let started = Instant::now();
+        if let Err(error) = sandbox.initialize().await {
+            options.emitter.emit(&Event::Sandbox {
+                event: SandboxLifecycle::InitializeFailed {
+                    provider:    provider_name.clone(),
+                    error:       error.to_string(),
+                    causes:      error.causes(),
+                    duration_ms: elapsed_ms(started),
+                },
+            });
+            return Err(Error::engine_with_source(
+                "Failed to initialize sandbox",
+                error,
+            ));
+        }
+        // A local sandbox's id is derived from its directory, which the
+        // record already names; it is not a name worth showing.
+        let name = Some(sandbox.sandbox_info())
+            .filter(|name| !name.is_empty() && !sandbox.kind().is_local());
+        options.emitter.emit(&Event::Sandbox {
+            event: SandboxLifecycle::Ready {
+                provider: provider_name.clone(),
+                duration_ms: elapsed_ms(started),
+                name,
+                url: sandbox.console_url().await,
+            },
+        });
     }
 
     let locations = RunLocations::for_sandbox(host_source_dir, sandbox.as_ref(), run_dir.clone());
@@ -495,9 +543,7 @@ pub async fn initialize(
     }
 
     if !attach_existing {
-        let run_sandbox = options
-            .sandbox
-            .to_run_sandbox_instance(&*sandbox, options.run_options.run_id);
+        let run_sandbox = options.sandbox.to_run_sandbox_instance(&sandbox);
         let runtime = &run_sandbox.runtime;
         options.emitter.emit(&Event::SandboxInitialized {
             working_directory: runtime.working_directory.clone(),
@@ -525,9 +571,12 @@ pub async fn initialize(
         github_token,
         github_access: _,
     } = built_env;
+    let git_identity = resolve_run_git_identity(&options, is_resume, github_token.as_ref()).await?;
+    options.run_options.git_identity = Some(git_identity.clone());
     let tool_env_provider = Arc::new(WorkflowToolEnvProvider {
         base_env:     base_env.clone(),
         github_token: github_token.clone(),
+        git_identity: Some(git_identity.clone()),
     });
     let github_token_refresh_managed = github_token
         .as_deref()
@@ -545,7 +594,7 @@ pub async fn initialize(
             &graph,
             Arc::clone(&llm_source),
             Arc::clone(&catalog),
-            tool_secrets.clone(),
+            search_secrets.clone(),
             options.fabro_run_tools.clone(),
         )
         .await?
@@ -568,7 +617,7 @@ pub async fn initialize(
         let sandbox_has_origin = sandbox.origin_url().is_some();
         if sandbox_has_origin {
             sandbox_git
-                .ensure_git_available(&*sandbox)
+                .ensure_git_available(&sandbox)
                 .await
                 .map_err(|err| Error::engine_with_source("sandbox git unavailable", err))?;
         }
@@ -604,11 +653,6 @@ pub async fn initialize(
             }
         }
     }
-    if sandbox.origin_url().is_some() {
-        let git_author = options.run_options.git_author();
-        configure_sandbox_git_identity(sandbox.as_ref(), &git_author).await?;
-    }
-
     if !options.lifecycle.setup_commands.is_empty() {
         options.emitter.emit(&Event::SetupStarted {
             command_count: options.lifecycle.setup_commands.len(),
@@ -622,13 +666,14 @@ pub async fn initialize(
             });
             let cmd_start = Instant::now();
             let cancel_token = options.run_options.cancel_token.child_token();
-            let step_env = (!setup.env.is_empty()).then_some(&setup.env);
+            let mut step_env = setup.env.clone();
+            git_identity::apply_git_identity_env(&mut step_env, &git_identity);
             let result = sandbox
                 .exec_command(
                     command,
                     options.lifecycle.setup_command_timeout_ms,
                     None,
-                    step_env,
+                    Some(&step_env),
                     Some(cancel_token.clone()),
                 )
                 .await
@@ -638,19 +683,19 @@ pub async fn initialize(
             }
             cancel_token.cancel();
             let duration_ms = crate::millis_u64(cmd_start.elapsed());
-            if !result.is_success() {
-                let exit_code = result.display_exit_code();
+            if !result.success() {
+                let exit_code = result.program_exit_code().unwrap_or(-1);
                 let exec_output_tail = result.default_redacted_output_tail();
+                let stderr = result.stderr_lossy();
                 options.emitter.emit(&Event::SetupFailed {
                     command: command.clone(),
                     index,
                     exit_code,
-                    stderr: result.stderr.clone(),
+                    stderr: stderr.clone(),
                     exec_output_tail,
                 });
                 return Err(Error::engine(format!(
-                    "Setup command failed (exit code {}): {command}\n{}",
-                    exit_code, result.stderr,
+                    "Setup command failed (exit code {exit_code}): {command}\n{stderr}",
                 )));
             }
             let exit_code = result.exit_code.unwrap_or(0);
@@ -686,6 +731,7 @@ pub async fn initialize(
         interviewer: Arc::clone(&options.interviewer),
         base_env,
         github_token,
+        git_identity: Some(git_identity),
         inputs: options.run_options.settings.run.inputs.clone(),
         dry_run: options.dry_run,
         workflow_path: options.workflow_path.clone(),
@@ -708,6 +754,14 @@ pub async fn initialize(
         engine,
         model: options.llm.model,
     })
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "A CLI worker resolves the Daytona control-plane URL from its own environment; server-spawned workers run with a cleared environment and take the defaults."
+)]
+fn process_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 #[cfg(test)]
@@ -754,7 +808,7 @@ mod tests {
     }
 
     fn test_catalog() -> Arc<Catalog> {
-        Arc::new(Catalog::from_builtin().expect("default catalog should build"))
+        Arc::new(fabro_llm::test_support::test_catalog())
     }
 
     fn memory_store() -> Arc<Database> {
@@ -867,6 +921,7 @@ mod tests {
             fork_source_ref:  None,
             base_branch:      None,
             display_base_sha: None,
+            git_identity:     None,
             git:              None,
         }
     }
@@ -881,10 +936,10 @@ mod tests {
             run_store,
             dry_run: false,
             emitter: Arc::clone(&emitter),
-            sandbox: SandboxSpec::Local { working_directory },
+            sandbox: SandboxSpec::local(working_directory, ProviderAccess::default()),
             llm: LlmSpec {
                 model:          "test-model".to_string(),
-                provider_id:    fabro_model::ProviderId::anthropic(),
+                provider_id:    lithos_llm::catalog::builtin::anthropic(),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -907,6 +962,8 @@ mod tests {
                 origin_url:         None,
             },
             vault: auth_test_support::empty_vault(),
+            sandbox_providers:
+                fabro_types::settings::server::ServerSandboxProvidersSettings::default(),
             git: None,
             run_control: None,
             registry_override: None,
@@ -999,26 +1056,182 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configure_sandbox_git_identity_uses_run_author() {
-        let sandbox = fabro_sandbox::test_support::MockSandbox::linux();
-        let author = GitAuthor::from_options(
-            Some("Fabro Bot".to_string()),
-            Some("fabro-bot@example.com".to_string()),
+    async fn initialize_resolves_the_generic_identity_without_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let (graph, source) = simple_graph();
+        let persisted = test_persisted(graph, source, &run_dir);
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        emitter.on_event({
+            let seen = Arc::clone(&seen);
+            move |event| seen.lock().unwrap().push(event.clone())
+        });
+
+        let run_store = memory_store().create_run(&test_run_id()).await.unwrap();
+        let initialized = initialize(
+            persisted,
+            test_init_options(
+                run_store.into(),
+                emitter,
+                std::env::current_dir().unwrap(),
+                test_settings(&run_dir),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let expected = fabro_types::GitIdentity::fabro_default();
+        assert_eq!(initialized.run_options.git_identity, Some(expected.clone()));
+        assert_eq!(initialized.engine.git_identity, Some(expected.clone()));
+        assert_eq!(
+            initialized.run_options.git_author(),
+            crate::git::GitAuthor::from(&expected)
         );
-
-        configure_sandbox_git_identity(&sandbox, &author)
-            .await
-            .expect("git identity should configure");
-
-        let commands = sandbox
-            .captured_commands
+        let resolved = seen
             .lock()
-            .expect("captured_commands lock poisoned")
-            .clone();
-        assert_eq!(commands, vec![
-            "git config --local user.name 'Fabro Bot' && git config --local user.email \
-             fabro-bot@example.com"
-        ]);
+            .unwrap()
+            .iter()
+            .find_map(|event| match &event.body {
+                fabro_types::EventBody::GitIdentityResolved(props) => Some(props.identity.clone()),
+                _ => None,
+            })
+            .expect("initialize should record the resolved identity");
+        assert_eq!(resolved, expected);
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.event_name() == "run.notice"),
+            "the generic identity without credentials is not a fallback warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_overlays_partial_explicit_author_on_the_generic_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let (graph, source) = simple_graph();
+        let mut settings = WorkflowSettings::default();
+        settings.run.git.author = Some(fabro_types::settings::run::GitAuthorSettings {
+            name:  Some("Release Bot".to_string()),
+            email: None,
+        });
+        let persisted = test_persisted_run(graph, source, &run_dir, settings.clone(), None);
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let mut run_options = test_settings(&run_dir);
+        run_options.settings = settings;
+
+        let run_store = memory_store().create_run(&test_run_id()).await.unwrap();
+        let initialized = initialize(
+            persisted,
+            test_init_options(
+                run_store.into(),
+                emitter,
+                std::env::current_dir().unwrap(),
+                run_options,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            initialized.run_options.git_identity,
+            Some(fabro_types::GitIdentity {
+                name:   "Release Bot".to_string(),
+                email:  fabro_types::GitIdentity::DEFAULT_EMAIL.to_string(),
+                source: fabro_types::GitIdentitySource::Default,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_warns_and_falls_back_for_a_standalone_installation_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let (graph, source) = simple_graph();
+        let persisted = test_persisted(graph, source, &run_dir);
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        emitter.on_event({
+            let seen = Arc::clone(&seen);
+            move |event| seen.lock().unwrap().push(event.clone())
+        });
+        let mut run_options = test_settings(&run_dir);
+        run_options.github_app = Some(fabro_github::GitHubCredentials::Installation(
+            fabro_github::InstallationToken {
+                token:      "ghs_token".to_string(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        ));
+
+        let run_store = memory_store().create_run(&test_run_id()).await.unwrap();
+        let initialized = initialize(
+            persisted,
+            test_init_options(
+                run_store.into(),
+                emitter,
+                std::env::current_dir().unwrap(),
+                run_options,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            initialized.run_options.git_identity,
+            Some(fabro_types::GitIdentity::fabro_default())
+        );
+        let notice = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|event| match &event.body {
+                fabro_types::EventBody::RunNotice(props) => Some(props.clone()),
+                _ => None,
+            })
+            .expect("standalone installation token should warn");
+        assert_eq!(notice.code, RunNoticeCode::GitIdentityFallback.to_string());
+        assert_eq!(notice.level, RunNoticeLevel::Warn);
+    }
+
+    /// The setup step's own env names a different author; the run's identity
+    /// must still win, and it must reach the shell even though the working
+    /// directory has no Git origin.
+    #[tokio::test]
+    async fn initialize_injects_the_git_identity_into_setup_commands() {
+        let setup = crate::run_options::SetupCommand {
+            command: format!(
+                "test \"$GIT_AUTHOR_NAME\" = {name} && test \"$GIT_AUTHOR_EMAIL\" = {email} && \
+                 test \"$GIT_COMMITTER_NAME\" = {name} && test \"$GIT_COMMITTER_EMAIL\" = {email}",
+                name = fabro_types::GitIdentity::DEFAULT_NAME,
+                email = fabro_types::GitIdentity::DEFAULT_EMAIL,
+            ),
+            env:     HashMap::from([
+                ("GIT_AUTHOR_NAME".to_string(), "step-author".to_string()),
+                (
+                    "GIT_COMMITTER_EMAIL".to_string(),
+                    "step@example.com".to_string(),
+                ),
+            ]),
+        };
+
+        let (result, events) = initialize_with_setup_step(setup).await;
+
+        assert!(
+            result.is_ok(),
+            "setup should see the run's Git identity: {:?}",
+            result.err()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_name() == "setup.completed")
+        );
     }
 
     #[tokio::test]
@@ -1074,18 +1287,16 @@ mod tests {
         assert_eq!(initialized.model, "test-model");
         assert_eq!(
             initialized.engine.run.provider_id,
-            fabro_model::ProviderId::anthropic()
+            lithos_llm::catalog::builtin::anthropic()
         );
         assert!(
-            initialized
-                .engine
-                .run
-                .llm_source
-                .resolve(&initialized.engine.run.catalog)
-                .await
-                .unwrap()
-                .credentials
-                .is_empty()
+            readiness(
+                initialized.engine.run.catalog.enabled_providers(),
+                initialized.engine.run.llm_source.as_ref(),
+            )
+            .await
+            .ready
+            .is_empty()
         );
     }
 
@@ -1157,9 +1368,14 @@ mod tests {
             .await
             .expect("a forked run should materialize a fresh sandbox before resuming");
 
+        // The Host provider reports the designated directory canonically
+        // (macOS resolves `/var` to `/private/var`).
+        let expected = workspace
+            .canonicalize()
+            .expect("materialized workspace should exist");
         assert_eq!(
             initialized.engine.run.sandbox.working_directory(),
-            workspace.to_string_lossy().as_ref()
+            expected.to_string_lossy().as_ref()
         );
     }
 
@@ -1198,11 +1414,12 @@ mod tests {
         let tool_env_provider = Arc::new(WorkflowToolEnvProvider {
             base_env:     HashMap::new(),
             github_token: None,
+            git_identity: None,
         });
         let (_registry, effective_dry_run) = build_registry(
             &LlmSpec {
                 model:          "claude-opus-4-6".to_string(),
-                provider_id:    fabro_model::ProviderId::anthropic(),
+                provider_id:    lithos_llm::catalog::builtin::anthropic(),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -1215,7 +1432,7 @@ mod tests {
             &graph,
             Arc::new(VaultCredentialSource::new(Arc::clone(&vault))),
             test_catalog(),
-            ToolSecrets::default(),
+            SearchSecrets::default(),
             None,
         )
         .await
@@ -1234,17 +1451,22 @@ mod tests {
         let expected_session_id = run_id.to_string();
 
         let source = build_llm_source(vault, run_id);
-        let resolved = source.resolve(test_catalog().as_ref()).await.unwrap();
+        let catalog = test_catalog();
+        let resolved = readiness(catalog.enabled_providers(), source.as_ref()).await;
 
-        assert!(!resolved.credentials.is_empty());
-        for credential in &resolved.credentials {
-            assert_eq!(
-                credential
-                    .extra_headers
-                    .get(SESSION_ID_HEADER)
-                    .map(String::as_str),
-                Some(expected_session_id.as_str())
-            );
+        assert!(!resolved.ready.is_empty());
+        for provider in &resolved.ready {
+            let provider = catalog.provider(provider.as_str()).unwrap();
+            let credentials = source.credentials(provider).await.unwrap();
+            let fabro_llm::credentials::Credentials::Http(http) = credentials else {
+                panic!("vault credentials should be HTTP credentials");
+            };
+            let session_header = http
+                .extra_headers
+                .iter()
+                .find(|header| header.name == SESSION_ID_HEADER)
+                .map(|header| header.value.expose_secret());
+            assert_eq!(session_header, Some(expected_session_id.as_str()));
         }
     }
 
@@ -1287,7 +1509,7 @@ mod tests {
             "acp.command".to_string(),
             AttrValue::String(format!(
                 "python3 {}",
-                fabro_sandbox::shell_quote(&script_path.to_string_lossy())
+                fabro_util::shell::shell_quote(&script_path.to_string_lossy())
             )),
         );
         let mut exit = Node::new("exit");
@@ -1319,12 +1541,10 @@ mod tests {
             run_store: run_store.into(),
             dry_run: false,
             emitter: emitter.clone(),
-            sandbox: SandboxSpec::Local {
-                working_directory: temp.path().to_path_buf(),
-            },
+            sandbox: SandboxSpec::local(temp.path(), ProviderAccess::default()),
             llm: LlmSpec {
                 model:          "fake-acp".to_string(),
-                provider_id:    fabro_model::ProviderId::openai(),
+                provider_id:    lithos_llm::catalog::builtin::openai(),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -1347,6 +1567,8 @@ mod tests {
                 origin_url:         None,
             },
             vault,
+            sandbox_providers:
+                fabro_types::settings::server::ServerSandboxProvidersSettings::default(),
             git: None,
             run_control: None,
             registry_override: None,
@@ -1422,12 +1644,13 @@ mod tests {
             run_store:         run_store.into(),
             dry_run:           false,
             emitter:           emitter.clone(),
-            sandbox:           SandboxSpec::Local {
-                working_directory: std::env::current_dir().unwrap(),
-            },
+            sandbox:           SandboxSpec::local(
+                std::env::current_dir().unwrap(),
+                ProviderAccess::default(),
+            ),
             llm:               LlmSpec {
                 model:          "test-model".to_string(),
-                provider_id:    fabro_model::ProviderId::anthropic(),
+                provider_id:    lithos_llm::catalog::builtin::anthropic(),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -1450,6 +1673,8 @@ mod tests {
                 origin_url:         None,
             },
             vault:             auth_test_support::empty_vault(),
+            sandbox_providers:
+                fabro_types::settings::server::ServerSandboxProvidersSettings::default(),
             git:               None,
             run_control:       None,
             registry_override: None,
@@ -1564,12 +1789,13 @@ mod tests {
             },
             dry_run: false,
             emitter: emitter.clone(),
-            sandbox: SandboxSpec::Local {
-                working_directory: std::env::current_dir().unwrap(),
-            },
+            sandbox: SandboxSpec::local(
+                std::env::current_dir().unwrap(),
+                ProviderAccess::default(),
+            ),
             llm: LlmSpec {
                 model:          "test-model".to_string(),
-                provider_id:    fabro_model::ProviderId::anthropic(),
+                provider_id:    lithos_llm::catalog::builtin::anthropic(),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -1592,6 +1818,8 @@ mod tests {
                 origin_url:         None,
             },
             vault: auth_test_support::empty_vault(),
+            sandbox_providers:
+                fabro_types::settings::server::ServerSandboxProvidersSettings::default(),
             git: None,
             run_control: None,
             registry_override: None,

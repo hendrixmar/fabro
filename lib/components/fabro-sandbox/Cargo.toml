@@ -4,14 +4,12 @@ edition.workspace = true
 version.workspace = true
 publish = false
 license.workspace = true
-description = "Sandbox trait and implementations for Fabro agent execution environments"
+description = "Fabro run sandboxes over the sandbox driver: local, Docker, and Daytona"
 
 [features]
 default = ["local"]
 local = []
-docker = ["dep:bollard", "dep:tar"]
-daytona = ["dep:daytona-sdk", "dep:daytona-api-client", "dep:git2", "dep:fabro-config", "dep:fabro-http", "dep:reqwest-middleware", "dep:rand", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls"]
-test-support = []
+test-support = ["dep:sandbox-driver-testing"]
 
 [lib]
 doctest = false
@@ -20,6 +18,15 @@ doctest = false
 workspace = true
 
 [dependencies]
+sandbox-driver.workspace = true
+sandbox-driver-protocol.workspace = true
+sandbox-driver-host.workspace = true
+sandbox-driver-docker.workspace = true
+sandbox-driver-docker-config.workspace = true
+sandbox-driver-daytona.workspace = true
+sandbox-driver-daytona-config.workspace = true
+sandbox-driver-testing = { workspace = true, optional = true }
+pebble-coding-agent.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
@@ -29,10 +36,8 @@ serde.workspace = true
 serde_json.workspace = true
 strum.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
 base64.workspace = true
-hmac.workspace = true
-sha2.workspace = true
-hex.workspace = true
 uuid.workspace = true
 fabro-proc = { path = "../../foundation/fabro-proc" }
 fabro-static.workspace = true
@@ -41,33 +46,17 @@ fabro-redact.workspace = true
 
 futures = { workspace = true }
 
-# docker
-bollard = { workspace = true, optional = true }
-tar = { workspace = true, optional = true }
-
-# daytona
-fabro-config = { path = "../../foundation/fabro-config", optional = true }
 fabro-github = { path = "../fabro-github" }
 fabro-types = { path = "../../foundation/fabro-types" }
 
 chrono = { workspace = true }
 
-# daytona
-rand = { workspace = true, optional = true }
-daytona-sdk = { workspace = true, optional = true }
-daytona-api-client = { workspace = true, optional = true }
-git2 = { workspace = true, optional = true }
-fabro-http = { workspace = true, optional = true }
-reqwest-middleware = { version = "0.5", features = ["json", "multipart", "form", "query"], optional = true }
-tokio-tungstenite = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"], optional = true }
-
 [dev-dependencies]
 fabro-github = { path = "../fabro-github", features = ["test-support"] }
+pebble-coding-agent = { workspace = true, features = ["test-util"] }
+sandbox-driver-testing.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
 serde_json.workspace = true
 toml.workspace = true
-httpmock = "0.8"
 fabro-test.workspace = true

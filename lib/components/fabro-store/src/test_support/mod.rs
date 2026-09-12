@@ -37,6 +37,13 @@ pub fn test_run_summary_store() -> Arc<RunSummaryStore> {
     ])))
 }
 
+/// An isolated in-memory SQLite pool with `migrations` installed on first
+/// use, for stores whose schema is not part of the run-history fixtures.
+#[must_use]
+pub fn in_memory_pool_with(migrations: &'static [&'static str]) -> sqlx::SqlitePool {
+    lazy_in_memory_pool(migrations)
+}
+
 /// Builds a single-connection in-memory SQLite pool that installs
 /// `migrations` on first use.
 ///

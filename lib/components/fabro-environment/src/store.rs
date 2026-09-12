@@ -9,8 +9,9 @@ use fabro_config::{
     EnvironmentNetworkLayer, EnvironmentResourcesLayer, MergeMap, StickyMap,
 };
 use fabro_db::DbPool;
-use fabro_types::settings::run::{DockerfileSource, EnvironmentProvider, EnvironmentSettings};
+use fabro_types::settings::run::{DockerfileSource, EnvironmentSettings};
 use fabro_types::settings::{Duration, InterpString, Size};
+use fabro_types::{BundledProvider, SandboxProviderKind};
 use serde::de::DeserializeOwned;
 use sqlx::Row as _;
 use sqlx::sqlite::SqliteRow;
@@ -135,7 +136,7 @@ impl CatalogState {
 fn synthetic_local_environment() -> Result<Environment, EnvironmentStoreError> {
     let id = EnvironmentId::new(RESERVED_LOCAL_ID).expect("reserved local id is valid");
     let settings = EnvironmentSettings {
-        provider: EnvironmentProvider::Local,
+        provider: SandboxProviderKind::LOCAL,
         ..EnvironmentSettings::default()
     };
     Environment::synthetic(id, &settings)
@@ -598,17 +599,25 @@ impl EnvironmentSqlRow {
 }
 
 pub async fn seed_environments(pool: &DbPool) -> Result<(), EnvironmentStoreError> {
-    seed_default_environment(pool, EnvironmentProvider::Docker).await
+    seed_default_environment(pool, SandboxProviderKind::DOCKER).await
 }
 
 pub async fn seed_default_environment(
     pool: &DbPool,
-    provider: EnvironmentProvider,
+    provider: SandboxProviderKind,
 ) -> Result<(), EnvironmentStoreError> {
-    let content = match provider {
-        EnvironmentProvider::Docker => DEFAULT_ENVIRONMENT_TOML,
-        EnvironmentProvider::Daytona => DAYTONA_DEFAULT_ENVIRONMENT_TOML,
-        EnvironmentProvider::Local => LOCAL_ENVIRONMENT_TOML,
+    let content = match provider.bundled() {
+        Some(BundledProvider::Docker) => DEFAULT_ENVIRONMENT_TOML,
+        Some(BundledProvider::Daytona) => DAYTONA_DEFAULT_ENVIRONMENT_TOML,
+        Some(BundledProvider::Local) => LOCAL_ENVIRONMENT_TOML,
+        None => {
+            return Err(EnvironmentValidationError::InvalidSettings {
+                errors: vec![format!(
+                    "no built-in default environment exists for sandbox provider `{provider}`"
+                )],
+            }
+            .into());
+        }
     };
     let layer: EnvironmentLayer = toml::from_str(content).map_err(|source| {
         EnvironmentStoreError::parse(PathBuf::from("built-in-default-environment.toml"), source)

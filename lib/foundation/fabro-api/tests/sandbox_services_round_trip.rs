@@ -4,10 +4,7 @@ use fabro_api::types::{
     SandboxService as ApiSandboxService,
     SandboxServiceListResponse as ApiSandboxServiceListResponse,
 };
-use fabro_types::{
-    SandboxService, SandboxServiceDiscoverySource, SandboxServiceListMeta,
-    SandboxServiceListResponse,
-};
+use fabro_types::{SandboxService, SandboxServiceListResponse};
 use serde_json::json;
 
 #[test]
@@ -22,15 +19,9 @@ fn sandbox_services_json_matches_openapi_shape() {
         data: vec![SandboxService {
             port:              3000,
             addresses:         vec!["127.0.0.1:3000".to_string(), "[::]:3000".to_string()],
-            processes:         vec![
-                r#"users:(("node",pid=42,fd=23))"#.to_string(),
-                r#"users:(("vite",pid=84,fd=19))"#.to_string(),
-            ],
+            processes:         vec!["node".to_string()],
             preview_supported: true,
         }],
-        meta: SandboxServiceListMeta {
-            source: SandboxServiceDiscoverySource::Ss,
-        },
     };
 
     assert_eq!(
@@ -39,27 +30,19 @@ fn sandbox_services_json_matches_openapi_shape() {
             "data": [{
                 "port": 3000,
                 "addresses": ["127.0.0.1:3000", "[::]:3000"],
-                "processes": [
-                    r#"users:(("node",pid=42,fd=23))"#,
-                    r#"users:(("vite",pid=84,fd=19))"#,
-                ],
+                "processes": ["node"],
                 "preview_supported": true
-            }],
-            "meta": {
-                "source": "ss"
-            }
+            }]
         })
     );
 }
 
 #[test]
 fn sandbox_services_deserializes_empty_response() {
-    let response: SandboxServiceListResponse =
-        serde_json::from_value(json!({ "data": [], "meta": { "source": "procfs" } }))
-            .expect("empty service response should deserialize");
+    let response: SandboxServiceListResponse = serde_json::from_value(json!({ "data": [] }))
+        .expect("empty service response should deserialize");
 
     assert!(response.data.is_empty());
-    assert_eq!(response.meta.source, SandboxServiceDiscoverySource::Procfs);
 }
 
 fn assert_same_type<T: 'static, U: 'static>() {

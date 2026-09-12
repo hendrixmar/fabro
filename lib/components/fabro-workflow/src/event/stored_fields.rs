@@ -1,5 +1,5 @@
 use ::fabro_types::{ParallelBranchId, Principal, StageId, SystemActorKind};
-use fabro_agent::AgentEvent;
+use pebble_coding_agent::events::{Actor, CodingEvent};
 
 use super::Event;
 use crate::stage_scope::StageScope;
@@ -132,7 +132,10 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
         | Event::AgentAcpCompleted { node_id, .. }
         | Event::AgentAcpCancelled { node_id, .. }
         | Event::AgentAcpTimedOut { node_id, .. } => node_stored_fields(Some(node_id.clone())),
-        Event::AgentAcpStarted { node_id, visit, .. } => {
+        Event::AgentAcpStarted { node_id, visit, .. }
+        | Event::AgentMcpReady { node_id, visit, .. }
+        | Event::AgentMcpFailed { node_id, visit, .. }
+        | Event::AgentMcpDisconnected { node_id, visit, .. } => {
             let node_id_str = node_id.clone();
             let node_label = default_node_label(Some(&node_id_str), None);
             StoredEventFields {
@@ -142,19 +145,6 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
                 ..StoredEventFields::default()
             }
         }
-        Event::AgentSessionStarted {
-            session_id,
-            parent_session_id,
-            ..
-        }
-        | Event::AgentSessionEnded {
-            session_id,
-            parent_session_id,
-        } => StoredEventFields {
-            session_id: Some(session_id.clone()),
-            parent_session_id: parent_session_id.clone(),
-            ..StoredEventFields::default()
-        },
         Event::AgentSessionActivated {
             node_id,
             visit,
@@ -237,25 +227,23 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
         Event::Agent {
             stage,
             visit,
-            event: agent_event,
-            session_id,
-            parent_session_id,
-            tool_call_id,
+            event: envelope,
         } => {
             let node_id = Some(stage.clone());
             let node_label = default_node_label(node_id.as_ref(), None);
             let stage_id = Some(StageId::new(stage.clone(), *visit));
-            let tool_call_id = tool_call_id
+            let tool_call_id = envelope
+                .tool_call_id
                 .clone()
-                .or_else(|| agent_tool_call_id(agent_event).map(str::to_string));
+                .or_else(|| agent_tool_call_id(&envelope.event).map(str::to_string));
             let actor = agent_actor_for_event(
-                agent_event,
-                session_id.as_deref(),
-                parent_session_id.as_deref(),
+                &envelope.event,
+                Some(envelope.session_id.as_str()),
+                envelope.parent_session_id.as_deref(),
             );
             StoredEventFields {
-                session_id: session_id.clone(),
-                parent_session_id: parent_session_id.clone(),
+                session_id: Some(envelope.session_id.clone()),
+                parent_session_id: envelope.parent_session_id.clone(),
                 node_id,
                 node_label,
                 stage_id,
@@ -307,34 +295,86 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
     }
 }
 
-fn agent_tool_call_id(event: &AgentEvent) -> Option<&str> {
+fn agent_tool_call_id(event: &CodingEvent) -> Option<&str> {
     match event {
-        AgentEvent::ToolCallStarted { tool_call_id, .. }
-        | AgentEvent::ToolCallCompleted { tool_call_id, .. } => Some(tool_call_id.as_str()),
+        CodingEvent::ToolCallStarted { tool_call_id, .. }
+        | CodingEvent::ToolCallCompleted { tool_call_id, .. } => Some(tool_call_id.as_str()),
         _ => None,
     }
 }
 
 fn agent_actor_for_event(
-    event: &AgentEvent,
+    event: &CodingEvent,
     session_id: Option<&str>,
     parent_session_id: Option<&str>,
 ) -> Option<Principal> {
     match event {
-        AgentEvent::AssistantMessage { model, .. } => Some(Principal::Agent {
+        CodingEvent::AssistantMessage { model, .. } => Some(Principal::Agent {
             session_id:        session_id.map(str::to_string),
             parent_session_id: parent_session_id.map(str::to_string),
-            model:             Some(model.model_id.to_string()),
+            model:             Some(model.clone()),
         }),
-        AgentEvent::ToolCallStarted { .. }
-        | AgentEvent::ToolCallOutputDelta { .. }
-        | AgentEvent::ToolCallCompleted { .. }
-        | AgentEvent::ToolProcessCompleted { .. } => Some(Principal::Agent {
+        CodingEvent::ToolCallStarted { .. }
+        | CodingEvent::ToolCallOutputDelta { .. }
+        | CodingEvent::ToolCallCompleted { .. }
+        | CodingEvent::ToolProcessCompleted { .. } => Some(Principal::Agent {
             session_id:        session_id.map(str::to_string),
             parent_session_id: parent_session_id.map(str::to_string),
             model:             None,
         }),
-        AgentEvent::SteeringInjected { actor, .. } => actor.clone(),
+        CodingEvent::SteeringInjected { actor, .. } => {
+            actor.as_ref().and_then(principal_from_actor)
+        }
         _ => None,
+    }
+}
+
+/// The principal pebble's steering author stands for, where the mapping is
+/// lossless. A human author cannot be rebuilt from pebble's `Actor`; the
+/// durable `run.steer` event that delivered the steer carries the principal.
+pub fn principal_from_actor(actor: &Actor) -> Option<Principal> {
+    match actor {
+        Actor::Agent { id } => Some(Principal::Agent {
+            session_id:        id.clone(),
+            parent_session_id: None,
+            model:             None,
+        }),
+        Actor::System => Some(Principal::System {
+            system_kind: SystemActorKind::Engine,
+        }),
+        _ => None,
+    }
+}
+
+/// The pebble author for a fabro principal steering a session.
+#[must_use]
+pub fn actor_from_principal(principal: &Principal) -> Actor {
+    match principal {
+        Principal::User(user) => Actor::User {
+            id:           Some(format!(
+                "{}|{}",
+                user.identity.issuer(),
+                user.identity.subject()
+            )),
+            display_name: Some(user.login.clone()),
+        },
+        Principal::Agent { session_id, .. } => Actor::Agent {
+            id: session_id.clone(),
+        },
+        Principal::System { .. } | Principal::Worker { .. } => Actor::System,
+        Principal::Webhook { delivery_id } => Actor::External {
+            label: Some(format!("webhook:{delivery_id}")),
+        },
+        Principal::Slack {
+            team_id,
+            user_id,
+            user_name,
+        } => Actor::External {
+            label: Some(
+                user_name
+                    .clone()
+                    .unwrap_or_else(|| format!("slack:{team_id}:{user_id}")),
+            ),
+        },
     }
 }

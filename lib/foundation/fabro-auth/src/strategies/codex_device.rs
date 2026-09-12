@@ -5,6 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use fabro_http::HttpClient;
+use lithos_llm::catalog::builtin;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
@@ -298,7 +299,7 @@ impl AuthStrategy for CodexDeviceStrategy {
                 .map_err(anyhow::Error::msg)?;
 
                 Ok(LoginResult::OAuth {
-                    provider:   fabro_model::ProviderId::openai(),
+                    provider:   builtin::openai(),
                     credential: OAuthCredential {
                         tokens:     OAuthTokens {
                             access_token:  token_response.access_token,

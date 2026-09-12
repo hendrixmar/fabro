@@ -38,8 +38,8 @@ describe("chats-store reducer", () => {
     expect(chat?.seedMessages).toHaveLength(1);
     expect(chat?.seedMessages[0]?.role).toBe("user");
     expect(chat?.seedMessages[0]?.content[0]).toEqual({
-      kind: "text",
-      data: { text: "Help me with React" },
+      type: "text",
+      text: "Help me with React",
     });
   });
 

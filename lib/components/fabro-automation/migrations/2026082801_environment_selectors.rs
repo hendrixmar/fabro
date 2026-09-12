@@ -35,7 +35,7 @@ pub async fn backfill_environment_selectors(
     }
 
     let compatible_ids = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM environments WHERE provider IN ('docker', 'daytona') ORDER BY id",
+        "SELECT id FROM environments WHERE provider <> 'local' ORDER BY id",
     )
     .fetch_all(pool)
     .await?;

@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Write as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -10,20 +10,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use fabro_agent::config::{ToolAccess, ToolAccessPolicy, ToolExposureMode};
-use fabro_agent::profiles::{self, EmbeddedPrompt};
-use fabro_agent::tool_registry::ToolRegistry;
-use fabro_agent::{
-    AgentEvent, AgentProfile, AgentProfileBuilder, Error as AgentError, Session, SessionEvent,
-    SessionOptions,
-};
 use fabro_api::types::{
     CreateRunSessionRequest, PaginatedEventList, PaginationMeta, SubmitTurnRequest,
 };
-use fabro_llm::types::ToolDefinition;
-use fabro_model::{AgentProfileKind, Catalog, ModelSelectionError, ProviderId, catalog};
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::{FabroClient, ModelSelectionError, selection};
+use fabro_sandbox::SecretRedactor;
 use fabro_sandbox::reconnect::reconnect_for_run;
-use fabro_static::EnvVars;
 use fabro_store::{
     EventPayload, ProjectedRunSession, RunDatabase, project_run_session, project_run_sessions,
 };
@@ -36,8 +29,18 @@ use fabro_types::run_event::{
 };
 use fabro_types::settings::ModelRef as SettingsModelRef;
 use fabro_types::{EventBody, EventEnvelope, RunEvent, RunId, SessionDetail, SessionId, TurnId};
-use fabro_workflow::handler::llm::api::register_named_fabro_run_tools;
+use fabro_workflow::handler::llm::register_named_fabro_run_tools;
 use fabro_workflow::services::FabroRunToolServices;
+use lithos_llm::catalog::ProviderId;
+use pebble_coding_agent::environment::Environment;
+use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, ToolSummary};
+use pebble_coding_agent::extensions::{
+    EnvContext, SystemPromptContext, SystemPromptDecision, SystemPromptTransform,
+};
+use pebble_coding_agent::tools::{
+    PermissionMiddleware, ToolPermission, ToolPermissionPolicy, canonical_tool_name,
+};
+use pebble_coding_agent::{CodingAgent, CodingAgentOptions, Error as AgentError, ResumeMode};
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
@@ -52,7 +55,6 @@ use super::super::{
 };
 use crate::error::ApiError;
 use crate::principal_middleware::RequiredUser;
-use crate::server_secrets::LlmClientResult;
 use crate::worker_token::issue_worker_token;
 
 const SESSION_SSE_BUFFER_CAPACITY: usize = 1024;
@@ -203,7 +205,7 @@ async fn create_run_session(
 
     let events = vec![event];
     match project_run_session(run_id, session_id, &events) {
-        Some(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Some(session) => (StatusCode::CREATED, Json(session.record)).into_response(),
         None => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Session event projection failed.",
@@ -225,12 +227,7 @@ async fn get_session(
         Ok(context) => context,
         Err(response) => return response,
     };
-    Json(SessionDetail::new(
-        session.record,
-        session.runtime_context,
-        session.last_seq,
-    ))
-    .into_response()
+    Json(SessionDetail::new(session.record, session.last_seq)).into_response()
 }
 
 async fn session_method_not_found() -> Response {
@@ -517,11 +514,11 @@ async fn run_streaming_turn(
 
     let outcome = {
         let runtime_entry = turn_lease.entry();
-        let mut session_slot = runtime_entry.lock_session().await;
-        if session_slot.is_none() {
-            match build_agent_session(&state, run_id, &session).await {
-                Ok(agent_session) => {
-                    *session_slot = Some(agent_session);
+        let mut agent_slot = runtime_entry.lock_agent().await;
+        if agent_slot.is_none() {
+            match build_agent(&state, run_id, &run_store, &session).await {
+                Ok(agent) => {
+                    *agent_slot = Some(agent);
                 }
                 Err(err) => {
                     error!(error = ?err, session_id = %session_id, turn_id = %turn_id, "Failed to build run-backed session runtime");
@@ -544,12 +541,11 @@ async fn run_streaming_turn(
                 }
             }
         }
-        let session = session_slot
+        let agent = agent_slot
             .as_mut()
             .expect("session runtime slot should be loaded");
-        let cancel_token = session.cancel_token();
+        let cancel_token = CancellationToken::new();
         turn_lease.attach_cancel_token(&cancel_token);
-        let initialize = !runtime_entry.is_initialized();
         let model_input = match run_store.state().await {
             Ok(projection) => {
                 let snapshot = build_ask_fabro_run_snapshot(&projection, run_id);
@@ -569,20 +565,30 @@ async fn run_streaming_turn(
             }
         };
         let mut output = None;
-        let result = Box::pin(drive_agent_session(
+        let result = Box::pin(drive_agent(
             &run_store,
-            session,
+            agent,
             run_id,
             session_id,
             turn_id,
             &model_input,
-            initialize,
+            &cancel_token,
             &sender,
             &mut output,
         ))
         .await;
-        if initialize && matches!(result, Ok(Ok(()))) {
-            runtime_entry.mark_initialized();
+        // The record is taken after the prompt's event barrier, so it holds
+        // the whole turn. Persisting it after every turn is what makes the
+        // session resumable by another process.
+        if !matches!(result, Ok(Err(pebble_coding_agent::Error::SessionClosed))) {
+            if let Err(err) = state
+                .stores
+                .session_records
+                .put(session_id, run_id, &agent.to_record(), Utc::now())
+                .await
+            {
+                error!(error = %err, session_id = %session_id, "Failed to persist Ask Fabro session record");
+            }
         }
         TurnExecutionOutcome { result, output }
     };
@@ -603,7 +609,7 @@ async fn run_streaming_turn(
             .await;
         }
         Ok(Err(err)) => {
-            turn_lease.entry().clear_session().await;
+            turn_lease.entry().clear_agent().await;
             let body = if matches!(err, AgentError::Interrupted(_)) {
                 EventBody::RunSessionTurnInterrupted(RunSessionTurnInterruptedProps {
                     turn_id,
@@ -618,7 +624,7 @@ async fn run_streaming_turn(
                     .await;
         }
         Err(err) => {
-            turn_lease.entry().clear_session().await;
+            turn_lease.entry().clear_agent().await;
             let _ = append_and_send_event(
                 &run_store,
                 &sender,
@@ -673,11 +679,14 @@ impl AskFabroBuildError {
     }
 }
 
-async fn build_agent_session(
+/// The Ask Fabro agent for `session`: resumed from its stored record when a
+/// turn has been persisted, built fresh otherwise.
+async fn build_agent(
     state: &AppState,
     run_id: RunId,
+    run_store: &RunDatabase,
     session: &ProjectedRunSession,
-) -> Result<Session, AskFabroBuildError> {
+) -> Result<CodingAgent, AskFabroBuildError> {
     let catalog = state.catalog();
     let llm_result = state.resolve_llm_client().await.map_err(|err| {
         AskFabroBuildError::LlmUnconfigured(format!("LLM credentials are not configured: {err}"))
@@ -685,12 +694,11 @@ async fn build_agent_session(
     for (provider, issue) in &llm_result.auth_issues {
         warn!(provider = %provider, error = %issue, "LLM provider unavailable due to auth issue");
     }
-    for issue in &llm_result.registration_issues {
-        warn!(provider = %issue.provider, error = %issue.error, "LLM provider unavailable due to registration issue");
+    for issue in &llm_result.build_issues {
+        warn!(provider = %issue.provider, error = %issue.cause, "LLM provider unavailable due to build issue");
     }
-    let (provider_id, model, profile_kind) =
-        selected_session_model(&catalog, &llm_result, session)?;
-    if !llm_result.client.has_provider(provider_id.as_str()) {
+    let (provider_id, model) = selected_session_model(&catalog, &llm_result, session)?;
+    if !llm_result.has_provider(&provider_id) {
         let message = format!("LLM credentials not configured for provider '{provider_id}'");
         return if session.record.model.is_some() {
             Err(AskFabroBuildError::ModelUnavailable(message))
@@ -699,11 +707,6 @@ async fn build_agent_session(
         };
     }
 
-    let run_store = state
-        .store_ref()
-        .open_run_reader(&run_id)
-        .await
-        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
     let projection = run_store
         .state()
         .await
@@ -715,23 +718,18 @@ async fn build_agent_session(
     let sandbox_instance = sandbox_record.instance().ok_or_else(|| {
         AskFabroBuildError::SandboxUnavailable(anyhow::anyhow!("run sandbox was not created"))
     })?;
-    let daytona_api_key = state
-        .vault_secret(EnvVars::DAYTONA_API_KEY)
+    let access = state
+        .provider_access()
         .await
         .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
-    let sandbox = reconnect_for_run(sandbox_instance, daytona_api_key, Some(run_id))
+    let sandbox = reconnect_for_run(sandbox_instance, &access, Some(run_id), None)
         .await
         .map_err(AskFabroBuildError::SandboxUnavailable)?;
     sandbox
         .activate()
         .await
         .map_err(|err| AskFabroBuildError::SandboxUnavailable(anyhow::Error::new(err)))?;
-    let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::from(sandbox);
-    // No optional web-tool dependencies: `AskFabroToolAccessPolicy` denies
-    // `web_search` and `web_fetch`, and both `tools()` and the prompt are
-    // filtered through that policy.
-    let mut profile =
-        AgentProfileBuilder::new(profile_kind, provider_id, &model, Arc::clone(&catalog)).build();
+    let environment: Arc<dyn Environment> = Arc::new(sandbox);
 
     // Give the Ask Fabro agent access to read-only run-inspection tools scoped
     // to its owning run. The session reaches the local HTTP API via a same-run
@@ -750,71 +748,86 @@ async fn build_agent_session(
         .map_err(AskFabroBuildError::Agent)?;
     let backend = ClientBackend::new(Arc::new(api_client)).with_run_scope(run_id);
     let services = FabroRunToolServices {
-        backend:            Arc::new(backend),
-        current_run_id:     run_id,
-        base_cwd:           PathBuf::new(),
-        user_settings_path: PathBuf::new(),
+        backend:        Arc::new(backend),
+        current_run_id: run_id,
     };
-    register_named_fabro_run_tools(
-        profile.tool_registry_mut(),
-        &services,
-        ASK_FABRO_RUN_TOOL_NAMES,
-    );
-    let ask_fabro_policy = build_ask_fabro_tool_access_policy();
-    let profile: Arc<dyn AgentProfile> =
-        Arc::new(AskFabroProfile::new(profile, Arc::clone(&ask_fabro_policy)));
+    let run_tools = register_named_fabro_run_tools(&services, ASK_FABRO_RUN_TOOL_NAMES);
+    let selector = format!("{provider_id}/{model}");
 
-    let config = SessionOptions {
-        tool_access_policy: Some(ask_fabro_policy),
-        tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
-        ..SessionOptions::default()
+    // A resumed session continues its stored conversation on the model it
+    // recorded; a record whose events outran it (a crash between the event
+    // log and the record write) is moved past the log's last sequence so the
+    // stream never reuses a number.
+    let stored = state
+        .stores
+        .session_records
+        .get(session.record.id)
+        .await
+        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
+    let builder = match stored {
+        Some(stored) => {
+            let mut record = stored.record;
+            if let Ok(Some(last_seq)) = run_store.last_event_seq().await {
+                record.resume_after(u64::from(last_seq));
+            }
+            CodingAgent::resume(
+                llm_result.client,
+                environment,
+                record,
+                ResumeMode::RecordedModel,
+            )
+        }
+        None => CodingAgent::builder(llm_result.client, environment)
+            .model(selector)
+            .options(
+                CodingAgentOptions::default()
+                    // A short-lived analyst has no project memory or skills of
+                    // its own; the prompt says what it may do.
+                    .with_context_compaction(true),
+            ),
     };
-
-    Session::from_record(
-        &session.record,
-        &session.runtime_context,
-        llm_result.client,
-        profile,
-        sandbox,
-        config,
-        None,
-    )
-    .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))
+    builder
+        .tools(run_tools)
+        // The read-only policy hides and refuses every other tool, so the
+        // agent gets exactly the read tools and the two run tools.
+        .tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(
+            AskFabroToolPolicy,
+        ))))
+        .system_prompt_transform(Arc::new(AskFabroPrompt))
+        .redactor(Arc::new(SecretRedactor))
+        .build()
+        .await
+        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))
 }
 
 fn selected_session_model(
     catalog: &Catalog,
-    llm_result: &LlmClientResult,
+    llm_result: &FabroClient,
     session: &ProjectedRunSession,
-) -> Result<(ProviderId, String, AgentProfileKind), AskFabroBuildError> {
+) -> Result<(ProviderId, String), AskFabroBuildError> {
     let eligible = llm_result
         .provider_ids()
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
     let record = &session.record;
-    let selected = catalog
-        .resolve_selection(record.model.as_deref(), record.provider.as_ref(), &eligible)
-        .map_err(|error| {
-            // A missing default with no provider pin means no LLM is
-            // configured at all; every other failure is about the requested
-            // model/provider.
-            if record.provider.is_none()
-                && matches!(error, ModelSelectionError::NoDefaultModel { .. })
-            {
-                AskFabroBuildError::LlmUnconfigured(error.to_string())
-            } else {
-                AskFabroBuildError::ModelUnavailable(error.to_string())
-            }
-        })?;
-    let (provider_id, model) = (selected.provider, selected.model);
-    let profile_kind = catalog
-        .effective_agent_profile(&provider_id, Some(&model))
-        .ok_or_else(|| {
-            AskFabroBuildError::ModelUnavailable(format!(
-                "provider '{provider_id}' is not configured"
-            ))
-        })?;
-    Ok((provider_id, model, profile_kind))
+    let selected = selection::resolve_selection(
+        catalog,
+        record.model.as_deref(),
+        record.provider.as_ref(),
+        &eligible,
+    )
+    .map_err(|error| {
+        // A missing default with no provider pin means no LLM is
+        // configured at all; every other failure is about the requested
+        // model/provider.
+        if record.provider.is_none() && matches!(error, ModelSelectionError::NoDefaultModel { .. })
+        {
+            AskFabroBuildError::LlmUnconfigured(error.to_string())
+        } else {
+            AskFabroBuildError::ModelUnavailable(error.to_string())
+        }
+    })?;
+    Ok((selected.provider, selected.model))
 }
 
 fn canonical_session_model(
@@ -825,31 +838,32 @@ fn canonical_session_model(
 ) -> Result<(ProviderId, String), ApiError> {
     let explicit_provider = explicit_provider
         .map(|provider| {
-            catalog
-                .provider(provider)
-                .map(|provider| provider.id.clone())
-                .ok_or_else(|| {
-                    session_selection_error(&ModelSelectionError::UnknownProvider {
-                        provider: provider.clone(),
-                    })
+            enabled_provider_id(catalog, provider.as_str()).ok_or_else(|| {
+                session_selection_error(&ModelSelectionError::UnknownProvider {
+                    provider: provider.to_string(),
                 })
+            })
         })
         .transpose()?;
     let Some(requested) = requested else {
-        let selected = catalog
-            .resolve_selection(None, explicit_provider.as_ref(), eligible)
-            .map_err(|error| session_selection_error(&error))?;
+        let selected =
+            selection::resolve_selection(catalog, None, explicit_provider.as_ref(), eligible)
+                .map_err(|error| session_selection_error(&error))?;
         return Ok((selected.provider, selected.model));
     };
     let requested = requested.trim();
     if requested.is_empty() {
         return Err(ApiError::bad_request("Session model must not be empty."));
     }
-    if catalog::legacy_builtin_model(requested).is_some() {
-        let selected = catalog
-            .resolve_selection(Some(requested), explicit_provider.as_ref(), eligible)
-            .map_err(|error| session_selection_error(&error))?;
-        return Ok((selected.provider, selected.model));
+    // An aggregator's wire id (`openai/gpt-5.6-sol` on OpenRouter) is matched
+    // whole on a pinned provider before its prefix is read as a provider.
+    if let Some(explicit) = explicit_provider.as_ref().filter(|p| eligible.contains(*p)) {
+        if let Some(entry) = catalog
+            .enabled_provider(explicit.as_str())
+            .and_then(|provider| provider.offering(requested))
+        {
+            return Ok((explicit.clone(), entry.model.id().to_string()));
+        }
     }
     let model_ref = requested
         .parse::<SettingsModelRef>()
@@ -857,15 +871,16 @@ fn canonical_session_model(
         .qualify(catalog);
     let (qualified_provider, selector) = match model_ref {
         SettingsModelRef::Qualified { provider, selector } => {
-            let requested_provider = ProviderId::new(provider);
-            let provider = catalog
-                .provider(&requested_provider)
-                .map(|provider| provider.id.clone())
-                .ok_or_else(|| {
-                    session_selection_error(&ModelSelectionError::UnknownProvider {
-                        provider: requested_provider,
-                    })
-                })?;
+            let provider = enabled_provider_id(catalog, &provider).ok_or_else(|| {
+                session_selection_error(&ModelSelectionError::UnknownProvider { provider })
+            })?;
+            // When the prefixed provider is not ready, the whole string may
+            // still be an eligible aggregator's wire id for the same model.
+            if explicit_provider.is_none() && !eligible.contains(&provider) {
+                if let Some(found) = api_model_on_eligible(catalog, requested, eligible) {
+                    return Ok(found);
+                }
+            }
             if let Some(explicit) = explicit_provider.as_ref() {
                 if explicit != &provider {
                     return Err(ApiError::bad_request(format!(
@@ -877,9 +892,7 @@ fn canonical_session_model(
             (Some(provider), selector)
         }
         SettingsModelRef::Bare(selector) => {
-            if explicit_provider.is_none()
-                && catalog.provider(&ProviderId::new(&selector)).is_some()
-            {
+            if explicit_provider.is_none() && catalog.enabled_provider(&selector).is_some() {
                 let detail = if catalog.is_model_selector(&selector) {
                     format!(
                         "Session model reference '{selector}' is ambiguous between a provider and \
@@ -896,74 +909,135 @@ fn canonical_session_model(
         }
     };
     let provider = qualified_provider.as_ref().or(explicit_provider.as_ref());
-    let selected = catalog
-        .resolve_selection(Some(&selector), provider, eligible)
+    let selected = selection::resolve_selection(catalog, Some(&selector), provider, eligible)
         .map_err(|error| session_selection_error(&error))?;
     Ok((selected.provider, selected.model))
+}
+
+/// The highest-priority eligible provider offering `api_model` as a wire id.
+fn api_model_on_eligible(
+    catalog: &Catalog,
+    api_model: &str,
+    eligible: &std::collections::HashSet<ProviderId>,
+) -> Option<(ProviderId, String)> {
+    catalog
+        .enabled_providers()
+        .into_iter()
+        .filter(|provider| eligible.contains(provider.id()))
+        .find_map(|provider| {
+            provider
+                .offerings()
+                .find(|model| model.model.api_model() == api_model)
+                .map(|model| (provider.id().clone(), model.model.id().to_string()))
+        })
+}
+
+/// The catalog id of an enabled provider named by id or alias.
+fn enabled_provider_id(catalog: &Catalog, selector: &str) -> Option<ProviderId> {
+    catalog
+        .enabled_provider(selector)
+        .map(|provider| provider.id().clone())
 }
 
 fn session_selection_error(error: &ModelSelectionError) -> ApiError {
     ApiError::bad_request(error.to_string())
 }
 
-struct AskFabroToolAccessPolicy;
+/// Ask Fabro reads. Every write, shell, web, and run-control tool is hidden
+/// from the model and refused if called anyway.
+struct AskFabroToolPolicy;
 
-impl ToolAccessPolicy for AskFabroToolAccessPolicy {
-    fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
-        // Resolve through the canonical name so a profile that exposes its own
-        // vocabulary (the Kimi profile uses `Read`/`Grep`/`Glob`) is not denied
-        // its whole tool set.
-        match fabro_agent::canonical_tool_name(tool_name) {
-            "read_file" | "grep" | "glob" => ToolAccess::Allowed,
-            name if ASK_FABRO_RUN_TOOL_NAMES.contains(&name) => ToolAccess::Allowed,
-            _ => ToolAccess::Denied,
+impl ToolPermissionPolicy for AskFabroToolPolicy {
+    fn permission(
+        &self,
+        _session: &pebble_coding_agent::SessionScope,
+        tool: &pebble_agent::ToolDescriptor,
+    ) -> ToolPermission {
+        if ask_fabro_allows_tool(tool.id().as_str()) {
+            ToolPermission::Allow
+        } else {
+            ToolPermission::Deny {
+                reason: "denied by tool access policy: Ask Fabro is read-only".to_string(),
+            }
         }
     }
 }
 
-fn build_ask_fabro_tool_access_policy() -> Arc<dyn ToolAccessPolicy> {
-    Arc::new(AskFabroToolAccessPolicy)
+/// Whether Ask Fabro may call `tool_name`, resolved through the canonical
+/// name so a profile with its own vocabulary (the Kimi profile uses
+/// `Read`/`Grep`/`Glob`) is not denied its whole tool set.
+fn ask_fabro_allows_tool(tool_name: &str) -> bool {
+    match canonical_tool_name(tool_name) {
+        "read_file" | "grep" | "glob" => true,
+        name => ASK_FABRO_RUN_TOOL_NAMES.contains(&name),
+    }
 }
 
-fn ask_fabro_effective_tool_definitions(
-    registry: &ToolRegistry,
-    policy: &dyn ToolAccessPolicy,
-) -> Vec<ToolDefinition> {
-    registry.definitions_for_policy(Some(policy), ToolExposureMode::AutoApprovedOnly)
+/// The Ask Fabro system prompt: the analyst contract plus the environment
+/// block and the tools the policy lets through.
+struct AskFabroPrompt;
+
+impl SystemPromptTransform for AskFabroPrompt {
+    fn transform(&self, context: SystemPromptContext<'_>) -> SystemPromptDecision {
+        SystemPromptDecision::Replace(build_ask_fabro_system_prompt(
+            context.environment(),
+            context.tools(),
+        ))
+    }
 }
 
-fn render_ask_fabro_tool_guidance(
-    registry: &ToolRegistry,
-    policy: &dyn ToolAccessPolicy,
-) -> String {
-    let mut definitions = ask_fabro_effective_tool_definitions(registry, policy);
-    definitions.sort_by(|left, right| left.name.cmp(&right.name));
-
-    definitions
+fn render_ask_fabro_tool_guidance(tools: &[ToolSummary]) -> String {
+    let mut tools: Vec<&ToolSummary> = tools
+        .iter()
+        .filter(|tool| ask_fabro_allows_tool(&tool.name))
+        .collect();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools
         .into_iter()
         .map(|tool| format!("- `{}`: {}", tool.name, tool.description))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn build_ask_fabro_system_prompt(
-    env: &dyn fabro_agent::Sandbox,
-    env_context: &fabro_agent::EnvContext,
-    _memory: &[String],
-    user_instructions: Option<&str>,
-    _skills: &[fabro_agent::Skill],
-    registry: &ToolRegistry,
-    policy: &dyn ToolAccessPolicy,
-) -> String {
+fn render_ask_fabro_env_block(environment: &EnvContext) -> String {
+    let mut lines = vec![
+        "<environment>".to_string(),
+        format!("Working directory: {}", environment.working_directory),
+        format!("Is git repository: {}", environment.is_git_repo),
+    ];
+    if let Some(branch) = &environment.git_branch {
+        lines.push(format!("Git branch: {branch}"));
+    }
+    lines.push(format!("Platform: {}", environment.platform));
+    lines.push(format!("OS version: {}", environment.os_version));
+    if !environment.current_date.is_empty() {
+        lines.push(format!("Today's date: {}", environment.current_date));
+    }
+    if !environment.model.is_empty() {
+        lines.push(format!("Model: {}", environment.model));
+    }
+    lines.push("</environment>".to_string());
+    lines.join("\n")
+}
+
+fn build_ask_fabro_system_prompt(environment: &EnvContext, tools: &[ToolSummary]) -> String {
     // `tool_guidance` is passed as a template variable rather than interpolated
     // into the template text: it carries tool names and descriptions that can
     // come from MCP servers, and MiniJinja does not re-render substituted
     // values, so arbitrary `{{ ... }}` in a tool description stays inert.
-    let tool_guidance = render_ask_fabro_tool_guidance(registry, policy);
-    let template = EmbeddedPrompt::new("ask_fabro.md.j2", ASK_FABRO_SYSTEM_PROMPT)
-        .with_string("tool_guidance", tool_guidance);
-
-    profiles::assemble_system_prompt(template, env, env_context, &[], user_instructions, &[])
+    let inputs = HashMap::from([
+        (
+            "env_block".to_string(),
+            toml::Value::String(render_ask_fabro_env_block(environment)),
+        ),
+        (
+            "tool_guidance".to_string(),
+            toml::Value::String(render_ask_fabro_tool_guidance(tools)),
+        ),
+    ]);
+    let ctx = fabro_template::TemplateContext::new().with_inputs(inputs);
+    fabro_template::render_named("ask_fabro.md.j2", ASK_FABRO_SYSTEM_PROMPT, &ctx)
+        .unwrap_or_else(|err| panic!("embedded Ask Fabro prompt failed to render: {err}"))
 }
 
 fn build_ask_fabro_run_snapshot(projection: &fabro_types::RunProjection, run_id: RunId) -> String {
@@ -1076,89 +1150,24 @@ User question:
     )
 }
 
-struct AskFabroProfile {
-    inner:  Box<dyn AgentProfile>,
-    policy: Arc<dyn ToolAccessPolicy>,
-}
-
-impl AskFabroProfile {
-    fn new(inner: Box<dyn AgentProfile>, policy: Arc<dyn ToolAccessPolicy>) -> Self {
-        Self { inner, policy }
-    }
-}
-
-impl AgentProfile for AskFabroProfile {
-    fn profile_kind(&self) -> AgentProfileKind {
-        self.inner.profile_kind()
-    }
-
-    fn provider_id(&self) -> ProviderId {
-        self.inner.provider_id()
-    }
-
-    fn model(&self) -> &str {
-        self.inner.model()
-    }
-
-    fn catalog(&self) -> Option<&Catalog> {
-        self.inner.catalog()
-    }
-
-    fn tool_registry(&self) -> &ToolRegistry {
-        self.inner.tool_registry()
-    }
-
-    fn tool_registry_mut(&mut self) -> &mut ToolRegistry {
-        self.inner.tool_registry_mut()
-    }
-
-    fn build_system_prompt(
-        &self,
-        env: &dyn fabro_agent::Sandbox,
-        env_context: &fabro_agent::EnvContext,
-        memory: &[String],
-        user_instructions: Option<&str>,
-        skills: &[fabro_agent::Skill],
-    ) -> String {
-        build_ask_fabro_system_prompt(
-            env,
-            env_context,
-            memory,
-            user_instructions,
-            skills,
-            self.tool_registry(),
-            self.policy.as_ref(),
-        )
-    }
-
-    fn tools(&self) -> Vec<ToolDefinition> {
-        ask_fabro_effective_tool_definitions(self.tool_registry(), self.policy.as_ref())
-    }
-}
-
-async fn drive_agent_session(
+async fn drive_agent(
     run_store: &RunDatabase,
-    session: &mut Session,
+    agent: &mut CodingAgent,
     run_id: RunId,
     session_id: SessionId,
     turn_id: TurnId,
     input: &str,
-    initialize: bool,
+    cancel_token: &CancellationToken,
     sender: &SessionSseSender,
     output: &mut Option<String>,
 ) -> anyhow::Result<Result<(), AgentError>> {
-    let mut receiver = session.subscribe();
-    let process = async {
-        if initialize {
-            session.initialize().await?;
-        }
-        session.process_input(input).await
-    };
-    tokio::pin!(process);
+    let mut receiver = agent.subscribe();
+    let prompt = agent.prompt_with_cancellation(input, cancel_token);
+    tokio::pin!(prompt);
 
     loop {
         tokio::select! {
-            result = &mut process => {
+            report = &mut prompt => {
                 while let Ok(event) = receiver.try_recv() {
                     record_turn_output(output, &event);
                     Box::pin(persist_agent_event(
@@ -1166,7 +1175,7 @@ async fn drive_agent_session(
                     ))
                     .await?;
                 }
-                return Ok(result);
+                return Ok(report.result.map(|_| ()));
             }
             event = receiver.recv() => {
                 match event {
@@ -1184,8 +1193,8 @@ async fn drive_agent_session(
     }
 }
 
-fn record_turn_output(output: &mut Option<String>, event: &SessionEvent) {
-    if let AgentEvent::AssistantMessage { text, .. } = &event.event {
+fn record_turn_output(output: &mut Option<String>, event: &CodingAgentEvent) {
+    if let CodingEvent::AssistantMessage { text, .. } = &event.event {
         *output = Some(text.clone());
     }
 }
@@ -1222,7 +1231,7 @@ async fn persist_agent_event(
     run_id: RunId,
     session_id: SessionId,
     turn_id: TurnId,
-    event: SessionEvent,
+    event: CodingAgentEvent,
     sender: &SessionSseSender,
 ) -> anyhow::Result<()> {
     let ts = event.timestamp.into();
@@ -1234,25 +1243,25 @@ async fn persist_agent_event(
         .map_err(Into::into)
 }
 
-fn agent_event_payload(event_turn_id: TurnId, event: AgentEvent) -> Option<EventBody> {
+fn agent_event_payload(event_turn_id: TurnId, event: CodingEvent) -> Option<EventBody> {
     match event {
-        AgentEvent::AssistantMessage {
+        CodingEvent::AssistantMessage {
             text, model, usage, ..
         } => Some(EventBody::RunSessionAssistantMessage(
             RunSessionAssistantMessageProps {
                 turn_id: event_turn_id,
                 text,
-                model: Some(model.model_id.to_string()),
+                model: Some(model),
                 usage: serde_json::to_value(usage).unwrap_or(Value::Null),
             },
         )),
-        AgentEvent::TextDelta { delta } => Some(EventBody::RunSessionAssistantDelta(
+        CodingEvent::TextDelta { delta } => Some(EventBody::RunSessionAssistantDelta(
             RunSessionAssistantDeltaProps {
                 turn_id: event_turn_id,
                 delta,
             },
         )),
-        AgentEvent::ToolCallStarted {
+        CodingEvent::ToolCallStarted {
             tool_name,
             tool_call_id,
             arguments,
@@ -1264,7 +1273,7 @@ fn agent_event_payload(event_turn_id: TurnId, event: AgentEvent) -> Option<Event
                 arguments,
             },
         )),
-        AgentEvent::ToolCallCompleted {
+        CodingEvent::ToolCallCompleted {
             tool_name,
             tool_call_id,
             output,
@@ -1272,6 +1281,7 @@ fn agent_event_payload(event_turn_id: TurnId, event: AgentEvent) -> Option<Event
             output_bytes_observed,
             output_bytes_retained,
             output_bytes_omitted,
+            ..
         } => Some(EventBody::RunSessionToolCallCompleted(
             RunSessionToolCallCompletedProps {
                 turn_id: event_turn_id,
@@ -1390,7 +1400,7 @@ async fn load_session(
         Ok(events) => events,
         Err(err) => return Err(store_error(&err).into_response()),
     };
-    match fabro_store::project_run_session_with_context(run_id, session_id, &events) {
+    match project_run_session(run_id, session_id, &events) {
         Some(session) => Ok((run_id, run_store, session)),
         None => Err(ApiError::not_found("Session not found.").into_response()),
     }
@@ -1410,7 +1420,7 @@ async fn load_session_read(
         Ok(events) => events,
         Err(err) => return Err(store_error(&err).into_response()),
     };
-    match fabro_store::project_run_session_with_context(run_id, session_id, &events) {
+    match project_run_session(run_id, session_id, &events) {
         Some(session) => Ok((run_id, session)),
         None => Err(ApiError::not_found("Session not found.").into_response()),
     }
@@ -1482,33 +1492,24 @@ fn parse_turn_id(value: &str) -> Result<TurnId, ApiError> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use fabro_agent::config::ToolAccess;
-    use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
-    use fabro_llm::types::{ToolCall, ToolDefinition};
-    use fabro_model::catalog::LlmCatalogSettings;
     use fabro_types::test_support;
+    use pebble_coding_agent::events::{ToolCategory, ToolSource};
 
     use super::*;
 
-    fn stub_tool(name: &str) -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition {
-                name:        name.to_string(),
-                description: format!("{name} test tool"),
-                parameters:  serde_json::json!({"type": "object"}),
-            },
-            executor:   Arc::new(|_args, _ctx: ToolContext| {
-                Box::pin(async { Ok("ok".to_string()) })
-            }),
-            source:     ToolSource::Native,
+    fn tool_summary(name: &str) -> ToolSummary {
+        ToolSummary {
+            name:        name.to_string(),
+            description: format!("{name} test tool"),
+            source:      ToolSource::Native,
+            category:    ToolCategory::Other,
+            invoked:     false,
         }
     }
 
-    fn ask_fabro_test_registry() -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        for name in [
+    fn ask_fabro_test_tools() -> Vec<ToolSummary> {
+        [
             "read_file",
             "grep",
             "glob",
@@ -1522,65 +1523,33 @@ mod tests {
             fabro_tool::FABRO_RUN_GET_TOOL_NAME,
             fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME,
             fabro_tool::FABRO_RUN_PAIR_TOOL_NAME,
-        ] {
-            registry.register(stub_tool(name));
-        }
-        registry
+        ]
+        .into_iter()
+        .map(tool_summary)
+        .collect()
     }
 
+    /// OpenAI and OpenRouter both offer `gpt-5.6-sol` under the `gpt-56-sol`
+    /// alias; OpenRouter ships disabled, so enable it the way an operator
+    /// would.
     fn portable_session_catalog() -> Catalog {
-        let settings: LlmCatalogSettings = toml::from_str(
+        fabro_llm::test_support::test_catalog_with_overlay(
             r#"
 [providers.openai]
-display_name = "OpenAI"
-adapter = "openai"
-agent_profile = "openai"
-priority = 90
-
-[providers.openai.models."gpt-5.6-sol"]
-display_name = "GPT-5.6 Sol"
-family = "gpt-5"
-aliases = ["gpt-56-sol"]
-default = true
-
-[providers.openai.models."gpt-5.6-sol".limits]
-context_window = 1000
-
-[providers.openai.models."gpt-5.6-sol".features]
-tools = true
-vision = false
-reasoning = false
+default_model = "gpt-5.6-sol"
 
 [providers.openrouter]
-display_name = "OpenRouter"
-adapter = "openai_compatible"
-agent_profile = "openai"
-priority = 25
+default_model = "gpt-5.6-sol"
+enabled = true
 
-[providers.openrouter.models."gpt-5.6-sol"]
-api_id = "openai/gpt-5.6-sol"
-display_name = "GPT-5.6 Sol (via OpenRouter)"
-family = "gpt-5"
-aliases = ["gpt-56-sol"]
-default = true
-
-[providers.openrouter.models."gpt-5.6-sol".limits]
-context_window = 1000
-
-[providers.openrouter.models."gpt-5.6-sol".features]
-tools = true
-vision = false
-reasoning = false
 "#,
         )
-        .unwrap();
-        Catalog::from_settings(&settings).unwrap()
     }
 
     #[test]
     fn canonical_session_model_uses_readiness_priority_and_explicit_pins() {
         let catalog = portable_session_catalog();
-        let openai = ProviderId::openai();
+        let openai = lithos_llm::catalog::builtin::openai();
         let openrouter = ProviderId::new("openrouter");
 
         assert_eq!(
@@ -1627,7 +1596,7 @@ reasoning = false
     #[test]
     fn canonical_session_model_preserves_unknown_passthrough_on_selected_provider() {
         let catalog = portable_session_catalog();
-        let openai = ProviderId::openai();
+        let openai = lithos_llm::catalog::builtin::openai();
         let openrouter = ProviderId::new("openrouter");
         let both = std::collections::HashSet::from([openai.clone(), openrouter.clone()]);
 
@@ -1647,7 +1616,7 @@ reasoning = false
     #[test]
     fn canonical_session_model_passes_through_colon_bearing_model_ids() {
         let catalog = portable_session_catalog();
-        let openai = ProviderId::openai();
+        let openai = lithos_llm::catalog::builtin::openai();
         let openrouter = ProviderId::new("openrouter");
         let both = std::collections::HashSet::from([openai.clone(), openrouter.clone()]);
 
@@ -1672,7 +1641,7 @@ reasoning = false
         let catalog = portable_session_catalog();
         let error = canonical_session_model(
             &catalog,
-            &std::collections::HashSet::from([ProviderId::openai()]),
+            &std::collections::HashSet::from([lithos_llm::catalog::builtin::openai()]),
             Some("gpt-56-sol"),
             Some(&ProviderId::new("openrouter")),
         )
@@ -1684,7 +1653,7 @@ reasoning = false
     #[test]
     fn canonical_session_model_normalizes_legacy_builtin_selector_before_qualification() {
         let catalog = portable_session_catalog();
-        let openai = ProviderId::openai();
+        let openai = lithos_llm::catalog::builtin::openai();
         let openrouter = ProviderId::new("openrouter");
         let both = std::collections::HashSet::from([openai.clone(), openrouter.clone()]);
 
@@ -1722,7 +1691,7 @@ reasoning = false
         assert_eq!(
             canonical_session_model(
                 &catalog,
-                &catalog.all_provider_ids(),
+                &catalog.enabled_provider_ids().into_iter().collect(),
                 Some("openrouter:gpt-56-sol"),
                 None,
             )
@@ -1736,9 +1705,9 @@ reasoning = false
         let catalog = portable_session_catalog();
         let error = canonical_session_model(
             &catalog,
-            &catalog.all_provider_ids(),
+            &catalog.enabled_provider_ids().into_iter().collect(),
             Some("openrouter:gpt-56-sol"),
-            Some(&ProviderId::openai()),
+            Some(&lithos_llm::catalog::builtin::openai()),
         )
         .unwrap_err();
 
@@ -1754,7 +1723,7 @@ reasoning = false
     #[test]
     fn agent_event_payload_maps_text_delta_to_session_assistant_delta() {
         let turn_id = TurnId::new();
-        let body = agent_event_payload(turn_id, AgentEvent::TextDelta {
+        let body = agent_event_payload(turn_id, CodingEvent::TextDelta {
             delta: "Hello".to_string(),
         });
 
@@ -1770,7 +1739,7 @@ reasoning = false
     #[test]
     fn agent_event_payload_drops_reasoning_delta() {
         let turn_id = TurnId::new();
-        let body = agent_event_payload(turn_id, AgentEvent::ReasoningDelta {
+        let body = agent_event_payload(turn_id, CodingEvent::ReasoningDelta {
             delta: "The user just said hello.".to_string(),
         });
 
@@ -1779,7 +1748,6 @@ reasoning = false
 
     #[test]
     fn ask_fabro_tool_policy_allows_only_expected_tools() {
-        let policy = build_ask_fabro_tool_access_policy();
         for tool_name in [
             "read_file",
             "grep",
@@ -1787,8 +1755,10 @@ reasoning = false
             fabro_tool::FABRO_RUN_EVENTS_TOOL_NAME,
             fabro_tool::FABRO_RUN_GET_TOOL_NAME,
         ] {
-            assert_eq!(policy.access_for_tool(tool_name), ToolAccess::Allowed);
+            assert!(ask_fabro_allows_tool(tool_name), "{tool_name}");
         }
+        // A profile vocabulary alias resolves to its canonical tool.
+        assert!(ask_fabro_allows_tool("Read"));
 
         for tool_name in [
             "write_file",
@@ -1800,43 +1770,46 @@ reasoning = false
             fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME,
             fabro_tool::FABRO_RUN_PAIR_TOOL_NAME,
         ] {
-            assert_eq!(policy.access_for_tool(tool_name), ToolAccess::Denied);
+            assert!(!ask_fabro_allows_tool(tool_name), "{tool_name}");
         }
     }
 
     #[test]
-    fn ask_fabro_effective_tools_are_limited_to_policy_allow_list() {
-        let registry = ask_fabro_test_registry();
-        let policy = build_ask_fabro_tool_access_policy();
+    fn ask_fabro_tool_policy_denies_with_a_reason_the_model_can_read() {
+        let scope = pebble_coding_agent::SessionScope::root(pebble_coding_agent::SessionId::new(
+            "ses_test",
+        ));
+        let descriptor = |name: &str| {
+            pebble_agent::ToolDescriptor::new(
+                pebble_agent::ToolId::try_new(name).expect("tool id"),
+                lithos_llm::types::ToolDefinition::function(
+                    name.to_string(),
+                    format!("{name} test tool"),
+                    serde_json::json!({"type": "object"}),
+                ),
+            )
+        };
 
-        let mut names: Vec<_> = ask_fabro_effective_tool_definitions(&registry, policy.as_ref())
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
-        names.sort();
-
-        assert_eq!(names, vec![
-            "fabro_run_events",
-            "fabro_run_get",
-            "glob",
-            "grep",
-            "read_file",
-        ]);
+        assert_eq!(
+            AskFabroToolPolicy.permission(&scope, &descriptor("read_file")),
+            ToolPermission::Allow
+        );
+        match AskFabroToolPolicy.permission(&scope, &descriptor("shell")) {
+            ToolPermission::Deny { reason } => {
+                assert!(reason.contains("denied by tool access policy"), "{reason}");
+            }
+            other => panic!("shell should be denied, got {other:?}"),
+        }
     }
 
     #[test]
     fn ask_fabro_prompt_lists_effective_tools_without_denied_tools() {
-        let registry = ask_fabro_test_registry();
-        let policy = build_ask_fabro_tool_access_policy();
-
         let prompt = build_ask_fabro_system_prompt(
-            &fabro_agent::LocalSandbox::new(std::env::current_dir().unwrap()),
-            &fabro_agent::EnvContext::default(),
-            &[],
-            None,
-            &[],
-            &registry,
-            policy.as_ref(),
+            &EnvContext {
+                working_directory: "/workspace".to_string(),
+                ..EnvContext::default()
+            },
+            &ask_fabro_test_tools(),
         );
 
         for tool_name in [
@@ -1866,6 +1839,7 @@ reasoning = false
                 "prompt should not mention hidden tool {hidden_tool}"
             );
         }
+        assert!(prompt.contains("Working directory: /workspace"));
         assert!(prompt.contains("read-only"));
         assert!(prompt.contains("run-scoped"));
         assert!(prompt.contains("interactive read-only"));
@@ -1876,21 +1850,10 @@ reasoning = false
 
     #[test]
     fn ask_fabro_prompt_keeps_tool_descriptions_inert() {
-        let mut registry = ToolRegistry::new();
-        let mut tool = stub_tool("read_file");
-        tool.definition.description = "{{ inputs.env_block }}".to_string();
-        registry.register(tool);
-        let policy = build_ask_fabro_tool_access_policy();
+        let mut tool = tool_summary("read_file");
+        tool.description = "{{ inputs.env_block }}".to_string();
 
-        let prompt = build_ask_fabro_system_prompt(
-            &fabro_agent::LocalSandbox::new(std::env::current_dir().unwrap()),
-            &fabro_agent::EnvContext::default(),
-            &[],
-            None,
-            &[],
-            &registry,
-            policy.as_ref(),
-        );
+        let prompt = build_ask_fabro_system_prompt(&EnvContext::default(), &[tool]);
 
         assert!(prompt.contains("- `read_file`: {{ inputs.env_block }}"));
         assert_eq!(prompt.matches("<environment>").count(), 1);
@@ -1995,69 +1958,289 @@ reasoning = false
         assert!(input.contains("Treat it as possibly stale"));
         assert!(input.ends_with("User question:\nWhy did it fail?"));
     }
+}
 
-    #[tokio::test]
-    async fn ask_fabro_blocks_denied_tools_at_execution_time() {
-        let denied_tools = [
-            "write_file",
-            "edit_file",
-            "shell",
-            "web_search",
-            "web_fetch",
-        ];
-        let executions = Arc::new(AtomicUsize::new(0));
-        let mut registry = ToolRegistry::new();
-        for tool_name in denied_tools {
-            let executions = Arc::clone(&executions);
-            registry.register(RegisteredTool {
-                definition: ToolDefinition {
-                    name:        tool_name.to_string(),
-                    description: format!("{tool_name} test tool"),
-                    parameters:  serde_json::json!({"type": "object"}),
-                },
-                executor:   Arc::new(move |_args, _ctx: ToolContext| {
-                    let executions = Arc::clone(&executions);
-                    Box::pin(async move {
-                        executions.fetch_add(1, Ordering::SeqCst);
-                        Ok("executed".to_string())
-                    })
+/// Ask Fabro across turns and processes: a second turn resumes the stored
+/// pebble record, and a record whose cursor fell behind the run's event log
+/// (a crash between the two writes) is moved past the log before it answers.
+#[cfg(test)]
+mod resume_tests {
+    use std::sync::Arc;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use fabro_config::daemon::ServerDaemon;
+    use fabro_config::{RunEnvironmentLayer, RunLayer, Storage};
+    use fabro_static::EnvVars;
+    use fabro_test::{TwinScenario, TwinScenarios, twin_openai};
+    use fabro_types::{RunId, SessionId};
+    use tower::ServiceExt;
+
+    use crate::server::{AppState, spawn_scheduler};
+    use crate::test_support::{
+        TestAppStateBuilder, build_test_router, default_test_server_settings,
+        llm_overlay_with_provider_base_url,
+    };
+
+    const MODEL: &str = "gpt-5.4-mini";
+    const DOT: &str = r#"digraph Test {
+    graph [goal="Test"]
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    start -> exit
+}"#;
+
+    fn api(path: &str) -> String {
+        format!("/api/v1{path}")
+    }
+
+    async fn json_response(
+        app: &axum::Router,
+        request: Request<Body>,
+        expected: StatusCode,
+    ) -> serde_json::Value {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            expected,
+            "unexpected status, body {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("response should be JSON")
+        }
+    }
+
+    fn post_json(path: &str, body: &serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(api(path))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A server whose `openai` provider is the twin under `namespace`, whose
+    /// runs execute in place, and whose own address Ask Fabro can resolve.
+    fn twin_backed_state(base_url: String, namespace: &str) -> Arc<AppState> {
+        let api_key = namespace.to_string();
+        let state = TestAppStateBuilder::new()
+            .runtime_settings(default_test_server_settings(), RunLayer {
+                environment: Some(RunEnvironmentLayer {
+                    id: Some("local".to_string()),
+                    ..RunEnvironmentLayer::default()
                 }),
-                source:     ToolSource::Native,
-            });
-        }
-        let config = SessionOptions {
-            tool_access_policy: Some(build_ask_fabro_tool_access_policy()),
-            tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
-            ..SessionOptions::default()
-        };
-        let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::new(fabro_agent::LocalSandbox::new(
-            std::env::current_dir().unwrap(),
-        ));
+                ..RunLayer::default()
+            })
+            .max_concurrent_runs(2)
+            // A registry factory runs the dry run in this process, so no
+            // worker executable is needed.
+            .registry_factory(|interviewer| {
+                fabro_workflow::handler::default_registry(interviewer, || None)
+            })
+            .llm_overlay(llm_overlay_with_provider_base_url("openai", base_url))
+            .vault_entries([(EnvVars::OPENAI_API_KEY, namespace.to_string())])
+            .env_lookup(move |name| (name == EnvVars::OPENAI_API_KEY).then(|| api_key.clone()))
+            .build();
+        let runtime_directory = Storage::new(state.server_storage_dir()).runtime_directory();
+        ServerDaemon::new(
+            std::process::id(),
+            fabro_config::bind::Bind::Tcp("127.0.0.1:32277".parse().unwrap()),
+            runtime_directory.log_path(),
+        )
+        .write(&runtime_directory)
+        .expect("test server record should be written");
+        state
+    }
 
-        for tool_name in denied_tools {
-            let result = fabro_agent::tool_execution::execute_and_emit_one_tool(
-                &ToolCall::new("call_1", tool_name, serde_json::json!({})),
-                &registry,
-                Arc::clone(&sandbox),
-                None,
-                tokio_util::sync::CancellationToken::new(),
-                &config,
-                &fabro_agent::Emitter::new(),
-                "test-session",
-                "test-session",
-                None,
+    /// A completed local dry run, so the session has a sandbox to reconnect.
+    async fn completed_run(app: &axum::Router) -> RunId {
+        let manifest = serde_json::json!({
+            "version": 1,
+            "cwd": std::env::temp_dir().display().to_string(),
+            "args": { "dry_run": true },
+            "target": { "path": "workflow.fabro" },
+            "workflows": { "workflow.fabro": { "source": DOT, "files": {} } },
+        });
+        let created = json_response(app, post_json("/runs", &manifest), StatusCode::CREATED).await;
+        let run_id = created["id"].as_str().unwrap().to_string();
+        let start = Request::builder()
+            .method("POST")
+            .uri(api(&format!("/runs/{run_id}/start")))
+            .body(Body::empty())
+            .unwrap();
+        json_response(app, start, StatusCode::OK).await;
+        for _ in 0..500 {
+            let get = Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}")))
+                .body(Body::empty())
+                .unwrap();
+            let run = json_response(app, get, StatusCode::OK).await;
+            match run["lifecycle"]["status"]["kind"].as_str() {
+                Some("succeeded") => return run_id.parse().unwrap(),
+                Some("failed") => panic!("the dry run failed: {run}"),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        panic!("run {run_id} did not complete");
+    }
+
+    /// Submits one turn and returns the streamed session events.
+    async fn turn(
+        app: &axum::Router,
+        session_id: SessionId,
+        input: &str,
+    ) -> Vec<serde_json::Value> {
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/sessions/{session_id}/turns"),
+                &serde_json::json!({ "input": input }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "run.session.turn.succeeded"),
+            "the turn should succeed: {events:#?}"
+        );
+        events
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resumed_session_continues_its_conversation_past_the_event_log() {
+        let twin = twin_openai().await;
+        let namespace = format!("{}::{}", module_path!(), line!());
+        TwinScenarios::new(namespace.clone())
+            .scenario(
+                TwinScenario::responses(MODEL)
+                    .input_contains("First question")
+                    .text("First answer"),
             )
+            .scenario(
+                TwinScenario::responses(MODEL)
+                    .input_contains("Second question")
+                    .text("Second answer"),
+            )
+            .load(twin)
             .await;
+        let state = twin_backed_state(twin.base_url.clone(), &namespace);
+        spawn_scheduler(Arc::clone(&state));
+        let app = build_test_router(Arc::clone(&state));
+        let run_id = completed_run(&app).await;
 
-            assert!(result.is_error, "{tool_name} should be blocked");
-            assert!(
-                result
-                    .content
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("denied by tool access policy")
-            );
-        }
-        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let created = json_response(
+            &app,
+            post_json(
+                &format!("/runs/{run_id}/sessions"),
+                &serde_json::json!({ "title": "Ask Fabro", "model": MODEL }),
+            ),
+            StatusCode::CREATED,
+        )
+        .await;
+        let session_id: SessionId = created["id"].as_str().unwrap().parse().unwrap();
+
+        turn(&app, session_id, "First question").await;
+        let after_first = state
+            .stores
+            .session_records
+            .get(session_id)
+            .await
+            .unwrap()
+            .expect("the first turn persists the record");
+        assert!(
+            after_first.record.last_event_seq > 0,
+            "the record carries the committed event cursor"
+        );
+
+        // The crash: the run's events were written, the record's cursor was
+        // not. Drop the agent so the next turn resumes from the stale record
+        // the way a new process would.
+        let mut stale = after_first.record.clone();
+        stale.last_event_seq = 0;
+        state
+            .stores
+            .session_records
+            .put(session_id, run_id, &stale, chrono::Utc::now())
+            .await
+            .unwrap();
+        state
+            .session_runtimes()
+            .load_or_create_runtime(session_id)
+            .clear_agent()
+            .await;
+        let log_head_before_resume = state
+            .store_ref()
+            .open_run_reader(&run_id)
+            .await
+            .unwrap()
+            .last_event_seq()
+            .await
+            .unwrap()
+            .expect("the run has events");
+
+        turn(&app, session_id, "Second question").await;
+
+        let after_second = state
+            .stores
+            .session_records
+            .get(session_id)
+            .await
+            .unwrap()
+            .expect("the second turn persists the record");
+        assert!(
+            after_second.record.last_event_seq > u64::from(log_head_before_resume),
+            "the resumed session numbers past the log head {log_head_before_resume}, got {}",
+            after_second.record.last_event_seq
+        );
+        assert!(
+            after_second.record.last_event_seq > after_first.record.last_event_seq,
+            "the cursor only moves forward"
+        );
+        assert_eq!(
+            after_second.record.messages.len(),
+            2 * after_first.record.messages.len(),
+            "the record holds both turns"
+        );
+
+        // The run's title generator also calls the model; the turns are the
+        // streamed requests. The twin logs the user side of the input, so the
+        // resumed turn shows as carrying the first question ahead of the
+        // second.
+        let logs = twin.request_logs(&namespace).await;
+        let turns: Vec<&str> = logs["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|request| request["stream"] == true)
+            .map(|request| request["input_text"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(turns.len(), 2, "one model call per turn: {logs}");
+        assert!(
+            !turns[0].contains("Second question"),
+            "the first turn knows nothing of the second, got {}",
+            turns[0]
+        );
+        let first_at = turns[1]
+            .find("User question: First question")
+            .expect("the resumed turn replays the first question");
+        let second_at = turns[1]
+            .find("User question: Second question")
+            .expect("the resumed turn ends with the second question");
+        assert!(first_at < second_at, "got {}", turns[1]);
     }
 }

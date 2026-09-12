@@ -17,6 +17,7 @@ use fabro_types::{
     PairTranscriptWarning, RunId, StageId,
 };
 use fabro_workflow::run_status::RunStatus;
+use pebble_coding_agent::events::CodingEvent;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 
@@ -283,80 +284,105 @@ fn transcript_entry_from_event(
                 text:                props.text.clone(),
             }),
         ),
-        EventBody::AgentMessage(props) if event_matches_pair_target(pair, &envelope.event) => Some(
-            PairTranscriptEntry::AssistantMessage(PairTranscriptAssistantMessage {
+        EventBody::Agent(props) if event_matches_pair_target(pair, &envelope.event) => {
+            agent_transcript_entry(pair, envelope, props.coding_event())
+        }
+        _ => None,
+    }
+}
+
+fn event_matches_pair_target(pair: &PairRecord, event: &fabro_types::RunEvent) -> bool {
+    event.stage_id.as_ref() == Some(&pair.target.stage_id)
+}
+
+/// The transcript entry for one coding agent event, when the entry kind
+/// exists for it.
+fn agent_transcript_entry(
+    pair: &PairRecord,
+    envelope: &EventEnvelope,
+    event: &CodingEvent,
+) -> Option<PairTranscriptEntry> {
+    match event {
+        CodingEvent::AssistantMessage {
+            text,
+            tool_call_count,
+            ..
+        } => Some(PairTranscriptEntry::AssistantMessage(
+            PairTranscriptAssistantMessage {
                 seq:             envelope.seq,
                 event_id:        envelope.event.id.clone(),
                 ts:              envelope.event.ts,
                 pair_id:         pair.pair_id,
                 target:          pair.target.clone(),
-                text:            props.text.clone(),
-                tool_call_count: props.tool_call_count,
-            }),
-        ),
-        EventBody::AgentToolStarted(props) if event_matches_pair_target(pair, &envelope.event) => {
-            Some(PairTranscriptEntry::ToolCall(PairTranscriptToolCall {
+                text:            text.clone(),
+                tool_call_count: *tool_call_count,
+            },
+        )),
+        CodingEvent::ToolCallStarted {
+            tool_name,
+            tool_call_id,
+            arguments,
+        } => Some(PairTranscriptEntry::ToolCall(PairTranscriptToolCall {
+            seq:          envelope.seq,
+            event_id:     envelope.event.id.clone(),
+            ts:           envelope.event.ts,
+            pair_id:      pair.pair_id,
+            target:       pair.target.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name:    tool_name.clone(),
+            status:       PairTranscriptToolStatus::Started,
+            summary:      compact_summary(tool_name, arguments, false),
+            is_error:     false,
+            truncated:    true,
+            detail_ref:   PairTranscriptDetailRef {
                 seq:          envelope.seq,
-                event_id:     envelope.event.id.clone(),
-                ts:           envelope.event.ts,
-                pair_id:      pair.pair_id,
-                target:       pair.target.clone(),
-                tool_call_id: props.tool_call_id.clone(),
-                tool_name:    props.tool_name.clone(),
-                status:       PairTranscriptToolStatus::Started,
-                summary:      compact_summary(&props.tool_name, &props.arguments, false),
-                is_error:     false,
-                truncated:    true,
-                detail_ref:   PairTranscriptDetailRef {
-                    seq:          envelope.seq,
-                    tool_call_id: Some(props.tool_call_id.clone()),
-                },
-            }))
-        }
-        EventBody::AgentToolCompleted(props)
-            if event_matches_pair_target(pair, &envelope.event) =>
-        {
-            Some(PairTranscriptEntry::ToolCall(PairTranscriptToolCall {
+                tool_call_id: Some(tool_call_id.clone()),
+            },
+        })),
+        CodingEvent::ToolCallCompleted {
+            tool_name,
+            tool_call_id,
+            output,
+            is_error,
+            ..
+        } => Some(PairTranscriptEntry::ToolCall(PairTranscriptToolCall {
+            seq:          envelope.seq,
+            event_id:     envelope.event.id.clone(),
+            ts:           envelope.event.ts,
+            pair_id:      pair.pair_id,
+            target:       pair.target.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name:    tool_name.clone(),
+            status:       PairTranscriptToolStatus::Completed,
+            summary:      compact_summary(tool_name, output, *is_error),
+            is_error:     *is_error,
+            truncated:    true,
+            detail_ref:   PairTranscriptDetailRef {
                 seq:          envelope.seq,
-                event_id:     envelope.event.id.clone(),
-                ts:           envelope.event.ts,
-                pair_id:      pair.pair_id,
-                target:       pair.target.clone(),
-                tool_call_id: props.tool_call_id.clone(),
-                tool_name:    props.tool_name.clone(),
-                status:       PairTranscriptToolStatus::Completed,
-                summary:      compact_summary(&props.tool_name, &props.output, props.is_error),
-                is_error:     props.is_error,
-                truncated:    true,
-                detail_ref:   PairTranscriptDetailRef {
-                    seq:          envelope.seq,
-                    tool_call_id: Some(props.tool_call_id.clone()),
-                },
-            }))
-        }
-        EventBody::AgentError(props) if event_matches_pair_target(pair, &envelope.event) => {
-            Some(PairTranscriptEntry::Error(PairTranscriptError {
-                seq:        envelope.seq,
-                event_id:   envelope.event.id.clone(),
-                ts:         envelope.event.ts,
-                pair_id:    pair.pair_id,
-                target:     pair.target.clone(),
-                message:    compact_value(&props.error, 240),
-                detail_ref: PairTranscriptDetailRef {
-                    seq:          envelope.seq,
-                    tool_call_id: None,
-                },
-            }))
-        }
-        EventBody::AgentWarning(props) if event_matches_pair_target(pair, &envelope.event) => {
+                tool_call_id: Some(tool_call_id.clone()),
+            },
+        })),
+        CodingEvent::Error { error } => Some(PairTranscriptEntry::Error(PairTranscriptError {
+            seq:        envelope.seq,
+            event_id:   envelope.event.id.clone(),
+            ts:         envelope.event.ts,
+            pair_id:    pair.pair_id,
+            target:     pair.target.clone(),
+            message:    compact_text(&error.message, 240),
+            detail_ref: PairTranscriptDetailRef {
+                seq:          envelope.seq,
+                tool_call_id: None,
+            },
+        })),
+        CodingEvent::Warning { kind, message, .. } => {
             Some(PairTranscriptEntry::Warning(PairTranscriptWarning {
                 seq:          envelope.seq,
                 event_id:     envelope.event.id.clone(),
                 ts:           envelope.event.ts,
                 pair_id:      pair.pair_id,
                 target:       pair.target.clone(),
-                warning_kind: props.kind.clone(),
-                message:      props.message.clone(),
+                warning_kind: kind.clone(),
+                message:      message.clone(),
                 detail_ref:   PairTranscriptDetailRef {
                     seq:          envelope.seq,
                     tool_call_id: None,
@@ -365,10 +391,6 @@ fn transcript_entry_from_event(
         }
         _ => None,
     }
-}
-
-fn event_matches_pair_target(pair: &PairRecord, event: &fabro_types::RunEvent) -> bool {
-    event.stage_id.as_ref() == Some(&pair.target.stage_id)
 }
 
 fn compact_summary(tool_name: &str, value: &serde_json::Value, is_error: bool) -> String {
@@ -846,13 +868,12 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use chrono::{TimeZone, Utc};
-    use fabro_model::{ModelRef, ProviderId};
-    use fabro_types::run_event::AgentMessageProps;
     use fabro_types::{
-        BilledTokenCounts, EventEnvelope, Graph, PairMessageId, RunEvent, StageId,
-        WorkflowSettings, fixtures, test_support,
+        AgentEventProps, EventEnvelope, Graph, PairMessageId, RunEvent, StageId, WorkflowSettings,
+        fixtures, test_support,
     };
     use fabro_workflow::event as workflow_event;
+    use pebble_coding_agent::events::{CodingAgentEvent, TokenUsage};
     use tower::ServiceExt;
 
     use super::*;
@@ -879,21 +900,24 @@ mod tests {
                 7,
                 Some("ses_01"),
                 Some(StageId::new("code", 1)),
-                EventBody::AgentMessage(AgentMessageProps {
-                    text:            "I found the issue.".to_string(),
-                    model:           ModelRef {
-                        provider: ProviderId::new("openai"),
-                        model_id: "gpt-5.4".into(),
-                        speed:    None,
-                    },
-                    billing:         BilledTokenCounts::default(),
-                    cost_source:     None,
-                    tool_call_count: 0,
-                    visit:           1,
-                    message:         None,
-                    context_window:  None,
-                    reasoning:       None,
-                }),
+                EventBody::Agent(AgentEventProps::new(
+                    "code",
+                    1,
+                    CodingAgentEvent::new(
+                        "ses_01",
+                        CodingEvent::AssistantMessage {
+                            text:            "I found the issue.".to_string(),
+                            model:           "gpt-5.4".to_string(),
+                            usage:           TokenUsage::default(),
+                            cost_usd_micros: None,
+                            cost_source:     None,
+                            tool_call_count: 0,
+                            context_window:  None,
+                            reasoning:       None,
+                        },
+                        std::time::SystemTime::UNIX_EPOCH,
+                    ),
+                )),
             ),
         )
         .unwrap();
@@ -913,21 +937,24 @@ mod tests {
                     8,
                     Some("ses_01"),
                     Some(StageId::new("other", 1)),
-                    EventBody::AgentMessage(AgentMessageProps {
-                        text:            "wrong stage".to_string(),
-                        model:           ModelRef {
-                            provider: ProviderId::new("openai"),
-                            model_id: "gpt-5.4".into(),
-                            speed:    None,
-                        },
-                        billing:         BilledTokenCounts::default(),
-                        cost_source:     None,
-                        tool_call_count: 0,
-                        visit:           1,
-                        message:         None,
-                        context_window:  None,
-                        reasoning:       None,
-                    }),
+                    EventBody::Agent(AgentEventProps::new(
+                        "code",
+                        1,
+                        CodingAgentEvent::new(
+                            "ses_01",
+                            CodingEvent::AssistantMessage {
+                                text:            "wrong stage".to_string(),
+                                model:           "gpt-5.4".to_string(),
+                                usage:           TokenUsage::default(),
+                                cost_usd_micros: None,
+                                cost_source:     None,
+                                tool_call_count: 0,
+                                context_window:  None,
+                                reasoning:       None,
+                            },
+                            std::time::SystemTime::UNIX_EPOCH,
+                        ),
+                    )),
                 ),
             )
             .is_none()

@@ -15,7 +15,7 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { AgentToolSummary } from './agent-tool-summary';
+import type { ToolSummary } from './tool-summary';
 
 /**
  * Properties for the `agent.tools.available` event.
@@ -24,6 +24,6 @@ export interface AgentToolsAvailableProps {
     /**
      * Effective model-callable tools exposed to the stage session.
      */
-    'tools': Array<AgentToolSummary>;
+    'tools': Array<ToolSummary>;
     'visit': number;
 }

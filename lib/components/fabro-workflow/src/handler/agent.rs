@@ -2,13 +2,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fabro_agent::Sandbox;
 use fabro_graphviz::graph::{Graph, Node};
+use fabro_sandbox::RunSandbox;
 use fabro_types::{StageModelUsage, StageTiming};
+use pebble_agent::ToolMiddleware;
+use pebble_coding_agent::extensions::HumanInputProvider;
 pub(crate) use structured_output::extract_status_fields;
 use tokio_util::sync::CancellationToken;
 
-use super::llm::api::EffectiveRequestControls;
+use super::llm::EffectiveRequestControls;
 use super::structured_output::{
     self, OutputSchemaKind, StructuredOutputError, ValidatedStructuredOutput,
 };
@@ -16,7 +18,7 @@ use super::{EngineServices, Handler, NodeTimeoutPolicy};
 use crate::context::{Context, WorkflowContext, keys};
 use crate::error::Error;
 use crate::event::{Emitter, Event, StageScope};
-use crate::interview_runtime::WorkflowAgentQuestionRuntime;
+use crate::interview_runtime::WorkflowHumanInput;
 use crate::outcome::{BilledModelUsage, Outcome, OutcomeExt};
 
 const LAST_FILE_ROUTING_EXTENSIONS: &[&str] = &["json", "md"];
@@ -40,15 +42,17 @@ pub enum CodergenResult {
 }
 
 pub struct CodergenRunRequest<'a> {
-    pub node:               &'a Node,
-    pub prompt:             &'a str,
-    pub context:            &'a Context,
-    pub thread_id:          Option<&'a str>,
-    pub emitter:            &'a Arc<Emitter>,
-    pub sandbox:            &'a Arc<dyn Sandbox>,
-    pub tool_hooks:         Option<Arc<dyn fabro_agent::ToolHookCallback>>,
-    pub cancel_token:       CancellationToken,
-    pub agent_tool_runtime: fabro_agent::AgentToolRuntime,
+    pub node:            &'a Node,
+    pub prompt:          &'a str,
+    pub context:         &'a Context,
+    pub thread_id:       Option<&'a str>,
+    pub emitter:         &'a Arc<Emitter>,
+    pub sandbox:         &'a Arc<RunSandbox>,
+    /// Tool hooks the stage's agent (and its subagents) run under.
+    pub tool_middleware: Option<Arc<dyn ToolMiddleware>>,
+    pub cancel_token:    CancellationToken,
+    /// Where the agent's `ask_user` questions go.
+    pub human_input:     Option<Arc<dyn HumanInputProvider>>,
 }
 
 pub struct OneShotRequest<'a> {
@@ -57,7 +61,7 @@ pub struct OneShotRequest<'a> {
     pub system_prompt: Option<&'a str>,
     pub emitter:       &'a Arc<Emitter>,
     pub stage_scope:   &'a StageScope,
-    pub sandbox:       &'a Arc<dyn Sandbox>,
+    pub sandbox:       &'a Arc<RunSandbox>,
     pub cancel_token:  CancellationToken,
 }
 
@@ -146,7 +150,7 @@ impl AgentHandler {
 pub(crate) async fn validate_agent_output_sources(
     schema: &OutputSchemaKind,
     response_text: &str,
-    sandbox: &Arc<dyn Sandbox>,
+    sandbox: &Arc<RunSandbox>,
     last_file_touched: Option<&str>,
 ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
     if !matches!(schema, OutputSchemaKind::Routing) {
@@ -179,14 +183,14 @@ pub(crate) async fn validate_agent_output_sources(
     Err(fallback_error)
 }
 
-async fn read_sandbox_file(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<String> {
+async fn read_sandbox_file(sandbox: &Arc<RunSandbox>, path: &str) -> Option<String> {
     sandbox.read_file_text(path).await.ok()
 }
 
 /// Extract the terminal JSON object from the last-touched file when it has an
 /// eligible extension. Does not check that the object contains routing fields;
 /// callers validate that.
-async fn read_last_file_routing_json(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<String> {
+async fn read_last_file_routing_json(sandbox: &Arc<RunSandbox>, path: &str) -> Option<String> {
     let extension = Path::new(path).extension()?.to_str()?;
     if !LAST_FILE_ROUTING_EXTENSIONS
         .iter()
@@ -276,20 +280,18 @@ impl Handler for AgentHandler {
             StageModelUsage::MODE_AGENT,
             self.backend.as_deref(),
         )?;
-        let agent_tool_runtime = fabro_agent::AgentToolRuntime::with_question_runtime(Arc::new(
-            WorkflowAgentQuestionRuntime::new(
-                Arc::clone(&services.interviewer),
-                Arc::clone(&services.run.emitter),
-                stage_scope.clone(),
-                node.id.clone(),
-                Arc::clone(&services.run.interview_blocker),
-            ),
+        let human_input: Arc<dyn HumanInputProvider> = Arc::new(WorkflowHumanInput::new(
+            Arc::clone(&services.interviewer),
+            Arc::clone(&services.run.emitter),
+            stage_scope.clone(),
+            node.id.clone(),
+            Arc::clone(&services.run.interview_blocker),
         ));
 
         // 3. Call LLM backend (agent loop)
         let thread_id = context.thread_id();
         let run_id = context.parsed_run_id()?;
-        let tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>> =
+        let tool_middleware: Option<Arc<dyn ToolMiddleware>> =
             services.run.hook_runner.as_ref().map(|hr| {
                 Arc::new(fabro_hooks::WorkflowToolHookCallback {
                     hook_runner: Arc::clone(hr),
@@ -298,7 +300,7 @@ impl Handler for AgentHandler {
                     workflow_name: graph.name.clone(),
                     hook_execution_context: services.run.locations.hook_execution_context(),
                     node_id: node.id.clone(),
-                }) as Arc<dyn fabro_agent::ToolHookCallback>
+                }) as Arc<dyn ToolMiddleware>
             });
         let (response_text, stage_usage, backend_files_touched, last_file_touched, timing) =
             if let Some(backend) = &self.backend {
@@ -310,9 +312,9 @@ impl Handler for AgentHandler {
                         thread_id: thread_id.as_deref(),
                         emitter: &services.run.emitter,
                         sandbox: &services.run.sandbox,
-                        tool_hooks,
+                        tool_middleware,
                         cancel_token: services.run.cancel_token(),
-                        agent_tool_runtime: agent_tool_runtime.clone(),
+                        human_input: Some(human_input),
                     })
                     .await;
                 match result {
@@ -445,9 +447,9 @@ mod tests {
     use std::time::Duration;
 
     use fabro_graphviz::graph::AttrValue;
-    use fabro_model::{ReasoningEffort, Speed};
     use fabro_store::{Database, RunDatabase, StageId};
     use fabro_types::{fixtures, test_support};
+    use lithos_llm::types::{ReasoningEffort, Speed};
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
@@ -541,17 +543,19 @@ mod tests {
         }
     }
 
-    fn sandbox_with_file(path: &str, contents: &str) -> (TempDir, Arc<dyn Sandbox>) {
+    async fn sandbox_with_file(path: &str, contents: &str) -> (TempDir, Arc<RunSandbox>) {
         let sandbox_dir = TempDir::new().unwrap();
         std::fs::write(sandbox_dir.path().join(path), contents).unwrap();
-        let sandbox: Arc<dyn Sandbox> = Arc::new(fabro_agent::LocalSandbox::new(
-            sandbox_dir.path().to_path_buf(),
-        ));
+        let sandbox: Arc<RunSandbox> = Arc::new(
+            fabro_sandbox::local_sandbox(sandbox_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
         (sandbox_dir, sandbox)
     }
 
     async fn execute_with_last_file(path: &str, contents: &str) -> Outcome {
-        let (_sandbox_dir, sandbox) = sandbox_with_file(path, contents);
+        let (_sandbox_dir, sandbox) = sandbox_with_file(path, contents).await;
 
         let handler = AgentHandler::new(Some(Box::new(LastFileBackend {
             path: path.to_string(),
@@ -574,7 +578,7 @@ mod tests {
         path: &str,
         contents: &str,
     ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
-        let (_sandbox_dir, sandbox) = sandbox_with_file(path, contents);
+        let (_sandbox_dir, sandbox) = sandbox_with_file(path, contents).await;
 
         validate_agent_output_sources(
             &OutputSchemaKind::Routing,
@@ -707,12 +711,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let mut services = EngineServices::test_default();
-        services.run =
-            services
-                .run
-                .with_sandbox(std::sync::Arc::new(fabro_agent::LocalSandbox::new(
-                    sandbox_dir.path().to_path_buf(),
-                )));
+        services.run = services.run.with_sandbox(std::sync::Arc::new(
+            fabro_sandbox::local_sandbox(sandbox_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        ));
 
         let outcome = handler
             .execute(&node, &context, &graph, tmp.path(), &services)
@@ -760,12 +763,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let mut services = EngineServices::test_default();
-        services.run =
-            services
-                .run
-                .with_sandbox(std::sync::Arc::new(fabro_agent::LocalSandbox::new(
-                    sandbox_dir.path().to_path_buf(),
-                )));
+        services.run = services.run.with_sandbox(std::sync::Arc::new(
+            fabro_sandbox::local_sandbox(sandbox_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        ));
 
         let outcome = handler
             .execute(&node, &context, &graph, tmp.path(), &services)
@@ -873,12 +875,11 @@ All checks passed.
         let tmp = TempDir::new().unwrap();
 
         let mut services = EngineServices::test_default();
-        services.run =
-            services
-                .run
-                .with_sandbox(std::sync::Arc::new(fabro_agent::LocalSandbox::new(
-                    sandbox_dir.path().to_path_buf(),
-                )));
+        services.run = services.run.with_sandbox(std::sync::Arc::new(
+            fabro_sandbox::local_sandbox(sandbox_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        ));
 
         let outcome = handler
             .execute(&node, &context, &graph, tmp.path(), &services)
@@ -972,12 +973,11 @@ All checks passed.
         let tmp = TempDir::new().unwrap();
 
         let mut services = EngineServices::test_default();
-        services.run =
-            services
-                .run
-                .with_sandbox(std::sync::Arc::new(fabro_agent::LocalSandbox::new(
-                    sandbox_dir.path().to_path_buf(),
-                )));
+        services.run = services.run.with_sandbox(std::sync::Arc::new(
+            fabro_sandbox::local_sandbox(sandbox_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        ));
 
         let outcome = handler
             .execute(&node, &context, &graph, tmp.path(), &services)

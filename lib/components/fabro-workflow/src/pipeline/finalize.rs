@@ -75,7 +75,7 @@ fn build_conclusion_from_projection(
     final_git_commit_sha: Option<String>,
 ) -> Conclusion {
     let billing = projection
-        .map(|projection| billing_rollup::billing_rollup_from_projection(projection, None))
+        .map(billing_rollup::billing_rollup_from_projection)
         .unwrap_or_default();
     let (stages, total_retries) = projection
         .map(|projection| billing.conclusion_stages(projection))
@@ -109,8 +109,8 @@ async fn compute_final_patch(
     };
     let to_sha = "HEAD";
     let (patch_result, numstat_result) = tokio::join!(
-        git_diff_with_timeout(&*services.sandbox, &base_sha, timeout_ms),
-        list_diff_numstat(&*services.sandbox, &base_sha, to_sha),
+        git_diff_with_timeout(&services.sandbox, &base_sha, timeout_ms),
+        list_diff_numstat(&services.sandbox, &base_sha, to_sha),
     );
     let final_patch = match patch_result {
         Ok(patch) if !patch.is_empty() => Some(patch),
@@ -140,7 +140,7 @@ async fn compute_final_patch(
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn billing_from_projection(projection: &RunProjection) -> Option<BilledTokenCounts> {
-    billing_rollup::billing_rollup_from_projection(projection, None).billing_if_present()
+    billing_rollup::billing_rollup_from_projection(projection).billing_if_present()
 }
 
 pub(crate) fn build_terminal_event(
@@ -365,7 +365,6 @@ mod tests {
     use anyhow::Result;
     use fabro_auth::test_support as auth_test_support;
     use fabro_graphviz::graph::Graph;
-    use fabro_model::Catalog;
     use fabro_sandbox::test_support::MockSandbox;
     use fabro_store::{Database, RunDatabase, RunProjection};
     use fabro_types::{
@@ -401,6 +400,7 @@ mod tests {
             fork_source_ref:  None,
             base_branch:      None,
             display_base_sha: None,
+            git_identity:     None,
             git:              None,
         }
     }
@@ -755,7 +755,7 @@ mod tests {
     fn test_services(
         run_store: RunStoreHandle,
         emitter: Arc<Emitter>,
-        sandbox: Arc<dyn fabro_agent::Sandbox>,
+        sandbox: Arc<fabro_sandbox::RunSandbox>,
     ) -> Arc<RunServices> {
         let locations = crate::services::RunLocations::for_sandbox(
             None,
@@ -769,10 +769,10 @@ mod tests {
             None,
             locations,
             tokio_util::sync::CancellationToken::new(),
-            fabro_model::ProviderId::anthropic(),
+            lithos_llm::catalog::builtin::anthropic(),
             "claude-sonnet-4-6".to_string(),
             auth_test_support::vault_only_credential_source(),
-            Arc::new(Catalog::from_builtin().expect("default catalog should build")),
+            Arc::new(fabro_llm::test_support::test_catalog()),
             Arc::new(SandboxGitRuntime::new()),
             crate::stage_execution::StageExecutionTracker::default(),
         )
@@ -788,9 +788,11 @@ mod tests {
         let emitter = Arc::new(Emitter::new(test_run_id()));
         let store_logger = StoreProgressLogger::new(run_store.clone());
         store_logger.register(&emitter);
-        let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::new(fabro_agent::LocalSandbox::new(
-            std::env::current_dir().unwrap(),
-        ));
+        let sandbox: Arc<fabro_sandbox::RunSandbox> = Arc::new(
+            fabro_sandbox::local_sandbox(std::env::current_dir().unwrap())
+                .await
+                .unwrap(),
+        );
         let locations =
             crate::services::RunLocations::for_sandbox(None, sandbox.as_ref(), run_dir.clone());
         let services = RunServices::new(
@@ -800,10 +802,10 @@ mod tests {
             None,
             locations,
             tokio_util::sync::CancellationToken::new(),
-            fabro_model::ProviderId::anthropic(),
+            lithos_llm::catalog::builtin::anthropic(),
             "claude-sonnet-4-6".to_string(),
             auth_test_support::vault_only_credential_source(),
-            Arc::new(Catalog::from_builtin().expect("default catalog should build")),
+            Arc::new(fabro_llm::test_support::test_catalog()),
             Arc::new(SandboxGitRuntime::new()),
             crate::stage_execution::StageExecutionTracker::default(),
         );
@@ -838,7 +840,7 @@ mod tests {
         let services = test_services(
             RunStoreHandle::local(seeded_run_store().await),
             emitter,
-            Arc::new(MockSandbox::linux()),
+            MockSandbox::linux().sandbox(),
         );
         let mut run_options = test_run_options(repo_dir.path());
         run_options.git = Some(GitCheckpointOptions {
@@ -883,7 +885,12 @@ mod tests {
     #[tokio::test]
     async fn final_push_failure_becomes_terminal_publish_failure() {
         let repo_dir = tempfile::tempdir().unwrap();
-        let sandbox = Arc::new(MockSandbox::linux());
+        // The sandbox is unreachable, so the final push cannot run.
+        let sandbox = MockSandbox {
+            exec_error: Some("sandbox unreachable".into()),
+            ..MockSandbox::linux()
+        }
+        .sandbox();
         let emitter = Arc::new(Emitter::new(test_run_id()));
         let events = record_events(&emitter);
         let services = test_services(
@@ -977,9 +984,11 @@ mod tests {
         let services = test_services(
             RunStoreHandle::local(seeded_run_store().await),
             emitter,
-            Arc::new(fabro_agent::LocalSandbox::new(
-                repo_dir.path().to_path_buf(),
-            )),
+            Arc::new(
+                fabro_sandbox::local_sandbox(repo_dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            ),
         );
         let mut run_options = test_run_options(repo_dir.path());
         run_options.base_branch = Some("main".to_string());
@@ -1039,9 +1048,11 @@ mod tests {
         let services = test_services(
             RunStoreHandle::local(seeded_run_store().await),
             emitter,
-            Arc::new(fabro_agent::LocalSandbox::new(
-                repo_dir.path().to_path_buf(),
-            )),
+            Arc::new(
+                fabro_sandbox::local_sandbox(repo_dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            ),
         );
         let mut run_options = test_run_options(repo_dir.path());
         run_options.base_branch = Some("main".to_string());
@@ -1094,9 +1105,11 @@ mod tests {
         let services = test_services(
             RunStoreHandle::local(seeded_run_store().await),
             emitter,
-            Arc::new(fabro_agent::LocalSandbox::new(
-                repo_dir.path().to_path_buf(),
-            )),
+            Arc::new(
+                fabro_sandbox::local_sandbox(repo_dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            ),
         );
         let mut run_options = test_run_options(repo_dir.path());
         run_options.base_branch = Some("main".to_string());
@@ -1160,11 +1173,11 @@ mod tests {
     #[tokio::test]
     async fn finalize_stops_sandbox_on_terminal_without_deleting() {
         let repo_dir = tempfile::tempdir().unwrap();
-        let sandbox = Arc::new(MockSandbox::linux());
+        let sandbox = MockSandbox::linux();
         let services = test_services(
             RunStoreHandle::local(seeded_run_store().await),
             Arc::new(Emitter::new(test_run_id())),
-            sandbox.clone(),
+            sandbox.sandbox(),
         );
         let executed = test_executed(
             Graph::new("test"),
@@ -1185,18 +1198,18 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(sandbox.stop_count(), 1);
-        assert_eq!(sandbox.delete_count(), 0);
+        assert_eq!(sandbox.driver().stop_count(), 1);
+        assert_eq!(sandbox.driver().delete_count(), 0);
     }
 
     #[tokio::test]
     async fn finalize_leaves_sandbox_running_when_stop_on_terminal_is_false() {
         let repo_dir = tempfile::tempdir().unwrap();
-        let sandbox = Arc::new(MockSandbox::linux());
+        let sandbox = MockSandbox::linux();
         let services = test_services(
             RunStoreHandle::local(seeded_run_store().await),
             Arc::new(Emitter::new(test_run_id())),
-            sandbox.clone(),
+            sandbox.sandbox(),
         );
         let executed = test_executed(
             Graph::new("test"),
@@ -1217,8 +1230,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(sandbox.stop_count(), 0);
-        assert_eq!(sandbox.delete_count(), 0);
+        assert_eq!(sandbox.driver().stop_count(), 0);
+        assert_eq!(sandbox.driver().delete_count(), 0);
     }
 
     #[tokio::test]
@@ -1241,7 +1254,11 @@ mod tests {
         let services = test_services(
             RunStoreHandle::local(run_store),
             Arc::clone(&emitter),
-            Arc::new(fabro_agent::LocalSandbox::new(repo.to_path_buf())),
+            Arc::new(
+                fabro_sandbox::local_sandbox(repo.to_path_buf())
+                    .await
+                    .unwrap(),
+            ),
         );
         let mut run_options = test_run_options(repo);
         run_options.git = Some(GitCheckpointOptions {

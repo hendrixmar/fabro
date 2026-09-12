@@ -282,6 +282,7 @@ mod duration_tests {
 }
 
 #[doc(hidden)]
+pub mod agent_memory;
 pub mod artifact;
 pub mod artifact_snapshot;
 pub mod artifact_upload;
@@ -294,6 +295,7 @@ pub mod event;
 pub mod file_resolver;
 pub mod git;
 pub(crate) mod git_bridge;
+pub mod git_identity;
 pub(crate) mod graph;
 pub mod handler;
 mod hook_context;
@@ -336,4 +338,5 @@ pub mod steering_hub;
 pub mod test_support;
 #[doc(hidden)]
 pub mod transforms;
+pub mod web_search;
 pub mod workflow_bundle;

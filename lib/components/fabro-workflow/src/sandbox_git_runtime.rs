@@ -1,9 +1,9 @@
-use fabro_agent::Sandbox;
-use fabro_sandbox::shell_quote;
+use fabro_sandbox::{ExecResult, ExecResultExt, RunSandbox, Termination};
 use fabro_util::error::SharedError;
+use fabro_util::shell;
 use tokio::sync::OnceCell;
 
-use crate::sandbox_git::{GIT_REMOTE, exec_err};
+use crate::sandbox_git::GitCommandError;
 
 pub(crate) struct SandboxGitRuntime {
     probe:                   OnceCell<Result<(), SharedError>>,
@@ -37,7 +37,7 @@ impl SandboxGitRuntime {
 
     pub(crate) async fn ensure_git_available(
         &self,
-        sandbox: &dyn Sandbox,
+        sandbox: &RunSandbox,
     ) -> Result<(), SharedError> {
         self.probe
             .get_or_init(|| async { probe_sandbox_git(sandbox).await })
@@ -52,7 +52,7 @@ impl Default for SandboxGitRuntime {
     }
 }
 
-async fn probe_sandbox_git(sandbox: &dyn Sandbox) -> Result<(), SharedError> {
+async fn probe_sandbox_git(sandbox: &RunSandbox) -> Result<(), SharedError> {
     let temp = sandbox_temp_dir(sandbox, "probe", "git");
     let index = format!("{temp}/index");
     let probe_file = format!("{temp}/probe.txt");
@@ -66,32 +66,52 @@ async fn probe_sandbox_git(sandbox: &dyn Sandbox) -> Result<(), SharedError> {
          GIT_INDEX_FILE={index_q} {git} update-index --add --cacheinfo 100644,$blob,probe.txt\n\
          GIT_INDEX_FILE={index_q} {git} write-tree >/dev/null\n\
          rm -rf {temp_q}",
-        temp_q = shell_quote(&temp),
-        probe_file_q = shell_quote(&probe_file),
-        index_q = shell_quote(&index),
-        git = GIT_REMOTE,
+        temp_q = shell::shell_quote(&temp),
+        probe_file_q = shell::shell_quote(&probe_file),
+        index_q = shell::shell_quote(&index),
+        git = "git -c maintenance.auto=0 -c gc.auto=0",
     );
     exec_ok(sandbox, &command).await
 }
 
-fn sandbox_temp_dir(sandbox: &dyn Sandbox, run_id: &str, label: &str) -> String {
+fn sandbox_temp_dir(sandbox: &RunSandbox, run_id: &str, label: &str) -> String {
     let cwd = sandbox.working_directory().trim_end_matches('/');
     let id = uuid::Uuid::new_v4();
     format!("{cwd}/.fabro/tmp/{label}-{run_id}-{id}")
 }
 
-async fn exec_ok(sandbox: &dyn Sandbox, command: &str) -> Result<(), SharedError> {
+async fn exec_ok(sandbox: &RunSandbox, command: &str) -> Result<(), SharedError> {
     let result = sandbox
         .exec_command(command, 30_000, None, None, None)
         .await
         .map_err(|err| {
             SharedError::new(anyhow::Error::new(err).context("sandbox git probe command failed"))
         })?;
-    if result.is_success() {
+    if result.success() {
         Ok(())
     } else {
         Err(SharedError::new(anyhow::Error::new(exec_err(
             command, result,
         ))))
+    }
+}
+
+/// The probe's failure, named by how the command ended; the output tail
+/// travels in the source.
+fn exec_err(label: &str, result: ExecResult) -> GitCommandError {
+    let duration_ms = result.duration_ms();
+    let message = match result.termination {
+        Termination::TimedOut => format!("{label} timed out after {duration_ms}ms"),
+        Termination::Cancelled | Termination::Killed => {
+            format!("{label} cancelled after {duration_ms}ms")
+        }
+        _ => format!(
+            "{label} failed (exit {})",
+            result.program_exit_code().unwrap_or(-1)
+        ),
+    };
+    GitCommandError {
+        message,
+        source: result.into_exec_error(label),
     }
 }

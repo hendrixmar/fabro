@@ -1,5 +1,5 @@
 use fabro_graphviz::graph::Graph;
-use fabro_model::Catalog;
+use fabro_llm::lithos_catalog::Catalog;
 
 use super::model_support::{check_model_known, check_provider_known};
 use crate::{Diagnostic, LintRule};
@@ -48,7 +48,7 @@ impl LintRule for Rule<'_> {
 #[cfg(test)]
 mod tests {
     use fabro_graphviz::graph::{AttrValue, Node};
-    use fabro_model::Catalog;
+    use fabro_llm::test_support::test_catalog;
 
     use super::Rule;
     use crate::rules::test_support::minimal_graph;
@@ -60,12 +60,11 @@ mod tests {
         let mut node = Node::new("work");
         node.attrs.insert(
             "model".to_string(),
-            AttrValue::String("claude-sonnet-4-5".to_string()),
+            AttrValue::String("claude-sonnet-4.5".to_string()),
         );
         g.nodes.insert("work".to_string(), node);
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert!(d.is_empty());
     }
@@ -79,9 +78,8 @@ mod tests {
             AttrValue::String("nonexistent-model-xyz".to_string()),
         );
         g.nodes.insert("work".to_string(), node);
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Severity::Warning);
@@ -96,9 +94,8 @@ mod tests {
         node.attrs
             .insert("model".to_string(), AttrValue::String("opus".to_string()));
         g.nodes.insert("work".to_string(), node);
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert!(d.is_empty());
     }
@@ -109,25 +106,23 @@ mod tests {
         let mut node = Node::new("work");
         node.attrs.insert(
             "provider".to_string(),
-            AttrValue::String("google".to_string()),
+            AttrValue::String("nonexistent-provider".to_string()),
         );
         g.nodes.insert("work".to_string(), node);
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Severity::Warning);
-        assert!(d[0].message.contains("google"));
+        assert!(d[0].message.contains("nonexistent-provider"));
         assert_eq!(d[0].node_id.as_deref(), Some("work"));
     }
 
     #[test]
     fn node_model_known_rule_no_model_no_provider() {
         let g = minimal_graph();
-        let rule = Rule {
-            catalog: Catalog::builtin(),
-        };
+        let catalog = test_catalog();
+        let rule = Rule { catalog: &catalog };
         let d = rule.apply(&g);
         assert!(d.is_empty());
     }

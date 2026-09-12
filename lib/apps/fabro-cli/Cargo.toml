@@ -22,10 +22,12 @@ fabro-auth = { path = "../../foundation/fabro-auth" }
 fabro-config = { path = "../../foundation/fabro-config" }
 fabro-environment = { path = "../../components/fabro-environment" }
 fabro-llm = { path = "../../components/fabro-llm" }
-fabro-model = { path = "../../foundation/fabro-model", features = ["clap"] }
 fabro-oauth = { path = "../../foundation/fabro-oauth" }
 fabro-github = { path = "../../components/fabro-github" }
-fabro-agent = { path = "../../components/fabro-agent" }
+pebble-agent.workspace = true
+pebble-coding-agent.workspace = true
+pebble-cli-core.workspace = true
+sandbox-driver.workspace = true
 fabro-dump = { path = "../../components/fabro-dump" }
 fabro-hooks = { path = "../../components/fabro-hooks" }
 fabro-install = { path = "../../components/fabro-install" }
@@ -34,7 +36,7 @@ fabro-mcp = { path = "../../components/fabro-mcp" }
 fabro-mcp-server = { path = "../fabro-mcp-server" }
 fabro-manifest = { path = "../../components/fabro-manifest" }
 fabro-proc = { path = "../../foundation/fabro-proc" }
-fabro-sandbox = { path = "../../components/fabro-sandbox", features = ["daytona"] }
+fabro-sandbox = { path = "../../components/fabro-sandbox" }
 fabro-checkpoint = { path = "../../components/fabro-checkpoint" }
 fabro-graphviz = { path = "../../components/fabro-graphviz" }
 fabro-validate = { path = "../../components/fabro-validate" }
@@ -46,6 +48,7 @@ fabro-telemetry = { path = "../../foundation/fabro-telemetry" }
 fabro-store = { path = "../../components/fabro-store" }
 fabro-vault = { path = "../../foundation/fabro-vault" }
 fabro-types = { path = "../../foundation/fabro-types", features = ["clap"] }
+lithos-llm = { workspace = true, features = ["runtime"] }
 fabro-redact.workspace = true
 fabro-util = { path = "../../foundation/fabro-util" }
 fabro-http.workspace = true
@@ -57,7 +60,6 @@ clap_complete.workspace = true
 cli-table.workspace = true
 console.workspace = true
 indicatif.workspace = true
-daytona-sdk.workspace = true
 anyhow.workspace = true
 miette.workspace = true
 dotenvy.workspace = true
@@ -94,17 +96,16 @@ serde_yaml = "0.9"
 tempfile = "3"
 sha2.workspace = true
 shlex = "1"
-walkdir.workspace = true
 object_store.workspace = true
 bytes.workspace = true
 tokio-util.workspace = true
 libc = "0.2"
-nix = { version = "0.30", features = ["fs"] }
+nix = { version = "0.30", features = ["fs", "signal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { version = "0.9", optional = true }
 
-# Vendor openssl only for musl targets. daytona-sdk transitively pulls
+# Vendor openssl only for musl targets. Transitive dependencies pull
 # native-tls via reqwest, which needs libssl. On glibc runners the system
 # libssl is used; on musl runners we compile openssl from source.
 [target.'cfg(target_env = "musl")'.dependencies]
@@ -116,8 +117,11 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
+walkdir.workspace = true
 fabro-acp = { path = "../../components/fabro-acp", features = ["test-support"] }
+fabro-mcp = { path = "../../components/fabro-mcp", features = ["test-support"] }
 fabro-build-support = { path = "../../foundation/build-support" }
+fabro-sandbox = { path = "../../components/fabro-sandbox", features = ["test-support"] }
 fabro-server = { path = "../fabro-server", features = ["test-support"] }
 fabro-workflow = { path = "../../components/fabro-workflow", features = ["test-support"] }
 fabro-types = { path = "../../foundation/fabro-types", features = ["clap", "test-support"] }

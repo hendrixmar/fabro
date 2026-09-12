@@ -1,12 +1,20 @@
+//! A stage's session on the steering bus, with fabro's lifecycle events.
+//!
+//! Activating attaches the session at its stage, records
+//! `agent.session.activated` with the route and capabilities the run should
+//! show, and then drains steers that waited for it. Releasing detaches and
+//! records `agent.session.deactivated` once, however many times it is asked.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use fabro_model::{ReasoningEffort, Speed};
 use fabro_types::{PermissionLevel, SessionCapability, StageId};
+use lithos_llm::types::{ReasoningEffort, Speed};
+use pebble_coding_agent::steering::SteerableSession;
 
 use crate::error::Error;
 use crate::event::{Emitter, Event};
-use crate::steering_hub::{ActiveControlHandle, SteeringHub};
+use crate::steering_hub::SteeringHub;
 
 pub struct ActivationLease {
     stage_id:   StageId,
@@ -33,23 +41,17 @@ pub struct ActivationLeaseOptions {
 impl ActivationLease {
     pub fn activate(
         options: ActivationLeaseOptions,
-        handle: &Arc<dyn ActiveControlHandle>,
+        session: Arc<dyn SteerableSession>,
     ) -> Result<Arc<Self>, Error> {
-        let attached = if let Some(pair_handle) = handle.pair_handle() {
-            options
-                .hub
-                .attach_pairable_handle(&options.stage_id, &options.session_id, pair_handle)
-        } else {
-            options
-                .hub
-                .attach_handle(&options.stage_id, &options.session_id, Arc::clone(handle))
-        };
-        if !attached {
-            return Err(Error::Precondition(format!(
-                "stage {} already has a different active agent session",
-                options.stage_id
-            )));
-        }
+        options
+            .hub
+            .attach(&options.stage_id, &options.session_id, session)
+            .map_err(|_| {
+                Error::Precondition(format!(
+                    "stage {} already has a different active agent session",
+                    options.stage_id
+                ))
+            })?;
 
         options.emitter.emit(&Event::AgentSessionActivated {
             node_id:          options.stage_id.node_id().to_string(),
@@ -63,9 +65,7 @@ impl ActivationLease {
             permission_level: options.permission_level,
             capabilities:     options.capabilities,
         });
-        options
-            .hub
-            .drain_pending_into(&options.stage_id, handle.as_ref());
+        options.hub.drain_pending_into(&options.stage_id);
 
         Ok(Arc::new(Self {
             stage_id:   options.stage_id,
@@ -83,14 +83,13 @@ impl ActivationLease {
         self.hub.detach(&self.stage_id, &self.session_id);
     }
 
-    pub fn release_if_no_pending_control_work(&self, handle: &dyn ActiveControlHandle) -> bool {
+    /// The close-the-door check: release only if the session has no steering
+    /// waiting. Returns whether the lease is released.
+    pub fn release_if_idle(&self) -> bool {
         if self.released.load(Ordering::Acquire) {
             return true;
         }
-        if !self
-            .hub
-            .detach_if_no_pending_control_work(&self.stage_id, &self.session_id, handle)
-        {
+        if !self.hub.detach_if_idle(&self.stage_id, &self.session_id) {
             return false;
         }
         self.mark_released();
@@ -131,10 +130,40 @@ impl Drop for ActivationLease {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use fabro_agent::SessionControlHandle;
     use fabro_types::RunId;
+    use pebble_coding_agent::{SteeringMessage, SteeringOutcome};
 
     use super::*;
+
+    #[derive(Default)]
+    struct SessionControlHandle {
+        queue: Mutex<Vec<SteeringMessage>>,
+    }
+
+    impl SessionControlHandle {
+        fn queue_len(&self) -> usize {
+            self.queue.lock().unwrap().len()
+        }
+    }
+
+    impl SteerableSession for SessionControlHandle {
+        fn steer(&self, message: SteeringMessage) -> SteeringOutcome {
+            self.queue.lock().unwrap().push(message);
+            SteeringOutcome::Accepted
+        }
+
+        fn interrupt(&self) -> bool {
+            false
+        }
+
+        fn steer_now(&self, message: SteeringMessage) -> SteeringOutcome {
+            self.steer(message)
+        }
+
+        fn has_pending_steering(&self) -> bool {
+            !self.queue.lock().unwrap().is_empty()
+        }
+    }
 
     fn collect_event_names(emitter: &Arc<Emitter>) -> Arc<Mutex<Vec<String>>> {
         let names = Arc::new(Mutex::new(Vec::new()));
@@ -169,8 +198,8 @@ mod tests {
         }
     }
 
-    fn control_handle(handle: &SessionControlHandle) -> Arc<dyn ActiveControlHandle> {
-        Arc::new(handle.clone())
+    fn session(handle: &Arc<SessionControlHandle>) -> Arc<dyn SteerableSession> {
+        Arc::clone(handle) as Arc<dyn SteerableSession>
     }
 
     #[test]
@@ -179,7 +208,7 @@ mod tests {
         let names = collect_event_names(&emitter);
         let hub = Arc::new(SteeringHub::new(Arc::clone(&emitter)));
         let stage_id = StageId::new("agent", 1);
-        let handle = SessionControlHandle::new();
+        let handle = Arc::new(SessionControlHandle::default());
 
         hub.deliver_steer("queued".to_string(), None);
         let _lease = ActivationLease::activate(
@@ -189,7 +218,7 @@ mod tests {
                 Arc::clone(&hub),
                 Arc::clone(&emitter),
             ),
-            &control_handle(&handle),
+            session(&handle),
         )
         .unwrap();
 
@@ -207,8 +236,8 @@ mod tests {
         let names = collect_event_names(&emitter);
         let hub = Arc::new(SteeringHub::new(Arc::clone(&emitter)));
         let stage_id = StageId::new("agent", 1);
-        let handle_a = SessionControlHandle::new();
-        let handle_b = SessionControlHandle::new();
+        let handle_a = Arc::new(SessionControlHandle::default());
+        let handle_b = Arc::new(SessionControlHandle::default());
 
         let _lease = ActivationLease::activate(
             options(
@@ -217,7 +246,7 @@ mod tests {
                 Arc::clone(&hub),
                 Arc::clone(&emitter),
             ),
-            &control_handle(&handle_a),
+            session(&handle_a),
         )
         .unwrap();
         let result = ActivationLease::activate(
@@ -227,7 +256,7 @@ mod tests {
                 Arc::clone(&hub),
                 Arc::clone(&emitter),
             ),
-            &control_handle(&handle_b),
+            session(&handle_b),
         );
 
         assert!(result.is_err());
@@ -244,12 +273,12 @@ mod tests {
     }
 
     #[test]
-    fn release_is_idempotent() {
+    fn release_is_idempotent_and_release_if_idle_waits_for_steering() {
         let emitter = Arc::new(Emitter::new(RunId::new()));
         let names = collect_event_names(&emitter);
         let hub = Arc::new(SteeringHub::new(Arc::clone(&emitter)));
         let stage_id = StageId::new("agent", 1);
-        let handle = SessionControlHandle::new();
+        let handle = Arc::new(SessionControlHandle::default());
 
         let lease = ActivationLease::activate(
             options(
@@ -258,10 +287,17 @@ mod tests {
                 Arc::clone(&hub),
                 Arc::clone(&emitter),
             ),
-            &control_handle(&handle),
+            session(&handle),
         )
         .unwrap();
-        lease.release();
+        hub.deliver_steer("late".to_string(), None);
+        assert!(
+            !lease.release_if_idle(),
+            "a waiting steer keeps the door open"
+        );
+        handle.queue.lock().unwrap().clear();
+        assert!(lease.release_if_idle());
+        assert!(lease.release_if_idle(), "released stays released");
         lease.release();
 
         assert_eq!(

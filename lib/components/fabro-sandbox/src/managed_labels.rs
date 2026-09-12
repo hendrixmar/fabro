@@ -1,44 +1,32 @@
-use std::collections::HashMap;
+//! The labels that mark a sandbox as fabro's.
+//!
+//! Providers share a daemon or an organization with every other
+//! application, so a persisted id is trusted only when the sandbox behind
+//! it still carries fabro's labels. The driver's ownership scope stamps them
+//! on every sandbox fabro creates, narrows every listing to them, and
+//! refuses to attach to or delete a sandbox without them; this module only
+//! says which labels those are.
 
 use fabro_types::RunId;
+use sandbox_driver::Ownership;
 
 pub(crate) const MANAGED_LABEL: &str = "sh.fabro.managed";
 pub(crate) const MANAGED_LABEL_VALUE: &str = "true";
 pub(crate) const RUN_ID_LABEL: &str = "sh.fabro.run_id";
 
-/// True when the provided label map carries the Fabro managed sentinel.
-#[cfg(any(feature = "docker", feature = "daytona", test))]
-pub(crate) fn is_managed(labels: &HashMap<String, String>) -> bool {
-    labels.get(MANAGED_LABEL).map(String::as_str) == Some(MANAGED_LABEL_VALUE)
-}
-
-#[cfg(any(feature = "docker", test))]
-pub(crate) fn for_run(run_id: Option<&RunId>) -> HashMap<String, String> {
-    let mut labels = HashMap::new();
-    insert_for_run(&mut labels, run_id);
-    labels
-}
-
-#[cfg(any(feature = "daytona", test))]
-pub(crate) fn merge_for_run(
-    user_labels: Option<&HashMap<String, String>>,
-    run_id: Option<&RunId>,
-) -> HashMap<String, String> {
-    let mut labels = user_labels.cloned().unwrap_or_default();
-    insert_for_run(&mut labels, run_id);
-    labels
-}
-
-fn insert_for_run(labels: &mut HashMap<String, String>, run_id: Option<&RunId>) {
-    labels.insert(MANAGED_LABEL.to_string(), MANAGED_LABEL_VALUE.to_string());
-    if let Some(run_id) = run_id {
-        labels.insert(RUN_ID_LABEL.to_string(), run_id.to_string());
+/// Fabro's ownership of a sandbox: everything fabro manages, narrowed to
+/// one run when `run_id` is known.
+pub(crate) fn ownership(run_id: Option<&RunId>) -> Ownership {
+    let ownership = Ownership::label(MANAGED_LABEL, MANAGED_LABEL_VALUE);
+    match run_id {
+        Some(run_id) => ownership.and_label(RUN_ID_LABEL, run_id.to_string()),
+        None => ownership,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use fabro_types::RunId;
 
@@ -58,33 +46,27 @@ mod tests {
     }
 
     #[test]
-    fn managed_labels_include_run_id_when_present() {
+    fn ownership_requires_fabro_and_the_run_when_known() {
         let run_id: RunId = "01HY0000000000000000000000".parse().unwrap();
-        let labels = for_run(Some(&run_id));
+        let mut labels = BTreeMap::new();
+        assert!(!ownership(None).owns(&labels));
+        labels.insert(MANAGED_LABEL.to_string(), "true".to_string());
+        assert!(ownership(None).owns(&labels));
+        assert!(!ownership(Some(&run_id)).owns(&labels));
+        labels.insert(RUN_ID_LABEL.to_string(), run_id.to_string());
+        assert!(ownership(Some(&run_id)).owns(&labels));
 
-        assert_eq!(labels.get(MANAGED_LABEL).map(String::as_str), Some("true"));
-        assert_eq!(
-            labels.get(RUN_ID_LABEL).map(String::as_str),
-            Some("01HY0000000000000000000000")
-        );
-        assert!(is_managed(&labels));
-    }
-
-    #[test]
-    fn managed_labels_override_reserved_user_labels() {
-        let run_id: RunId = "01HY0000000000000000000000".parse().unwrap();
-        let user_labels = HashMap::from([
+        // Stamping overrides whatever a caller put under the reserved keys.
+        let mut given = BTreeMap::from([
             ("team".to_string(), "platform".to_string()),
             (MANAGED_LABEL.to_string(), "false".to_string()),
             (RUN_ID_LABEL.to_string(), "wrong".to_string()),
         ]);
-
-        let labels = merge_for_run(Some(&user_labels), Some(&run_id));
-
-        assert_eq!(labels.get("team").map(String::as_str), Some("platform"));
-        assert_eq!(labels.get(MANAGED_LABEL).map(String::as_str), Some("true"));
+        ownership(Some(&run_id)).stamp(&mut given);
+        assert_eq!(given.get("team").map(String::as_str), Some("platform"));
+        assert_eq!(given.get(MANAGED_LABEL).map(String::as_str), Some("true"));
         assert_eq!(
-            labels.get(RUN_ID_LABEL).map(String::as_str),
+            given.get(RUN_ID_LABEL).map(String::as_str),
             Some("01HY0000000000000000000000")
         );
     }

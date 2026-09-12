@@ -90,13 +90,17 @@ describe("eventsToActivity", () => {
         event: "agent.message",
         stage_id: "verify@1",
         node_id: "verify",
-        properties: { text: "first visit reply" },
+        properties: {
+          event: { AssistantMessage: { text: "first visit reply" } },
+        },
       }),
       envelope(4, {
         event: "agent.message",
         stage_id: "verify@2",
         node_id: "verify",
-        properties: { text: "second visit reply" },
+        properties: {
+          event: { AssistantMessage: { text: "second visit reply" } },
+        },
       }),
     ];
 
@@ -204,19 +208,19 @@ describe("eventsToActivity", () => {
         event: "agent.tool.started",
         node_id: "detect-drift",
         properties: {
-          tool_call_id: "call-1",
+          event: { ToolCallStarted: { tool_call_id: "call-1",
           tool_name: "read_file",
-          arguments: { path: "config.toml" },
+          arguments: { path: "config.toml" } } },
         },
       }),
       envelope(2, {
         event: "agent.tool.completed",
         node_id: "detect-drift",
         properties: {
-          tool_call_id: "call-1",
+          event: { ToolCallCompleted: { tool_call_id: "call-1",
           tool_name: "read_file",
           output: "[redis]",
-          is_error: false,
+          is_error: false } },
         },
       }),
     ];
@@ -242,13 +246,17 @@ describe("eventsToActivity", () => {
         event: "agent.steering.injected",
         stage_id: "nap@1",
         node_id: "nap",
-        properties: { text: "say hello", visit: 1 },
+        properties: {
+          event: { SteeringInjected: { text: "say hello" } },
+        },
       }),
       envelope(3, {
         event: "agent.steering.injected",
         stage_id: "other@1",
         node_id: "other",
-        properties: { text: "wrong stage", visit: 1 },
+        properties: {
+          event: { SteeringInjected: { text: "wrong stage" } },
+        },
       }),
     ];
 
@@ -410,8 +418,8 @@ describe("eventsToActivity", () => {
         stage_id: "simplify@1",
         node_id: "simplify",
         properties: {
-          text: "Done.",
-          billing: { input_tokens: 10, output_tokens: 5 },
+          event: { AssistantMessage: { text: "Done.",
+          usage: { input: 10, output: 5 } } },
         },
       }),
       envelope(3, {
@@ -482,7 +490,7 @@ describe("eventsToActivity", () => {
             event: "agent.message",
             stage_id: "plan@1",
             node_id: "plan",
-            properties,
+            properties: { event: { AssistantMessage: properties } },
           }),
         ],
         "plan@1",
@@ -549,7 +557,9 @@ describe("eventsToActivity", () => {
       envelope(2, {
         event: "agent.message",
         node_id: "detect-drift",
-        properties: { text: "signal" },
+        properties: {
+          event: { AssistantMessage: { text: "signal" } },
+        },
       }),
       envelope(3, {
         event: "run.running",
@@ -559,7 +569,9 @@ describe("eventsToActivity", () => {
       envelope(4, {
         event: "agent.message",
         node_id: "other-stage",
-        properties: { text: "wrong stage" },
+        properties: {
+          event: { AssistantMessage: { text: "wrong stage" } },
+        },
       }),
     ];
 
@@ -942,9 +954,9 @@ describe("buildStageActivity pending tools", () => {
         stage_id: "plan@1",
         node_id: "plan",
         properties: {
-          tool_call_id: "call-1",
+          event: { ToolCallStarted: { tool_call_id: "call-1",
           tool_name: "shell",
-          arguments: { command: "cargo build" },
+          arguments: { command: "cargo build" } } },
         },
       }),
       envelope(2, {
@@ -952,16 +964,18 @@ describe("buildStageActivity pending tools", () => {
         stage_id: "plan@1",
         node_id: "plan",
         properties: {
-          tool_call_id: "call-2",
+          event: { ToolCallStarted: { tool_call_id: "call-2",
           tool_name: "read_file",
-          arguments: { file_path: "/tmp/x" },
+          arguments: { file_path: "/tmp/x" } } },
         },
       }),
       envelope(3, {
         event: "agent.tool.completed",
         stage_id: "plan@1",
         node_id: "plan",
-        properties: { tool_call_id: "call-1", output: "ok" },
+        properties: {
+          event: { ToolCallCompleted: { tool_call_id: "call-1", output: "ok" } },
+        },
       }),
     ];
     expect(buildStageActivity(events, "plan@1").pendingTools).toEqual([
@@ -980,9 +994,9 @@ describe("buildStageActivity pending tools", () => {
         stage_id: "plan@2",
         node_id: "plan",
         properties: {
-          tool_call_id: "call-1",
+          event: { ToolCallStarted: { tool_call_id: "call-1",
           tool_name: "shell",
-          arguments: {},
+          arguments: {} } },
         },
       }),
     ];
@@ -995,18 +1009,18 @@ describe("buildStageActivity pending tools", () => {
         event: "agent.tool.started",
         stage_id: "plan@1",
         properties: {
-          tool_call_id: "call-1",
+          event: { ToolCallStarted: { tool_call_id: "call-1",
           tool_name: "shell",
-          arguments: { command: "cargo build" },
+          arguments: { command: "cargo build" } } },
         },
       }),
       envelope(2, {
         event: "agent.tool.started",
         stage_id: "plan@1",
         properties: {
-          tool_call_id: "call-2",
+          event: { ToolCallStarted: { tool_call_id: "call-2",
           tool_name: "shell",
-          arguments: { command: "cargo test" },
+          arguments: { command: "cargo test" } } },
         },
       }),
     ];
@@ -1030,21 +1044,25 @@ describe("buildStageActivity pending tools", () => {
       envelope(1, {
         event: "agent.tool.started",
         stage_id: "plan@1",
-        properties: { tool_name: "shell", arguments: { command: "ignored" } },
+        properties: {
+          event: { ToolCallStarted: { tool_name: "shell", arguments: { command: "ignored" } } },
+        },
       }),
       envelope(2, {
         event: "agent.tool.started",
         stage_id: "plan@1",
         properties: {
-          tool_call_id: "call-1",
+          event: { ToolCallStarted: { tool_call_id: "call-1",
           tool_name: "shell",
-          arguments: { command: "kept" },
+          arguments: { command: "kept" } } },
         },
       }),
       envelope(3, {
         event: "agent.tool.completed",
         stage_id: "plan@1",
-        properties: { output: "must not clear call-1" },
+        properties: {
+          event: { ToolCallCompleted: { output: "must not clear call-1" } },
+        },
       }),
     ];
 
@@ -1253,9 +1271,9 @@ describe("tool-call-only agent responses", () => {
         stage_id: "code@1",
         node_id: "code",
         properties: {
-          text: "",
-          billing: { input_tokens: 4200, output_tokens: 96 },
-          tool_call_count: 2,
+          event: { AssistantMessage: { text: "",
+          usage: { input: 4200, output: 96 },
+          tool_call_count: 2 } },
         },
       }),
     ];
@@ -1279,7 +1297,9 @@ describe("tool-call-only agent responses", () => {
         event: "agent.message",
         stage_id: "code@1",
         node_id: "code",
-        properties: { text: "", tool_call_count: 1 },
+        properties: {
+          event: { AssistantMessage: { text: "", tool_call_count: 1 } },
+        },
       }),
       envelope(2, {
         event: "prompt.completed",
@@ -1341,10 +1361,10 @@ describe("tool batch boundaries", () => {
       stage_id: STAGE,
       node_id: "code",
       properties: {
-        text,
-        billing: { input_tokens: 1000, output_tokens: 20 },
-        tool_call_count: toolCallCount,
-      },
+          event: { AssistantMessage: { text,
+        usage: { input: 1000, output: 20 },
+        tool_call_count: toolCallCount } },
+        },
     });
   }
 
@@ -1362,9 +1382,9 @@ describe("tool batch boundaries", () => {
         stage_id: STAGE,
         node_id: "code",
         properties: {
-          tool_call_id: callId,
+          event: { ToolCallStarted: { tool_call_id: callId,
           tool_name: "shell",
-          arguments: { command },
+          arguments: { command } } },
         },
       }),
       envelope(seq + 1, {
@@ -1372,7 +1392,9 @@ describe("tool batch boundaries", () => {
         ts: endTs,
         stage_id: STAGE,
         node_id: "code",
-        properties: { tool_call_id: callId, tool_name: "shell", output: "ok" },
+        properties: {
+          event: { ToolCallCompleted: { tool_call_id: callId, tool_name: "shell", output: "ok" } },
+        },
       }),
     ];
   }

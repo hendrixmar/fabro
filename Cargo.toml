@@ -3,7 +3,6 @@ members = [
     "lib/apps/*",
     "lib/components/*",
     "lib/foundation/*",
-    "test/twin/openai",
     "test/twin/github",
 ]
 default-members = ["lib/apps/fabro-cli"]
@@ -11,7 +10,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.347.0-nightly.0"
+version = "0.354.0-nightly.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -28,7 +27,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "query", "form", "multipart"] }
-sse-stream = "0.2"
 ulid = "1"
 uuid = { version = "1", features = ["v4", "v7", "v8"] }
 rand = "0.9"
@@ -62,13 +60,13 @@ clap_complete = "4"
 jsonschema = { version = "0.42", default-features = false }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 dashmap = "6"
-bollard = "0.18"
-tar = "0.4"
 cli-table = { version = "0.5", default-features = false }
 console = "0.15"
 dialoguer = "0.12"
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2", "vendored-openssl", "https"] }
 tracing = "0.1"
+unicase = "2"
+unicode-normalization = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
 rmcp = { version = "1.4", default-features = false }
@@ -93,12 +91,41 @@ sha2 = "0.10"
 hex = "0.4"
 insta = "1"
 fabro-test = { path = "lib/foundation/fabro-test" }
-twin-openai = { path = "test/twin/openai" }
+# Provider-neutral LLM catalog and client. Pinned to a revision until 0.x is
+# published to crates.io.
+lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", rev = "a1e3fd37b7153870411701327ac117606753fe90", default-features = false }
+# Deterministic OpenAI twin used by twin-mode E2E tests; the same revision
+# lithos-llm verifies its codecs against.
+twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "ca45f0e50a6716d716aa2f638ca3cf767e88f613" }
 twin-github = { path = "test/twin/github" }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-daytona-sdk = { git = "https://github.com/brynary/daytona-sdk-rust", rev = "be2c7b7272740d47c023cac8abc9f63c1a51a511", package = "daytona-sdk" }
-daytona-api-client = { git = "https://github.com/brynary/daytona-sdk-rust", rev = "be2c7b7272740d47c023cac8abc9f63c1a51a511", package = "daytona-api-client" }
+# sandbox-driver: the sandbox provider layer. Bundled Host, Docker, and
+# Daytona providers link in-process; third-party providers run as stdio
+# plugins through sandbox-driver-protocol. Pinned by rev; currently the head of
+# the sandbox-driver `section-4-driver-items` branch (provider-owned scopes, the
+# supervisor as provider, Host attach by directory, git retry and verbs in the
+# driver, status image/snapshot/network, Daytona snapshot caching, services port
+# wait and list, RFC 3339 timestamps), to move to main on merge. The CI plugin
+# job installs the driver executables at the same rev, read from this file.
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47" }
+sandbox-driver-protocol = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47" }
+sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47" }
+sandbox-driver-docker = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47" }
+sandbox-driver-docker-config = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47" }
+sandbox-driver-daytona = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47" }
+sandbox-driver-daytona-config = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47" }
+sandbox-driver-testing = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47" }
+# pebble: the coding agent loop fabro runs its agent stages, Ask Fabro
+# sessions, hook evaluators, and `fabro exec` on. Pinned by rev to pebble
+# `main`. The `PreviewUrls` trait objects fabro hands pebble's MCP servers
+# only cross when fabro and pebble's `mcp` feature name the same
+# sandbox-driver revision, so move the two pins together. Pebble pins the
+# same lithos-llm rev as fabro, and its lockfile policy is that every shared
+# crate resolves to the version lithos-llm locks.
+pebble-agent = { git = "https://github.com/lithoscomputer/pebble", rev = "4c0063327394cd0f1e9fee2c24541b829b93a8f7" }
+pebble-coding-agent = { git = "https://github.com/lithoscomputer/pebble", rev = "4c0063327394cd0f1e9fee2c24541b829b93a8f7", features = ["mcp", "search-providers"] }
+pebble-cli-core = { git = "https://github.com/lithoscomputer/pebble", rev = "4c0063327394cd0f1e9fee2c24541b829b93a8f7" }
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "ureq", "rustls"] }
 fork = "0.2"
 exec = "0.3"

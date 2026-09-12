@@ -1,11 +1,23 @@
-use std::collections::{HashMap, HashSet};
+//! Fabro's git operations on a run's sandbox, over the driver's git facet.
+//!
+//! The driver runs every command hardened (no auto maintenance or gc, no
+//! repository hooks, no fsmonitor, unquoted paths, no signing; read verbs
+//! refuse the file transport and external diff drivers) and returns typed
+//! results. Fabro decides what to stage, what to say in a checkpoint
+//! commit, and which ranges the Run Files endpoint reads.
 
-use fabro_agent::Sandbox;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
 use fabro_checkpoint::trailer as trailerlink;
 use fabro_checkpoint::trailer::Trailer;
-use fabro_sandbox::shell_quote;
+use fabro_sandbox::RunSandbox;
 use fabro_types::settings::run::RunCheckpointSettings;
 use fabro_util::error::SharedError;
+use sandbox_driver::{
+    Git as _, GitChange, GitCommitOptions, GitDiffEntry, GitDiffOptions, GitFacet, GitFailureKind,
+    GitRevisionRange,
+};
 
 use crate::artifact_snapshot;
 use crate::git::GitAuthor;
@@ -19,37 +31,35 @@ pub struct GitCommandError {
     pub source:  fabro_sandbox::Error,
 }
 
-pub const GIT_REMOTE: &str =
-    "git -c maintenance.auto=0 -c gc.auto=0 -c commit.gpgsign=false -c tag.gpgsign=false";
+/// Rename detection threshold for the diffs the Run Files endpoint and the
+/// checkpoint summaries read.
+const FIND_RENAMES_PERCENT: u8 = 50;
 
-pub(crate) fn exec_err(label: &str, r: fabro_sandbox::ExecResult) -> GitCommandError {
-    if r.is_timed_out() {
-        return GitCommandError {
-            message: format!("{label} timed out after {}ms", r.duration_ms),
-            source:  fabro_sandbox::Error::exec(label, r),
-        };
-    }
-    if r.is_cancelled() {
-        return GitCommandError {
-            message: format!("{label} cancelled after {}ms", r.duration_ms),
-            source:  fabro_sandbox::Error::exec(label, r),
-        };
-    }
+/// Budget for the machine-readable diffs behind the Run Files endpoint.
+const RUN_FILES_TIMEOUT: Duration = Duration::from_secs(10);
 
-    let exit = r.display_exit_code();
+/// The sandbox's git facet, or the error a git operation reports when the
+/// provider has none.
+fn facet<'a>(sandbox: &'a RunSandbox, label: &str) -> Result<GitFacet<'a>, GitCommandError> {
+    sandbox.git().map_err(|source| GitCommandError {
+        message: format!("{label} failed"),
+        source,
+    })
+}
+
+fn git_error(label: &str, error: sandbox_driver::Error) -> GitCommandError {
     GitCommandError {
-        message: format!("{label} failed (exit {exit})"),
-        source:  fabro_sandbox::Error::exec(label, r),
+        message: format!("{label} failed"),
+        source:  fabro_sandbox::Error::from(error),
     }
 }
 
-/// Run a git checkpoint commit via the sandbox.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Checkpointing needs explicit run metadata, checkpoint settings, and author inputs."
-)]
+/// Commit the run's checkpoint: everything under the working directory
+/// except the built-in and configured excludes, as an allow-empty commit
+/// carrying fabro's trailers. Repository hooks never run: the driver
+/// disables them on every command it issues.
 pub async fn git_checkpoint(
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     run_id: &str,
     node_id: &str,
     status: &str,
@@ -57,30 +67,24 @@ pub async fn git_checkpoint(
     checkpoint: &RunCheckpointSettings,
     author: &GitAuthor,
 ) -> std::result::Result<String, GitCommandError> {
-    let mut all_excludes: Vec<String> = artifact_snapshot::EXCLUDE_DIRS
-        .iter()
-        .map(|d| format!("**/{d}/**"))
-        .collect();
-    all_excludes.extend(checkpoint.exclude_globs.iter().cloned());
+    let git = facet(sandbox, "git add")?;
+    let repo = sandbox.working_directory();
 
-    let pathspecs: Vec<String> = all_excludes
-        .iter()
-        .map(|g| format!("':(glob,exclude){g}'"))
-        .collect();
-    let add_cmd = format!("{GIT_REMOTE} add -A -- . {}", pathspecs.join(" "));
-    let add_result = sandbox
-        .exec_command(&add_cmd, checkpoint.commit_timeout_ms, None, None, None)
-        .await;
-    match add_result {
-        Ok(r) if r.is_success() => {}
-        Ok(r) => return Err(exec_err("git add", r)),
-        Err(e) => {
-            return Err(GitCommandError {
-                message: "git add failed".to_string(),
-                source:  e,
-            });
-        }
-    }
+    let mut pathspecs = vec![".".to_owned()];
+    pathspecs.extend(
+        artifact_snapshot::EXCLUDE_DIRS
+            .iter()
+            .map(|dir| format!(":(glob,exclude)**/{dir}/**")),
+    );
+    pathspecs.extend(
+        checkpoint
+            .exclude_globs
+            .iter()
+            .map(|glob| format!(":(glob,exclude){glob}")),
+    );
+    git.add_all(repo, &pathspecs)
+        .await
+        .map_err(|error| git_error("git add", error))?;
 
     let subject = format!("fabro({run_id}): {node_id} ({status})");
     let completed_str = completed_count.to_string();
@@ -97,52 +101,11 @@ pub async fn git_checkpoint(
     let mut message = trailerlink::format_message(&subject, "", &trailers);
     author.append_footer(&mut message);
 
-    let msg_path = format!("/tmp/fabro-commit-msg-{}", uuid::Uuid::new_v4());
-    if let Err(e) = sandbox.write_file(&msg_path, &message).await {
-        return Err(GitCommandError {
-            message: "failed to write commit message file".to_string(),
-            source:  e,
-        });
-    }
-
-    let msg_path_q = shell_quote(&msg_path);
-    let no_verify = if checkpoint.skip_git_hooks {
-        " --no-verify"
-    } else {
-        ""
-    };
-    let commit_cmd = format!(
-        "{GIT_REMOTE} -c user.name={name} -c user.email={email} commit --allow-empty{no_verify} -F {msg_path_q}",
-        name = shell_quote(&author.name),
-        email = shell_quote(&author.email),
-    );
-    let commit_result = sandbox
-        .exec_command(&commit_cmd, checkpoint.commit_timeout_ms, None, None, None)
-        .await;
-    let _ = sandbox.delete_file(&msg_path).await;
-    match commit_result {
-        Ok(r) if r.is_success() => {}
-        Ok(r) => return Err(exec_err("git commit", r)),
-        Err(e) => {
-            return Err(GitCommandError {
-                message: "git commit failed".to_string(),
-                source:  e,
-            });
-        }
-    }
-
-    let sha_cmd = format!("{GIT_REMOTE} rev-parse HEAD");
-    let sha_result = sandbox
-        .exec_command(&sha_cmd, 10_000, None, None, None)
-        .await;
-    match sha_result {
-        Ok(r) if r.is_success() => Ok(r.stdout.trim().to_string()),
-        Ok(r) => Err(exec_err("git rev-parse HEAD", r)),
-        Err(e) => Err(GitCommandError {
-            message: "git rev-parse HEAD failed".to_string(),
-            source:  e,
-        }),
-    }
+    let mut options = GitCommitOptions::new(message, &author.name, &author.email);
+    options.allow_empty = true;
+    git.commit(repo, &options)
+        .await
+        .map_err(|error| git_error("git commit", error))
 }
 
 /// Run a git checkpoint after the per-run sandbox git capability probe.
@@ -153,7 +116,7 @@ pub async fn git_checkpoint(
 #[tracing::instrument(name = "git_op", skip_all, fields(op = "checkpoint-commit"))]
 pub(crate) async fn checked_git_checkpoint(
     runtime: &SandboxGitRuntime,
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     run_id: &str,
     node_id: &str,
     status: &str,
@@ -177,75 +140,41 @@ pub(crate) async fn checked_git_checkpoint(
     .map_err(|err| SharedError::new(anyhow::Error::new(err)))
 }
 
-/// Run a git diff via the sandbox (30 s default timeout).
+/// The unified diff from `base` to `HEAD` (30 s default timeout).
 pub(crate) async fn git_diff(
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     base: &str,
 ) -> std::result::Result<String, GitCommandError> {
     git_diff_with_timeout(sandbox, base, 30_000).await
 }
 
-/// Run a git diff via the sandbox with a caller-supplied timeout in
-/// milliseconds.
+/// The unified diff from `base` to `HEAD` under a caller-supplied timeout
+/// in milliseconds.
 ///
 /// Failure-path capture uses a shorter timeout than the checkpoint path so a
 /// pathological workspace (FS locks, corrupted index) doesn't stall terminal
-/// event emission downstream (Slack notifier, SSE, CI hooks).
+/// event emission downstream (Slack notifier, SSE, CI hooks). Paths come
+/// back unquoted, which the Run Files denylist parser relies on.
 pub(crate) async fn git_diff_with_timeout(
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     base: &str,
     timeout_ms: u64,
 ) -> std::result::Result<String, GitCommandError> {
-    // `-c core.quotePath=false` forces paths with non-ASCII, tabs, quotes,
-    // or backslashes to emit unquoted. The Run Files Changed endpoint's
-    // `strip_denylisted_sections` parser only recognizes unquoted
-    // `diff --git a/<old> b/<new>` headers; without this flag git would
-    // wrap such paths in `"a/…"` / `"b/…"` and evade the denylist (see
-    // docs/agent/reviews/2026-04-19-run-files-security-review.md).
-    let cmd = format!("{GIT_REMOTE} -c core.quotePath=false diff {base} HEAD");
-    match sandbox
-        .exec_command(&cmd, timeout_ms, None, None, None)
+    let git = facet(sandbox, "git diff")?;
+    let options = GitDiffOptions::new(GitRevisionRange::new(base).to("HEAD"))
+        .timeout(Duration::from_millis(timeout_ms));
+    git.diff_patch(sandbox.working_directory(), &options)
         .await
-    {
-        Ok(r) if r.is_success() => Ok(r.stdout),
-        Ok(r) => Err(exec_err("git diff", r)),
-        Err(e) => Err(GitCommandError {
-            message: "git diff failed".to_string(),
-            source:  e,
-        }),
-    }
+        .map_err(|error| git_error("git diff", error))
 }
 
 // ── Machine-readable diff enumeration (Run Files endpoint) ─────────────────
 
-/// Hardened git-command prefix for the Run Files endpoint.
+/// A single changed-file entry of a range, as the Run Files endpoint reads
+/// it.
 ///
-/// Layers on top of [`GIT_REMOTE`]:
-/// - `core.hooksPath=/dev/null`: repo-supplied hooks do not run.
-/// - `core.fsmonitor=false`: no fsmonitor daemon interactions.
-/// - `protocol.file.allow=never`: blocks local-protocol fetches.
-///
-/// These invocations use [`sandbox_git_hardening_env`] via `exec_command` to
-/// disable terminal prompts and external diff drivers.
-const GIT_HARDENED: &str = "git -c maintenance.auto=0 -c gc.auto=0 -c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.file.allow=never -c core.quotePath=false";
-
-/// Environment additions applied to every hardened sandbox-side git invocation.
-///
-/// `GIT_TERMINAL_PROMPT=0` prevents git from stalling on credential prompts
-/// when a remote or subprocess triggers one. Clearing `GIT_EXTERNAL_DIFF`
-/// neutralizes any inherited custom diff driver.
-fn sandbox_git_hardening_env() -> std::collections::HashMap<String, String> {
-    std::collections::HashMap::from([
-        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        ("GIT_EXTERNAL_DIFF".to_string(), String::new()),
-    ])
-}
-
-/// A single changed-file entry from `git diff --raw -z --find-renames=50%`.
-///
-/// Paths are repo-relative, UTF-8; non-UTF-8 filenames are rejected by the
-/// parser. Blob SHAs are lowercase hex. Modes are octal integers (`100644`,
-/// `100755`, `120000`, `160000`, …).
+/// Paths are repo-relative, UTF-8. Blob SHAs are lowercase hex. Modes are
+/// octal strings (`100644`, `100755`, `120000`, `160000`, …).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawDiffEntry {
     Added {
@@ -272,107 +201,111 @@ pub enum RawDiffEntry {
         new_mode:   String,
         similarity: u8,
     },
+    /// Symlink creation, deletion, or target change. No blob contents are
+    /// fetched for these: the "content" is the link target, which is
+    /// not meaningful to diff as file text.
     Symlink {
         path:        String,
         change_kind: SymlinkChange,
         old_blob:    Option<String>,
         new_blob:    Option<String>,
     },
+    /// Submodule (gitlink) pointer change. No blob contents exist for
+    /// these in the parent repo.
     Submodule {
         path:        String,
         change_kind: SubmoduleChange,
     },
 }
 
-/// Lifecycle of a symlink entry (mode `120000`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymlinkChange {
     Added,
-    Modified,
     Deleted,
+    Modified,
 }
 
-/// Lifecycle of a submodule entry (mode `160000`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmoduleChange {
     Added,
-    Modified,
     Deleted,
+    Modified,
 }
 
-/// Error produced by the sandbox-git helpers.
-///
-/// Callers discriminate between transient (retry-safe) and permanent
-/// conditions: a 503 can be returned to the client on `Transient`, while
-/// `Permanent` errors should fall through to the patch-only fallback.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Errors from the machine-readable diff paths, classified so the server
+/// can fall back or retry.
+#[derive(Debug, thiserror::Error)]
 pub enum DiffError {
-    /// Retry-safe failure: timeout, process kill, transient I/O.
-    Transient { message: String },
-    /// Non-retryable failure: unknown revision, malformed output, etc.
+    /// Unknown revision, missing object, or a repository the driver could
+    /// not read: retrying will not help.
+    #[error("permanent git error: {message}")]
     Permanent { message: String },
+    /// A timeout, a transport failure, or any other failure worth retrying.
+    #[error("transient git error: {message}")]
+    Transient { message: String },
 }
 
-impl std::fmt::Display for DiffError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Transient { message } => write!(f, "transient: {message}"),
-            Self::Permanent { message } => write!(f, "permanent: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for DiffError {}
-
-/// Size metadata for a single blob, as reported by `git cat-file
-/// --batch-check`.
+/// Blob metadata from a batch lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobMeta {
     pub sha:  String,
-    /// `None` if the blob is missing (git reports `missing`).
+    /// `None` when git reports the blob as missing.
     pub size: Option<u64>,
 }
 
 /// Enumerate files changed between `base_sha` and `to_sha` via the sandbox.
 ///
-/// Uses `git diff --raw -z --find-renames=50%` to get a machine-readable,
-/// null-separated, SHA-addressed listing. Paths from this output are treated
-/// as metadata only — blob reads use the SHAs, not the paths.
-///
-/// The `--numstat` side-call classifies text vs binary so callers can skip
-/// binary contents without ever invoking `git cat-file --batch` on them.
+/// Paths from this listing are treated as metadata only; blob reads use
+/// the SHAs, not the paths. The `--numstat` companion classifies text vs
+/// binary so callers can skip binary contents without ever fetching them.
 pub async fn list_changed_files_raw(
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     base_sha: &str,
     to_sha: &str,
 ) -> std::result::Result<Vec<RawDiffEntry>, DiffError> {
-    let base_q = shell_quote(base_sha);
-    let to_q = shell_quote(to_sha);
-    let env = sandbox_git_hardening_env();
-    let cmd = format!("{GIT_HARDENED} diff --raw -z --find-renames=50% {base_q}..{to_q}");
-    let res = sandbox
-        .exec_command(&cmd, 10_000, None, Some(&env), None)
+    let git = diff_facet(sandbox)?;
+    let options = GitDiffOptions::new(GitRevisionRange::new(base_sha).to(to_sha))
+        .find_renames(FIND_RENAMES_PERCENT)
+        .timeout(RUN_FILES_TIMEOUT);
+    let entries = git
+        .diff_entries(sandbox.working_directory(), &options)
         .await
-        .map_err(|e| DiffError::Transient {
-            message: e.display_with_causes(),
-        })?;
+        .map_err(|error| diff_error(&error))?;
+    entries
+        .into_iter()
+        .map(raw_diff_entry)
+        .collect::<std::result::Result<Vec<_>, String>>()
+        .map_err(|message| DiffError::Permanent { message })
+}
 
-    if res.is_timed_out() {
-        return Err(DiffError::Transient {
-            message: "git diff --raw timed out".to_string(),
-        });
-    }
-    if !res.is_success() {
-        // An unknown-object / bad-revision error is permanent; everything
-        // else we treat as transient so the server can retry safely.
-        let stderr = res.stderr.trim().to_string();
-        if is_permanent_git_error(&stderr) {
-            return Err(DiffError::Permanent { message: stderr });
+fn diff_facet(sandbox: &RunSandbox) -> std::result::Result<GitFacet<'_>, DiffError> {
+    sandbox.git().map_err(|error| DiffError::Permanent {
+        message: fabro_sandbox::display_for_log(&error),
+    })
+}
+
+/// What a driver failure means for the Run Files endpoint: an unknown
+/// revision or missing object is permanent (the handler falls through to
+/// the stored patch), and so is output the driver could not read, since a
+/// retry reads the same object; a timeout, a transport failure, or anything
+/// else is transient and surfaces as a 503 for the client to retry.
+fn diff_error(error: &sandbox_driver::Error) -> DiffError {
+    let message = fabro_sandbox::display_for_log(error);
+    match error {
+        sandbox_driver::Error::Io { .. } => DiffError::Permanent { message },
+        sandbox_driver::Error::Git(failure) => {
+            let stderr = failure
+                .output()
+                .map(|output| String::from_utf8_lossy(output.stderr()).into_owned())
+                .unwrap_or_default();
+            if failure.kind() == GitFailureKind::RefNotFound || is_permanent_git_error(&stderr) {
+                DiffError::Permanent { message }
+            } else {
+                DiffError::Transient { message }
+            }
         }
-        return Err(DiffError::Transient { message: stderr });
+        _ => DiffError::Transient { message },
     }
-
-    parse_raw_z(&res.stdout).map_err(|message| DiffError::Permanent { message })
 }
 
 fn is_permanent_git_error(stderr: &str) -> bool {
@@ -381,137 +314,89 @@ fn is_permanent_git_error(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
     lower.contains("unknown revision")
         || lower.contains("bad revision")
+        || lower.contains("bad object")
         || lower.contains("invalid revision")
         || lower.contains("no such path")
         || lower.contains("not a valid object name")
 }
 
-fn parse_raw_z(stdout: &str) -> std::result::Result<Vec<RawDiffEntry>, String> {
-    // git diff --raw -z format:
-    //   ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0"
-    // For renames/copies:
-    //   ":<srcmode> <dstmode> <srcsha> <dstsha> R<score>\0<oldpath>\0<newpath>\0"
-    //
-    // Multiple entries are concatenated with no separator between them.
-    let mut entries = Vec::new();
-    let mut tokens = stdout.split('\0').peekable();
-    while let Some(header) = tokens.next() {
-        if header.is_empty() {
-            continue;
-        }
-        if !header.starts_with(':') {
-            return Err(format!("unexpected token in diff --raw: {header:?}"));
-        }
-        let fields: Vec<&str> = header[1..].split(' ').collect();
-        if fields.len() < 5 {
-            return Err(format!("short raw-diff header: {header:?}"));
-        }
-        let src_mode = fields[0];
-        let dst_mode = fields[1];
-        let src_sha = fields[2];
-        let dst_sha = fields[3];
-        let status = fields[4];
+/// The Run Files entry for one path of the driver's diff. Mode 120000 is a
+/// symlink, 160000 a submodule.
+fn raw_diff_entry(entry: GitDiffEntry) -> std::result::Result<RawDiffEntry, String> {
+    let is_mode = |mode: &Option<String>, expected: &str| mode.as_deref() == Some(expected);
+    let is_symlink = is_mode(&entry.old_mode, "120000") || is_mode(&entry.new_mode, "120000");
+    let is_submodule = is_mode(&entry.old_mode, "160000") || is_mode(&entry.new_mode, "160000");
+    let path = entry.path;
+    let old_blob = entry.old_blob.unwrap_or_default();
+    let new_blob = entry.new_blob.unwrap_or_default();
+    let old_mode = entry.old_mode.unwrap_or_default();
+    let new_mode = entry.new_mode.unwrap_or_default();
 
-        let entry = if status.starts_with('R') || status.starts_with('C') {
-            let score: u8 = status[1..].parse().unwrap_or(0);
-            let old_path = tokens
-                .next()
-                .ok_or_else(|| "missing old_path for rename".to_string())?
-                .to_string();
-            let new_path = tokens
-                .next()
-                .ok_or_else(|| "missing new_path for rename".to_string())?
-                .to_string();
-            RawDiffEntry::Renamed {
-                old_path,
-                new_path,
-                old_blob: src_sha.to_string(),
-                new_blob: dst_sha.to_string(),
-                new_mode: dst_mode.to_string(),
-                similarity: score,
-            }
-        } else {
-            let path = tokens
-                .next()
-                .ok_or_else(|| "missing path for diff entry".to_string())?
-                .to_string();
-            classify_entry(status, src_mode, dst_mode, src_sha, dst_sha, &path)?
-        };
-        entries.push(entry);
-    }
-    Ok(entries)
-}
-
-fn classify_entry(
-    status: &str,
-    src_mode: &str,
-    dst_mode: &str,
-    src_sha: &str,
-    dst_sha: &str,
-    path: &str,
-) -> std::result::Result<RawDiffEntry, String> {
-    // Mode 120000 = symlink, 160000 = submodule (gitlink).
-    let is_symlink_change = src_mode == "120000" || dst_mode == "120000";
-    let is_submodule_change = src_mode == "160000" || dst_mode == "160000";
-
-    Ok(match (status, is_symlink_change, is_submodule_change) {
-        ("A", true, _) => RawDiffEntry::Symlink {
-            path:        path.to_string(),
-            change_kind: SymlinkChange::Added,
-            old_blob:    None,
-            new_blob:    Some(dst_sha.to_string()),
+    Ok(match (entry.change, is_symlink, is_submodule) {
+        (GitChange::Renamed | GitChange::Copied, _, _) => RawDiffEntry::Renamed {
+            old_path: entry.old_path.unwrap_or_default(),
+            new_path: path,
+            old_blob,
+            new_blob,
+            new_mode,
+            similarity: entry.similarity.unwrap_or(0),
         },
-        ("A", _, true) => RawDiffEntry::Submodule {
-            path:        path.to_string(),
+        (GitChange::Added, true, _) => RawDiffEntry::Symlink {
+            path,
+            change_kind: SymlinkChange::Added,
+            old_blob: None,
+            new_blob: Some(new_blob),
+        },
+        (GitChange::Added, _, true) => RawDiffEntry::Submodule {
+            path,
             change_kind: SubmoduleChange::Added,
         },
-        ("A", _, _) => RawDiffEntry::Added {
-            path:     path.to_string(),
-            new_blob: dst_sha.to_string(),
-            new_mode: dst_mode.to_string(),
+        (GitChange::Added, _, _) => RawDiffEntry::Added {
+            path,
+            new_blob,
+            new_mode,
         },
-        ("D", true, _) => RawDiffEntry::Symlink {
-            path:        path.to_string(),
+        (GitChange::Deleted, true, _) => RawDiffEntry::Symlink {
+            path,
             change_kind: SymlinkChange::Deleted,
-            old_blob:    Some(src_sha.to_string()),
-            new_blob:    None,
+            old_blob: Some(old_blob),
+            new_blob: None,
         },
-        ("D", _, true) => RawDiffEntry::Submodule {
-            path:        path.to_string(),
+        (GitChange::Deleted, _, true) => RawDiffEntry::Submodule {
+            path,
             change_kind: SubmoduleChange::Deleted,
         },
-        ("D", _, _) => RawDiffEntry::Deleted {
-            path:     path.to_string(),
-            old_blob: src_sha.to_string(),
-            old_mode: src_mode.to_string(),
+        (GitChange::Deleted, _, _) => RawDiffEntry::Deleted {
+            path,
+            old_blob,
+            old_mode,
         },
-        ("M" | "T", true, _) => RawDiffEntry::Symlink {
-            path:        path.to_string(),
+        (GitChange::Modified | GitChange::TypeChanged, true, _) => RawDiffEntry::Symlink {
+            path,
             change_kind: SymlinkChange::Modified,
-            old_blob:    Some(src_sha.to_string()),
-            new_blob:    Some(dst_sha.to_string()),
+            old_blob: Some(old_blob),
+            new_blob: Some(new_blob),
         },
-        ("M" | "T", _, true) => RawDiffEntry::Submodule {
-            path:        path.to_string(),
+        (GitChange::Modified | GitChange::TypeChanged, _, true) => RawDiffEntry::Submodule {
+            path,
             change_kind: SubmoduleChange::Modified,
         },
-        ("M" | "T", _, _) => RawDiffEntry::Modified {
-            path:     path.to_string(),
-            old_blob: src_sha.to_string(),
-            new_blob: dst_sha.to_string(),
-            new_mode: dst_mode.to_string(),
+        (GitChange::Modified | GitChange::TypeChanged, _, _) => RawDiffEntry::Modified {
+            path,
+            old_blob,
+            new_blob,
+            new_mode,
         },
         (other, _, _) => {
-            return Err(format!("unknown raw-diff status {other:?} for {path:?}"));
+            return Err(format!("unknown diff status {other:?} for {path:?}"));
         }
     })
 }
 
 pub use fabro_types::{DiffStats, DiffSummary};
 
-/// Output of `git diff --numstat`: which paths are binary, plus per-path
-/// `+/-` line totals for text files in the range. Both pieces come from a
-/// single git invocation so callers don't need to run two diffs.
+/// What `git diff --numstat` says about a range: which paths are binary,
+/// plus per-path `+/-` line totals for text files.
 #[derive(Debug, Default)]
 pub struct DiffNumstat {
     /// Repo-relative paths (post-rename) that git classifies as binary.
@@ -541,258 +426,86 @@ pub fn summarize_diff_numstat(numstat: &DiffNumstat) -> DiffSummary {
     }
 }
 
-/// Run `git diff --numstat` once and return both the set of binary paths and
-/// text-file `+/-` totals. The single call replaces the previous binary-only
-/// helper.
+/// The numstat of `base_sha..to_sha`: the set of binary paths and the
+/// text-file `+/-` totals, from one driver call.
 pub async fn list_diff_numstat(
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     base_sha: &str,
     to_sha: &str,
 ) -> std::result::Result<DiffNumstat, DiffError> {
-    let base_q = shell_quote(base_sha);
-    let to_q = shell_quote(to_sha);
-    let env = sandbox_git_hardening_env();
-    let cmd = format!("{GIT_HARDENED} diff --numstat --find-renames=50% {base_q}..{to_q}");
-    let res = sandbox
-        .exec_command(&cmd, 10_000, None, Some(&env), None)
+    let git = diff_facet(sandbox)?;
+    let options = GitDiffOptions::new(GitRevisionRange::new(base_sha).to(to_sha))
+        .find_renames(FIND_RENAMES_PERCENT)
+        .timeout(RUN_FILES_TIMEOUT);
+    let rows = git
+        .diff_numstat(sandbox.working_directory(), &options)
         .await
-        .map_err(|e| DiffError::Transient {
-            message: e.display_with_causes(),
-        })?;
-
-    if res.is_timed_out() {
-        return Err(DiffError::Transient {
-            message: "git diff --numstat timed out".to_string(),
-        });
-    }
-    if !res.is_success() {
-        let stderr = res.stderr.trim().to_string();
-        if is_permanent_git_error(&stderr) {
-            return Err(DiffError::Permanent { message: stderr });
-        }
-        return Err(DiffError::Transient { message: stderr });
-    }
+        .map_err(|error| diff_error(&error))?;
 
     let mut out = DiffNumstat::default();
-    for line in res.stdout.lines() {
-        // `-\t-\t<path>` marks binary. Rename lines read `<+>\t<->\t<path> =>
-        // <path>` or `<+>\t<->\t{<old> => <new>}`.
-        if let Some(rest) = line.strip_prefix("-\t-\t") {
-            out.binary_paths.insert(extract_new_path_from_numstat(rest));
-            continue;
+    for row in rows {
+        match (row.additions, row.deletions) {
+            (Some(additions), Some(deletions)) => {
+                out.line_stats_by_path.insert(row.path, DiffStats {
+                    additions: i64::try_from(additions).unwrap_or(i64::MAX),
+                    deletions: i64::try_from(deletions).unwrap_or(i64::MAX),
+                });
+            }
+            _ => {
+                out.binary_paths.insert(row.path);
+            }
         }
-        // Text rows: `<adds>\t<dels>\t<path>`. Tolerate malformed lines
-        // (e.g. trailing whitespace) by skipping rather than failing the
-        // whole diff — the rest of the response stays usable.
-        let mut parts = line.splitn(3, '\t');
-        let adds_s = parts.next().unwrap_or("");
-        let dels_s = parts.next().unwrap_or("");
-        let Some(path_s) = parts.next() else {
-            continue;
-        };
-        let Ok(adds) = adds_s.parse::<i64>() else {
-            continue;
-        };
-        let Ok(dels) = dels_s.parse::<i64>() else {
-            continue;
-        };
-        let path = extract_new_path_from_numstat(path_s);
-        out.line_stats_by_path.insert(path, DiffStats {
-            additions: adds,
-            deletions: dels,
-        });
     }
     Ok(out)
 }
 
-fn extract_new_path_from_numstat(rest: &str) -> String {
-    // Forms seen:
-    //   "simple/path"
-    //   "old => new"
-    //   "prefix/{old => new}/suffix"
-    if let Some(open_idx) = rest.find('{') {
-        if let Some(close_idx) = rest[open_idx..].find('}') {
-            let before = &rest[..open_idx];
-            let after = &rest[open_idx + close_idx + 1..];
-            let inside = &rest[open_idx + 1..open_idx + close_idx];
-            if let Some((_, new)) = inside.split_once(" => ") {
-                return format!("{before}{new}{after}");
-            }
-        }
-    }
-    if let Some((_, new)) = rest.split_once(" => ") {
-        return new.to_string();
-    }
-    rest.to_string()
-}
-
-/// Fetch blob metadata (size) for many SHAs in one sandbox invocation via
-/// `git cat-file --batch-check`.
-///
-/// The order of returned `BlobMeta` entries matches the input `shas` order.
-/// SHAs reported as `missing` by git yield `BlobMeta { size: None, .. }`.
+/// Blob sizes for many SHAs in one driver call, in the order of `shas`.
+/// A blob git does not have yields `BlobMeta { size: None, .. }`.
 pub async fn stream_blob_metadata(
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     shas: &[String],
 ) -> std::result::Result<Vec<BlobMeta>, DiffError> {
     if shas.is_empty() {
         return Ok(Vec::new());
     }
-    let env = sandbox_git_hardening_env();
-    let quoted_shas: Vec<String> = shas.iter().map(|s| shell_quote(s)).collect();
-    let cmd = format!(
-        "printf '%s\\n' {} | {GIT_HARDENED} cat-file --batch-check",
-        quoted_shas.join(" ")
-    );
-    let res = sandbox
-        .exec_command(&cmd, 10_000, None, Some(&env), None)
+    let git = diff_facet(sandbox)?;
+    let sizes = git
+        .blob_sizes(sandbox.working_directory(), shas)
         .await
-        .map_err(|e| DiffError::Transient {
-            message: e.display_with_causes(),
-        })?;
-
-    if res.is_timed_out() {
-        return Err(DiffError::Transient {
-            message: "git cat-file --batch-check timed out".to_string(),
-        });
-    }
-    if !res.is_success() {
-        return Err(DiffError::Transient {
-            message: format!("git cat-file --batch-check failed: {}", res.stderr.trim()),
-        });
-    }
-
-    let mut metas = Vec::with_capacity(shas.len());
-    for line in res.stdout.lines() {
-        // Lines: "<sha> <type> <size>" OR "<sha> missing"
-        let mut parts = line.split(' ');
-        let sha = parts
-            .next()
-            .ok_or_else(|| DiffError::Permanent {
-                message: format!("empty cat-file line: {line:?}"),
-            })?
-            .to_string();
-        let second = parts.next().unwrap_or("");
-        if second == "missing" {
-            metas.push(BlobMeta { sha, size: None });
-            continue;
-        }
-        let size_str = parts.next().unwrap_or("");
-        let size = size_str.parse::<u64>().map_err(|e| DiffError::Permanent {
-            message: format!("unparseable size {size_str:?} for {sha}: {e}"),
-        })?;
-        metas.push(BlobMeta {
-            sha,
-            size: Some(size),
-        });
-    }
-    Ok(metas)
+        .map_err(|error| diff_error(&error))?;
+    Ok(shas
+        .iter()
+        .zip(sizes)
+        .map(|(sha, size)| BlobMeta {
+            sha: sha.clone(),
+            size,
+        })
+        .collect())
 }
 
-/// Fetch blob contents for many SHAs in one sandbox invocation via
-/// `git cat-file --batch`.
+/// Blob contents for many SHAs in one driver call, in the order of `shas`.
 ///
 /// Contents are size-capped per blob: any blob exceeding `size_cap_bytes`
-/// returns `None` in its slot (the caller should flag that entry as
-/// truncated). Callers are expected to have pre-filtered binary blobs via
-/// [`list_diff_numstat`] — `--batch` output stream is text-oriented and
-/// non-UTF-8 bytes are lossy through the sandbox `String` channel.
+/// returns `None` in its slot (the caller flags that entry as truncated),
+/// as does a blob git does not have or one that is not UTF-8. Callers are
+/// expected to have pre-filtered binary blobs via [`list_diff_numstat`].
 pub async fn stream_blobs(
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     shas: &[String],
     size_cap_bytes: u64,
 ) -> std::result::Result<Vec<Option<String>>, DiffError> {
     if shas.is_empty() {
         return Ok(Vec::new());
     }
-    let env = sandbox_git_hardening_env();
-    let quoted_shas: Vec<String> = shas.iter().map(|s| shell_quote(s)).collect();
-    let cmd = format!(
-        "printf '%s\\n' {} | {GIT_HARDENED} cat-file --batch",
-        quoted_shas.join(" ")
-    );
-    let res = sandbox
-        .exec_command(&cmd, 10_000, None, Some(&env), None)
+    let git = diff_facet(sandbox)?;
+    let blobs = git
+        .blobs(sandbox.working_directory(), shas, size_cap_bytes)
         .await
-        .map_err(|e| DiffError::Transient {
-            message: e.display_with_causes(),
-        })?;
-
-    if res.is_timed_out() {
-        return Err(DiffError::Transient {
-            message: "git cat-file --batch timed out".to_string(),
-        });
-    }
-    if !res.is_success() {
-        return Err(DiffError::Transient {
-            message: format!("git cat-file --batch failed: {}", res.stderr.trim()),
-        });
-    }
-
-    parse_batch_output(&res.stdout, shas, size_cap_bytes)
-        .map_err(|message| DiffError::Permanent { message })
-}
-
-fn parse_batch_output(
-    stdout: &str,
-    shas: &[String],
-    size_cap_bytes: u64,
-) -> std::result::Result<Vec<Option<String>>, String> {
-    // `git cat-file --batch` output per blob:
-    //   "<sha> <type> <size>\n<content-bytes>\n"
-    // `missing` blob: "<sha> missing\n" (no content).
-    let mut results: Vec<Option<String>> = Vec::with_capacity(shas.len());
-    let bytes = stdout.as_bytes();
-    let mut pos = 0;
-
-    while pos < bytes.len() {
-        // Find end of header line.
-        let Some(nl_rel) = bytes[pos..].iter().position(|&b| b == b'\n') else {
-            break;
-        };
-        let header = std::str::from_utf8(&bytes[pos..pos + nl_rel])
-            .map_err(|e| format!("non-utf8 header in cat-file output: {e}"))?;
-        pos += nl_rel + 1;
-
-        let mut parts = header.split(' ');
-        let _sha = parts.next().unwrap_or("");
-        let second = parts.next().unwrap_or("");
-        if second == "missing" {
-            results.push(None);
-            continue;
-        }
-        let size_str = parts.next().unwrap_or("");
-        let size: usize = size_str
-            .parse()
-            .map_err(|e| format!("unparseable size {size_str:?}: {e}"))?;
-
-        let end = pos + size;
-        if end > bytes.len() {
-            return Err(format!(
-                "cat-file stream truncated: expected {size} bytes, have {}",
-                bytes.len() - pos
-            ));
-        }
-        if (size as u64) > size_cap_bytes {
-            results.push(None);
-        } else {
-            let content = std::str::from_utf8(&bytes[pos..end])
-                .map_err(|e| format!("non-utf8 blob contents: {e}"))?;
-            results.push(Some(content.to_string()));
-        }
-        pos = end;
-        // Trailing newline that delimits the next entry.
-        if pos < bytes.len() && bytes[pos] == b'\n' {
-            pos += 1;
-        }
-    }
-
-    // Pad with None if the stream didn't cover every requested SHA (e.g.
-    // duplicate-sha deduping by git).
-    while results.len() < shas.len() {
-        results.push(None);
-    }
-    Ok(results)
+        .map_err(|error| diff_error(&error))?;
+    Ok(blobs
+        .into_iter()
+        .map(|blob| blob.and_then(|bytes| String::from_utf8(bytes).ok()))
+        .collect())
 }
 
 #[cfg(test)]
@@ -802,216 +515,37 @@ mod tests {
         reason = "These unit tests use the real git CLI to construct sandbox-git fixture repositories and sync-write fixtures to disk."
     )]
 
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
-    use async_trait::async_trait;
-    use fabro_agent::{DirEntry, ExecResult, GrepOptions};
-    use fabro_types::CommandTermination;
-    use tokio_util::sync::CancellationToken;
+    use fabro_sandbox::test_support::{MockSandbox, exec_result};
+    use fabro_sandbox::{ExecResult, Termination};
 
     use super::*;
 
-    struct ScriptedSandbox {
-        exec_results: Mutex<VecDeque<ExecResult>>,
-        commands:     Mutex<Vec<String>>,
-        timeouts:     Mutex<Vec<u64>>,
-        write_paths:  Mutex<Vec<String>>,
-        delete_paths: Mutex<Vec<String>>,
-    }
-
-    impl ScriptedSandbox {
-        fn new(exec_results: Vec<ExecResult>) -> Self {
-            Self {
-                exec_results: Mutex::new(exec_results.into()),
-                commands:     Mutex::new(Vec::new()),
-                timeouts:     Mutex::new(Vec::new()),
-                write_paths:  Mutex::new(Vec::new()),
-                delete_paths: Mutex::new(Vec::new()),
-            }
+    /// A sandbox answering commands from `exec_results`, in order.
+    fn scripted(exec_results: &[ExecResult]) -> MockSandbox {
+        let sandbox = MockSandbox::default();
+        for result in exec_results {
+            sandbox.driver().scripted_exec().push_result(result.clone());
         }
-
-        fn commands(&self) -> Vec<String> {
-            self.commands
-                .lock()
-                .expect("commands lock poisoned")
-                .clone()
-        }
-
-        fn timeouts(&self) -> Vec<u64> {
-            self.timeouts
-                .lock()
-                .expect("timeouts lock poisoned")
-                .clone()
-        }
-
-        fn write_paths(&self) -> Vec<String> {
-            self.write_paths
-                .lock()
-                .expect("write_paths lock poisoned")
-                .clone()
-        }
-
-        fn delete_paths(&self) -> Vec<String> {
-            self.delete_paths
-                .lock()
-                .expect("delete_paths lock poisoned")
-                .clone()
-        }
-    }
-
-    #[async_trait]
-    impl Sandbox for ScriptedSandbox {
-        async fn read_file_bytes(&self, _path: &str) -> fabro_sandbox::Result<Vec<u8>> {
-            Err("read_file not implemented for ScriptedSandbox".into())
-        }
-
-        async fn write_file(&self, path: &str, _content: &str) -> fabro_sandbox::Result<()> {
-            self.write_paths
-                .lock()
-                .expect("write_paths lock poisoned")
-                .push(path.to_string());
-            Ok(())
-        }
-
-        async fn delete_file(&self, path: &str) -> fabro_sandbox::Result<()> {
-            self.delete_paths
-                .lock()
-                .expect("delete_paths lock poisoned")
-                .push(path.to_string());
-            Ok(())
-        }
-
-        async fn file_exists(&self, _path: &str) -> fabro_sandbox::Result<bool> {
-            Ok(false)
-        }
-
-        async fn list_directory(
-            &self,
-            _path: &str,
-            _depth: Option<usize>,
-        ) -> fabro_sandbox::Result<Vec<DirEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn exec_command(
-            &self,
-            command: &str,
-            timeout_ms: u64,
-            _working_dir: Option<&str>,
-            _env_vars: Option<&std::collections::HashMap<String, String>>,
-            _cancel_token: Option<CancellationToken>,
-        ) -> fabro_sandbox::Result<ExecResult> {
-            self.commands
-                .lock()
-                .expect("commands lock poisoned")
-                .push(command.to_string());
-            self.timeouts
-                .lock()
-                .expect("timeouts lock poisoned")
-                .push(timeout_ms);
-            self.exec_results
-                .lock()
-                .expect("exec_results lock poisoned")
-                .pop_front()
-                .ok_or_else(|| fabro_sandbox::Error::message("unexpected exec_command call"))
-        }
-
-        async fn grep(
-            &self,
-            _pattern: &str,
-            _path: &str,
-            _options: &GrepOptions,
-        ) -> fabro_sandbox::Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-
-        async fn glob(
-            &self,
-            _pattern: &str,
-            _path: Option<&str>,
-        ) -> fabro_sandbox::Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-
-        async fn download_file_to_local(
-            &self,
-            _remote_path: &str,
-            _local_path: &std::path::Path,
-        ) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        async fn upload_file_from_local(
-            &self,
-            _local_path: &std::path::Path,
-            _remote_path: &str,
-        ) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        async fn initialize(&self) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        async fn cleanup(&self) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        fn working_directory(&self) -> &str {
-            "/work"
-        }
-
-        fn platform(&self) -> &str {
-            "darwin"
-        }
-
-        fn os_version(&self) -> String {
-            "Darwin".to_string()
-        }
+        sandbox
     }
 
     fn exec_ok() -> ExecResult {
-        ExecResult {
-            stdout:      String::new(),
-            stderr:      String::new(),
-            exit_code:   Some(0),
-            termination: CommandTermination::Exited,
-            duration_ms: 1,
-        }
+        exec_result("", "", Some(0), Termination::Exited, 1)
     }
 
     fn exec_timed_out(duration_ms: u64) -> ExecResult {
-        ExecResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: None,
-            termination: CommandTermination::TimedOut,
-            duration_ms,
-        }
+        exec_result("", "", None, Termination::TimedOut, duration_ms)
     }
 
     fn exec_failed(exit_code: i32, stdout: &str, stderr: &str) -> ExecResult {
-        ExecResult {
-            stdout:      stdout.to_string(),
-            stderr:      stderr.to_string(),
-            exit_code:   Some(exit_code),
-            termination: CommandTermination::Exited,
-            duration_ms: 1,
-        }
-    }
-
-    #[test]
-    fn git_remote_disables_commit_and_tag_signing() {
-        assert!(GIT_REMOTE.contains("-c commit.gpgsign=false"));
-        assert!(GIT_REMOTE.contains("-c tag.gpgsign=false"));
+        exec_result(stdout, stderr, Some(exit_code), Termination::Exited, 1)
     }
 
     #[tokio::test]
     async fn git_checkpoint_reports_add_timeout() {
-        let sandbox = ScriptedSandbox::new(vec![exec_timed_out(77)]);
+        let sandbox = scripted(&[exec_timed_out(77)]);
         let err = git_checkpoint(
-            &sandbox,
+            &sandbox.sandbox(),
             "run1",
             "work",
             "success",
@@ -1022,7 +556,13 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(err.to_string(), "git add timed out after 77ms");
+        assert_eq!(err.to_string(), "git add failed");
+        let timed_out = matches!(
+            err.source.driver(),
+            Some(sandbox_driver::Error::Git(failure))
+                if failure.output().is_some_and(|output| output.termination() == Termination::TimedOut)
+        );
+        assert!(timed_out, "{}", fabro_sandbox::display_for_log(&err));
         assert!(
             fabro_sandbox::default_redacted_output_tail(&err).is_none(),
             "empty exec streams should not produce a tail"
@@ -1031,12 +571,12 @@ mod tests {
 
     #[tokio::test]
     async fn checked_git_checkpoint_fails_before_checkpoint_when_probe_fails() {
-        let sandbox = ScriptedSandbox::new(vec![exec_failed(127, "", "git missing\n")]);
+        let sandbox = scripted(&[exec_failed(127, "", "git missing\n")]);
         let runtime = crate::sandbox_git_runtime::SandboxGitRuntime::new();
 
         let err = checked_git_checkpoint(
             &runtime,
-            &sandbox,
+            &sandbox.sandbox(),
             "run1",
             "work",
             "success",
@@ -1063,9 +603,9 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkpoint_reports_commit_timeout() {
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_timed_out(88)]);
+        let sandbox = scripted(&[exec_ok(), exec_timed_out(88)]);
         let err = git_checkpoint(
-            &sandbox,
+            &sandbox.sandbox(),
             "run1",
             "work",
             "success",
@@ -1076,14 +616,15 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(err.to_string(), "git commit timed out after 88ms");
+        assert_eq!(err.to_string(), "git commit failed");
     }
 
     #[tokio::test]
-    async fn git_checkpoint_reports_rev_parse_killed_without_output() {
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_failed(-1, "", "")]);
+    async fn git_checkpoint_reports_a_failed_sha_read_as_the_commit_failing() {
+        // add, commit, then the driver's own rev-parse of the new HEAD.
+        let sandbox = scripted(&[exec_ok(), exec_ok(), exec_failed(-1, "", "")]);
         let err = git_checkpoint(
-            &sandbox,
+            &sandbox.sandbox(),
             "run1",
             "work",
             "success",
@@ -1094,116 +635,92 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(err.to_string(), "git rev-parse HEAD failed (exit -1)");
+        assert_eq!(err.to_string(), "git commit failed");
     }
 
+    /// The commit message and author travel in the driver's own commit
+    /// command, and repository hooks never run: the driver disables them
+    /// whatever the checkpoint settings say.
     #[tokio::test]
-    async fn git_checkpoint_uses_unique_commit_message_paths_for_same_run_and_node() {
-        let sandbox = ScriptedSandbox::new(vec![
-            exec_ok(),
-            exec_ok(),
-            exec_ok(),
-            exec_ok(),
-            exec_ok(),
-            exec_ok(),
-        ]);
-        let author = crate::git::GitAuthor::default();
-
-        let first = git_checkpoint(
-            &sandbox,
-            "run1",
-            "work",
-            "success",
-            1,
-            &RunCheckpointSettings::default(),
-            &author,
-        )
-        .await;
-        let second = git_checkpoint(
-            &sandbox,
-            "run1",
-            "work",
-            "success",
-            1,
-            &RunCheckpointSettings::default(),
-            &author,
-        )
-        .await;
-
-        assert!(first.is_ok(), "first checkpoint failed: {:?}", first.err());
-        assert!(
-            second.is_ok(),
-            "second checkpoint failed: {:?}",
-            second.err()
-        );
-
-        let write_paths = sandbox.write_paths();
-        assert_eq!(write_paths.len(), 2);
-        assert!(
-            write_paths
-                .iter()
-                .all(|path| path.starts_with("/tmp/fabro-commit-msg-")),
-            "unexpected commit message paths: {write_paths:?}"
-        );
-        assert_ne!(write_paths[0], write_paths[1]);
-
-        let delete_paths = sandbox.delete_paths();
-        assert_eq!(delete_paths, write_paths);
-
-        let commands = sandbox.commands();
-        let commit_commands = commands
-            .iter()
-            .filter(|command| command.contains(" commit "))
-            .collect::<Vec<_>>();
-        assert_eq!(commit_commands.len(), 2);
-        for (command, path) in commit_commands.iter().zip(write_paths.iter()) {
-            assert!(
-                command.contains(&format!("-F {}", shell_quote(path))),
-                "expected commit command to use {path:?}, got {command:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn git_checkpoint_uses_configured_timeout_for_add_and_commit() {
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_ok()]);
+    async fn git_checkpoint_commits_through_the_hardened_driver_command() {
+        let mut sha = exec_ok();
+        sha.stdout = b"abc123\n".to_vec();
+        let sandbox = scripted(&[exec_ok(), exec_ok(), sha]);
         let checkpoint = RunCheckpointSettings {
-            commit_timeout_ms: 600_000,
+            skip_git_hooks: false,
             ..RunCheckpointSettings::default()
         };
-        git_checkpoint(
-            &sandbox,
+        let author = crate::git::GitAuthor::default();
+
+        let sha = git_checkpoint(
+            &sandbox.sandbox(),
             "run1",
             "work",
             "success",
             1,
             &checkpoint,
-            &crate::git::GitAuthor::default(),
+            &author,
         )
         .await
-        .expect("checkpoint should succeed");
+        .expect("checkpoint succeeds");
+        assert_eq!(sha, "abc123");
 
-        assert_eq!(sandbox.timeouts(), vec![600_000, 600_000, 10_000]);
+        let commands = sandbox.driver().scripted_exec().commands();
+        let add = commands
+            .iter()
+            .find(|command| command.contains("'add' '-A'"))
+            .expect("the add ran");
+        assert!(
+            add.contains(":(glob,exclude)**/node_modules/**"),
+            "built-in excludes are pathspecs: {add}"
+        );
+        let commit = commands
+            .iter()
+            .find(|command| command.contains("'commit'"))
+            .expect("the commit ran");
+        assert!(commit.contains("core.hooksPath=/dev/null"), "{commit}");
+        assert!(commit.contains("commit.gpgsign=false"), "{commit}");
+        assert!(commit.contains("'--allow-empty'"), "{commit}");
+        assert!(
+            commit.contains("fabro(run1): work (success)")
+                && commit.contains("Fabro-Run: run1")
+                && !commit.contains("Fabro-Checkpoint"),
+            "{commit}"
+        );
+        assert!(
+            commit.contains(&format!("user.name={}", author.name)),
+            "{commit}"
+        );
+        assert!(
+            sandbox.written_files().is_empty(),
+            "no message file is written"
+        );
     }
 
     #[tokio::test]
     async fn git_diff_reports_timeout() {
-        let sandbox = ScriptedSandbox::new(vec![exec_timed_out(99)]);
-        let err = git_diff_with_timeout(&sandbox, "HEAD~1", 99)
+        let sandbox = scripted(&[exec_timed_out(99)]);
+        let err = git_diff_with_timeout(&sandbox.sandbox(), "HEAD~1", 99)
             .await
             .unwrap_err();
 
-        assert_eq!(err.to_string(), "git diff timed out after 99ms");
+        assert_eq!(err.to_string(), "git diff failed");
+        let timed_out = matches!(
+            err.source.driver(),
+            Some(sandbox_driver::Error::Git(failure))
+                if failure.output().is_some_and(|output| output.termination() == Termination::TimedOut)
+        );
+        assert!(timed_out, "{}", fabro_sandbox::display_for_log(&err));
     }
 
     #[tokio::test]
     async fn git_diff_reports_failure_detail() {
-        let sandbox = ScriptedSandbox::new(vec![exec_failed(128, "", "fatal: bad revision\n")]);
-        let err = git_diff_with_timeout(&sandbox, "bad-base", 100)
+        let sandbox = scripted(&[exec_failed(128, "", "fatal: bad revision\n")]);
+        let err = git_diff_with_timeout(&sandbox.sandbox(), "bad-base", 100)
             .await
             .unwrap_err();
 
-        assert_eq!(err.to_string(), "git diff failed (exit 128)");
+        assert_eq!(err.to_string(), "git diff failed");
         assert!(!err.to_string().contains("fatal: bad revision"));
 
         let tail = fabro_sandbox::default_redacted_output_tail(&err).expect("tail present");
@@ -1211,60 +728,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_checkpoint_appends_no_verify_when_skip_hooks_enabled() {
-        // add, commit, rev-parse
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_ok()]);
-        let checkpoint = RunCheckpointSettings {
-            skip_git_hooks: true,
-            ..RunCheckpointSettings::default()
-        };
-        git_checkpoint(
-            &sandbox,
-            "run1",
-            "work",
-            "success",
-            1,
-            &checkpoint,
-            &crate::git::GitAuthor::default(),
-        )
-        .await
-        .expect("checkpoint should succeed");
-
-        let commands = sandbox.commands();
-        let commit_cmd = commands
-            .iter()
-            .find(|c| c.contains(" commit "))
-            .expect("commit command should be issued");
+    async fn git_diff_passes_the_range_and_timeout_to_the_driver() {
+        let mut patch = exec_ok();
+        patch.stdout = b"diff --git a/x b/x\n".to_vec();
+        let sandbox = scripted(&[patch]);
+        let diff = git_diff_with_timeout(&sandbox.sandbox(), "base-sha", 5_000)
+            .await
+            .expect("diff succeeds");
+        assert_eq!(diff, "diff --git a/x b/x\n");
+        let commands = sandbox.driver().scripted_exec().commands();
         assert!(
-            commit_cmd.contains("--no-verify"),
-            "commit command should include --no-verify when skip_git_hooks=true; got {commit_cmd:?}"
+            commands[0].contains("'diff'") && commands[0].contains("'base-sha..HEAD'"),
+            "{}",
+            commands[0]
         );
-    }
-
-    #[tokio::test]
-    async fn git_checkpoint_omits_no_verify_when_skip_hooks_disabled() {
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_ok()]);
-        git_checkpoint(
-            &sandbox,
-            "run1",
-            "work",
-            "success",
-            1,
-            &RunCheckpointSettings::default(),
-            &crate::git::GitAuthor::default(),
-        )
-        .await
-        .expect("checkpoint should succeed");
-
-        let commands = sandbox.commands();
-        let commit_cmd = commands
-            .iter()
-            .find(|c| c.contains(" commit "))
-            .expect("commit command should be issued");
-        assert!(
-            !commit_cmd.contains("--no-verify"),
-            "commit command should omit --no-verify when skip_git_hooks=false; got {commit_cmd:?}"
-        );
+        assert_eq!(sandbox.captured_timeouts(), vec![5_000]);
     }
 
     #[tokio::test]
@@ -1299,7 +777,9 @@ mod tests {
         std::fs::create_dir_all(repo.join(".venv/lib")).unwrap();
         std::fs::write(repo.join(".venv/lib/site.py"), "venv").unwrap();
 
-        let sandbox = fabro_agent::LocalSandbox::new(repo.to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(repo.to_path_buf())
+            .await
+            .unwrap();
         let author = crate::git::GitAuthor::default();
 
         // Call git_checkpoint with empty user excludes — built-in excludes should still
@@ -1327,7 +807,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let staged_files: Vec<&str> = status.stdout.lines().collect();
+        let status_stdout = status.stdout_lossy();
+        let staged_files: Vec<&str> = status_stdout.lines().collect();
         assert!(
             staged_files.contains(&"hello.txt"),
             "expected hello.txt to be staged, got: {staged_files:?}"
@@ -1397,7 +878,9 @@ mod tests {
         std::fs::remove_file(repo.join("drop.txt")).unwrap();
         let head = git_commit_all(repo, "change");
 
-        let sandbox = fabro_agent::LocalSandbox::new(repo.to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(repo.to_path_buf())
+            .await
+            .unwrap();
         let entries = list_changed_files_raw(&sandbox, &base, &head)
             .await
             .unwrap();
@@ -1436,7 +919,9 @@ mod tests {
         std::fs::write(repo.join("new.txt"), &content).unwrap();
         let head = git_commit_all(repo, "rename");
 
-        let sandbox = fabro_agent::LocalSandbox::new(repo.to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(repo.to_path_buf())
+            .await
+            .unwrap();
         let entries = list_changed_files_raw(&sandbox, &base, &head)
             .await
             .unwrap();
@@ -1480,7 +965,9 @@ mod tests {
         std::fs::write(repo.join("logo.png"), png).unwrap();
         let head = git_commit_all(repo, "change");
 
-        let sandbox = fabro_agent::LocalSandbox::new(repo.to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(repo.to_path_buf())
+            .await
+            .unwrap();
         let stats = list_diff_numstat(&sandbox, &base, &head).await.unwrap();
 
         assert!(
@@ -1524,7 +1011,9 @@ mod tests {
             sha_by_name.insert(path.to_string(), sha.to_string());
         }
 
-        let sandbox = fabro_agent::LocalSandbox::new(repo.to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(repo.to_path_buf())
+            .await
+            .unwrap();
         let shas = vec![sha_by_name["a.txt"].clone(), sha_by_name["b.txt"].clone()];
         let metas = stream_blob_metadata(&sandbox, &shas).await.unwrap();
         assert_eq!(metas.len(), 2);
@@ -1560,7 +1049,9 @@ mod tests {
             sha_by_name.insert(path.to_string(), sha.to_string());
         }
 
-        let sandbox = fabro_agent::LocalSandbox::new(repo.to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(repo.to_path_buf())
+            .await
+            .unwrap();
         let shas = vec![sha_by_name["a.txt"].clone(), sha_by_name["big.txt"].clone()];
 
         // size_cap = 100 bytes — "hello\n" (6) stays, 200-byte blob truncates.
@@ -1578,24 +1069,13 @@ mod tests {
         std::fs::write(repo.join("x"), "x").unwrap();
         git_commit_all(repo, "seed");
 
-        let sandbox = fabro_agent::LocalSandbox::new(repo.to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(repo.to_path_buf())
+            .await
+            .unwrap();
         let err =
             list_changed_files_raw(&sandbox, "0000000000000000000000000000000000000000", "HEAD")
                 .await
                 .expect_err("expected error for unknown base sha");
         assert!(matches!(err, DiffError::Permanent { .. }), "err: {err:?}");
-    }
-
-    #[test]
-    fn extract_new_path_from_numstat_handles_brace_renames() {
-        assert_eq!(extract_new_path_from_numstat("simple/path"), "simple/path");
-        assert_eq!(
-            extract_new_path_from_numstat("old.txt => new.txt"),
-            "new.txt"
-        );
-        assert_eq!(
-            extract_new_path_from_numstat("src/{old => new}/file.rs"),
-            "src/new/file.rs"
-        );
     }
 }

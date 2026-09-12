@@ -1,4 +1,4 @@
-use fabro_model::Catalog;
+use fabro_llm::lithos_catalog::Catalog;
 use fabro_validate::LintRule;
 
 use super::types::{Transformed, Validated};

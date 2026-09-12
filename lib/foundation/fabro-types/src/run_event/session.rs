@@ -1,4 +1,4 @@
-use fabro_model::ProviderId;
+use lithos_llm::catalog::ProviderId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

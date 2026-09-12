@@ -10,7 +10,7 @@ description = "HTTP server for Fabro pipelines"
 doctest = false
 
 [features]
-test-support = ["fabro-store/test-support"]
+test-support = ["fabro-store/test-support", "fabro-llm/test-support", "fabro-auth/test-support"]
 
 [[test]]
 name = "it"
@@ -34,17 +34,19 @@ fabro-slack = { path = "../../components/fabro-slack" }
 fabro-workflow = { path = "../../components/fabro-workflow" }
 fabro-workflow-version = { path = "../../components/fabro-workflow-version" }
 fabro-validate = { path = "../../components/fabro-validate" }
-fabro-sandbox = { path = "../../components/fabro-sandbox", features = ["daytona", "docker"] }
+fabro-sandbox = { path = "../../components/fabro-sandbox" }
+sandbox-driver.workspace = true
 fabro-github = { path = "../../components/fabro-github" }
-fabro-agent = { path = "../../components/fabro-agent" }
+pebble-agent.workspace = true
+pebble-coding-agent.workspace = true
 fabro-llm = { path = "../../components/fabro-llm" }
 fabro-manifest = { path = "../../components/fabro-manifest" }
 fabro-mcp-store = { path = "../../components/fabro-mcp-store" }
-fabro-model = { path = "../../foundation/fabro-model" }
 fabro-proc = { path = "../../foundation/fabro-proc" }
 fabro-template = { path = "../../foundation/fabro-template" }
 fabro-tool = { path = "../../components/fabro-tool" }
 fabro-types = { path = "../../foundation/fabro-types" }
+lithos-llm = { workspace = true, features = ["runtime"] }
 fabro-util = { path = "../../foundation/fabro-util" }
 fabro-api = { path = "../../foundation/fabro-api" }
 fabro-client = { path = "../../foundation/fabro-client" }
@@ -113,6 +115,7 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 fabro-auth = { path = "../../foundation/fabro-auth", features = ["test-support"] }
+fabro-llm = { path = "../../components/fabro-llm", features = ["test-support"] }
 git2.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = "0.5"

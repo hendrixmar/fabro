@@ -50,7 +50,7 @@ Relevant current Fabro sources:
 - `docs-internal/events-strategy.md`
 - `lib/components/fabro-workflow/src/event.rs`
 - `lib/foundation/fabro-types/src/run_event/mod.rs`
-- `lib/components/fabro-agent/src/types.rs`
+- pebble's `CodingEvent` (`pebble-coding-agent`, re-exported from `fabro_types`)
 
 ## Comparison Matrix
 

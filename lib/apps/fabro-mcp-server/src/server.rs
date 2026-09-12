@@ -1,8 +1,8 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use fabro_manifest::SuppliedWorkflowVersionPackager;
 use fabro_tool::fabro_client::ClientBackend;
 use fabro_tool::{self as run_tools, FabroToolBackend};
 use fabro_util::version::FABRO_VERSION;
@@ -17,14 +17,12 @@ use tokio::time;
 use tracing::warn;
 
 use crate::executable_monitor::ExecutableMonitor;
-use crate::manifest_builder::McpRunManifestBuilder;
 use crate::{FabroMcpServerSettings, SERVER_NAME};
 
 #[derive(Clone)]
 pub(crate) struct FabroMcpServer {
     settings:    Arc<FabroMcpServerSettings>,
     backend:     Arc<OnceCell<Arc<dyn FabroToolBackend>>>,
-    cwd:         PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
@@ -74,39 +72,59 @@ impl ServerHandler for FabroMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(SERVER_NAME, FABRO_VERSION).with_title("Fabro"))
-            .with_instructions("Use these tools to create, inspect, control, wait for, and read events from Fabro workflow runs.")
+            .with_instructions("Use these tools to register workflow versions and create, inspect, control, wait for, and read events from Fabro workflow runs.")
     }
 }
 
 #[tool_router(router = tool_router)]
 impl FabroMcpServer {
     pub(crate) fn new(settings: Arc<FabroMcpServerSettings>) -> Self {
-        let cwd = settings.cwd.clone();
         Self {
             settings,
             backend: Arc::new(OnceCell::new()),
-            cwd,
             tool_router: Self::tool_router(),
         }
     }
 
     #[tool(
-        name = "fabro_run_create",
-        description = "Create one or more Fabro workflow runs, optionally under a parent run, starting them by default."
+        name = "fabro_workflow_version_create",
+        description = "Register supplied workflow file contents and all local dependencies as a reusable immutable workflow version ID. Obtain files with shell/read tools first; this does not create or start a run."
     )]
-    async fn fabro_run_create(
+    async fn fabro_workflow_version_create(
         &self,
-        params: Parameters<run_tools::FabroRunCreateParams>,
+        params: Parameters<run_tools::FabroWorkflowVersionCreateParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let params = match run_tools::ValidatedCreateRuns::try_from(params.0) {
-            Ok(params) => params,
+        let source = match run_tools::ValidatedWorkflowVersionCreate::try_from(params.0) {
+            Ok(source) => source,
             Err(err) => return Ok(error_result(&err)),
         };
         let backend = match self.backend().await {
             Ok(backend) => backend,
             Err(err) => return Ok(error_result(&err)),
         };
-        match run_tools::create_runs(backend, &self.cwd, &self.settings.config_path, params).await {
+        match run_tools::create_workflow_version(backend, source).await {
+            Ok(result) => success_result(&result, run_tools::workflow_version_create_text(&result)),
+            Err(err) => Ok(error_result(&err)),
+        }
+    }
+
+    #[tool(
+        name = "fabro_run_create",
+        description = "Create runs from registered workflow_version_id values and canonical RunIntent settings. Register contents with fabro_workflow_version_create first. Standalone calls require an explicit target; native workers may inherit the parent target. Starts runs by default."
+    )]
+    async fn fabro_run_create(
+        &self,
+        params: Parameters<run_tools::FabroRunCreateParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = params.0;
+        if let Err(err) = params.validate(run_tools::CreateRunOptions::default()) {
+            return Ok(error_result(&err));
+        }
+        let backend = match self.backend().await {
+            Ok(backend) => backend,
+            Err(err) => return Ok(error_result(&err)),
+        };
+        match run_tools::create_runs(backend, params).await {
             Ok(result) => success_result(&result, run_tools::create_runs_text(&result)),
             Err(err) => Ok(error_result(&err)),
         }
@@ -251,8 +269,9 @@ impl FabroMcpServer {
                     .await
                     .map(|client| {
                         Arc::new(
-                            ClientBackend::new(Arc::new(client))
-                                .with_manifest_builder(Arc::new(McpRunManifestBuilder)),
+                            ClientBackend::new(Arc::new(client)).with_workflow_version_packager(
+                                Arc::new(SuppliedWorkflowVersionPackager),
+                            ),
                         ) as Arc<dyn FabroToolBackend>
                     })
                     .map_err(|err| run_tools::ToolError::from_anyhow(&err))
@@ -283,7 +302,7 @@ fn error_result(err: &run_tools::ToolError) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use serde_json::Value;
@@ -291,11 +310,64 @@ mod tests {
     use super::*;
     use crate::FabroMcpServerSettings;
 
+    #[tokio::test]
+    async fn workflow_version_mcp_surface_matches_catalog_and_returns_minimal_result() {
+        let mock = httpmock::MockServer::start_async().await;
+        let version = fabro_types::WorkflowVersion::new(
+            "workflow".parse().unwrap(),
+            BTreeMap::from([("workflow".parse().unwrap(), "digraph W {}".to_string())]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let id = version.id().unwrap();
+        let upload = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/api/v1/workflow-versions")
+                    .json_body_obj(&version);
+                then.status(201)
+                    .json_body(serde_json::json!({"workflow_version_id":id}));
+            })
+            .await;
+        let url = mock.url("");
+        let server = FabroMcpServer::new(Arc::new(FabroMcpServerSettings {
+            client_factory: Arc::new(move || {
+                let url = url.clone();
+                Box::pin(async move { fabro_client::Client::new_no_proxy(&url) })
+            }),
+        }));
+        let tools = server.tool_router.list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "fabro_workflow_version_create")
+            .unwrap();
+        let definition = run_tools::tool_definitions()
+            .iter()
+            .find(|tool| tool.name == "fabro_workflow_version_create")
+            .unwrap();
+        let mut expected = definition.parameters.clone();
+        expected.as_object_mut().unwrap().remove("$schema");
+        let mut actual = Value::Object(tool.input_schema.as_ref().clone());
+        actual.as_object_mut().unwrap().remove("$schema");
+        assert_eq!(actual, expected);
+        assert_eq!(tool.description.as_deref(), Some(definition.description));
+        let params =
+            serde_json::json!({"entrypoint":"workflow","files":{"workflow":"digraph W {}"}});
+        let result = server
+            .fabro_workflow_version_create(Parameters(serde_json::from_value(params).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({"workflow_version_id":id}))
+        );
+        assert_ne!(result.is_error, Some(true));
+        upload.assert_calls_async(1).await;
+    }
+
     #[test]
     fn server_info_reports_fabro_version() {
         let settings = FabroMcpServerSettings {
-            cwd:            PathBuf::from("."),
-            config_path:    PathBuf::from("fabro.toml"),
             client_factory: Arc::new(|| {
                 Box::pin(async { panic!("client should not be constructed while reading info") })
             }),
@@ -310,8 +382,6 @@ mod tests {
     #[test]
     fn fabro_run_pair_tool_is_registered_with_stage_based_schema() {
         let settings = FabroMcpServerSettings {
-            cwd:            PathBuf::from("."),
-            config_path:    PathBuf::from("fabro.toml"),
             client_factory: Arc::new(|| {
                 Box::pin(async { panic!("client should not be constructed while listing tools") })
             }),
@@ -337,10 +407,8 @@ mod tests {
     }
 
     #[test]
-    fn fabro_run_create_tool_advertises_string_and_object_run_specs() {
+    fn fabro_run_create_tool_advertises_canonical_version_contract() {
         let settings = FabroMcpServerSettings {
-            cwd:            PathBuf::from("."),
-            config_path:    PathBuf::from("fabro.toml"),
             client_factory: Arc::new(|| {
                 Box::pin(async { panic!("client should not be constructed while listing tools") })
             }),
@@ -352,35 +420,15 @@ mod tests {
             .find(|tool| tool.name.as_ref() == "fabro_run_create")
             .expect("fabro_run_create should be registered");
         let schema = Value::Object(tool.input_schema.as_ref().clone());
-        let variants = schema
-            .pointer("/properties/runs/items/anyOf")
-            .and_then(Value::as_array)
-            .expect("runs items should advertise string and object variants");
-
-        assert!(
-            variants.iter().any(|variant| variant["type"] == "string"),
-            "runs items should include workflow string shorthand: {schema}"
-        );
-        let object_variant = variants
+        let definition = run_tools::tool_definitions()
             .iter()
-            .find(|variant| variant["type"] == "object")
-            .unwrap_or_else(|| {
-                panic!("runs items should include object create spec variant: {schema}")
-            });
-        assert!(
-            object_variant.pointer("/properties/workflow").is_some(),
-            "object create spec should expose workflow property: {schema}"
-        );
-        assert!(
-            object_variant.pointer("/properties/goal_file").is_some(),
-            "object create spec should expose goal_file property: {schema}"
-        );
-        assert!(
-            object_variant
-                .get("required")
-                .and_then(Value::as_array)
-                .is_some_and(|required| required.iter().any(|name| name == "workflow")),
-            "object create spec should require workflow: {schema}"
-        );
+            .find(|definition| definition.name == "fabro_run_create")
+            .unwrap();
+        let mut expected = definition.parameters.clone();
+        expected.as_object_mut().unwrap().remove("$schema");
+        let mut actual = schema;
+        actual.as_object_mut().unwrap().remove("$schema");
+        assert_eq!(actual, expected);
+        assert_eq!(tool.description.as_deref(), Some(definition.description));
     }
 }

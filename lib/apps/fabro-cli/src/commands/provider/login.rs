@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use fabro_api::types;
 use fabro_auth::{AuthContextRequest, AuthMethod, LoginResult, OPENAI_CODEX_VAULT_SECRET_NAME};
-use fabro_model::ProviderId;
 use fabro_util::printer::Printer;
 use fabro_util::terminal::Styles;
+use lithos_llm::catalog::ProviderId;
 use tokio::task::spawn_blocking;
 
 use crate::args::ProviderLoginArgs;

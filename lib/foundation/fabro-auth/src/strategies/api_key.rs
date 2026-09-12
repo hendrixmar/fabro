@@ -1,6 +1,5 @@
 use async_trait::async_trait;
-use fabro_model::catalog::CatalogProvider;
-use fabro_model::{CredentialRef, ProviderId};
+use lithos_llm::catalog::{CatalogProvider, ProviderId};
 
 use crate::context::{AuthContextRequest, AuthContextResponse};
 use crate::strategy::{AuthStrategy, LoginResult};
@@ -15,24 +14,11 @@ pub struct ApiKeyStrategy {
 impl ApiKeyStrategy {
     #[must_use]
     pub fn new(provider: &CatalogProvider) -> Self {
-        let env_var_names = provider
-            .auth
-            .as_ref()
-            .map(|auth| {
-                auth.credentials
-                    .iter()
-                    .filter_map(|credential_ref| match credential_ref {
-                        CredentialRef::Env(name) => Some(name.clone()),
-                        CredentialRef::Vault(_) | CredentialRef::AwsSigv4 => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         Self {
-            provider_id: provider.id.clone(),
-            display_name: provider.display_name.clone(),
-            env_var_names,
-            api_key_url: provider.api_key_url.clone(),
+            provider_id:   provider.id().clone(),
+            display_name:  provider.display_name().to_string(),
+            env_var_names: crate::secret_names(provider),
+            api_key_url:   provider.api_key_url().map(str::to_string),
         }
     }
 }

@@ -1,4 +1,4 @@
-use fabro_model::ProviderId;
+use lithos_llm::catalog::ProviderId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthContextRequest {

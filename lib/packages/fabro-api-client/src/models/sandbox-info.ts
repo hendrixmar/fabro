@@ -15,63 +15,15 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { SandboxNetwork } from './sandbox-network';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxProviderKind } from './sandbox-provider-kind';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxResources } from './sandbox-resources';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxState } from './sandbox-state';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { SandboxTimestamps } from './sandbox-timestamps';
+import type { SandboxStatus } from './sandbox-status';
 
 /**
- * Provider-backed inventory record for a Fabro-managed sandbox.
+ * One sandbox of fabro\'s provider-backed inventory, as the provider fabro connected it through and the sandbox driver\'s status.
  */
 export interface SandboxInfo {
-    'provider': SandboxProviderKind;
     /**
-     * Provider-native sandbox id.
+     * Sandbox provider kind. `local`, `docker`, and `daytona` are bundled with the server; any other value names a sandbox-driver plugin configured under `server.sandbox.providers.<kind>`.
      */
-    'id': string;
-    /**
-     * Provider display name when distinct from the native id.
-     */
-    'display_name'?: string | null;
-    'state': SandboxState;
-    /**
-     * Original provider state string before normalization. Display/debugging only; UI behavior keys off `state`.
-     */
-    'native_state'?: string | null;
-    /**
-     * Provider image when surfaced by the sandbox provider.
-     */
-    'image'?: string | null;
-    /**
-     * Provider snapshot when surfaced by the sandbox provider.
-     */
-    'snapshot'?: string | null;
-    /**
-     * Provider region or target. Null for local-style providers.
-     */
-    'region'?: string | null;
-    /**
-     * Provider dashboard URL for this sandbox when available.
-     */
-    'web_url'?: string | null;
-    /**
-     * Provider-reported or Fabro-default working directory when available.
-     */
-    'working_directory'?: string | null;
-    'resources': SandboxResources;
-    'network': SandboxNetwork;
-    /**
-     * Provider-reported labels.
-     */
-    'labels': { [key: string]: string; };
-    'timestamps': SandboxTimestamps;
+    'provider': string;
+    'status': SandboxStatus;
 }

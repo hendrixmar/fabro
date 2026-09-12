@@ -1,7 +1,7 @@
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::ModelCosts as ApiModelCosts;
-use fabro_model::ModelCosts;
+use fabro_types::ModelCosts;
 
 #[test]
 fn model_costs_reuses_canonical_type() {
@@ -16,7 +16,7 @@ fn model_costs_json_matches_openapi_shape() {
         cache_input_cost_per_mtok: Some(0.5),
     };
 
-    let json = serde_json::to_value(&costs).unwrap();
+    let json = serde_json::to_value(costs).unwrap();
     assert_eq!(json["input_cost_per_mtok"], 5.0);
     assert_eq!(json["output_cost_per_mtok"], 25.0);
     assert_eq!(json["cache_input_cost_per_mtok"], 0.5);

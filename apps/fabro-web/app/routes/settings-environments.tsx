@@ -9,7 +9,7 @@ import type { Environment } from "@qltysh/fabro-api-client";
 import { ApiError, apiData, environmentsApi } from "../lib/api-client";
 import { useEnvironments, useServerSettings } from "../lib/queries";
 import { queryKeys } from "../lib/query-keys";
-import { CREATABLE_PROVIDERS, providerLabel } from "../lib/environment-providers";
+import { creatableProviders, providerLabel } from "../lib/environment-providers";
 import {
   Badge,
   Muted,
@@ -67,9 +67,7 @@ const NEW_BUTTON_CLASS =
 // environment's lifetime. `local` is never offered (it's reserved/in-memory).
 function NewEnvironmentMenu() {
   const { data } = useServerSettings();
-  const providers = data
-    ? CREATABLE_PROVIDERS.filter((provider) => data.server.sandbox.providers[provider].enabled)
-    : [];
+  const providers = data ? creatableProviders(data.server.sandbox.providers) : [];
 
   if (providers.length === 0) {
     return (

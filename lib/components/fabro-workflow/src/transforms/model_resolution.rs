@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use fabro_graphviz::graph::{AttrValue, Graph};
-use fabro_model::{Catalog, ProviderId};
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::selection;
+use lithos_llm::catalog::ProviderId;
 
 use super::Transform;
 use crate::error::Error;
@@ -19,7 +21,7 @@ pub struct ModelResolutionTransform {
 impl ModelResolutionTransform {
     #[must_use]
     pub fn new(catalog: Arc<Catalog>) -> Self {
-        let eligible_providers = catalog.all_provider_ids();
+        let eligible_providers = catalog.enabled_provider_ids().into_iter().collect();
         Self {
             catalog,
             default_provider: None,
@@ -65,14 +67,19 @@ impl ModelResolutionTransform {
         explicit_provider: Option<&ProviderId>,
     ) -> Result<(String, ProviderId), Error> {
         let selected = if self.catalog_fallback {
-            self.catalog.resolve_selection_with_catalog_fallback(
+            selection::resolve_selection_with_catalog_fallback(
+                &self.catalog,
                 Some(model),
                 explicit_provider,
                 &self.eligible_providers,
             )
         } else {
-            self.catalog
-                .resolve_selection(Some(model), explicit_provider, &self.eligible_providers)
+            selection::resolve_selection(
+                &self.catalog,
+                Some(model),
+                explicit_provider,
+                &self.eligible_providers,
+            )
         }?;
         Ok((selected.model, selected.provider))
     }
@@ -148,45 +155,40 @@ mod tests {
     use std::sync::Arc;
 
     use fabro_graphviz::graph::{AttrValue, Graph, Node};
-    use fabro_model::catalog::LlmCatalogSettings;
+    use fabro_llm::test_support::{test_catalog, test_catalog_with_overlay};
 
     use super::*;
 
+    /// An operator-defined provider with one aliased model, the shape an
+    /// `[llm]` overlay produces. It joins the built-ins rather than replacing
+    /// them: lithos catalogs are layered, never standalone.
     fn custom_catalog() -> Arc<Catalog> {
-        let settings: LlmCatalogSettings = toml::from_str(
+        Arc::new(test_catalog_with_overlay(
             r#"
-[providers.venice]
-display_name = "Venice"
-adapter = "openai_compatible"
-agent_profile = "openai"
+[providers.acme-venice]
+display_name = "Acme Venice"
+adapter = "openai-compatible"
+codec = "openai-chat"
 base_url = "https://api.venice.ai/api/v1"
+auth = { type = "bearer" }
+priority = 200
+default_model = "venice-large"
 
-[providers.venice.auth]
-credentials = ["env:VENICE_API_KEY"]
+[providers.acme-venice.metadata.agent]
+profile = "openai"
 
-[models."venice-large"]
-provider = "venice"
+[providers.acme-venice.models.venice-large]
 display_name = "Venice Large"
-family = "venice"
-default = true
 aliases = ["vl"]
-
-[models."venice-large".limits]
-context_window = 128000
-
-[models."venice-large".features]
-tools = true
-vision = false
-reasoning = false
+api_model = "venice-large"
+limits = { context_tokens = 128000, max_output_tokens = 8192 }
+capabilities = { text = true, tools = true }
 "#,
-        )
-        .unwrap();
-        Arc::new(Catalog::from_settings(&settings).unwrap())
+        ))
     }
 
     fn builtin_transform() -> ModelResolutionTransform {
-        let catalog = Catalog::from_builtin().unwrap();
-        ModelResolutionTransform::new(Arc::new(catalog))
+        ModelResolutionTransform::new(Arc::new(test_catalog()))
     }
 
     #[test]
@@ -195,7 +197,7 @@ reasoning = false
         let mut node = Node::new("a");
         node.attrs.insert(
             "model".to_string(),
-            AttrValue::String("claude-sonnet-4-5".to_string()),
+            AttrValue::String("claude-sonnet-4.5".to_string()),
         );
         graph.nodes.insert("a".to_string(), node);
 
@@ -216,7 +218,7 @@ reasoning = false
         let mut node = Node::new("a");
         node.attrs.insert(
             "model".to_string(),
-            AttrValue::String("claude-sonnet-4-5".to_string()),
+            AttrValue::String("claude-sonnet-4.5".to_string()),
         );
         node.attrs.insert(
             "provider".to_string(),
@@ -238,7 +240,7 @@ reasoning = false
                 .attrs
                 .get("model")
                 .and_then(AttrValue::as_str),
-            Some("claude-sonnet-4-5")
+            Some("claude-sonnet-4.5")
         );
     }
 
@@ -345,20 +347,15 @@ reasoning = false
                 .attrs
                 .get("provider")
                 .and_then(AttrValue::as_str),
-            Some("venice")
+            Some("acme-venice")
         );
     }
 
     #[test]
     fn fallback_resolution_keeps_ready_preference_for_unpinned_nodes() {
-        let overrides: LlmCatalogSettings = toml::from_str(
-            r"
-[providers.openrouter]
-enabled = true
-",
-        )
-        .unwrap();
-        let catalog = Arc::new(Catalog::from_builtin_with_overrides(&overrides).unwrap());
+        let catalog = Arc::new(test_catalog_with_overlay(
+            "[providers.openrouter]\nenabled = true\n",
+        ));
         let mut graph = Graph::new("test");
         let mut portable = Node::new("portable");
         portable.attrs.insert(
@@ -414,7 +411,7 @@ enabled = true
                 .attrs
                 .get("default_provider")
                 .and_then(AttrValue::as_str),
-            Some("venice")
+            Some("acme-venice")
         );
     }
 }

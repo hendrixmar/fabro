@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router";
 import { ChevronDownIcon } from "@heroicons/react/16/solid";
 import { ComputerDesktopIcon } from "@heroicons/react/24/outline";
-import type { ServerSandboxProvidersSettings } from "@qltysh/fabro-api-client";
+import type { ServerSandboxProviderSettings } from "@qltysh/fabro-api-client";
 import { useServerSettings } from "../lib/queries";
 import {
   Dot,
@@ -12,23 +12,55 @@ import {
   SettingsPageIntro,
 } from "../components/settings-panel";
 import { plural } from "../lib/plural";
+import {
+  DAYTONA_PROVIDER,
+  DOCKER_PROVIDER,
+  LOCAL_PROVIDER,
+  compareProviderKinds,
+  providerLabel,
+  type ProviderSettingsMap,
+} from "../lib/environment-providers";
 
 export function meta() {
   return [{ title: "Sandboxes — Fabro" }];
 }
 
-type SandboxProviderId = "local" | "docker" | "daytona";
-
 type SandboxProvider = {
-  id: SandboxProviderId;
+  id: string;
   name: string;
   description: string;
   enabled: boolean;
+  bundled: boolean;
   secretName?: string;
 };
 
 const DESCRIPTION =
   "Runtime environments where workflow stages execute. Configured via settings.toml.";
+
+// Display copy for the providers linked into the server. Any other kind is a
+// sandbox-driver plugin configured under `server.sandbox.providers.<kind>`.
+const BUNDLED_PROVIDER_COPY: Record<string, Omit<SandboxProvider, "id" | "enabled" | "bundled">> = {
+  [LOCAL_PROVIDER]: {
+    name: "Local",
+    description: "Run stages directly on the Fabro host.",
+  },
+  [DOCKER_PROVIDER]: {
+    name: "Docker",
+    description: "Run stages in isolated Docker containers on the host daemon.",
+  },
+  [DAYTONA_PROVIDER]: {
+    name: "Daytona",
+    description: "Run stages in cloud sandboxes managed by Daytona.",
+    secretName: "DAYTONA_API_KEY",
+  },
+};
+
+function pluginDescription(settings: ServerSandboxProviderSettings): string {
+  const path = settings.plugin?.path;
+  return path
+    ? `Sandbox plugin executable at ${path}.`
+    : "Sandbox plugin executable resolved from PATH.";
+}
 
 export default function SettingsSandboxes() {
   const query = useServerSettings();
@@ -42,29 +74,24 @@ export default function SettingsSandboxes() {
   );
 }
 
-function ProvidersPanel({ settings }: { settings: ServerSandboxProvidersSettings }) {
+function ProvidersPanel({ settings }: { settings: ProviderSettingsMap }) {
   const providers: SandboxProvider[] = useMemo(
-    () => [
-      {
-        id: "local",
-        name: "Local",
-        description: "Run stages directly on the Fabro host.",
-        enabled: settings.local.enabled,
-      },
-      {
-        id: "docker",
-        name: "Docker",
-        description: "Run stages in isolated Docker containers on the host daemon.",
-        enabled: settings.docker.enabled,
-      },
-      {
-        id: "daytona",
-        name: "Daytona",
-        description: "Run stages in cloud sandboxes managed by Daytona.",
-        enabled: settings.daytona.enabled,
-        secretName: "DAYTONA_API_KEY",
-      },
-    ],
+    () =>
+      Object.keys(settings)
+        .sort(compareProviderKinds)
+        .map((id) => {
+          const entry = settings[id];
+          const copy = BUNDLED_PROVIDER_COPY[id];
+          return copy
+            ? { id, enabled: entry.enabled, bundled: true, ...copy }
+            : {
+                id,
+                enabled: entry.enabled,
+                bundled: false,
+                name: providerLabel(id),
+                description: pluginDescription(entry),
+              };
+        }),
     [settings],
   );
 
@@ -138,7 +165,7 @@ function ProviderLogo({ provider }: { provider: SandboxProvider }) {
     "grid size-10 shrink-0 place-items-center rounded-md bg-ice-50 ring-1 ring-line-strong";
   const dim = provider.enabled ? "" : "opacity-60";
 
-  if (provider.id === "local") {
+  if (provider.id === LOCAL_PROVIDER) {
     return (
       <span className={`${chip} text-page ${dim}`}>
         <ComputerDesktopIcon className="size-6" aria-hidden="true" />
@@ -146,7 +173,7 @@ function ProviderLogo({ provider }: { provider: SandboxProvider }) {
     );
   }
 
-  if (failed) {
+  if (failed || !provider.bundled) {
     return (
       <span className={`${chip} text-base font-medium text-page ${dim}`}>
         {provider.name.charAt(0)}

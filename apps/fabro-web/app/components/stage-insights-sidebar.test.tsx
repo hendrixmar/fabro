@@ -3,13 +3,13 @@ import TestRenderer, { act } from "react-test-renderer";
 import { MemoryRouter } from "react-router";
 
 import {
-  AgentSkillActivationSource,
-  AgentToolCategory,
-  StageContextWindowCategory,
-  StageContextWindowCountMethod,
-  StageContextWindowStaleness,
+  ContextWindowCategory,
+  ContextWindowCountMethod,
+  ContextWindowStaleness,
+  SkillActivationSource,
   TodoListKind,
   TodoStatus,
+  ToolCategory,
 } from "@qltysh/fabro-api-client";
 import type {
   StageContextWindow,
@@ -43,14 +43,14 @@ function makeContextWindow(overrides: Partial<StageContextWindow> = {}): StageCo
     context_window_tokens: 200_000,
     input_tokens:          62_000,
     usage_percent:         31,
-    count_method:          StageContextWindowCountMethod.PROVIDER_API_SCALED_BREAKDOWN,
-    staleness:             StageContextWindowStaleness.LIVE,
+    count_method:          ContextWindowCountMethod.PROVIDER_API_SCALED_BREAKDOWN,
+    staleness:             ContextWindowStaleness.LIVE,
     generated_at:          new Date().toISOString(),
     event_seq:             42,
     breakdown:             [
-      { category: StageContextWindowCategory.SYSTEM_PROMPT, tokens: 8_000, usage_percent: 4 },
-      { category: StageContextWindowCategory.TOOLS, tokens: 12_000, usage_percent: 6 },
-      { category: StageContextWindowCategory.CONVERSATION, tokens: 42_000, usage_percent: 21 },
+      { category: ContextWindowCategory.SYSTEM_PROMPT, tokens: 8_000, usage_percent: 4 },
+      { category: ContextWindowCategory.TOOLS, tokens: 12_000, usage_percent: 6 },
+      { category: ContextWindowCategory.CONVERSATION, tokens: 42_000, usage_percent: 21 },
     ],
     warnings: [],
     ...overrides,
@@ -139,7 +139,7 @@ describe("StageInsightsSidebar", () => {
       available:          false,
       usage_percent:      null,
       input_tokens:       null,
-      staleness:          StageContextWindowStaleness.UNAVAILABLE,
+      staleness:          ContextWindowStaleness.UNAVAILABLE,
       unavailable_reason: null,
     });
     const dom = render(makeStage(), cw);
@@ -155,14 +155,14 @@ describe("StageInsightsSidebar", () => {
             name:        "apply_patch",
             description: "Apply a unified diff patch",
             source:      { kind: "native" },
-            category:    AgentToolCategory.WRITE,
+            category:    ToolCategory.WRITE,
             invoked:     true,
           },
           {
             name:        "grep",
             description: "Search file contents",
             source:      { kind: "native" },
-            category:    AgentToolCategory.READ,
+            category:    ToolCategory.READ,
             invoked:     false,
           },
         ],
@@ -215,13 +215,33 @@ describe("StageInsightsSidebar", () => {
     expect(dom).toContain("Failed");
   });
 
+  test("renders a disconnected mcp server as disconnected, still counted as used", () => {
+    const dom = render(
+      makeStage({
+        mcp_servers: [
+          {
+            server_name: "github",
+            tool_count:  4,
+            status:      { kind: "disconnected", error: "transport closed" },
+            invoked:     true,
+          },
+        ],
+      }),
+      null,
+    );
+    expect(dom).toContain("1/1");
+    expect(dom).toContain("github");
+    expect(dom).toContain("Disconnected");
+    expect(dom).not.toContain("Failed");
+  });
+
   test("shows skill activated/available ratio with source label", () => {
     const dom = render(
       makeStage({
         skills: {
           activated: [
-            { name: "frontend-design", source: AgentSkillActivationSource.SLASH },
-            { name: "debug", source: AgentSkillActivationSource.TOOL },
+            { name: "frontend-design", source: SkillActivationSource.SLASH },
+            { name: "debug", source: SkillActivationSource.TOOL },
           ],
           available: [
             { name: "frontend-design", description: "" },

@@ -3,7 +3,7 @@
     reason = "integration tests stage fixtures with sync std::fs; test infrastructure, not Tokio-hot path"
 )]
 
-use fabro_test::test_context;
+use fabro_test::TestContext;
 
 use super::{
     completed_nodes, dump_export, find_run_dir, fixture, has_event, read_conclusion, read_run_spec,
@@ -12,9 +12,7 @@ use super::{
 
 sandbox_tests!(full_stack, keys = ["ANTHROPIC_API_KEY"]);
 
-fn scenario_full_stack(sandbox: &str) {
-    let context = test_context!();
-
+fn scenario_full_stack(context: &TestContext, sandbox: &str) {
     context
         .run_cmd()
         .args([
@@ -29,7 +27,7 @@ fn scenario_full_stack(sandbox: &str) {
         .assert()
         .success();
 
-    let run_dir = find_run_dir(&context);
+    let run_dir = find_run_dir(context);
     let conclusion = read_conclusion(&run_dir);
     assert_eq!(
         conclusion["status"].as_str(),
@@ -72,7 +70,7 @@ fn scenario_full_stack(sandbox: &str) {
     }
 
     // Verify node stdout should contain PASS
-    let export_dir = dump_export(&context, &run_id_for(&run_dir));
+    let export_dir = dump_export(context, &run_id_for(&run_dir));
     let stdout =
         std::fs::read_to_string(stage_dump_dir(&export_dir, "verify@1").join("output.log"))
             .expect("verify output.log should exist");

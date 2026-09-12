@@ -1,26 +1,28 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use fabro_agent::{Sandbox, shell_quote};
+use fabro_sandbox::RunSandbox;
+use fabro_util::shell;
+use sandbox_driver::{Git as _, GitDiffOptions, GitRevisionRange};
 
-const DIFF_MARKER: &str = "__FABRO_CHANGED_FILES_DIFF__";
-const UNTRACKED_MARKER: &str = "__FABRO_CHANGED_FILES_UNTRACKED__";
-
-pub async fn detect_changed_files(sandbox: &Arc<dyn Sandbox>) -> Vec<String> {
+/// The paths the working tree changed against `HEAD`, plus the untracked
+/// files git does not ignore, sorted and deduplicated. A sandbox without
+/// git, or a working directory that is not a repository, has no changed
+/// files.
+pub async fn detect_changed_files(sandbox: &Arc<RunSandbox>) -> Vec<String> {
+    let Ok(git) = sandbox.git() else {
+        return Vec::new();
+    };
+    let repo = sandbox.working_directory();
     let mut files: Vec<String> = Vec::new();
-    let command = format!(
-        "printf '%s\\n' {diff}; git diff --name-only || true; \
-         printf '%s\\n' {untracked}; git ls-files --others --exclude-standard || true",
-        diff = shell_quote(DIFF_MARKER),
-        untracked = shell_quote(UNTRACKED_MARKER),
-    );
-    if let Ok(result) = sandbox
-        .exec_command(&command, 30_000, None, None, None)
+    if let Ok(entries) = git
+        .diff_entries(repo, &GitDiffOptions::new(GitRevisionRange::new("HEAD")))
         .await
     {
-        if result.is_success() {
-            files.extend(parse_changed_files(&result.stdout));
-        }
+        files.extend(entries.into_iter().map(|entry| entry.path));
+    }
+    if let Ok(untracked) = git.untracked_files(repo).await {
+        files.extend(untracked);
     }
 
     files.sort();
@@ -29,7 +31,7 @@ pub async fn detect_changed_files(sandbox: &Arc<dyn Sandbox>) -> Vec<String> {
 }
 
 pub async fn files_touched_since(
-    sandbox: &Arc<dyn Sandbox>,
+    sandbox: &Arc<RunSandbox>,
     files_before: &[String],
 ) -> (Vec<String>, Option<String>) {
     let files_after = detect_changed_files(sandbox).await;
@@ -42,42 +44,20 @@ pub async fn files_touched_since(
     let last_file_touched = if files_touched.is_empty() {
         None
     } else {
-        let quoted_files: Vec<String> =
-            files_touched.iter().map(|file| shell_quote(file)).collect();
+        let quoted_files: Vec<String> = files_touched
+            .iter()
+            .map(|file| shell::shell_quote(file))
+            .collect();
         let cmd = format!("ls -t {} | head -1", quoted_files.join(" "));
         sandbox
             .exec_command(&cmd, 5_000, None, None, None)
             .await
             .ok()
             .and_then(|result| {
-                let trimmed = result.stdout.trim().to_string();
-                (result.is_success() && !trimmed.is_empty()).then_some(trimmed)
+                let trimmed = result.stdout_lossy().trim().to_string();
+                (result.success() && !trimmed.is_empty()).then_some(trimmed)
             })
     };
 
     (files_touched, last_file_touched)
-}
-
-fn parse_changed_files(stdout: &str) -> impl Iterator<Item = String> + '_ {
-    stdout.lines().filter_map(|line| {
-        let trimmed = line.trim();
-        (!trimmed.is_empty() && trimmed != DIFF_MARKER && trimmed != UNTRACKED_MARKER)
-            .then(|| trimmed.to_string())
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_changed_files;
-
-    #[test]
-    fn parse_changed_files_ignores_section_markers() {
-        let files = parse_changed_files(
-            "__FABRO_CHANGED_FILES_DIFF__\nsrc/main.rs\n\
-             __FABRO_CHANGED_FILES_UNTRACKED__\nREADME.md\n",
-        )
-        .collect::<Vec<_>>();
-
-        assert_eq!(files, vec!["src/main.rs", "README.md"]);
-    }
 }

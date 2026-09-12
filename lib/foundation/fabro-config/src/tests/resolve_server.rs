@@ -3,6 +3,7 @@
     reason = "sync test fixture setup and raw template source assertions; not on a Tokio path"
 )]
 
+use fabro_types::SandboxProviderKind;
 use fabro_types::settings::server::{
     GithubIntegrationStrategy, LogDestination, ObjectStoreSettings, ServerAuthMethod,
     ServerListenSettings, ServerNamespace,
@@ -207,9 +208,15 @@ methods = ["dev-token"]
     .expect("server settings should resolve");
 
     let sandbox = settings.server.sandbox;
-    assert!(sandbox.providers.local.enabled);
-    assert!(sandbox.providers.docker.enabled);
-    assert!(sandbox.providers.daytona.enabled);
+    assert!(sandbox.providers.is_enabled(&SandboxProviderKind::LOCAL));
+    assert!(sandbox.providers.is_enabled(&SandboxProviderKind::DOCKER));
+    assert!(sandbox.providers.is_enabled(&SandboxProviderKind::DAYTONA));
+    assert!(
+        !sandbox
+            .providers
+            .is_enabled(&SandboxProviderKind::try_new("e2b").unwrap()),
+        "an unconfigured plugin kind is disabled"
+    );
 }
 
 #[test]
@@ -228,13 +235,57 @@ enabled = false
     .expect("server settings should resolve");
 
     let sandbox = settings.server.sandbox;
-    assert!(sandbox.providers.local.enabled);
-    assert!(sandbox.providers.docker.enabled);
-    assert!(!sandbox.providers.daytona.enabled);
+    assert!(sandbox.providers.is_enabled(&SandboxProviderKind::LOCAL));
+    assert!(sandbox.providers.is_enabled(&SandboxProviderKind::DOCKER));
+    assert!(!sandbox.providers.is_enabled(&SandboxProviderKind::DAYTONA));
 }
 
 #[test]
-fn parsing_rejects_unknown_server_sandbox_provider() {
+fn server_sandbox_accepts_plugin_providers_by_kind() {
+    let settings = ServerSettingsBuilder::from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.e2b]
+path = "/opt/fabro/plugins/fabro-sandbox-e2b"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+args = ["--region", "us"]
+inherit_env = ["PATH"]
+
+[server.sandbox.providers.e2b.env]
+E2B_API_URL = "https://api.e2b.example"
+"#,
+    )
+    .expect("server settings should resolve");
+
+    let providers = settings.server.sandbox.providers;
+    let kind = SandboxProviderKind::try_new("e2b").unwrap();
+    assert!(providers.is_enabled(&kind));
+    let plugin = providers
+        .get(&kind)
+        .and_then(|entry| entry.plugin.as_ref())
+        .expect("plugin kinds carry launch settings");
+    assert_eq!(
+        plugin.path.as_deref(),
+        Some("/opt/fabro/plugins/fabro-sandbox-e2b")
+    );
+    assert_eq!(plugin.args, vec!["--region", "us"]);
+    assert_eq!(plugin.inherit_env, vec!["PATH"]);
+    assert_eq!(
+        plugin.env.get("E2B_API_URL").map(String::as_str),
+        Some("https://api.e2b.example")
+    );
+    assert!(!plugin.dev);
+    let enabled: Vec<_> = providers.enabled_kinds().map(ToString::to_string).collect();
+    assert_eq!(enabled, vec!["daytona", "docker", "e2b", "local"]);
+    assert_eq!(providers.enabled_plugins().count(), 1);
+}
+
+#[test]
+fn server_sandbox_rejects_plugin_settings_on_bundled_providers() {
     let err = ServerSettingsBuilder::from_toml(
         r#"
 _version = 1
@@ -242,14 +293,36 @@ _version = 1
 [server.auth]
 methods = ["dev-token"]
 
-[server.sandbox.providers.exe]
+[server.sandbox.providers.docker]
+path = "/usr/local/bin/fabro-sandbox-docker"
+"#,
+    )
+    .expect_err("bundled providers take no plugin settings");
+
+    assert!(
+        err.to_string()
+            .contains("server.sandbox.providers.docker.path"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn parsing_rejects_invalid_server_sandbox_provider_kind() {
+    let err = ServerSettingsBuilder::from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers."Bad Kind"]
 enabled = true
 "#,
     )
-    .expect_err("unknown sandbox provider should be rejected");
+    .expect_err("an invalid provider kind name should be rejected");
 
     assert!(
-        err.to_string().contains("unknown field `exe`"),
+        err.to_string().contains("invalid sandbox provider kind"),
         "unexpected error: {err}"
     );
 }

@@ -4,14 +4,13 @@ This document defines how Fabro resolves LLM credentials and constructs `fabro-l
 
 ## Core Rules
 
-- `fabro_auth::CredentialSource` is the credential authority.
-- Long-lived runtime contexts store `Arc<dyn CredentialSource>` and `Arc<Catalog>`, not `Client`.
+- The lithos `CredentialProvider` trait is the credential authority; Fabro's vault, SQL secret store, and API-key stores implement it directly.
+- Long-lived runtime contexts store `Arc<dyn CredentialProvider>` and `Arc<Catalog>`, not `Client`.
 - Call `fabro_llm::client::Client::from_source(&source, catalog).await?` at the point of use.
 - Standalone setup and tests that use default settings build a default `Arc<Catalog>` locally, then pass it explicitly.
 - `GenerateParams::new(model, client)` always receives an explicit `Arc<Client>`.
-- When a caller needs diagnostics in runtime request-serving paths, call `source.resolve(catalog)` directly and consume both `credentials` and `auth_issues`.
-- `EnvCredentialSource` is the env-backed source for env-only or no-vault contexts.
-- `VaultCredentialSource` is the normal source for vault-backed runtime contexts.
+- When a caller needs diagnostics in runtime request-serving paths, read `FabroClient::ready` and `auth_issues` (from `ClientBuilder::build_ready`), or call `lithos_llm::credentials::readiness` directly.
+- `VaultCredentialSource` is the normal source for vault-backed runtime contexts; `VaultCredentialSource::environment_only()` serves env-only or no-vault contexts.
 
 ## Why
 

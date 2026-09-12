@@ -261,9 +261,9 @@ fn dump_exports_completed_run_snapshot() {
     ");
 
     assert_snapshot!(dump_file_summary(&output_dir), @"
-    checkpoints/0014.json
     checkpoints/0018.json
     checkpoints/0022.json
+    checkpoints/0026.json
     events.jsonl
     graph.fabro
     run.json

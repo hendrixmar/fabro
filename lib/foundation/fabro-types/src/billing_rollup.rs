@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use fabro_model::Catalog;
-
 use crate::{BilledTokenCounts, ModelRef, RunProjection, RunTiming, StageSummary, StageTiming};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,10 +117,7 @@ impl ProjectionBillingRollup {
 }
 
 #[must_use]
-pub fn billing_rollup_from_projection(
-    projection: &RunProjection,
-    catalog: Option<&Catalog>,
-) -> ProjectionBillingRollup {
+pub fn billing_rollup_from_projection(projection: &RunProjection) -> ProjectionBillingRollup {
     let mut stage_indices = HashMap::<String, usize>::new();
     let mut stages = Vec::<ProjectionBillingStage>::new();
     let mut by_model = HashMap::<ModelRef, ProjectionBillingByModel>::new();
@@ -134,8 +129,7 @@ pub fn billing_rollup_from_projection(
         if projection.is_boundary_stage(stage_id.node_id()) {
             continue;
         }
-        let usage = stage.billed_usage(catalog);
-        let usage = usage.as_ref();
+        let usage = &stage.usage;
         if stage.completion.is_none() && stage.timing.is_none() && usage.is_zero() {
             continue;
         }
@@ -180,19 +174,7 @@ pub fn billing_rollup_from_projection(
     }
 
     let mut by_model = by_model.into_values().collect::<Vec<_>>();
-    by_model.sort_by(|left, right| {
-        let left_provider = left.model.provider.to_string();
-        let right_provider = right.model.provider.to_string();
-        left_provider
-            .cmp(&right_provider)
-            .then_with(|| left.model.model_id.cmp(&right.model.model_id))
-            .then_with(|| {
-                left.model
-                    .speed
-                    .map(<&'static str>::from)
-                    .cmp(&right.model.speed.map(<&'static str>::from))
-            })
-    });
+    by_model.sort_by(|left, right| left.model.sort_key().cmp(&right.model.sort_key()));
 
     ProjectionBillingRollup {
         stages,

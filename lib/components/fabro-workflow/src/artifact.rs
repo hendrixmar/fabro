@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use fabro_agent::Sandbox;
 use fabro_config::RunScratch;
+use fabro_sandbox::RunSandbox;
 use fabro_types::{
     BlobHash, ParallelBranchResult, format_blob_ref, parse_blob_ref, parse_managed_blob_file_ref,
 };
@@ -176,7 +176,7 @@ pub async fn demote_large_values_for_prompt(
     values: &mut HashMap<String, Value>,
     node_outcomes: &mut HashMap<String, Outcome>,
     run_store: &RunStoreHandle,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
     run_dir: &Path,
 ) {
     let mut locality = SandboxLocality::default();
@@ -228,7 +228,7 @@ pub async fn demote_large_values_for_prompt(
 pub async fn demote_large_items_for_prompt(
     items: &mut [Value],
     run_store: &RunStoreHandle,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
     run_dir: &Path,
 ) {
     let mut locality = SandboxLocality::default();
@@ -258,7 +258,7 @@ async fn demote_value_for_prompt(
     value: &mut Value,
     max_inline_bytes: usize,
     run_store: &RunStoreHandle,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
     run_dir: &Path,
     locality: &mut SandboxLocality,
 ) -> Result<bool> {
@@ -282,7 +282,7 @@ async fn demote_value_for_prompt(
 async fn materialize_value_bytes(
     bytes: &[u8],
     run_store: &RunStoreHandle,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
     run_dir: &Path,
     locality: &mut SandboxLocality,
 ) -> Result<String> {
@@ -315,14 +315,14 @@ async fn materialize_value_bytes(
 /// a later checkpoint can never commit it. The `runtime/blobs` suffix keeps
 /// the path recognizable as a managed blob reference, so durable storage
 /// still records `blob://sha256/...` instead of this execution-local path.
-fn remote_materialized_blob_path(env: &dyn Sandbox, blob_hash: &BlobHash) -> Result<String> {
+fn remote_materialized_blob_path(env: &RunSandbox, blob_hash: &BlobHash) -> Result<String> {
     let runtime_directory = env.runtime_directory().ok_or_else(|| {
         Error::engine("sandbox exposes no runtime directory for blob materialization")
     })?;
     Ok(format!("{runtime_directory}/blobs/{blob_hash}.json"))
 }
 
-async fn write_remote_blob_file(env: &dyn Sandbox, path: &str, bytes: &[u8]) -> Result<()> {
+async fn write_remote_blob_file(env: &RunSandbox, path: &str, bytes: &[u8]) -> Result<()> {
     let content = std::str::from_utf8(bytes)
         .map_err(|e| Error::engine_with_source("artifact blob was not valid UTF-8 JSON", e))?;
     env.write_file(path, content)
@@ -457,7 +457,7 @@ pub fn normalize_checkpoint_for_resume(checkpoint: &mut Checkpoint) {
 pub async fn resolve_context_for_execution(
     context: &Context,
     run_store: &RunStoreHandle,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
     run_dir: &Path,
 ) -> Result<Context> {
     let values = resolved_context_snapshot(context, run_store, env, run_dir).await?;
@@ -484,7 +484,7 @@ pub async fn resolve_context_for_edge_selection(
 pub async fn resolve_outcomes_for_execution(
     node_outcomes: &HashMap<String, Outcome>,
     run_store: &RunStoreHandle,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
     run_dir: &Path,
 ) -> Result<HashMap<String, Outcome>> {
     let mut resolved = node_outcomes.clone();
@@ -505,7 +505,7 @@ pub async fn resolve_outcomes_for_execution(
 pub async fn resolved_context_snapshot(
     context: &Context,
     run_store: &RunStoreHandle,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
     run_dir: &Path,
 ) -> Result<HashMap<String, Value>> {
     let mut values = context.snapshot();
@@ -613,7 +613,7 @@ pub async fn resolve_text_or_blob_ref_str(
 /// fails.
 pub async fn sync_artifacts_to_env(
     updates: &mut HashMap<String, Value>,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
 ) -> Result<()> {
     for value in updates.values_mut() {
         let local_path = match artifact_path(value) {
@@ -676,7 +676,7 @@ fn normalize_durable_value(value: &mut Value) {
 fn resolve_execution_values<'a>(
     values: &'a mut HashMap<String, Value>,
     run_store: &'a RunStoreHandle,
-    env: &'a dyn Sandbox,
+    env: &'a RunSandbox,
     run_dir: &'a Path,
     locality: &'a mut SandboxLocality,
 ) -> BoxFuture<'a, Result<()>> {
@@ -697,7 +697,7 @@ fn resolve_execution_value<'a>(
     key: Option<&'a str>,
     value: &'a mut Value,
     run_store: &'a RunStoreHandle,
-    env: &'a dyn Sandbox,
+    env: &'a RunSandbox,
     run_dir: &'a Path,
     locality: &'a mut SandboxLocality,
 ) -> BoxFuture<'a, Result<()>> {
@@ -747,7 +747,7 @@ fn resolve_execution_value<'a>(
 async fn materialize_blob_ref(
     blob_hash: &BlobHash,
     run_store: &RunStoreHandle,
-    env: &dyn Sandbox,
+    env: &RunSandbox,
     run_dir: &Path,
     locality: &mut SandboxLocality,
 ) -> Result<String> {
@@ -814,7 +814,7 @@ async fn read_required_blob(
         .ok_or_else(|| Error::engine(format!("artifact blob missing: {blob_hash}")))
 }
 
-async fn resolve_explicit_file_ref(value: &str, env: &dyn Sandbox) -> Result<String> {
+async fn resolve_explicit_file_ref(value: &str, env: &RunSandbox) -> Result<String> {
     let local_path = value
         .strip_prefix(ARTIFACT_POINTER_PREFIX)
         .ok_or_else(|| Error::engine(format!("invalid artifact pointer: {value}")))?;
@@ -858,7 +858,7 @@ struct SandboxLocality {
 }
 
 impl SandboxLocality {
-    async fn is_local(&mut self, env: &dyn Sandbox, run_dir: &Path) -> Result<bool> {
+    async fn is_local(&mut self, env: &RunSandbox, run_dir: &Path) -> Result<bool> {
         if let Some(local) = self.cached {
             return Ok(local);
         }
@@ -888,10 +888,30 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use fabro_sandbox::test_support::MockSandbox;
     use object_store::memory::InMemory;
     use ulid::Ulid;
 
     use super::*;
+
+    /// A remote-style sandbox: the run directory is not visible inside it
+    /// unless a test seeds it, and `runtime_dir` is its scratch directory.
+    fn remote_env(runtime_dir: Option<&'static str>) -> MockSandbox {
+        MockSandbox {
+            working_dir: "/workspace",
+            runtime_dir,
+            ..MockSandbox::linux()
+        }
+    }
+
+    /// A sandbox in which `visible` exists, as the run directory does for a
+    /// local run.
+    fn local_env(visible: &Path) -> MockSandbox {
+        MockSandbox {
+            files: HashMap::from([(format!("{}/.probe", visible.display()), String::new())]),
+            ..remote_env(None)
+        }
+    }
 
     fn test_run_id(label: &str) -> fabro_types::RunId {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1158,13 +1178,17 @@ mod tests {
                 }
             }]),
         );
-        let env = TestSyncEnv::new(true, "/workspace");
         let run_dir = tempfile::tempdir().unwrap();
+        let env = local_env(run_dir.path());
 
-        let resolved =
-            resolved_context_snapshot(&context, &run_store.clone().into(), &env, run_dir.path())
-                .await
-                .unwrap();
+        let resolved = resolved_context_snapshot(
+            &context,
+            &run_store.clone().into(),
+            &env.sandbox(),
+            run_dir.path(),
+        )
+        .await
+        .unwrap();
 
         let updates = &resolved[context::keys::PARALLEL_RESULTS][0]["context_updates"];
         assert_eq!(updates["response.branch_a"], serde_json::json!(response));
@@ -1202,15 +1226,20 @@ mod tests {
         let context = Context::new();
         context.set("first", fabro_types::format_blob_ref(&first_blob).into());
         context.set("second", fabro_types::format_blob_ref(&second_blob).into());
-        let env = TestSyncEnv::new(true, "/workspace");
         let run_dir = tempfile::tempdir().unwrap();
+        let env = local_env(run_dir.path());
 
-        resolved_context_snapshot(&context, &run_store.clone().into(), &env, run_dir.path())
-            .await
-            .unwrap();
+        resolved_context_snapshot(
+            &context,
+            &run_store.clone().into(),
+            &env.sandbox(),
+            run_dir.path(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
-            *env.exists_calls.lock().unwrap(),
+            env.driver().memory_fs().exists_calls(),
             1,
             "sandbox locality should be probed once per resolution pass"
         );
@@ -1354,133 +1383,6 @@ mod tests {
 
     // --- sync_artifacts_to_env tests ---
 
-    use std::sync::Mutex;
-
-    struct TestSyncEnv {
-        accessible:   bool,
-        written:      Mutex<Vec<(String, String)>>,
-        working_dir:  String,
-        runtime_dir:  Option<String>,
-        exists_calls: Mutex<usize>,
-    }
-
-    impl TestSyncEnv {
-        fn new(accessible: bool, working_dir: &str) -> Self {
-            Self {
-                accessible,
-                written: Mutex::new(Vec::new()),
-                working_dir: working_dir.to_string(),
-                runtime_dir: None,
-                exists_calls: Mutex::new(0),
-            }
-        }
-
-        fn with_runtime_directory(mut self, runtime_dir: &str) -> Self {
-            self.runtime_dir = Some(runtime_dir.to_string());
-            self
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Sandbox for TestSyncEnv {
-        async fn read_file_bytes(&self, _path: &str) -> fabro_sandbox::Result<Vec<u8>> {
-            Err("not implemented".into())
-        }
-
-        async fn write_file(&self, path: &str, content: &str) -> fabro_sandbox::Result<()> {
-            self.written
-                .lock()
-                .unwrap()
-                .push((path.to_string(), content.to_string()));
-            Ok(())
-        }
-
-        async fn delete_file(&self, _path: &str) -> fabro_sandbox::Result<()> {
-            Err("not implemented".into())
-        }
-
-        async fn file_exists(&self, _path: &str) -> fabro_sandbox::Result<bool> {
-            *self.exists_calls.lock().unwrap() += 1;
-            Ok(self.accessible)
-        }
-
-        async fn list_directory(
-            &self,
-            _path: &str,
-            _depth: Option<usize>,
-        ) -> fabro_sandbox::Result<Vec<fabro_agent::DirEntry>> {
-            Err("not implemented".into())
-        }
-
-        async fn exec_command(
-            &self,
-            _command: &str,
-            _timeout_ms: u64,
-            _working_dir: Option<&str>,
-            _env_vars: Option<&std::collections::HashMap<String, String>>,
-            _cancel_token: Option<tokio_util::sync::CancellationToken>,
-        ) -> fabro_sandbox::Result<fabro_agent::ExecResult> {
-            Err("not implemented".into())
-        }
-
-        async fn grep(
-            &self,
-            _pattern: &str,
-            _path: &str,
-            _options: &fabro_agent::GrepOptions,
-        ) -> fabro_sandbox::Result<Vec<String>> {
-            Err("not implemented".into())
-        }
-
-        async fn glob(
-            &self,
-            _pattern: &str,
-            _path: Option<&str>,
-        ) -> fabro_sandbox::Result<Vec<String>> {
-            Err("not implemented".into())
-        }
-
-        async fn download_file_to_local(
-            &self,
-            _remote_path: &str,
-            _local_path: &std::path::Path,
-        ) -> fabro_sandbox::Result<()> {
-            Err("not implemented".into())
-        }
-
-        async fn upload_file_from_local(
-            &self,
-            _local_path: &std::path::Path,
-            _remote_path: &str,
-        ) -> fabro_sandbox::Result<()> {
-            Err("not implemented".into())
-        }
-
-        async fn initialize(&self) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        async fn cleanup(&self) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        fn working_directory(&self) -> &str {
-            &self.working_dir
-        }
-
-        fn runtime_directory(&self) -> Option<&str> {
-            self.runtime_dir.as_deref()
-        }
-
-        fn platform(&self) -> &str {
-            "linux"
-        }
-
-        fn os_version(&self) -> String {
-            "Linux 5.15".to_string()
-        }
-    }
-
     #[tokio::test]
     async fn sync_uploads_artifact_when_not_accessible() {
         let dir = tempfile::tempdir().unwrap();
@@ -1491,10 +1393,12 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert("response.plan".to_string(), Value::String(pointer));
 
-        let env = TestSyncEnv::new(false, "/workspace");
-        sync_artifacts_to_env(&mut updates, &env).await.unwrap();
+        let env = remote_env(None);
+        sync_artifacts_to_env(&mut updates, &env.sandbox())
+            .await
+            .unwrap();
 
-        let written = env.written.lock().unwrap();
+        let written = env.written_files();
         assert_eq!(written.len(), 1);
         assert_eq!(
             written[0].0,
@@ -1519,10 +1423,15 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert("key".to_string(), Value::String(pointer.clone()));
 
-        let env = TestSyncEnv::new(true, "/workspace");
-        sync_artifacts_to_env(&mut updates, &env).await.unwrap();
+        let env = MockSandbox {
+            files: HashMap::from([(artifact_file.display().to_string(), "{}".to_string())]),
+            ..remote_env(None)
+        };
+        sync_artifacts_to_env(&mut updates, &env.sandbox())
+            .await
+            .unwrap();
 
-        let written = env.written.lock().unwrap();
+        let written = env.written_files();
         assert!(written.is_empty());
         assert_eq!(updates["key"].as_str().unwrap(), &pointer);
     }
@@ -1534,10 +1443,12 @@ mod tests {
         updates.insert("count".to_string(), serde_json::json!(42));
         updates.insert("nested".to_string(), serde_json::json!({"a": 1}));
 
-        let env = TestSyncEnv::new(false, "/workspace");
-        sync_artifacts_to_env(&mut updates, &env).await.unwrap();
+        let env = remote_env(None);
+        sync_artifacts_to_env(&mut updates, &env.sandbox())
+            .await
+            .unwrap();
 
-        let written = env.written.lock().unwrap();
+        let written = env.written_files();
         assert!(written.is_empty());
         assert_eq!(updates["name"], serde_json::json!("Alice"));
         assert_eq!(updates["count"], serde_json::json!(42));
@@ -1550,7 +1461,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let run_dir = tmp.path().join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
-        let sandbox = fabro_agent::LocalSandbox::new(tmp.path().to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(tmp.path().to_path_buf())
+            .await
+            .unwrap();
 
         let dataset = serde_json::json!({
             "rows": vec![serde_json::json!({"payload": "x".repeat(64)}); 256]
@@ -1605,8 +1518,7 @@ mod tests {
     async fn demote_materializes_remote_values_under_sandbox_runtime_directory() {
         let run_store: RunStoreHandle = make_run_store("prompt-demote-remote").await.into();
         let run_dir = tempfile::tempdir().unwrap();
-        let env =
-            TestSyncEnv::new(false, "/workspace").with_runtime_directory("/tmp/fabro/runtime");
+        let env = remote_env(Some("/tmp/fabro/runtime"));
 
         let oversized = serde_json::json!("x".repeat(PROMPT_INLINE_VALUE_MAX + 1));
         let expected_bytes = serde_json::to_vec(&oversized).unwrap();
@@ -1620,7 +1532,7 @@ mod tests {
             &mut values,
             &mut HashMap::new(),
             &run_store,
-            &env,
+            &env.sandbox(),
             run_dir.path(),
         )
         .await;
@@ -1628,7 +1540,7 @@ mod tests {
         let details = prompt_large_value(&values["dataset"])
             .expect("oversized remote context value should demote");
         assert_eq!(details.path, expected_path);
-        let written = env.written.lock().unwrap();
+        let written = env.written_files();
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].0, expected_path);
         assert_eq!(written[0].1.as_bytes(), expected_bytes);
@@ -1642,7 +1554,7 @@ mod tests {
     async fn demote_keeps_value_inline_when_sandbox_has_no_runtime_directory() {
         let run_store: RunStoreHandle = make_run_store("prompt-demote-no-runtime").await.into();
         let run_dir = tempfile::tempdir().unwrap();
-        let env = TestSyncEnv::new(false, "/workspace");
+        let env = remote_env(None);
 
         let oversized = serde_json::json!("x".repeat(PROMPT_INLINE_VALUE_MAX + 1));
         let mut values = HashMap::from([("dataset".to_string(), oversized.clone())]);
@@ -1651,13 +1563,13 @@ mod tests {
             &mut values,
             &mut HashMap::new(),
             &run_store,
-            &env,
+            &env.sandbox(),
             run_dir.path(),
         )
         .await;
 
         assert_eq!(values["dataset"], oversized);
-        assert!(env.written.lock().unwrap().is_empty());
+        assert!(env.written_files().is_empty());
     }
 
     #[tokio::test]
@@ -1668,21 +1580,24 @@ mod tests {
         let blob_hash = run_store.write_blob(&report_bytes).await.unwrap();
         let context = Context::new();
         context.set("report", fabro_types::format_blob_ref(&blob_hash).into());
-        let env =
-            TestSyncEnv::new(false, "/workspace").with_runtime_directory("/tmp/fabro/runtime");
+        let env = remote_env(Some("/tmp/fabro/runtime"));
         let run_dir = tempfile::tempdir().unwrap();
 
-        let resolved =
-            resolved_context_snapshot(&context, &run_store.clone().into(), &env, run_dir.path())
-                .await
-                .unwrap();
+        let resolved = resolved_context_snapshot(
+            &context,
+            &run_store.clone().into(),
+            &env.sandbox(),
+            run_dir.path(),
+        )
+        .await
+        .unwrap();
 
         let expected_path = format!("/tmp/fabro/runtime/blobs/{blob_hash}.json");
         assert_eq!(
             resolved["report"],
             serde_json::json!(format!("file://{expected_path}"))
         );
-        let written = env.written.lock().unwrap();
+        let written = env.written_files();
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].0, expected_path);
         assert_eq!(written[0].1.as_bytes(), report_bytes);
@@ -1703,7 +1618,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let run_dir = tmp.path().join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
-        let sandbox = fabro_agent::LocalSandbox::new(tmp.path().to_path_buf());
+        let sandbox = fabro_sandbox::local_sandbox(tmp.path().to_path_buf())
+            .await
+            .unwrap();
 
         let inherited_preamble = "p".repeat(PROMPT_INLINE_VALUE_MAX + 1);
         let mut values = HashMap::from([(

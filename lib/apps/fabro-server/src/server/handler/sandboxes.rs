@@ -21,7 +21,7 @@ async fn list_sandboxes(
     State(state): State<Arc<AppState>>,
     _auth: RequiredRunManagementActor,
 ) -> Json<SandboxListResponse> {
-    Json(state.sandbox_provider_registry().list_managed().await)
+    Json(state.sandbox_inventory().list_managed().await)
 }
 
 async fn retrieve_sandbox(
@@ -30,7 +30,7 @@ async fn retrieve_sandbox(
     _auth: RequiredRunManagementActor,
 ) -> Result<Json<SandboxInfo>, ApiError> {
     state
-        .sandbox_provider_registry()
+        .sandbox_inventory()
         .get_managed_by_native_id(&id)
         .await
         .map(Json)
@@ -79,21 +79,47 @@ fn provider_list(providers: &[SandboxProviderKind]) -> String {
 mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use fabro_sandbox::SandboxProviderRegistry;
-    use fabro_sandbox::test_support::{
-        FakeGet, FakeList, FakeSandboxProvider, fake_registry, fake_sandbox_info,
-    };
+    use fabro_sandbox::SandboxInventory;
+    use fabro_sandbox::driver::{ConnectedProvider, ProviderConnectOptions};
+    use fabro_sandbox::test_support::{managed_scripted_sandbox, scripted_inventory_provider};
     use fabro_types::SandboxProviderKind;
+    use fabro_types::settings::server::{SandboxPluginSettings, ServerSandboxProviderSettings};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
     use crate::test_support::{TestAppStateBuilder, build_test_router};
 
-    fn app_with_registry(registry: SandboxProviderRegistry) -> axum::Router {
+    fn app_with_inventory(inventory: SandboxInventory) -> axum::Router {
         let state = TestAppStateBuilder::new()
-            .sandbox_provider_registry(registry)
+            .sandbox_inventory(inventory)
             .build();
         build_test_router(state)
+    }
+
+    /// A connected provider of `kind` holding fabro-managed sandboxes `ids`.
+    fn provider(kind: SandboxProviderKind, ids: &[&str]) -> ConnectedProvider {
+        scripted_inventory_provider(
+            kind,
+            ids.iter().map(|id| managed_scripted_sandbox(id)).collect(),
+        )
+    }
+
+    /// A plugin kind whose executable does not exist, so every lookup fails
+    /// to connect.
+    fn with_unreachable_plugin(inventory: SandboxInventory, name: &str) -> SandboxInventory {
+        let settings = ServerSandboxProviderSettings {
+            enabled: true,
+            plugin:  Some(SandboxPluginSettings {
+                path: Some(format!("/nonexistent/fabro-sandbox-{name}")),
+                dev: true,
+                ..SandboxPluginSettings::default()
+            }),
+        };
+        inventory.with_lazy(
+            SandboxProviderKind::try_new(name).expect("valid kind"),
+            settings,
+            ProviderConnectOptions::default(),
+        )
     }
 
     fn req_get(uri: &str) -> Request<Body> {
@@ -113,37 +139,28 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_provider_backed_data_without_run_projection_state() {
-        let docker = fake_sandbox_info(SandboxProviderKind::Docker, "docker-native-id");
-        let app = app_with_registry(fake_registry(vec![FakeSandboxProvider::new(
-            SandboxProviderKind::Docker,
-            FakeList::Ok(vec![docker]),
-            FakeGet::Missing,
-        )]));
+        let app = app_with_inventory(
+            SandboxInventory::empty()
+                .with_connected(provider(SandboxProviderKind::DOCKER, &["docker-native-id"])),
+        );
 
         let response = app.oneshot(req_get("/api/v1/sandboxes")).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert_eq!(body["data"][0]["id"], "docker-native-id");
+        assert_eq!(body["data"][0]["status"]["id"], "docker-native-id");
         assert_eq!(body["data"][0]["provider"], "docker");
+        assert_eq!(body["data"][0]["status"]["state"], "running");
         assert_eq!(body["meta"]["provider_errors"], json!([]));
     }
 
     #[tokio::test]
     async fn retrieve_searches_all_configured_providers() {
-        let daytona = fake_sandbox_info(SandboxProviderKind::Daytona, "native-id");
-        let app = app_with_registry(fake_registry(vec![
-            FakeSandboxProvider::new(
-                SandboxProviderKind::Docker,
-                FakeList::Ok(Vec::new()),
-                FakeGet::Missing,
-            ),
-            FakeSandboxProvider::new(
-                SandboxProviderKind::Daytona,
-                FakeList::Ok(Vec::new()),
-                FakeGet::Found(Box::new(daytona)),
-            ),
-        ]));
+        let app = app_with_inventory(
+            SandboxInventory::empty()
+                .with_connected(provider(SandboxProviderKind::DOCKER, &[]))
+                .with_connected(provider(SandboxProviderKind::DAYTONA, &["native-id"])),
+        );
 
         let response = app
             .oneshot(req_get("/api/v1/sandboxes/native-id"))
@@ -152,24 +169,17 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert_eq!(body["id"], "native-id");
+        assert_eq!(body["status"]["id"], "native-id");
         assert_eq!(body["provider"], "daytona");
     }
 
     #[tokio::test]
     async fn no_matching_sandbox_returns_404() {
-        let app = app_with_registry(fake_registry(vec![
-            FakeSandboxProvider::new(
-                SandboxProviderKind::Docker,
-                FakeList::Ok(Vec::new()),
-                FakeGet::Missing,
-            ),
-            FakeSandboxProvider::new(
-                SandboxProviderKind::Daytona,
-                FakeList::Ok(Vec::new()),
-                FakeGet::Missing,
-            ),
-        ]));
+        let app = app_with_inventory(
+            SandboxInventory::empty()
+                .with_connected(provider(SandboxProviderKind::DOCKER, &[]))
+                .with_connected(provider(SandboxProviderKind::DAYTONA, &[])),
+        );
 
         let response = app
             .oneshot(req_get("/api/v1/sandboxes/missing"))
@@ -181,24 +191,11 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_native_ids_return_409() {
-        let app = app_with_registry(fake_registry(vec![
-            FakeSandboxProvider::new(
-                SandboxProviderKind::Docker,
-                FakeList::Ok(Vec::new()),
-                FakeGet::Found(Box::new(fake_sandbox_info(
-                    SandboxProviderKind::Docker,
-                    "same-id",
-                ))),
-            ),
-            FakeSandboxProvider::new(
-                SandboxProviderKind::Daytona,
-                FakeList::Ok(Vec::new()),
-                FakeGet::Found(Box::new(fake_sandbox_info(
-                    SandboxProviderKind::Daytona,
-                    "same-id",
-                ))),
-            ),
-        ]));
+        let app = app_with_inventory(
+            SandboxInventory::empty()
+                .with_connected(provider(SandboxProviderKind::DOCKER, &["same-id"]))
+                .with_connected(provider(SandboxProviderKind::DAYTONA, &["same-id"])),
+        );
 
         let response = app
             .oneshot(req_get("/api/v1/sandboxes/same-id"))
@@ -217,18 +214,10 @@ mod tests {
 
     #[tokio::test]
     async fn provider_lookup_uncertainty_returns_502() {
-        let app = app_with_registry(fake_registry(vec![
-            FakeSandboxProvider::new(
-                SandboxProviderKind::Docker,
-                FakeList::Ok(Vec::new()),
-                FakeGet::Missing,
-            ),
-            FakeSandboxProvider::new(
-                SandboxProviderKind::Daytona,
-                FakeList::Ok(Vec::new()),
-                FakeGet::Err("daytona unavailable"),
-            ),
-        ]));
+        let app = app_with_inventory(with_unreachable_plugin(
+            SandboxInventory::empty().with_connected(provider(SandboxProviderKind::DOCKER, &[])),
+            "e2b",
+        ));
 
         let response = app
             .oneshot(req_get("/api/v1/sandboxes/maybe-missing"))
@@ -241,7 +230,7 @@ mod tests {
             body["errors"][0]["detail"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("daytona unavailable")
+                .contains("e2b: Failed to connect to the e2b provider")
         );
     }
 }

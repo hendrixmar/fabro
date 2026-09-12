@@ -26,10 +26,7 @@ function makeIdlePreview(): PreviewMutationShape {
 }
 
 function makeServicesData(data: SandboxService[]) {
-  return {
-    data,
-    meta: { source: "ss" as const },
-  };
+  return { data };
 }
 
 const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];
@@ -114,46 +111,6 @@ describe("ServicesPanelView", () => {
         node.children.includes("No services"),
     );
     expect(titles).toHaveLength(1);
-  });
-
-  test("shows an iproute2 tip when services were discovered from procfs", () => {
-    const service: SandboxService = {
-      port:              3000,
-      addresses:         ["0.0.0.0:3000"],
-      processes:         [],
-      preview_supported: true,
-    };
-    const renderer = renderView({
-      servicesQuery: {
-        ...makeIdleQuery(),
-        data: {
-          data: [service],
-          meta: { source: "procfs" },
-        },
-      },
-      previewMutation: makeIdlePreview(),
-    });
-
-    const tipLabels = renderer.root.findAll(
-      (node) =>
-        node.type === "span" &&
-        Array.isArray(node.children) &&
-        node.children.includes("Tip:"),
-    );
-    expect(tipLabels).toHaveLength(1);
-
-    const commands = renderer.root.findAll(
-      (node) =>
-        node.type === "code" &&
-        Array.isArray(node.children) &&
-        node.children.includes("apt-get install iproute2"),
-    );
-    expect(commands).toHaveLength(1);
-
-    const tipText = JSON.stringify(renderer.toJSON());
-    expect(tipText).toContain("Install ");
-    expect(tipText).toContain("ss");
-    expect(tipText).toContain(" in the sandbox for improved services listing:");
   });
 
   test("shows API error state with the error message", () => {

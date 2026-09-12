@@ -23,13 +23,15 @@ workspace = true
 anyhow.workspace = true
 fabro-auth = { path = "../../foundation/fabro-auth" }
 fabro-acp = { path = "../fabro-acp" }
-fabro-agent = { path = "../fabro-agent" }
 fabro-config = { path = "../../foundation/fabro-config" }
 fabro-graphviz = { path = "../fabro-graphviz" }
 fabro-hooks = { path = "../fabro-hooks" }
 fabro-validate = { path = "../fabro-validate" }
-fabro-sandbox = { path = "../fabro-sandbox", features = ["daytona"] }
+fabro-sandbox = { path = "../fabro-sandbox" }
+sandbox-driver.workspace = true
 fabro-mcp = { path = "../fabro-mcp" }
+pebble-agent.workspace = true
+pebble-coding-agent.workspace = true
 fabro-github = { path = "../fabro-github" }
 fabro-interview = { path = "../fabro-interview" }
 fabro-template = { path = "../../foundation/fabro-template" }
@@ -38,11 +40,11 @@ fabro-util = { path = "../../foundation/fabro-util" }
 fabro-redact.workspace = true
 fabro-checkpoint = { path = "../fabro-checkpoint" }
 fabro-llm = { path = "../fabro-llm" }
-fabro-model = { path = "../../foundation/fabro-model" }
 fabro-core = { path = "../../foundation/fabro-core" }
 fabro-store = { path = "../fabro-store" }
 fabro-static.workspace = true
 fabro-types = { path = "../../foundation/fabro-types" }
+lithos-llm = { workspace = true, features = ["runtime"] }
 fabro-http.workspace = true
 thiserror.workspace = true
 strum.workspace = true
@@ -75,6 +77,9 @@ toml.workspace = true
 fabro-vault = { path = "../../foundation/fabro-vault" }
 [dev-dependencies]
 fabro-dump = { path = "../fabro-dump" }
+fabro-client = { path = "../../foundation/fabro-client" }
+fabro-workflow-version = { path = "../fabro-workflow-version" }
+fabro-llm = { path = "../fabro-llm", features = ["test-support"] }
 fabro-store = { path = "../fabro-store", features = ["test-support"] }
 fabro-auth = { path = "../../foundation/fabro-auth", features = ["test-support"] }
 fabro-github = { path = "../fabro-github", features = ["test-support"] }
@@ -83,9 +88,10 @@ fabro-acp = { path = "../fabro-acp", features = ["test-support"] }
 fabro-workflow = { path = ".", features = ["test-support"] }
 fabro-api = { path = "../../foundation/fabro-api" }
 fabro-environment = { path = "../fabro-environment" }
-fabro-sandbox = { path = "../fabro-sandbox", features = ["daytona", "docker", "test-support"] }
+fabro-sandbox = { path = "../fabro-sandbox", features = ["test-support"] }
 fabro-mcp = { path = "../fabro-mcp" }
 tokio = { workspace = true, features = ["test-util", "macros"] }
+pebble-coding-agent = { workspace = true, features = ["test-util"] }
 object_store.workspace = true
 assert_cmd = "2"
 predicates = "3"

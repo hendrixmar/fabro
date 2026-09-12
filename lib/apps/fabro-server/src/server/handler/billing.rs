@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use fabro_model::Catalog;
 use fabro_types::{
     Graph, RunProjection, StageHandler, StageId, StageProjection, StageState, StageTiming,
 };
@@ -23,7 +22,6 @@ fn run_stage_from_projection(
     stage_id: &StageId,
     stage: &StageProjection,
     graph: &Graph,
-    catalog: &Catalog,
     now: DateTime<Utc>,
 ) -> RunStage {
     let handler = stage.handler.unwrap_or_else(|| {
@@ -43,7 +41,7 @@ fn run_stage_from_projection(
         id: stage_id.clone(),
         name: stage_id.node_id().to_owned(),
         handler,
-        billing: stage.billed_usage(Some(catalog)).into_owned(),
+        billing: stage.usage.clone(),
         status: stage.effective_state(),
         wall_time_ms: stage.live_wall_time_ms(now),
         node_id: stage_id.node_id().to_owned(),
@@ -76,10 +74,9 @@ async fn list_run_stages(
 
     let now = Utc::now();
     let graph = projection.spec().graph();
-    let catalog = state.catalog();
     let stages = projection
         .iter_stages()
-        .map(|(stage_id, stage)| run_stage_from_projection(stage_id, stage, graph, &catalog, now))
+        .map(|(stage_id, stage)| run_stage_from_projection(stage_id, stage, graph, now))
         .collect::<Vec<_>>();
 
     (StatusCode::OK, Json(ListResponse::new(stages))).into_response()
@@ -95,8 +92,7 @@ async fn get_run_billing(
         Err(err) => return err.into_response(),
     };
 
-    let catalog = state.catalog();
-    let rollup = fabro_workflow::billing_rollup_from_projection(&projection, Some(&catalog));
+    let rollup = fabro_workflow::billing_rollup_from_projection(&projection);
     let by_model = rollup
         .by_model
         .iter()

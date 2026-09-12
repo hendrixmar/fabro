@@ -1,20 +1,22 @@
-#[cfg(feature = "daytona")]
 mod daytona_streaming_live {
     use std::sync::Arc;
     use std::time::Duration;
 
     use anyhow::{Context, Result, ensure};
-    use fabro_sandbox::daytona::{DaytonaConfig, DaytonaSandbox};
-    use fabro_sandbox::{CommandOutputCallback, ExecStreamingResult, Sandbox};
+    use fabro_sandbox::{
+        CloneRequest, DaytonaCredentials, ExecControls, ExecSpec, ExecStreamingResult, OutputSink,
+        OutputStream, ProviderAccess, RunSandbox, SandboxProviderKind, Termination,
+        provider_sandbox,
+    };
     use fabro_static::EnvVars;
-    use fabro_types::{CommandOutputStream, CommandTermination};
+    use sandbox_driver::{SandboxSource, SandboxSpec};
     use tokio::sync::Mutex;
     use tokio::time::{Instant, sleep};
     use tokio_util::sync::CancellationToken;
 
     #[derive(Debug, Clone)]
     struct CapturedChunk {
-        stream: CommandOutputStream,
+        stream: OutputStream,
         text:   String,
     }
 
@@ -27,16 +29,11 @@ mod daytona_streaming_live {
         );
 
         let sandbox = Arc::new(
-            DaytonaSandbox::new(
-                DaytonaConfig {
-                    skip_clone: true,
-                    ..Default::default()
-                },
-                None,
-                None,
-                None,
-                None,
-                None,
+            provider_sandbox(
+                SandboxProviderKind::DAYTONA,
+                &daytona_access(live_credentials()?),
+                SandboxSpec::new(SandboxSource::HostDirectory),
+                &CloneRequest::none(),
                 None,
                 None,
             )
@@ -46,7 +43,7 @@ mod daytona_streaming_live {
         sandbox.initialize().await?;
 
         let smoke_result = run_smoke(Arc::clone(&sandbox)).await;
-        let cleanup_result = sandbox.cleanup().await.context("clean up Daytona sandbox");
+        let cleanup_result = sandbox.delete().await.context("clean up Daytona sandbox");
 
         smoke_result?;
         cleanup_result?;
@@ -66,16 +63,11 @@ mod daytona_streaming_live {
             "DAYTONA_API_KEY must be set to run this live smoke test"
         );
 
-        let sandbox = DaytonaSandbox::new(
-            DaytonaConfig {
-                skip_clone: true,
-                ..Default::default()
-            },
-            None,
-            None,
-            None,
-            None,
-            None,
+        let sandbox = provider_sandbox(
+            SandboxProviderKind::DAYTONA,
+            &daytona_access(live_credentials()?),
+            SandboxSpec::new(SandboxSource::HostDirectory),
+            &CloneRequest::none(),
             None,
             None,
         )
@@ -97,7 +89,7 @@ mod daytona_streaming_live {
                 &format!("exec_command should run Bash-only syntax: {non_streaming:?}"),
             )?;
             ensure_contains(
-                &non_streaming.stdout,
+                &non_streaming.stdout_lossy(),
                 "two",
                 "exec_command should report the Bash-only result",
             )?;
@@ -109,7 +101,7 @@ mod daytona_streaming_live {
                 &format!("exec_command_streaming should run Bash-only syntax: {streaming:?}"),
             )?;
             ensure_contains(
-                &streaming.result.stdout,
+                &streaming.result.stdout_lossy(),
                 "two",
                 "exec_command_streaming should report the Bash-only result",
             )?;
@@ -130,7 +122,7 @@ mod daytona_streaming_live {
             )?;
             ensure_eq(
                 &stdin_result.result.stdout,
-                &stdin.to_string(),
+                &stdin.as_bytes().to_vec(),
                 "exec_command_streaming should preserve exact stdin bytes",
             )?;
             let stdin_cleanup = sandbox
@@ -144,7 +136,7 @@ mod daytona_streaming_live {
                 )
                 .await?;
             ensure!(
-                stdin_cleanup.is_success(),
+                stdin_cleanup.success(),
                 "Daytona stdin data must stay inert and its temporary file must be deleted: {stdin_cleanup:?}"
             );
 
@@ -152,7 +144,7 @@ mod daytona_streaming_live {
         }
         .await;
 
-        let cleanup_result = sandbox.cleanup().await.context("clean up Daytona sandbox");
+        let cleanup_result = sandbox.delete().await.context("clean up Daytona sandbox");
 
         checks?;
         cleanup_result?;
@@ -168,33 +160,29 @@ mod daytona_streaming_live {
             "DAYTONA_API_KEY must be set to run this live smoke test"
         );
 
-        let run_id: fabro_types::RunId = "01HY0000000000000000000000".parse().unwrap();
-        let sandbox = DaytonaSandbox::new(
-            DaytonaConfig {
-                skip_clone: true,
-                labels: Some(std::collections::HashMap::from([(
-                    "team".to_string(),
-                    "platform".to_string(),
-                )])),
-                ..Default::default()
-            },
+        // A fresh id per run: a fixed one would collide with a sandbox an
+        // interrupted earlier run left behind.
+        let run_id = fabro_types::RunId::new();
+        let sandbox = provider_sandbox(
+            SandboxProviderKind::DAYTONA,
+            &daytona_access(live_credentials()?),
+            SandboxSpec::new(SandboxSource::HostDirectory)
+                .label("team".to_string(), "platform".to_string()),
+            &CloneRequest::none(),
             None,
             Some(run_id),
-            None,
-            None,
-            None,
-            None,
-            None,
         )
         .await?;
 
         sandbox.initialize().await?;
         let labels = sandbox
-            .sandbox_handle()
+            .handle()
             .context("sandbox handle should be initialized")?
-            .labels
-            .clone();
-        let cleanup_result = sandbox.cleanup().await.context("clean up Daytona sandbox");
+            .describe()
+            .await
+            .context("describe sandbox")?
+            .labels;
+        let cleanup_result = sandbox.delete().await.context("clean up Daytona sandbox");
 
         ensure_eq(
             &labels.get("sh.fabro.managed").map(String::as_str),
@@ -203,7 +191,7 @@ mod daytona_streaming_live {
         )?;
         ensure_eq(
             &labels.get("sh.fabro.run_id").map(String::as_str),
-            &Some("01HY0000000000000000000000"),
+            &Some(run_id.to_string().as_str()),
             "Daytona should accept and return the run id label",
         )?;
         ensure_eq(
@@ -224,16 +212,14 @@ mod daytona_streaming_live {
             "DAYTONA_API_KEY must be set to run this live smoke test"
         );
 
-        let sandbox = DaytonaSandbox::new(
-            DaytonaConfig {
-                skip_clone: false,
-                ..Default::default()
+        let sandbox = provider_sandbox(
+            SandboxProviderKind::DAYTONA,
+            &daytona_access(live_credentials()?),
+            SandboxSpec::new(SandboxSource::HostDirectory),
+            &CloneRequest {
+                origin_url: Some("https://github.com/brynary/rack-test".to_string()),
+                ..CloneRequest::default()
             },
-            None,
-            None,
-            Some("https://github.com/brynary/rack-test".to_string()),
-            None,
-            None,
             None,
             None,
         )
@@ -260,16 +246,16 @@ mod daytona_streaming_live {
                 None,
             )
             .await?;
-        let cleanup_result = sandbox.cleanup().await.context("clean up Daytona sandbox");
+        let cleanup_result = sandbox.delete().await.context("clean up Daytona sandbox");
 
         ensure!(
-            result.is_success(),
+            result.success(),
             "layout verification failed: stdout={} stderr={}",
-            result.stdout,
-            result.stderr
+            result.stdout_lossy(),
+            result.stderr_lossy()
         );
         ensure_contains(
-            &result.stdout,
+            &result.stdout_lossy(),
             "true",
             "default cwd should be inside the work tree",
         )?;
@@ -293,16 +279,11 @@ mod daytona_streaming_live {
             "DAYTONA_API_KEY must be set to run this live glob test"
         );
 
-        let sandbox = DaytonaSandbox::new(
-            DaytonaConfig {
-                skip_clone: true,
-                ..Default::default()
-            },
-            None,
-            None,
-            None,
-            None,
-            None,
+        let sandbox = provider_sandbox(
+            SandboxProviderKind::DAYTONA,
+            &daytona_access(live_credentials()?),
+            SandboxSpec::new(SandboxSource::HostDirectory),
+            &CloneRequest::none(),
             None,
             None,
         )
@@ -311,7 +292,7 @@ mod daytona_streaming_live {
         sandbox.initialize().await?;
 
         let glob_result = run_glob_checks(&sandbox).await;
-        let cleanup_result = sandbox.cleanup().await.context("clean up Daytona sandbox");
+        let cleanup_result = sandbox.delete().await.context("clean up Daytona sandbox");
 
         glob_result?;
         cleanup_result?;
@@ -319,7 +300,7 @@ mod daytona_streaming_live {
         Ok(())
     }
 
-    async fn run_glob_checks(sandbox: &DaytonaSandbox) -> Result<()> {
+    async fn run_glob_checks(sandbox: &RunSandbox) -> Result<()> {
         // Build a skills tree with a SKILL.md at the search root, one level
         // below it, and two levels below it.
         let seed = sandbox
@@ -333,10 +314,10 @@ mod daytona_streaming_live {
             )
             .await?;
         ensure!(
-            seed.is_success(),
+            seed.success(),
             "seeding the skills tree failed: stdout={} stderr={}",
-            seed.stdout,
-            seed.stderr
+            seed.stdout_lossy(),
+            seed.stderr_lossy()
         );
 
         // `*/SKILL.md` matches exactly one path segment: only the file one level
@@ -364,7 +345,7 @@ mod daytona_streaming_live {
         Ok(())
     }
 
-    async fn run_smoke(sandbox: Arc<DaytonaSandbox>) -> Result<()> {
+    async fn run_smoke(sandbox: Arc<RunSandbox>) -> Result<()> {
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let cancel_token = CancellationToken::new();
         let callback = capture_callback(Arc::clone(&chunks));
@@ -373,21 +354,22 @@ mod daytona_streaming_live {
 
         let live_exec = tokio::spawn(async move {
             sandbox_for_exec
-                .exec_command_streaming(fabro_sandbox::ExecStreamingRequest {
-                    timeout_ms: Some(60_000),
-                    cancel_token: Some(cancel_for_exec),
-                    output_callback: Some(callback),
-                    ..fabro_sandbox::ExecStreamingRequest::new(
-                        "printf 'live-out\\n'; printf 'live-err\\n' >&2; sleep 30",
-                    )
-                })
+                .exec_command_streaming(
+                    ExecSpec::bash("printf 'live-out\\n'; printf 'live-err\\n' >&2; sleep 30")
+                        .timeout(Duration::from_mins(1)),
+                    ExecControls {
+                        term: Some(cancel_for_exec),
+                        sink: Some(callback),
+                        ..ExecControls::default()
+                    },
+                )
                 .await
         });
 
         let saw_live_stdout_and_stderr =
             wait_for_chunks(&chunks, Duration::from_secs(20), |chunks| {
-                contains_chunk(chunks, CommandOutputStream::Stdout, "live-out")
-                    && contains_chunk(chunks, CommandOutputStream::Stderr, "live-err")
+                contains_chunk(chunks, OutputStream::Stdout, "live-out")
+                    && contains_chunk(chunks, OutputStream::Stderr, "live-err")
             })
             .await;
 
@@ -413,16 +395,16 @@ mod daytona_streaming_live {
         );
         ensure_eq(
             &live_result.result.termination,
-            &CommandTermination::Cancelled,
+            &Termination::Cancelled,
             "cancelled command should preserve cancellation termination",
         )?;
         ensure_contains(
-            &live_result.result.stdout,
+            &live_result.result.stdout_lossy(),
             "live-out",
             "cancelled command stdout should preserve partial logs",
         )?;
         ensure_contains(
-            &live_result.result.stderr,
+            &live_result.result.stderr_lossy(),
             "live-err",
             "cancelled command stderr should preserve partial logs",
         )?;
@@ -441,25 +423,25 @@ mod daytona_streaming_live {
         )?;
         ensure_eq(
             &nonzero.result.termination,
-            &CommandTermination::Exited,
+            &Termination::Exited,
             "nonzero command should be represented as a completed process",
         )?;
         ensure_contains(
-            &nonzero.result.stdout,
+            &nonzero.result.stdout_lossy(),
             "exit-out",
             "nonzero command stdout should be captured",
         )?;
         ensure_contains(
-            &nonzero.result.stderr,
+            &nonzero.result.stderr_lossy(),
             "exit-err",
             "nonzero command stderr should be captured",
         )?;
         ensure!(
-            contains_chunk(&nonzero_chunks, CommandOutputStream::Stdout, "exit-out"),
+            contains_chunk(&nonzero_chunks, OutputStream::Stdout, "exit-out"),
             "nonzero command should stream stdout chunks"
         );
         ensure!(
-            contains_chunk(&nonzero_chunks, CommandOutputStream::Stderr, "exit-err"),
+            contains_chunk(&nonzero_chunks, OutputStream::Stderr, "exit-err"),
             "nonzero command should stream stderr chunks"
         );
 
@@ -472,16 +454,16 @@ mod daytona_streaming_live {
         .await?;
         ensure_eq(
             &timed_out.result.termination,
-            &CommandTermination::TimedOut,
+            &Termination::TimedOut,
             "timed-out command should preserve timeout termination",
         )?;
         ensure_contains(
-            &timed_out.result.stdout,
+            &timed_out.result.stdout_lossy(),
             "timeout-out",
             "timed-out command stdout should preserve partial logs",
         )?;
         ensure_contains(
-            &timed_out.result.stderr,
+            &timed_out.result.stderr_lossy(),
             "timeout-err",
             "timed-out command stderr should preserve partial logs",
         )?;
@@ -490,7 +472,7 @@ mod daytona_streaming_live {
     }
 
     async fn run_captured(
-        sandbox: &DaytonaSandbox,
+        sandbox: &RunSandbox,
         command: &str,
         timeout_ms: u64,
         cancel_token: Option<CancellationToken>,
@@ -499,7 +481,7 @@ mod daytona_streaming_live {
     }
 
     async fn run_captured_with_stdin(
-        sandbox: &DaytonaSandbox,
+        sandbox: &RunSandbox,
         command: &str,
         timeout_ms: u64,
         cancel_token: Option<CancellationToken>,
@@ -507,13 +489,15 @@ mod daytona_streaming_live {
     ) -> Result<(ExecStreamingResult, Vec<CapturedChunk>)> {
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let callback = capture_callback(Arc::clone(&chunks));
+        let mut spec = ExecSpec::bash(command).timeout(Duration::from_millis(timeout_ms));
+        if let Some(stdin) = stdin {
+            spec = spec.stdin(stdin);
+        }
         let result = sandbox
-            .exec_command_streaming(fabro_sandbox::ExecStreamingRequest {
-                timeout_ms: Some(timeout_ms),
-                cancel_token,
-                stdin,
-                output_callback: Some(callback),
-                ..fabro_sandbox::ExecStreamingRequest::new(command)
+            .exec_command_streaming(spec, ExecControls {
+                term: cancel_token,
+                sink: Some(callback),
+                ..ExecControls::default()
             })
             .await?;
         let chunks = chunks.lock().await.clone();
@@ -521,7 +505,7 @@ mod daytona_streaming_live {
         Ok((result, chunks))
     }
 
-    fn capture_callback(chunks: Arc<Mutex<Vec<CapturedChunk>>>) -> CommandOutputCallback {
+    fn capture_callback(chunks: Arc<Mutex<Vec<CapturedChunk>>>) -> OutputSink {
         Arc::new(move |stream, bytes| {
             let chunks = Arc::clone(&chunks);
             Box::pin(async move {
@@ -540,6 +524,27 @@ mod daytona_streaming_live {
     )]
     fn daytona_api_key_present() -> bool {
         std::env::var_os(EnvVars::DAYTONA_API_KEY).is_some()
+    }
+
+    /// Live credentials from the process environment, the way the vault
+    /// would supply them in production.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "live smoke tests take Daytona credentials from the developer's environment"
+    )]
+    fn live_credentials() -> Result<DaytonaCredentials> {
+        let api_key =
+            std::env::var(EnvVars::DAYTONA_API_KEY).context("DAYTONA_API_KEY must be set")?;
+        Ok(DaytonaCredentials::from_api_key(api_key, |name| {
+            std::env::var(name).ok()
+        }))
+    }
+
+    fn daytona_access(credentials: DaytonaCredentials) -> ProviderAccess {
+        ProviderAccess {
+            daytona: Some(credentials),
+            ..ProviderAccess::default()
+        }
     }
 
     async fn wait_for_chunks(
@@ -561,7 +566,7 @@ mod daytona_streaming_live {
         }
     }
 
-    fn contains_chunk(chunks: &[CapturedChunk], stream: CommandOutputStream, text: &str) -> bool {
+    fn contains_chunk(chunks: &[CapturedChunk], stream: OutputStream, text: &str) -> bool {
         chunks
             .iter()
             .any(|chunk| chunk.stream == stream && chunk.text.contains(text))

@@ -1,69 +1,71 @@
-pub mod config;
+pub mod environment;
 pub mod error;
-#[cfg(any(feature = "docker", feature = "daytona"))]
-pub mod from_environment;
 pub mod provider;
 pub mod sandbox;
 pub mod sandbox_spec;
 
-#[cfg(any(feature = "docker", feature = "daytona"))]
 mod clone_source;
 
-mod git_retry;
+mod git_policy;
 
-#[cfg(any(feature = "docker", feature = "daytona", test))]
 mod managed_labels;
 
-mod push_credentials;
-
-pub mod redact;
+mod credentials;
 
 pub mod details;
 
+pub mod driver;
+pub mod driver_sandbox;
+
+pub mod exec;
+mod pebble_environment;
+
 pub mod reconnect;
+mod redact;
 
-pub mod terminal;
-
-pub mod local;
-
-#[cfg(feature = "docker")]
+mod clone;
 pub mod docker;
+pub mod provider_sandbox;
 
-#[cfg(feature = "daytona")]
 pub mod daytona;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 pub use details::sandbox_details;
-#[cfg(feature = "docker")]
-pub use docker::{DockerSandbox, DockerSandboxOptions};
+pub use docker::check_docker_daemon;
+pub use driver::{DaytonaCredentials, ProviderAccess};
+pub use driver_sandbox::RunSandbox;
+pub use environment::{CloneRequest, sandbox_spec_for_environment};
 pub use error::{Error, Result, default_redacted_output_tail, display_for_log};
+pub use exec::{
+    DEFAULT_RETAINED_OUTPUT_BYTES, DEFAULT_STOP_GRACE, ExecResultExt, SandboxExec,
+    command_termination, program_exit_code,
+};
 pub use fabro_github::token_source::{
     InstallationTokenSource, ResolvedToken, TokenProvenance, TokenSnapshot,
 };
 pub use fabro_types::{RunSandboxInstance, SandboxProviderKind};
-pub use git_retry::{
-    CredentialContext, GitRetryReason, RetryPlan, classify_failure, retry_git_operation,
+pub use git_policy::{
+    GitRetryReason, checkpoint_push_policy, publish_push_policy, repository_probe_policy,
+    retry_git_messages, transient_git_failure,
 };
-pub use local::LocalSandbox;
-#[cfg(feature = "daytona")]
-pub use provider::daytona::DaytonaSandboxProvider;
-#[cfg(feature = "docker")]
-pub use provider::docker::DockerSandboxProvider;
-pub use provider::{
-    LocalSandboxProvider, SandboxCreateSpec, SandboxLookupError, SandboxProvider,
-    SandboxProviderRegistry,
-};
-pub use push_credentials::RefreshErrorKind;
-pub use reconnect::{reconnect, reconnect_for_run, reconnect_for_run_with_callback};
+pub use provider::{SandboxInventory, SandboxLookupError};
+pub use provider_sandbox::{attach_provider_sandbox, local_sandbox, provider_sandbox};
+pub use reconnect::{open_terminal_for_run, reconnect_for_run};
+pub use redact::SecretRedactor;
 pub use sandbox::{
-    CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
-    ExecStreamingRequest, ExecStreamingResult, GitRunInfo, GitSetupIntent, GrepOptions,
-    OutputCaptureStats, PushAttempt, PushError, PushReport, RefreshOutcome, RemoteCredentialAction,
-    Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile, StderrCollector, StdioProcess,
-    StdioProcessHandle, StdioProcessTermination, WalkOptions, format_lines_numbered,
-    redacted_output_tail, setup_git_via_exec, shell_quote,
+    DEFAULT_EXEC_OUTPUT_TAIL_BYTES, GitRunInfo, GitSetupIntent, PushAttempt, PushError, PushReport,
+    SandboxFile, SandboxWorkspaceLayout, redacted_output_tail, setup_git,
+};
+/// Driver types a run sandbox speaks: what a command is and how it ended,
+/// what the file and search operations return, and what an environment
+/// asks of a sandbox. Re-exported so consumers need no direct driver
+/// dependency.
+pub use sandbox_driver::{
+    CaptureStats, DirEntry, ExecControls, ExecFailure, ExecResult, ExecSpec, ExecStreamingResult,
+    FileKind, GitRetryPolicy, GrepMatch, GrepOptions, LifecycleTimers, NetworkPolicy, OutputSink,
+    OutputStream, PtySession, PtySize, Resources, SandboxSource, SandboxSpec as DriverSpec,
+    StderrTail, StdioProcess, StdioProcessHandle, Termination, TransportError, WalkOptions,
 };
 pub use sandbox_spec::SandboxSpec;
-pub use terminal::{TerminalSession, TerminalSize, open_terminal_for_run};

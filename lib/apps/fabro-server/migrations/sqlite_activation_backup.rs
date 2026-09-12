@@ -78,7 +78,7 @@ pub(crate) async fn create_backup(
     let publish_staging = staging_path.clone();
     let publish_backup = backup_path.to_path_buf();
     let already_exists = spawn_blocking(move || {
-        let staging = tempfile::TempPath::from_path(publish_staging);
+        let staging = tempfile::TempPath::try_from_path(publish_staging)?;
         match staging.persist_noclobber(&publish_backup) {
             Ok(()) => {
                 // Make the rename's directory entry durable: the retained

@@ -15,7 +15,13 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
+import type { BillingSpeed } from './billing-speed';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { CompletionMessage } from './completion-message';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { CompletionResponseFormat } from './completion-response-format';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { CompletionToolChoice } from './completion-tool-choice';
@@ -26,15 +32,22 @@ import type { CompletionToolDefinition } from './completion-tool-definition';
 // @ts-ignore
 import type { ReasoningEffort } from './reasoning-effort';
 
+/**
+ * A lithos `Request` plus `stream`. Field names match the lithos wire form so a serialized lithos request can be posted as-is.
+ */
 export interface CreateCompletionRequest {
     /**
      * The conversation messages.
      */
     'messages': Array<CompletionMessage>;
     /**
-     * Model ID or alias. Server picks a ready-provider default if omitted.
+     * Model selector: `provider/model`, a model id or alias, or a provider id. The server picks a ready-provider default when omitted.
      */
     'model'?: string;
+    /**
+     * Optional provider pin for a bare model selector.
+     */
+    'provider'?: string;
     /**
      * System prompt (convenience; prepended as a system message).
      */
@@ -48,9 +61,10 @@ export interface CreateCompletionRequest {
      */
     'tools'?: Array<CompletionToolDefinition>;
     'tool_choice'?: CompletionToolChoice;
+    'response_format'?: CompletionResponseFormat;
     'schema'?: any;
+    'max_output_tokens'?: number;
     'temperature'?: number;
-    'max_tokens'?: number;
     'top_p'?: number;
     /**
      * Stop sequences.
@@ -61,8 +75,15 @@ export interface CreateCompletionRequest {
      */
     'reasoning_effort'?: ReasoningEffort;
     /**
-     * Optional provider pin.
+     * Requested speed tier.
      */
-    'provider'?: string;
-    'provider_options'?: any;
+    'speed'?: BillingSpeed;
+    /**
+     * Request tags forwarded to providers that accept them.
+     */
+    'metadata'?: { [key: string]: string; };
+    /**
+     * Raw provider options keyed by provider id.
+     */
+    'provider_options'?: { [key: string]: any; };
 }

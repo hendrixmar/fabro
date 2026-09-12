@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use fabro_model::{Catalog, ProviderId};
+use lithos_llm::catalog::{Catalog, ProviderId, builtin};
 
 use crate::context::{AuthContextRequest, AuthContextResponse};
 use crate::credential::{OAuthConfig, OAuthCredential};
@@ -60,7 +60,7 @@ pub fn strategy_for(
     match method {
         AuthMethod::ApiKey => {
             let provider = catalog
-                .provider(provider_id)
+                .provider(provider_id.as_str())
                 .expect("API key auth requires a catalog provider");
             Box::new(ApiKeyStrategy::new(provider))
         }
@@ -73,7 +73,7 @@ pub fn strategy_for(
             // forgets the constraint.
             assert_eq!(
                 provider_id.as_str(),
-                ProviderId::OPENAI,
+                builtin::ids::OPENAI,
                 "CodexDevice auth is only constructed by CLI code for the \
                  OpenAI provider; all existing call sites enforce this pairing: \
                  got provider_id={provider_id}"
@@ -87,6 +87,7 @@ pub fn strategy_for(
 mod tests {
     use super::*;
     use crate::context::AuthContextRequest;
+    use crate::test_support::test_catalog;
 
     #[test]
     fn codex_oauth_config_has_expected_defaults() {
@@ -99,13 +100,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_key_strategy_uses_provider_env_names() {
-        let catalog = Catalog::builtin();
-        let provider = catalog.provider(&ProviderId::anthropic()).unwrap();
+    async fn api_key_strategy_uses_provider_secret_names() {
+        let catalog = test_catalog();
+        let provider = catalog.provider("anthropic").unwrap();
         let mut strategy = ApiKeyStrategy::new(provider);
         let request = strategy.init().await.unwrap();
         assert_eq!(request, AuthContextRequest::ApiKey {
-            provider_id:   ProviderId::anthropic(),
+            provider_id:   ProviderId::new("anthropic"),
             display_name:  "Anthropic".to_string(),
             env_var_names: vec!["ANTHROPIC_API_KEY".to_string()],
             api_key_url:   Some("https://console.anthropic.com/settings/keys".to_string()),

@@ -12,6 +12,7 @@ use tokio::process::Command;
 use crate::token_source::SecretString;
 
 pub mod access;
+pub mod identity;
 pub mod token_source;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -20,6 +21,7 @@ pub mod test_support;
 pub(crate) mod tests_mock;
 
 pub use access::GitHubRepositoryAccess;
+pub use identity::GitHubAccountIdentity;
 
 pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 
@@ -491,7 +493,7 @@ pub fn sign_app_jwt(app_id: &str, private_key_pem: &str) -> anyhow::Result<Strin
 }
 
 /// Standard GitHub API headers for authenticated requests.
-fn github_headers(auth: &str) -> [(&str, &str); 3] {
+pub(crate) fn github_headers(auth: &str) -> [(&str, &str); 3] {
     [
         ("Authorization", auth),
         ("Accept", "application/vnd.github+json"),

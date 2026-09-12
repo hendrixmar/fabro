@@ -10,8 +10,9 @@ use fabro_workflow_version::{
 };
 
 use super::super::{
-    ApiError, AppState, IntoResponse, Json, RequiredUser, Response, Router, State, StatusCode, post,
+    ApiError, AppState, IntoResponse, Json, Response, Router, State, StatusCode, post,
 };
+use crate::principal_middleware::RequiredRunManagementActor;
 
 const INVALID_JSON_CODE: &str = "invalid_json";
 const INVALID_VERSION_CODE: &str = "workflow_version_invalid";
@@ -26,7 +27,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 async fn create_workflow_version(
-    _auth: RequiredUser,
+    _auth: RequiredRunManagementActor,
     State(state): State<Arc<AppState>>,
     payload: Result<Json<WorkflowVersion>, JsonRejection>,
 ) -> Result<Response, ApiError> {

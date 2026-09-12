@@ -3,17 +3,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
-use fabro_model::{Catalog, ReasoningEffort, Speed};
+use lithos_llm::types::{ReasoningEffort, Speed};
+use pebble_coding_agent::events::{
+    ContextWindowBreakdownItem, ContextWindowCountMethod, ContextWindowSnapshot,
+    ContextWindowStaleness, ContextWindowWarning, LlmOutputKind, PermissionLevel,
+    SkillActivationSource, SkillSummary, TodoListProjection, ToolSummary,
+};
 use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::run_event::{AgentSessionActivatedProps, StagePromptProps};
 use crate::{
-    AgentBackend, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
-    AgentToolSummary, BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord,
-    InvalidTransition, LlmOutputKind, ModelRef, ParallelBranchId, PermissionLevel,
-    PullRequestCreation, PullRequestLink, RunApproval, RunControlAction, RunDiff, RunId,
-    RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion, StageHandler, StageId, StageState,
-    StageTiming, StartRecord, TodoListProjection, timing,
+    AgentBackend, AgentMcpToolSummary, BilledTokenCounts, Checkpoint, Conclusion, GitIdentity,
+    InterviewQuestionRecord, InvalidTransition, ModelRef, ParallelBranchId, PullRequestCreation,
+    PullRequestLink, RunApproval, RunControlAction, RunDiff, RunId, RunSandbox, RunSpec, RunStatus,
+    RunTiming, StageCompletion, StageHandler, StageId, StageState, StageTiming, StartRecord,
+    timing,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -43,6 +47,10 @@ pub struct RunProjection {
     pub superseded_by:         Option<RunId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retried_from:          Option<RunId>,
+    /// The Git author/committer identity the run resolved for its commits.
+    /// Absent until the run's first initialization resolves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_identity:          Option<GitIdentity>,
     pub pending_interviews:    BTreeMap<String, PendingInterviewRecord>,
     stages:                    HashMap<StageId, StageProjection>,
 }
@@ -126,75 +134,6 @@ impl StageModelUsage {
     Copy,
     PartialEq,
     Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    Display,
-    EnumString,
-    IntoStaticStr,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum StageContextWindowCategory {
-    SystemPrompt,
-    Tools,
-    McpTools,
-    Skills,
-    Memory,
-    Conversation,
-    Other,
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    Display,
-    EnumString,
-    IntoStaticStr,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum StageContextWindowCountMethod {
-    ProviderApiScaledBreakdown,
-    ResponseUsageScaledBreakdown,
-    LocalEstimate,
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    Display,
-    EnumString,
-    IntoStaticStr,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum StageContextWindowStaleness {
-    Live,
-    Stored,
-    Unavailable,
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
     Hash,
     serde::Serialize,
     serde::Deserialize,
@@ -208,37 +147,6 @@ pub enum StageContextWindowUnavailableReason {
     NotAgentStage,
     NotObserved,
     ProviderUnconfigured,
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct StageContextWindowWarning {
-    pub code:    String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct StageContextWindowBreakdownItem {
-    pub category:      StageContextWindowCategory,
-    pub tokens:        u64,
-    pub usage_percent: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct StageContextWindowProjection {
-    pub provider:              String,
-    pub model:                 String,
-    pub context_window_tokens: u64,
-    pub input_tokens:          u64,
-    pub usage_percent:         f64,
-    pub count_method:          StageContextWindowCountMethod,
-    pub staleness:             StageContextWindowStaleness,
-    pub generated_at:          DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event_seq:             Option<u32>,
-    #[serde(default)]
-    pub breakdown:             Vec<StageContextWindowBreakdownItem>,
-    #[serde(default)]
-    pub warnings:              Vec<StageContextWindowWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -258,21 +166,21 @@ pub struct StageContextWindow {
     #[serde(default)]
     pub usage_percent:         Option<f64>,
     #[serde(default)]
-    pub count_method:          Option<StageContextWindowCountMethod>,
-    pub staleness:             StageContextWindowStaleness,
+    pub count_method:          Option<ContextWindowCountMethod>,
+    pub staleness:             ContextWindowStaleness,
     #[serde(default)]
     pub generated_at:          Option<DateTime<Utc>>,
     #[serde(default)]
-    pub event_seq:             Option<u32>,
+    pub event_seq:             Option<u64>,
     #[serde(default)]
-    pub breakdown:             Vec<StageContextWindowBreakdownItem>,
+    pub breakdown:             Vec<ContextWindowBreakdownItem>,
     #[serde(default)]
-    pub warnings:              Vec<StageContextWindowWarning>,
+    pub warnings:              Vec<ContextWindowWarning>,
 }
 
 impl StageContextWindow {
     #[must_use]
-    pub fn available(stage_id: StageId, snapshot: &StageContextWindowProjection) -> Self {
+    pub fn available(stage_id: StageId, snapshot: &ContextWindowSnapshot) -> Self {
         Self {
             stage_id,
             available: true,
@@ -284,7 +192,7 @@ impl StageContextWindow {
             usage_percent: Some(snapshot.usage_percent),
             count_method: Some(snapshot.count_method),
             staleness: snapshot.staleness,
-            generated_at: Some(snapshot.generated_at),
+            generated_at: Some(DateTime::<Utc>::from(snapshot.generated_at)),
             event_seq: snapshot.event_seq,
             breakdown: snapshot.breakdown.clone(),
             warnings: snapshot.warnings.clone(),
@@ -308,11 +216,11 @@ impl StageContextWindow {
             input_tokens: None,
             usage_percent: None,
             count_method: None,
-            staleness: StageContextWindowStaleness::Unavailable,
+            staleness: ContextWindowStaleness::Unavailable,
             generated_at: None,
             event_seq: None,
             breakdown: Vec::new(),
-            warnings: vec![StageContextWindowWarning {
+            warnings: vec![ContextWindowWarning {
                 code: reason.to_string(),
                 message,
             }],
@@ -402,11 +310,11 @@ pub struct StageProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_level:      Option<PermissionLevel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agent_tools:           Vec<AgentToolSummary>,
+    pub agent_tools:           Vec<ToolSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers:           Vec<McpServerProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window:        Option<StageContextWindowProjection>,
+    pub context_window:        Option<ContextWindowSnapshot>,
     /// Open inference bracket for this stage, if the event log contains one.
     ///
     /// `Some` means exactly *"an `agent.llm.started` was recorded and no
@@ -464,9 +372,10 @@ pub struct StageInferenceProjection {
     /// overwrite the root session's bracket.
     pub session_id:        String,
     pub started_at:        DateTime<Utc>,
-    /// Provider and model the request was *sent to*. Failover can re-target,
-    /// so `StageProjection::model` stays authoritative for what answered.
-    pub requested_model:   ModelRef,
+    /// The model the request was *sent to*, as the agent names it. Failover
+    /// can re-target, so `StageProjection::model` stays authoritative for
+    /// what answered.
+    pub requested_model:   String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_output_at:   Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -516,7 +425,7 @@ pub enum SubAgentStatus {
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SkillsProjection {
-    pub available: Vec<AgentSkillSummary>,
+    pub available: Vec<SkillSummary>,
     pub activated: Vec<ActivatedSkill>,
 }
 
@@ -530,7 +439,7 @@ impl SkillsProjection {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ActivatedSkill {
     pub name:   String,
-    pub source: AgentSkillActivationSource,
+    pub source: SkillActivationSource,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -545,8 +454,17 @@ pub struct McpServerProjection {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpServerStatus {
-    Ready { tools: Vec<AgentMcpToolSummary> },
-    Failed { error: String },
+    Ready {
+        tools: Vec<AgentMcpToolSummary>,
+    },
+    Failed {
+        error: String,
+    },
+    /// The server was ready and then its connection closed during the
+    /// stage; its tools fail until the session ends.
+    Disconnected {
+        error: String,
+    },
 }
 
 /// Convert a 1-based event sequence number into the `NonZeroU32` form used for
@@ -603,29 +521,6 @@ impl StageProjection {
     #[must_use]
     pub fn effective_state(&self) -> StageState {
         self.state
-    }
-
-    /// This stage's token counts with a cost attached.
-    ///
-    /// A provider-reported cost always wins. Otherwise the catalog prices the
-    /// recorded tokens for the stage's model. The stored counts pass through
-    /// untouched when there is no catalog, no model, or no price for that
-    /// model. Empty usage also passes through untouched. These cases leave
-    /// `total_usd_micros` as `None` rather than zero.
-    #[must_use]
-    pub fn billed_usage(&self, catalog: Option<&Catalog>) -> Cow<'_, BilledTokenCounts> {
-        if self.usage.total_usd_micros.is_some() || self.usage.is_zero() {
-            return Cow::Borrowed(&self.usage);
-        }
-        let (Some(catalog), Some(model)) = (catalog, self.model.as_ref()) else {
-            return Cow::Borrowed(&self.usage);
-        };
-        let Some(total_usd_micros) = catalog.price_tokens(model, &self.usage.token_counts()) else {
-            return Cow::Borrowed(&self.usage);
-        };
-        let mut usage = self.usage.clone();
-        usage.total_usd_micros = Some(total_usd_micros);
-        Cow::Owned(usage)
     }
 
     /// Live wall-clock time in milliseconds.
@@ -878,6 +773,7 @@ impl RunProjection {
             pull_request_creation: None,
             superseded_by: None,
             retried_from: None,
+            git_identity: None,
             pending_interviews: BTreeMap::new(),
             stages: HashMap::new(),
         }
@@ -1119,11 +1015,10 @@ mod iter_stages_tests {
     use std::num::NonZeroU32;
 
     use chrono::Utc;
-    use fabro_model::{Catalog, ModelRef, ProviderId};
     use serde_json::json;
 
     use super::RunProjection;
-    use crate::{AgentControlState, BilledTokenCounts, StageProjection, test_support};
+    use crate::{AgentControlState, StageProjection, test_support};
 
     fn seq(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).unwrap()
@@ -1230,77 +1125,6 @@ mod iter_stages_tests {
             assert_eq!(order, vec!["build@1", "verify@1", "verify@2"]);
         }
     }
-
-    fn priced_stage(total_usd_micros: Option<i64>) -> StageProjection {
-        let mut stage = StageProjection::new(seq(1));
-        stage.usage = BilledTokenCounts {
-            input_tokens: 500_000,
-            output_tokens: 125_000,
-            total_tokens: 625_000,
-            total_usd_micros,
-            ..BilledTokenCounts::default()
-        };
-        stage.model = Some(ModelRef {
-            provider: ProviderId::openai(),
-            model_id: "gpt-5.4".into(),
-            speed:    None,
-        });
-        stage
-    }
-
-    #[test]
-    fn billed_usage_prices_uncosted_tokens_from_the_catalog() {
-        let stage = priced_stage(None);
-
-        assert_eq!(stage.billed_usage(None).total_usd_micros, None);
-        let priced = stage.billed_usage(Some(Catalog::builtin()));
-        assert!(
-            priced.total_usd_micros.is_some_and(|cost| cost > 0),
-            "expected a catalog price, got {:?}",
-            priced.total_usd_micros
-        );
-        // Pricing only fills in the cost; the token buckets pass through.
-        assert_eq!(priced.input_tokens, 500_000);
-        assert_eq!(priced.output_tokens, 125_000);
-    }
-
-    #[test]
-    fn billed_usage_keeps_a_provider_reported_cost_over_the_catalog_estimate() {
-        let stage = priced_stage(Some(42));
-
-        assert_eq!(
-            stage
-                .billed_usage(Some(Catalog::builtin()))
-                .total_usd_micros,
-            Some(42)
-        );
-    }
-
-    #[test]
-    fn billed_usage_leaves_a_modelless_stage_uncosted() {
-        let mut stage = priced_stage(None);
-        stage.model = None;
-
-        assert_eq!(
-            stage
-                .billed_usage(Some(Catalog::builtin()))
-                .total_usd_micros,
-            None
-        );
-    }
-
-    #[test]
-    fn billed_usage_leaves_zero_tokens_uncosted() {
-        let mut stage = priced_stage(None);
-        stage.usage = BilledTokenCounts::default();
-
-        assert_eq!(
-            stage
-                .billed_usage(Some(Catalog::builtin()))
-                .total_usd_micros,
-            None
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1309,7 +1133,7 @@ mod live_timing_tests {
 
     use super::{RunProjection, StageToolBatchProjection};
     use crate::{
-        ModelRef, StageHandler, StageInferenceProjection, StageProjection, StageState, StageTiming,
+        StageHandler, StageInferenceProjection, StageProjection, StageState, StageTiming,
         StartRecord, first_event_seq, test_support,
     };
 
@@ -1334,11 +1158,7 @@ mod live_timing_tests {
         StageInferenceProjection {
             session_id: "session-1".to_string(),
             started_at,
-            requested_model: ModelRef {
-                provider: "anthropic".parse().unwrap(),
-                model_id: "claude-sonnet-5".into(),
-                speed:    None,
-            },
+            requested_model: "claude-sonnet-5".to_string(),
             first_output_at: None,
             first_output_kind: None,
             retries: 0,

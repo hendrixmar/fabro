@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
@@ -5,6 +6,8 @@ use std::marker::PhantomData;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
+use unicase::UniCase;
+use unicode_normalization::UnicodeNormalization as _;
 
 use crate::{BlobHash, WorkflowPath, WorkflowVersionId};
 
@@ -119,61 +122,110 @@ impl WorkflowVersion {
     }
 
     fn validate_shape(&self) -> Result<(), WorkflowVersionShapeError> {
-        if self.files.len() > MAX_WORKFLOW_VERSION_FILES {
-            return Err(WorkflowVersionShapeError::TooManyFiles {
-                actual:  self.files.len(),
-                maximum: MAX_WORKFLOW_VERSION_FILES,
-            });
-        }
+        validate_workflow_files(&self.entrypoint, &self.files)?;
         if self.workflow_dependencies.len() > MAX_WORKFLOW_VERSION_DEPENDENCIES {
             return Err(WorkflowVersionShapeError::TooManyWorkflowDependencies {
                 actual:  self.workflow_dependencies.len(),
                 maximum: MAX_WORKFLOW_VERSION_DEPENDENCIES,
             });
         }
-        for (path, content) in &self.files {
-            if content.len() > MAX_WORKFLOW_VERSION_FILE_BYTES {
-                return Err(WorkflowVersionShapeError::FileTooLarge {
-                    path:    path.clone(),
-                    actual:  content.len(),
-                    maximum: MAX_WORKFLOW_VERSION_FILE_BYTES,
-                });
-            }
-        }
-        if !self.files.contains_key(&self.entrypoint) {
-            return Err(WorkflowVersionShapeError::MissingEntrypoint {
-                path: self.entrypoint.clone(),
-            });
-        }
         self.validate_path_collisions()
     }
 
     fn validate_path_collisions(&self) -> Result<(), WorkflowVersionShapeError> {
-        // Keys are unique within each map, so equality can only collide
-        // across files and workflow dependencies.
-        let mut by_text =
-            HashMap::with_capacity(self.files.len() + self.workflow_dependencies.len());
-        for path in self.files.keys().chain(self.workflow_dependencies.keys()) {
-            if let Some(existing) = by_text.insert(path.as_str(), path) {
+        validate_path_collisions(
+            self.files.keys().chain(self.workflow_dependencies.keys()),
+            Cow::Borrowed,
+        )
+    }
+}
+
+/// Validate the file limits and entrypoint shared by source trees and versions.
+/// Aggregate source bytes, canonical bytes, and path policies are checked
+/// separately.
+pub fn validate_workflow_files(
+    entrypoint: &WorkflowPath,
+    files: &BTreeMap<WorkflowPath, String>,
+) -> Result<(), WorkflowVersionShapeError> {
+    if files.len() > MAX_WORKFLOW_VERSION_FILES {
+        return Err(WorkflowVersionShapeError::TooManyFiles {
+            actual:  files.len(),
+            maximum: MAX_WORKFLOW_VERSION_FILES,
+        });
+    }
+    for (path, content) in files {
+        if content.len() > MAX_WORKFLOW_VERSION_FILE_BYTES {
+            return Err(WorkflowVersionShapeError::FileTooLarge {
+                path:    path.clone(),
+                actual:  content.len(),
+                maximum: MAX_WORKFLOW_VERSION_FILE_BYTES,
+            });
+        }
+    }
+    if !files.contains_key(entrypoint) {
+        return Err(WorkflowVersionShapeError::MissingEntrypoint {
+            path: entrypoint.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Reject file and directory aliases before materializing a portable source
+/// tree, including Unicode case folding and normalization. Canonical versions
+/// themselves retain their exact, case-sensitive semantics.
+pub fn validate_workflow_source_paths<'a>(
+    paths: impl IntoIterator<Item = &'a WorkflowPath>,
+) -> Result<(), WorkflowVersionShapeError> {
+    validate_path_collisions(paths, |text| {
+        if text.is_ascii() {
+            Cow::Owned(text.to_ascii_lowercase())
+        } else {
+            // Normalize before folding: case folding is not closed under
+            // canonical equivalence, so folding a decomposed sequence and
+            // folding its precomposed form can yield different strings.
+            let normalized: String = text.nfc().collect();
+            Cow::Owned(
+                UniCase::unicode(normalized)
+                    .to_folded_case()
+                    .nfc()
+                    .collect(),
+            )
+        }
+    })
+}
+
+/// Detect colliding paths under a comparison key: identical keys, or a key
+/// that names an ancestor directory of another.
+fn validate_path_collisions<'a>(
+    paths: impl IntoIterator<Item = &'a WorkflowPath>,
+    key: impl Fn(&'a str) -> Cow<'a, str>,
+) -> Result<(), WorkflowVersionShapeError> {
+    let keyed: Vec<(Cow<'a, str>, &WorkflowPath)> = paths
+        .into_iter()
+        .map(|path| (key(path.as_str()), path))
+        .collect();
+    let mut by_text = HashMap::with_capacity(keyed.len());
+    for (text, path) in &keyed {
+        if let Some(existing) = by_text.insert(text.as_ref(), *path) {
+            return Err(WorkflowVersionShapeError::PathCollision {
+                first:  existing.clone(),
+                second: (*path).clone(),
+            });
+        }
+    }
+    // Walk the input order, not the map, so the reported pair is stable when
+    // more than one ancestor collision exists.
+    for (text, path) in &keyed {
+        for (index, _) in text.match_indices('/') {
+            if let Some(ancestor) = by_text.get(&text[..index]) {
                 return Err(WorkflowVersionShapeError::PathCollision {
-                    first:  existing.clone(),
-                    second: path.clone(),
+                    first:  (*ancestor).clone(),
+                    second: (*path).clone(),
                 });
             }
         }
-        for path in self.files.keys().chain(self.workflow_dependencies.keys()) {
-            let text = path.as_str();
-            for (index, _) in text.match_indices('/') {
-                if let Some(ancestor) = by_text.get(&text[..index]) {
-                    return Err(WorkflowVersionShapeError::PathCollision {
-                        first:  (*ancestor).clone(),
-                        second: path.clone(),
-                    });
-                }
-            }
-        }
-        Ok(())
     }
+    Ok(())
 }
 
 impl<'de> Deserialize<'de> for WorkflowVersion {
@@ -507,5 +559,62 @@ mod tests {
             "workflow_dependencies":{}
         }"#;
         assert!(serde_json::from_str::<WorkflowVersion>(duplicate).is_err());
+    }
+}
+
+#[cfg(test)]
+mod source_path_tests {
+    use super::*;
+
+    #[test]
+    fn ancestor_collision_reports_the_first_pair_in_input_order() {
+        let paths = ["assets", "assets/item.txt", "libs", "libs/child.fabro"]
+            .map(|path| WorkflowPath::new(path).unwrap());
+        for _ in 0..32 {
+            let error = validate_workflow_source_paths(paths.iter()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "workflow paths collide: `assets` and `assets/item.txt`"
+            );
+            let version = WorkflowVersion::new(
+                paths[1].clone(),
+                paths.iter().map(|p| (p.clone(), String::new())).collect(),
+                BTreeMap::new(),
+            )
+            .unwrap_err();
+            assert_eq!(version.to_string(), error.to_string());
+        }
+    }
+
+    #[test]
+    fn workflow_source_collisions_are_portable_in_both_orders() {
+        for pair in [
+            ["A", "a"],
+            ["A", "a/b.md"],
+            ["a", "A/b.md"],
+            ["é", "É/b"],
+            ["ΟΣ", "οσ/b"],
+            ["é", "e\u{301}/b"],
+            ["Straße", "STRASSE/b"],
+            // Canonically equivalent, but folding before normalizing yields
+            // different keys (U+03B1 U+03AF vs U+03AC U+03B9).
+            ["α\u{345}\u{301}.md", "\u{1FB4}.md"],
+        ] {
+            let paths = pair.map(|path| WorkflowPath::new(path).unwrap());
+            assert!(validate_workflow_source_paths(paths.iter()).is_err());
+            assert!(validate_workflow_source_paths(paths.iter().rev()).is_err());
+        }
+        let version = WorkflowVersion::new(
+            WorkflowPath::new("A").unwrap(),
+            BTreeMap::from([
+                (WorkflowPath::new("A").unwrap(), "x".into()),
+                (WorkflowPath::new("a").unwrap(), "y".into()),
+            ]),
+            BTreeMap::new(),
+        );
+        assert!(
+            version.is_ok(),
+            "canonical versions keep exact path semantics"
+        );
     }
 }

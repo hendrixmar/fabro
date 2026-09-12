@@ -92,6 +92,7 @@ import {
   getNumber,
   getObject,
   getString,
+  isRecord,
   type UnknownRecord,
 } from "../lib/unknown";
 import type {
@@ -293,6 +294,20 @@ interface PendingCommand {
   script: string;
 }
 
+/**
+ * The coding agent's own payload inside an `agent.*` event: `properties.event`
+ * is externally tagged, `{ AssistantMessage: {...} }`, so the variant's fields
+ * live one level down. An event with no such payload reads as empty.
+ */
+function agentEventPayload(props: UnknownRecord): UnknownRecord {
+  const event = getObject(props, "event");
+  if (!event) return {};
+  for (const value of Object.values(event)) {
+    if (isRecord(value)) return value;
+  }
+  return {};
+}
+
 function readTurnReasoning(props: UnknownRecord): ReasoningOutput | null {
   const reasoning = getObject(props, "reasoning");
   if (!reasoning) return null;
@@ -339,15 +354,17 @@ export function buildStageActivity(
         // A text-free message still marks the end of a model response — it is
         // the boundary between two batches of tool calls. Dropping it would
         // splice unrelated batches into one tool group.
-        const billing = (props.billing ?? {}) as UnknownRecord;
+        const message = agentEventPayload(props);
+        const usage = getObject(message, "usage") ?? {};
         turns.push({
           kind: "assistant",
           ts: e.ts,
-          content: getString(props, "text") ?? e.text ?? "",
-          inputTokens: getNumber(billing, "input_tokens") ?? 0,
-          outputTokens: getNumber(billing, "output_tokens") ?? 0,
-          toolCallCount: getNumber(props, "tool_call_count") ?? null,
-          reasoning: readTurnReasoning(props),
+          content: getString(message, "text") ?? "",
+          inputTokens: getNumber(usage, "input") ?? 0,
+          outputTokens:
+            (getNumber(usage, "output") ?? 0) + (getNumber(usage, "reasoning") ?? 0),
+          toolCallCount: getNumber(message, "tool_call_count") ?? null,
+          reasoning: readTurnReasoning(message),
         });
         break;
       }
@@ -368,7 +385,7 @@ export function buildStageActivity(
         break;
       }
       case "agent.steering.injected": {
-        const text = getString(props, "text") ?? e.text ?? "";
+        const text = getString(agentEventPayload(props), "text") ?? "";
         if (text) {
           turns.push({ kind: "steer", ts: e.ts, content: text });
         }
@@ -403,35 +420,33 @@ export function buildStageActivity(
         break;
       }
       case "agent.tool.started": {
-        const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
+        const call = agentEventPayload(props);
+        const callId = getString(call, "tool_call_id") ?? e.tool_call_id ?? "";
         if (!callId) break;
-        const args = props.arguments ?? e.arguments;
+        const args = call.arguments;
         pendingTools.set(callId, {
           ts: e.ts,
-          toolName: getString(props, "tool_name") ?? e.tool_name ?? "",
+          toolName: getString(call, "tool_name") ?? "",
           input: typeof args === "string" ? args : JSON.stringify(args ?? ""),
         });
         break;
       }
       case "agent.tool.completed": {
-        const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
+        const call = agentEventPayload(props);
+        const callId = getString(call, "tool_call_id") ?? e.tool_call_id ?? "";
         if (!callId) break;
         const started = pendingTools.get(callId);
         pendingTools.delete(callId);
-        const output = props.output ?? e.output ?? "";
+        const output = call.output ?? "";
         const result =
           typeof output === "string" ? output : JSON.stringify(output, null, 2);
         turns.push({
           kind: "tool",
           ts: started?.ts ?? e.ts,
-          toolName:
-            started?.toolName ??
-            getString(props, "tool_name") ??
-            e.tool_name ??
-            "",
+          toolName: started?.toolName ?? getString(call, "tool_name") ?? "",
           input: started?.input ?? "",
           result,
-          isError: (props.is_error ?? e.is_error) === true,
+          isError: call.is_error === true,
           durationMs: durationBetween(started?.ts, e.ts),
         });
         break;

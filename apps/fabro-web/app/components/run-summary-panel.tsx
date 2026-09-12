@@ -80,10 +80,10 @@ function SandboxValue({
 }) {
   const display = SANDBOX_STATE_DISPLAY[state] ?? SANDBOX_STATE_DISPLAY.unknown;
   const cpu = resources?.cpu_cores;
-  const memory = resources?.memory_bytes;
+  const memoryMb = resources?.memory_mb;
   const valueText =
-    cpu != null && memory != null
-      ? `${formatCpuCores(cpu)} CPU · ${formatBytesAsMemory(memory)}`
+    cpu != null && memoryMb != null
+      ? `${formatCpuCores(cpu)} CPU · ${formatBytesAsMemory(memoryMb * 1024 * 1024)}`
       : display.label;
 
   return (
@@ -221,8 +221,8 @@ export function RunSummaryPanel({ runId }: { runId: string }) {
     <RunSummaryPanelView
       run={runQuery.data ?? null}
       runLoading={runQuery.isLoading && !runQuery.data}
-      sandboxState={sandboxQuery.data?.state ?? null}
-      sandboxResources={sandboxQuery.data?.resources ?? null}
+      sandboxState={sandboxQuery.data?.status.state ?? null}
+      sandboxResources={sandboxQuery.data?.status.resources ?? null}
       sandboxLoading={sandboxReady && sandboxQuery.isLoading && !sandboxQuery.data}
       artifactsCount={artifactsQuery.data?.data.length ?? null}
       artifactsLoading={artifactsQuery.isLoading && !artifactsQuery.data}

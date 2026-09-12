@@ -1,3 +1,4 @@
+use fabro_llm::lithos_catalog::Catalog;
 mod all_conditional_edges;
 mod auto_status_deprecated;
 mod backend_valid;
@@ -82,7 +83,7 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
 
 /// Returns lint rules that require the caller's resolved model catalog.
 #[must_use]
-pub fn catalog_rules(catalog: &fabro_model::Catalog) -> Vec<Box<dyn LintRule + '_>> {
+pub fn catalog_rules(catalog: &Catalog) -> Vec<Box<dyn LintRule + '_>> {
     vec![
         stylesheet_model_known::rule(catalog),
         node_model_known::rule(catalog),

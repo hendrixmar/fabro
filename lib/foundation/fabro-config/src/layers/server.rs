@@ -1,5 +1,8 @@
 //! Sparse `[server]` settings layer definitions.
 
+use std::collections::BTreeMap;
+
+use fabro_types::SandboxProviderKind;
 use fabro_types::settings::server::{
     GithubIntegrationStrategy, LogDestination, ObjectStoreProvider, ServerAuthMethod,
     WebhookStrategy,
@@ -8,6 +11,7 @@ use fabro_types::settings::{Duration, InterpString};
 use serde::{Deserialize, Serialize};
 
 use super::LogFilter;
+use super::combine::Combine;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
 #[serde(deny_unknown_fields)]
@@ -99,22 +103,46 @@ pub struct ServerSandboxLayer {
     pub providers: Option<ServerSandboxProvidersLayer>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
+/// `[server.sandbox.providers.<kind>]`, keyed by provider kind. Bundled
+/// kinds carry only `enabled`; any other kind names a plugin executable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ServerSandboxProvidersLayer {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local:   Option<ServerSandboxProviderLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub docker:  Option<ServerSandboxProviderLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub daytona: Option<ServerSandboxProviderLayer>,
+    pub entries: BTreeMap<SandboxProviderKind, ServerSandboxProviderLayer>,
+}
+
+impl Combine for ServerSandboxProvidersLayer {
+    fn combine(self, other: Self) -> Self {
+        let mut combined = other.entries;
+        for (kind, layer) in self.entries {
+            let layer = match combined.remove(&kind) {
+                Some(fallback) => layer.combine(fallback),
+                None => layer,
+            };
+            combined.insert(kind, layer);
+        }
+        Self { entries: combined }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSandboxProviderLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
+    pub enabled:     Option<bool>,
+    /// Plugin executable path. Rejected for bundled kinds at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path:        Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256:      Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev:         Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args:        Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env:         Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_env: Option<Vec<String>>,
 }
 
 /// `[server.storage]` — single managed local disk root.

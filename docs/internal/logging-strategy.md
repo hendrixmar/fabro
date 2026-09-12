@@ -135,7 +135,7 @@ Server auth intentionally exposes a mutable `RequestAuth` context slot for publi
 
 ### Examples by crate
 
-**fabro-agent:**
+**fabro-workflow (agent stages):**
 ```rust
 info!(model = %model, "Starting agent session");
 info!(turns = turn_count, tool_calls = total_calls, "Agent session complete");
@@ -176,7 +176,7 @@ Every crate that does meaningful work should emit tracing events. The `tracing` 
 tracing.workspace = true
 ```
 
-The subscriber is initialized once in `fabro-cli`. Library crates (`fabro-agent`, `fabro-llm`, etc.) only emit events — they never configure the subscriber. This means:
+The subscriber is initialized once in `fabro-cli`. Library crates (`fabro-workflow`, `fabro-llm`, etc.) only emit events — they never configure the subscriber. This means:
 
 - Library crates import `tracing::{info, debug, warn, error}` and call the macros
 - The events go nowhere in unit tests (this is fine — tests verify behavior, not log output)

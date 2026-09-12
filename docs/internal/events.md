@@ -1421,6 +1421,7 @@ Emitted when a sub-agent is spawned.
         "original_name": "list_issues"
       }
     ],
+    "startup_ms": 842,
     "visit": 1
   }
 }
@@ -1431,6 +1432,7 @@ Emitted when a sub-agent is spawned.
 | `server_name` | string | MCP server name |
 | `tool_count` | number | Number of tools available |
 | `tools` | array | Names-only tool summaries for the ready server, sorted by qualified `name`. Each entry has `name` (Fabro-qualified `mcp__{server}__{tool}` identifier) and `original_name` (server-provided tool name). Descriptions and input schemas are intentionally omitted. The field is omitted from serialized JSON for legacy parity when empty. |
+| `startup_ms` | number | Whole milliseconds from the server's launch to its tools being listed. Events written before the field existed read as `0`. |
 | `visit` | number | Stage visit count when the server became ready |
 
 ### `agent.mcp.failed`
@@ -1443,7 +1445,9 @@ Emitted when a sub-agent is spawned.
   "session_id": "ses_abc",
   "properties": {
     "server_name": "filesystem",
-    "error": "Connection refused"
+    "error": "Connection refused",
+    "startup_ms": 4,
+    "visit": 1
   }
 }
 ```
@@ -1452,6 +1456,37 @@ Emitted when a sub-agent is spawned.
 |----------|------|-------------|
 | `server_name` | string | MCP server name |
 | `error` | string | Error message |
+| `startup_ms` | number | Whole milliseconds from the server's launch to the failure. Events written before the field existed read as `0`. |
+| `visit` | number | Stage visit count when the server failed |
+
+### `agent.mcp.disconnected`
+
+An MCP server that was ready lost its connection during the stage. Pebble
+publishes the disconnect once per server, from whichever session's tool call
+first observed the closed connection, so the event can originate in a
+sub-agent. Every later call to that server's tools fails until the session
+ends. The stage projection moves the server's status from `ready` to
+`disconnected`; its `tool_count` and `invoked` flag are kept.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.mcp.disconnected",
+  "node_id": "code", "node_label": "code",
+  "session_id": "ses_abc",
+  "properties": {
+    "server_name": "github",
+    "error": "transport closed",
+    "visit": 1
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `server_name` | string | MCP server name |
+| `error` | string | What closed the connection, as the client observed it |
+| `visit` | number | Stage visit count when the disconnect was observed |
 
 ### `agent.memory.loaded`
 
@@ -1807,82 +1842,52 @@ Emitted after the engine completes sandbox initialization (distinct from `sandbo
 | `provider` | string | Sandbox provider name |
 | `error` | string | Error message |
 
-### `sandbox.snapshot.pulling`
+### Sandbox driver events
 
-Emitted only when the Docker image cache misses and Fabro starts pulling the image.
+Everything the sandbox driver reports about a run's sandbox is stored whole. The
+event name derives from the driver's event: `<subject>.<action>.<phase>` for an
+operation (`sandbox.start.started`, `sandbox.stop.completed`, `sandbox.delete.failed`,
+`sandbox.create.progress` for an image pull inside the create, `snapshot.create.started`
+and `snapshot.create.completed` for a snapshot build), `<subject>.state` for a state
+observation, and `<subject>.notice` for a notice. `properties` is the driver's event as
+the driver serializes it.
 
 ```json
 {
   "id": "...", "ts": "...", "run_id": "...",
-  "event": "sandbox.snapshot.pulling",
+  "event": "sandbox.stop.completed",
   "properties": {
-    "name": "my-image:latest"
+    "id": {"source_id": "9b2f…", "sequence": 4},
+    "occurred_at": "2026-08-31T20:00:00Z",
+    "provider": "docker",
+    "subject": {"type": "sandbox", "id": "container-abc123"},
+    "operation_id": "58a1…",
+    "correlation_id": "01JQ…",
+    "type": "operation_completed",
+    "action": "stop",
+    "duration": {"secs": 1, "nanos": 250000000}
   }
 }
 ```
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `name` | string | Image/snapshot name |
+| `id` | object | The driver's event id: `source_id` and `sequence` within that source |
+| `occurred_at` | string | When the driver observed the event (RFC 3339) |
+| `provider` | string | The driver's provider kind (`host`, `docker`, `daytona`, a plugin's kind) |
+| `subject` | object | `type` (`sandbox`, `snapshot`, `volume`, `provider`) with the resource's `id` and `name` when known |
+| `operation_id` | string | Groups the started, progress, and completed or failed events of one operation |
+| `correlation_id` | string | The run id fabro attached |
+| `type` | string | `operation_started`, `operation_progress`, `operation_completed`, `operation_failed`, `state_observed`, or `notice` |
+| `action` | string | The operation (`create`, `start`, `stop`, `delete`, `snapshot`, …) on operation events |
+| `progress` | object | `code` (`image.pull`, `snapshot.build`, …), `message`, and optional `completed`, `total`, `unit` on progress events |
+| `duration` | object | `secs` and `nanos` on completed and failed events |
+| `error` | object | `kind`, `message`, `retryable`, `causes` on failed events |
 
-### `sandbox.snapshot.creating`
-
-Emitted only when a Daytona snapshot cache miss or inactive snapshot requires Fabro to create or wait for the snapshot.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "sandbox.snapshot.creating",
-  "properties": {
-    "name": "my-snapshot"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `name` | string | Snapshot name |
-
-### `sandbox.snapshot.ready`
-
-Emitted when an image or snapshot ensure step succeeds. Cache hits still emit this event with a near-zero `duration_ms`; explicit no-op paths such as Docker `auto_pull = false` and the Daytona default snapshot path do not.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "sandbox.snapshot.ready",
-  "properties": {
-    "name": "my-snapshot",
-    "duration_ms": 30000
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `name` | string | Snapshot name |
-| `duration_ms` | number | Ensure duration |
-
-### `sandbox.snapshot.failed`
-
-Emitted when an image or snapshot ensure step fails.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "sandbox.snapshot.failed",
-  "properties": {
-    "name": "my-snapshot",
-    "error": "disk quota exceeded"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `name` | string | Snapshot name |
-| `error` | string | Error message |
-| `causes` | string[] | Optional error cause chain |
+Events stored under `sandbox.start.*`, `sandbox.stop.*`, `sandbox.delete.*`, and
+`sandbox.snapshot.*` before the driver's events were kept whole carry fabro's earlier
+`provider`, `name`, `duration_ms`, and `error` properties instead; readers treat them as
+unknown bodies.
 
 ### `sandbox.git.started`
 

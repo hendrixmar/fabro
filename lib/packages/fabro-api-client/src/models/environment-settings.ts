@@ -24,13 +24,13 @@ import type { EnvironmentLifecycleSettings } from './environment-lifecycle-setti
 import type { EnvironmentNetworkSettings } from './environment-network-settings';
 // May contain unused imports in some cases
 // @ts-ignore
-import type { EnvironmentProvider } from './environment-provider';
-// May contain unused imports in some cases
-// @ts-ignore
 import type { EnvironmentResourcesSettings } from './environment-resources-settings';
 
 export interface EnvironmentSettings {
-    'provider': EnvironmentProvider;
+    /**
+     * Sandbox provider kind. `local`, `docker`, and `daytona` are bundled with the server; any other value names a sandbox-driver plugin configured under `server.sandbox.providers.<kind>`.
+     */
+    'provider': string;
     /**
      * Local-provider command working directory for this environment. Docker and Daytona ignore this value.
      */

@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use fabro_api::types;
-use fabro_auth::auth_issue_message;
 use fabro_config::parse::SettingsSource;
 use fabro_config::{
     CliLayer, CliOutputLayer, EnvironmentLayer, MergeMap, RunLayer, SettingsLayer,
@@ -15,22 +14,21 @@ use fabro_config::{
 use fabro_github::token_source::{InstallationTokenSource, ResolvedToken, TokenSnapshot};
 use fabro_graphviz::graph::{Graph, is_llm_handler_type};
 use fabro_graphviz::render::apply_direction;
-use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe};
-use fabro_model::{Catalog, ProviderId};
-use fabro_sandbox::daytona::DaytonaConfig;
-use fabro_sandbox::from_environment::{
-    daytona_config_from_environment, docker_config_from_environment,
-    local_working_directory_from_environment,
+use fabro_llm::FabroClient;
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::probe::{self, ModelTestStatus};
+use fabro_proc::ProcessError;
+use fabro_sandbox::{
+    CloneRequest, ProviderAccess, RunSandbox, SandboxSpec, sandbox_spec_for_environment,
 };
-use fabro_sandbox::redact::redact_auth_url;
-use fabro_sandbox::{DockerSandboxOptions, Sandbox, SandboxSpec};
 use fabro_static::EnvVars;
 use fabro_types::settings::ModelRef;
 use fabro_types::settings::cli::OutputVerbosity;
 use fabro_types::settings::interp::InterpString;
-use fabro_types::settings::run::{EnvironmentProvider, McpServerSettings, RunGoal, RunNamespace};
+use fabro_types::settings::run::{McpServerSettings, RunGoal, RunNamespace};
 use fabro_types::{
-    ManifestPath, RunId, RunNoticeLevel, SandboxProviderKind, ServerSettings, WorkflowSettings,
+    BundledProvider, ManifestPath, RunId, RunNoticeLevel, SandboxProviderKind, ServerSettings,
+    WorkflowSettings,
 };
 use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
 use fabro_validate::Severity;
@@ -43,12 +41,14 @@ use fabro_workflow::pipeline::Validated;
 use fabro_workflow::run_materialization::materialize_run_with_ready_providers;
 use fabro_workflow::workflow_bundle::{BundledWorkflow, ParsedWorkflowConfig, WorkflowBundle};
 use futures_util::stream::{self, StreamExt};
+use lithos_llm::catalog::ProviderId;
 use tokio::process::Command;
+#[cfg(test)]
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 use crate::run_compiler;
 use crate::server::AppState;
-use crate::server_secrets::LlmClientResult;
 
 #[derive(Clone)]
 pub(crate) struct PreparedManifest {
@@ -227,7 +227,7 @@ pub(crate) async fn run_preflight(
     state: &AppState,
     prepared: &PreparedManifest,
     validated: &Validated,
-    llm_result: Result<LlmClientResult>,
+    llm_result: Result<FabroClient>,
 ) -> Result<(types::PreflightResponse, bool)> {
     let (report, checks_ok) =
         build_preflight_report(state, prepared, validated, llm_result).await?;
@@ -401,7 +401,7 @@ async fn build_preflight_report(
     state: &AppState,
     prepared: &PreparedManifest,
     validated: &Validated,
-    llm_result: Result<LlmClientResult>,
+    llm_result: Result<FabroClient>,
 ) -> Result<(CheckReport, bool)> {
     let graph = validated.graph();
     let mut checks = base_preflight_checks(prepared, graph);
@@ -421,7 +421,7 @@ async fn build_preflight_report(
     let catalog = state.catalog();
     let ready_providers = llm_result
         .as_ref()
-        .map(LlmClientResult::provider_ids)
+        .map(FabroClient::provider_ids)
         .unwrap_or_default();
     let materialized = materialize_run_with_ready_providers(
         prepared.settings.clone(),
@@ -439,7 +439,7 @@ async fn build_preflight_report(
     let server_settings = state.server_settings();
     let github_integration = &server_settings.server.integrations.github;
     let sandbox_provider = effective_sandbox_provider(&resolved_run);
-    if let Some(error) = sandbox_provider_policy_error(&server_settings, sandbox_provider) {
+    if let Some(error) = sandbox_provider_policy_error(&server_settings, &sandbox_provider) {
         checks.push(CheckResult {
             name:        "Sandbox Provider Policy".into(),
             status:      CheckStatus::Error,
@@ -465,8 +465,8 @@ async fn build_preflight_report(
         &ready_providers,
         &resolved_run.model.fallbacks,
     );
-    let needs_github_credentials =
-        sandbox_provider.is_clone_based() || resolved_run.integrations.github.is_token_requested();
+    let needs_github_credentials = sandbox_provider.clones_workspace()
+        || resolved_run.integrations.github.is_token_requested();
     let github_app = if needs_github_credentials {
         match state.github_credentials(github_integration).await {
             Ok(credentials) => credentials,
@@ -483,19 +483,19 @@ async fn build_preflight_report(
         None
     };
 
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY).await?;
+    let access = state.provider_access().await?;
     let sandbox_ok = run_sandbox_check(
         &mut checks,
-        sandbox_provider,
+        &sandbox_provider,
         prepared,
         &resolved_run,
         github_app.clone(),
-        daytona_api_key,
+        &access,
     )
     .await;
     let repository_access_ok = run_repository_access_check(
         &mut checks,
-        sandbox_provider,
+        &sandbox_provider,
         prepared,
         &resolved_run,
         github_app.clone(),
@@ -650,35 +650,26 @@ fn base_preflight_checks(prepared: &PreparedManifest, graph: &Graph) -> Vec<Chec
 
 pub(crate) fn sandbox_provider_policy_error(
     server_settings: &ServerSettings,
-    provider: SandboxProviderKind,
+    provider: &SandboxProviderKind,
 ) -> Option<String> {
-    let enabled = server_settings
-        .server
-        .sandbox
-        .providers
-        .for_provider(provider)
-        .enabled;
-    (!enabled).then(|| {
-        format!(
+    let providers = &server_settings.server.sandbox.providers;
+    match providers.get(provider) {
+        Some(entry) if entry.enabled => None,
+        Some(_) => Some(format!(
             "sandbox provider \"{provider}\" is disabled by server.sandbox.providers.{provider}.enabled"
-        )
-    })
+        )),
+        None => Some(format!(
+            "sandbox provider \"{provider}\" is not configured; add [server.sandbox.providers.{provider}] to settings.toml"
+        )),
+    }
 }
 
 pub(crate) fn configured_sandbox_provider(settings: &RunNamespace) -> SandboxProviderKind {
-    SandboxProviderKind::from(settings.environment.provider)
+    settings.environment.provider.clone()
 }
 
 pub(crate) fn effective_sandbox_provider(settings: &RunNamespace) -> SandboxProviderKind {
     configured_sandbox_provider(settings).effective_for(settings.execution.mode)
-}
-
-fn resolve_daytona_config(settings: &RunNamespace) -> DaytonaConfig {
-    daytona_config_from_environment(&settings.environment, &settings.clone)
-}
-
-fn resolve_docker_config(settings: &RunNamespace) -> DockerSandboxOptions {
-    docker_config_from_environment(&settings.environment, &settings.clone)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -687,11 +678,11 @@ struct GitRemoteRefCheck {
     branch:     Option<String>,
 }
 
-fn clone_disabled_for_provider(provider: SandboxProviderKind, resolved_run: &RunNamespace) -> bool {
-    match provider {
-        SandboxProviderKind::Docker | SandboxProviderKind::Daytona => !resolved_run.clone.enabled,
-        SandboxProviderKind::Local => false,
-    }
+fn clone_disabled_for_provider(
+    provider: &SandboxProviderKind,
+    resolved_run: &RunNamespace,
+) -> bool {
+    provider.clones_workspace() && !resolved_run.clone.enabled
 }
 
 fn run_environment_capability_check(checks: &mut Vec<CheckResult>, resolved_run: &RunNamespace) {
@@ -714,8 +705,8 @@ fn run_environment_capability_check(checks: &mut Vec<CheckResult>, resolved_run:
 fn environment_capability_warnings(resolved_run: &RunNamespace) -> Vec<String> {
     let environment = &resolved_run.environment;
     let mut warnings = Vec::new();
-    match environment.provider {
-        EnvironmentProvider::Local => {
+    match environment.provider.bundled() {
+        Some(BundledProvider::Local) => {
             if environment.resources.cpu.is_some()
                 || environment.resources.memory.is_some()
                 || environment.resources.disk.is_some()
@@ -729,7 +720,7 @@ fn environment_capability_warnings(resolved_run: &RunNamespace) -> Vec<String> {
                 warnings.push("local provider ignores lifecycle.auto_stop".to_string());
             }
         }
-        EnvironmentProvider::Docker => {
+        Some(BundledProvider::Docker) => {
             if environment.cwd.is_some() {
                 warnings.push("docker provider ignores cwd".to_string());
             }
@@ -746,9 +737,14 @@ fn environment_capability_warnings(resolved_run: &RunNamespace) -> Vec<String> {
                 warnings.push("docker provider ignores image.dockerfile".to_string());
             }
         }
-        EnvironmentProvider::Daytona => {
+        Some(BundledProvider::Daytona) => {
             if environment.cwd.is_some() {
                 warnings.push("daytona provider ignores cwd".to_string());
+            }
+        }
+        None => {
+            if environment.cwd.is_some() {
+                warnings.push(format!("{} provider ignores cwd", environment.provider));
             }
         }
     }
@@ -765,7 +761,7 @@ fn repository_access_details(request: &GitRemoteRefCheck) -> Vec<CheckDetail> {
 
 async fn run_repository_access_check(
     checks: &mut Vec<CheckResult>,
-    sandbox_provider: SandboxProviderKind,
+    sandbox_provider: &SandboxProviderKind,
     prepared: &PreparedManifest,
     resolved_run: &RunNamespace,
     github_app: Option<fabro_github::GitHubCredentials>,
@@ -783,7 +779,7 @@ async fn run_repository_access_check(
 
 async fn run_repository_access_check_with<F, Fut>(
     checks: &mut Vec<CheckResult>,
-    sandbox_provider: SandboxProviderKind,
+    sandbox_provider: &SandboxProviderKind,
     prepared: &PreparedManifest,
     resolved_run: &RunNamespace,
     github_app: Option<fabro_github::GitHubCredentials>,
@@ -793,7 +789,7 @@ where
     F: FnOnce(GitRemoteRefCheck, Option<fabro_github::GitHubCredentials>) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    if !sandbox_provider.is_clone_based()
+    if !sandbox_provider.clones_workspace()
         || clone_disabled_for_provider(sandbox_provider, resolved_run)
     {
         return true;
@@ -879,20 +875,29 @@ async fn check_git_remote_ref(
 
     run_ls_remote(command)
         .await
-        .map_err(|message| redact_auth_url(&message, auth_url.as_ref()))
+        .map_err(|message| match &auth_url {
+            Some(auth_url) => auth_url.redact_in(&message),
+            None => message,
+        })
 }
 
 /// Run a prepared `git ls-remote` invocation with a 10s timeout, reducing a
 /// failure to its most useful message: stderr, then stdout, then the exit
 /// status.
 async fn run_ls_remote(mut command: Command) -> std::result::Result<(), String> {
-    // Dropping a timed-out `Command::output` future does not stop the child
-    // unless kill-on-drop is enabled.
-    command.kill_on_drop(true);
-    let output = time::timeout(Duration::from_secs(10), command.output())
-        .await
-        .map_err(|_| "git ls-remote timed out after 10s".to_string())?
-        .map_err(|err| format!("Failed to run git ls-remote: {err}"))?;
+    let output = fabro_proc::capture(
+        &mut command,
+        Some(Duration::from_secs(10)),
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .map_err(|err| match err {
+        ProcessError::TimedOut => "git ls-remote timed out after 10s".to_string(),
+        ProcessError::Io(source) => format!("Failed to run git ls-remote: {source}"),
+        ProcessError::Cancelled => "git ls-remote cancelled".to_string(),
+    })?
+    .output;
 
     if output.status.success() {
         return Ok(());
@@ -910,11 +915,11 @@ async fn run_ls_remote(mut command: Command) -> std::result::Result<(), String> 
 }
 
 fn preflight_sandbox_spec(
-    sandbox_provider: SandboxProviderKind,
+    sandbox_provider: &SandboxProviderKind,
     prepared: &PreparedManifest,
     resolved_run: &RunNamespace,
     github_app: Option<fabro_github::GitHubCredentials>,
-    daytona_api_key: Option<String>,
+    access: &ProviderAccess,
 ) -> std::result::Result<SandboxSpec, fabro_sandbox::Error> {
     let clone_origin_url = prepared
         .git
@@ -922,58 +927,53 @@ fn preflight_sandbox_spec(
         .map(|git| fabro_github::normalize_repo_origin_url(&git.origin_url));
     let clone_branch = prepared.git.as_ref().map(|git| git.branch.clone());
 
-    Ok(match sandbox_provider {
-        SandboxProviderKind::Local => {
-            let working_directory = local_working_directory_from_environment(
-                &resolved_run.environment,
-                Some(&prepared.source_directory),
-            )?;
-            SandboxSpec::Local { working_directory }
-        }
-        SandboxProviderKind::Docker => {
-            let mut config = resolve_docker_config(resolved_run);
-            config.skip_clone = true;
-            SandboxSpec::Docker {
-                config,
-                github_app,
-                run_id: None,
-                clone_origin_url,
-                clone_branch,
-                clone_tag: None,
-                clone_commit_sha: None,
-            }
-        }
-        SandboxProviderKind::Daytona => {
-            let mut config = resolve_daytona_config(resolved_run);
-            config.skip_clone = true;
-            SandboxSpec::Daytona {
-                config: Box::new(config),
-                github_app,
-                run_id: None,
-                clone_origin_url,
-                clone_branch,
-                clone_tag: None,
-                clone_commit_sha: None,
-                api_key: daytona_api_key,
-            }
-        }
+    if sandbox_provider.bundled() == Some(BundledProvider::Local) {
+        let working_directory = resolved_run
+            .environment
+            .local_working_directory(Some(&prepared.source_directory))
+            .map_err(|err| {
+                fabro_sandbox::Error::context(
+                    "Failed to resolve local environment working directory",
+                    err,
+                )
+            })?;
+        return Ok(SandboxSpec::local(working_directory, access.clone()));
+    }
+    // No vault is available on this path, so a `{{ secrets.* }}` value keeps
+    // its source form. Preflight never clones.
+    let spec = sandbox_spec_for_environment(
+        &resolved_run.environment,
+        resolved_run.environment.unresolved_env(),
+    )?;
+    let clone = CloneRequest {
+        origin_url: clone_origin_url,
+        branch: clone_branch,
+        ..CloneRequest::none()
+    };
+    Ok(SandboxSpec {
+        kind: sandbox_provider.clone(),
+        access: access.clone(),
+        spec,
+        clone,
+        github_app,
+        run_id: None,
     })
 }
 
 async fn run_sandbox_check(
     checks: &mut Vec<CheckResult>,
-    sandbox_provider: SandboxProviderKind,
+    sandbox_provider: &SandboxProviderKind,
     prepared: &PreparedManifest,
     resolved_run: &RunNamespace,
     github_app: Option<fabro_github::GitHubCredentials>,
-    daytona_api_key: Option<String>,
+    access: &ProviderAccess,
 ) -> bool {
     let spec = match preflight_sandbox_spec(
         sandbox_provider,
         prepared,
         resolved_run,
         github_app.clone(),
-        daytona_api_key,
+        access,
     ) {
         Ok(spec) => spec,
         Err(err) => {
@@ -987,8 +987,8 @@ async fn run_sandbox_check(
             return false;
         }
     };
-    let sandbox_result: Result<Arc<dyn Sandbox>, String> = spec.build(None).await.map_err(|err| {
-        if matches!(sandbox_provider, SandboxProviderKind::Daytona) {
+    let sandbox_result: Result<Arc<RunSandbox>, String> = spec.build(None).await.map_err(|err| {
+        if *sandbox_provider == SandboxProviderKind::DAYTONA {
             format!("Daytona sandbox creation failed: {err}")
         } else {
             err.to_string()
@@ -999,7 +999,7 @@ async fn run_sandbox_check(
         Ok(sandbox) => match sandbox.initialize().await {
             Ok(()) => {
                 let mut details = vec![CheckDetail::new(format!("Provider: {sandbox_provider}"))];
-                if sandbox_provider.is_clone_based()
+                if sandbox_provider.clones_workspace()
                     && prepared.git.is_none()
                     && !clone_disabled_for_provider(sandbox_provider, resolved_run)
                 {
@@ -1008,7 +1008,7 @@ async fn run_sandbox_check(
                         warn: true,
                     });
                 }
-                if let Err(err) = sandbox.cleanup().await {
+                if let Err(err) = sandbox.delete().await {
                     checks.push(CheckResult {
                         name: "Sandbox".into(),
                         status: CheckStatus::Error,
@@ -1028,7 +1028,7 @@ async fn run_sandbox_check(
                 true
             }
             Err(err) => {
-                let cleanup_error = sandbox.cleanup().await.err();
+                let cleanup_error = sandbox.delete().await.err();
                 checks.push(CheckResult {
                     name:        "Sandbox".into(),
                     status:      CheckStatus::Error,
@@ -1071,7 +1071,7 @@ async fn run_llm_check(
     model: &str,
     default_provider: &str,
     catalog: &Catalog,
-    llm_result: Result<LlmClientResult>,
+    llm_result: Result<FabroClient>,
 ) -> bool {
     let mut model_providers = std::collections::BTreeSet::new();
     let mut has_llm_nodes = false;
@@ -1093,7 +1093,7 @@ async fn run_llm_check(
     match llm_result {
         Ok(result) => {
             let auth_issues = result.auth_issues;
-            let registration_issues = result.registration_issues;
+            let registration_issues = result.build_issues;
             let client = Arc::new(result.client);
 
             let mut all_ok = true;
@@ -1111,7 +1111,7 @@ async fn run_llm_check(
                         status:      CheckStatus::Warning,
                         summary:     model_id.clone(),
                         details:     vec![CheckDetail::new(format!("Provider: {provider_name}"))],
-                        remediation: Some(auth_issue_message(&provider_id, issue)),
+                        remediation: Some(issue.to_string()),
                     }));
                 } else if let Some(issue) = registration_issues
                     .iter()
@@ -1123,9 +1123,9 @@ async fn run_llm_check(
                         status:      CheckStatus::Warning,
                         summary:     model_id.clone(),
                         details:     vec![CheckDetail::new(format!("Provider: {provider_name}"))],
-                        remediation: Some(issue.error.to_string()),
+                        remediation: Some(issue.cause.to_string()),
                     }));
-                } else if !client.has_provider(provider_name) {
+                } else if !client.available_providers().contains(&provider_id) {
                     all_ok = false;
                     completed_checks.push((index, CheckResult {
                         name:        "LLM".into(),
@@ -1149,9 +1149,12 @@ async fn run_llm_check(
                 .map(|probe| {
                     let client = Arc::clone(&client);
                     async move {
-                        let outcome =
-                            run_basic_model_probe(&probe.model_id, &probe.provider_name, client)
-                                .await;
+                        let outcome = probe::run_basic_probe(
+                            &client,
+                            &format!("{}/{}", probe.provider_name, probe.model_id),
+                            Duration::from_secs(fabro_types::ModelTestMode::Basic.timeout_secs()),
+                        )
+                        .await;
                         let (status, remediation) = if outcome.status == ModelTestStatus::Ok {
                             (CheckStatus::Pass, None)
                         } else {
@@ -1206,10 +1209,10 @@ async fn run_llm_check(
 }
 
 fn canonical_provider_id(catalog: &Catalog, provider_name: &str) -> ProviderId {
-    let provider_id = ProviderId::from(provider_name);
-    catalog
-        .provider(&provider_id)
-        .map_or(provider_id, |provider| provider.id.clone())
+    catalog.enabled_provider(provider_name).map_or_else(
+        || ProviderId::new(provider_name),
+        |provider| provider.id().clone(),
+    )
 }
 
 async fn run_github_token_check(
@@ -1506,23 +1509,21 @@ async fn probe_github_repository(
 
 /// Retry auth-shaped failures with the SAME token: replication of a given
 /// token only makes progress, while re-minting would restart the replication
-/// clock. The sandbox git retry executor owns attempt limits,
-/// classification, and pacing.
+/// clock. The driver's git retry owns the decision and the pacing; fabro's
+/// probe policy owns the attempt count.
 async fn probe_with_replication_retry<F, Fut>(
     snapshot: TokenSnapshot,
-    mut run: F,
+    run: F,
 ) -> std::result::Result<(), String>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<(), String>>,
 {
-    let credential_context = fabro_sandbox::CredentialContext::from_snapshot(Some(&snapshot));
-    fabro_sandbox::retry_git_operation(
-        SandboxProviderKind::Local,
+    fabro_sandbox::retry_git_messages(
+        &fabro_sandbox::repository_probe_policy(),
+        Some(&snapshot),
         "repository probe",
-        &fabro_sandbox::RetryPlan::repository_probe(),
-        |_attempt| run(),
-        |message| fabro_sandbox::classify_failure(message, credential_context),
+        run,
     )
     .await
 }
@@ -1664,11 +1665,36 @@ fn report_to_api(report: &CheckReport) -> types::PreflightCheckReport {
 
 #[cfg(test)]
 mod tests {
-    use fabro_model::ProviderId;
-    use fabro_model::catalog::LlmCatalogSettings;
     use fabro_workflow::run_materialization::materialize_run;
+    use lithos_llm::catalog::ProviderId;
 
     use super::*;
+
+    #[tokio::test]
+    async fn ls_remote_capture_keeps_diagnostic_precedence_and_unlimited_output() {
+        for (script, expected) in [
+            ("printf stdout; printf stderr >&2; exit 7", "stderr"),
+            ("printf stdout; exit 7", "stdout"),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            assert_eq!(super::run_ls_remote(command).await.unwrap_err(), expected);
+        }
+        let mut command = Command::new("sh");
+        command.args(["-c", "head -c 200000 /dev/zero | tr '\\0' x >&2; exit 7"]);
+        assert_eq!(
+            super::run_ls_remote(command).await.unwrap_err().len(),
+            200_000
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        assert!(
+            super::run_ls_remote(command)
+                .await
+                .unwrap_err()
+                .starts_with("git ls-remote exited with status")
+        );
+    }
 
     fn minimal_manifest() -> types::RunManifest {
         types::RunManifest {
@@ -1757,18 +1783,13 @@ mod tests {
     }
 
     fn test_catalog() -> Arc<Catalog> {
-        Arc::new(Catalog::from_builtin().unwrap())
+        Arc::new(fabro_llm::test_support::test_catalog())
     }
 
     fn openrouter_catalog() -> Catalog {
-        let overrides = toml::from_str(
-            r"
-[providers.openrouter]
-enabled = true
-",
+        fabro_llm::test_support::test_catalog_with_overlay(
+            "[providers.openrouter]\nenabled = true\n",
         )
-        .expect("catalog override should parse");
-        Catalog::from_builtin_with_overrides(&overrides).expect("catalog should build")
     }
 
     fn model_refs(values: &[&str]) -> Vec<fabro_types::settings::ModelRef> {
@@ -1879,20 +1900,18 @@ enabled = true
     ) -> Arc<crate::server::AppState> {
         let moonshot_url = server.url("/moonshot/v1");
         let openrouter_url = server.url("/openrouter/v1");
-        let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(
-            r#"
+        crate::test_support::TestAppStateBuilder::new()
+            .llm_overlay_toml(&format!(
+                r#"
 [providers.moonshot]
 base_url = "{moonshot_url}"
 
 [providers.openrouter]
 base_url = "{openrouter_url}"
 enabled = true
-"#
-        ))
-        .expect("catalog overrides should parse");
 
-        crate::test_support::TestAppStateBuilder::new()
-            .llm_catalog_settings(llm_catalog_settings)
+"#
+            ))
             .vault_entries([
                 (EnvVars::KIMI_API_KEY, "test-moonshot-key"),
                 (EnvVars::OPENROUTER_API_KEY, "test-openrouter-key"),
@@ -1907,7 +1926,7 @@ enabled = true
         let llm_result = state.resolve_llm_client().await;
         let mut ready_providers = llm_result
             .as_ref()
-            .map(LlmClientResult::provider_ids)
+            .map(FabroClient::provider_ids)
             .unwrap_or_default();
         ready_providers.sort();
         assert_eq!(ready_providers, vec![
@@ -1983,7 +2002,7 @@ digraph Demo {{
     }
 
     fn prepared_and_resolved_for_sandbox(
-        provider: SandboxProviderKind,
+        provider: &SandboxProviderKind,
         clone_enabled: bool,
         git: Option<types::GitContext>,
     ) -> (PreparedManifest, RunNamespace) {
@@ -2021,8 +2040,8 @@ enabled = {clone_enabled}
         let resolved = materialize_run(
             prepared.settings.clone(),
             validated.graph(),
-            Catalog::builtin(),
-            &[ProviderId::anthropic()],
+            test_catalog().as_ref(),
+            &[lithos_llm::catalog::builtin::anthropic()],
         )
         .unwrap()
         .run;
@@ -2033,7 +2052,7 @@ enabled = {clone_enabled}
     #[test]
     fn docker_environment_cwd_is_reported_as_ignored() {
         let mut resolved = RunNamespace::default();
-        resolved.environment.provider = EnvironmentProvider::Docker;
+        resolved.environment.provider = SandboxProviderKind::DOCKER;
         resolved.environment.cwd = Some("/workspace/custom".to_string());
 
         assert_eq!(environment_capability_warnings(&resolved), vec![
@@ -2044,7 +2063,7 @@ enabled = {clone_enabled}
     #[test]
     fn daytona_environment_cwd_is_reported_as_ignored() {
         let mut resolved = RunNamespace::default();
-        resolved.environment.provider = EnvironmentProvider::Daytona;
+        resolved.environment.provider = SandboxProviderKind::DAYTONA;
         resolved.environment.cwd = Some("/home/daytona/workspace/custom".to_string());
 
         assert_eq!(environment_capability_warnings(&resolved), vec![
@@ -2079,14 +2098,14 @@ provider = "local"
 
         assert_eq!(
             prepared.settings.run.environment.provider,
-            EnvironmentProvider::Local
+            SandboxProviderKind::LOCAL
         );
     }
 
     #[tokio::test]
     async fn repository_access_check_skips_when_clone_is_disabled() {
         let (prepared, resolved) = prepared_and_resolved_for_sandbox(
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             false,
             Some(git_context("https://github.com/acme/widgets", "main")),
         );
@@ -2096,7 +2115,7 @@ provider = "local"
 
         let ok = run_repository_access_check_with(
             &mut checks,
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             &prepared,
             &resolved,
             None,
@@ -2115,7 +2134,7 @@ provider = "local"
     #[tokio::test]
     async fn repository_access_check_rejects_non_github_origins_before_remote_probe() {
         let (prepared, resolved) = prepared_and_resolved_for_sandbox(
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             true,
             Some(git_context("https://gitlab.com/acme/widgets", "main")),
         );
@@ -2125,7 +2144,7 @@ provider = "local"
 
         let ok = run_repository_access_check_with(
             &mut checks,
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             &prepared,
             &resolved,
             None,
@@ -2153,7 +2172,7 @@ provider = "local"
     #[tokio::test]
     async fn repository_access_check_probes_normalized_github_branch() {
         let (prepared, resolved) = prepared_and_resolved_for_sandbox(
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             true,
             Some(git_context(
                 "git@github.com:acme/widgets.git",
@@ -2166,7 +2185,7 @@ provider = "local"
 
         let ok = run_repository_access_check_with(
             &mut checks,
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             &prepared,
             &resolved,
             None,
@@ -2190,7 +2209,7 @@ provider = "local"
     #[tokio::test]
     async fn repository_access_check_surfaces_remote_probe_failure() {
         let (prepared, resolved) = prepared_and_resolved_for_sandbox(
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             true,
             Some(git_context("https://github.com/acme/widgets", "missing")),
         );
@@ -2198,7 +2217,7 @@ provider = "local"
 
         let ok = run_repository_access_check_with(
             &mut checks,
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             &prepared,
             &resolved,
             None,
@@ -2222,35 +2241,27 @@ provider = "local"
     #[test]
     fn preflight_sandbox_spec_disables_docker_clone_but_preserves_clone_metadata() {
         let (prepared, resolved) = prepared_and_resolved_for_sandbox(
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             true,
             Some(git_context("https://github.com/acme/widgets", "main")),
         );
 
         let spec = preflight_sandbox_spec(
-            SandboxProviderKind::Docker,
+            &SandboxProviderKind::DOCKER,
             &prepared,
             &resolved,
             None,
-            None,
+            &ProviderAccess::default(),
         );
 
-        match spec {
-            Ok(SandboxSpec::Docker {
-                config,
-                clone_origin_url,
-                clone_branch,
-                ..
-            }) => {
-                assert!(config.skip_clone);
-                assert_eq!(
-                    clone_origin_url.as_deref(),
-                    Some("https://github.com/acme/widgets")
-                );
-                assert_eq!(clone_branch.as_deref(), Some("main"));
-            }
-            _ => panic!("expected Docker preflight sandbox spec"),
-        }
+        let spec = spec.expect("Docker preflight sandbox spec");
+        assert_eq!(spec.kind, SandboxProviderKind::DOCKER);
+        assert!(spec.clone.skip);
+        assert_eq!(
+            spec.clone.origin_url.as_deref(),
+            Some("https://github.com/acme/widgets")
+        );
+        assert_eq!(spec.clone.branch.as_deref(), Some("main"));
     }
 
     #[test]
@@ -2913,7 +2924,7 @@ digraph Demo {
                 .remediation
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Rate limited by openai: quota limited")
+                .contains("quota limited")
         );
         assert!(response_mock.calls_async().await >= 1);
     }
@@ -3015,7 +3026,7 @@ digraph Demo {
 
         assert!(matches!(
             error,
-            WorkflowError::ModelSelection(fabro_model::ModelSelectionError::UnknownProvider {
+            WorkflowError::ModelSelection(fabro_llm::ModelSelectionError::UnknownProvider {
                 provider
             }) if provider.as_str() == "missing-provider"
         ));
@@ -3023,35 +3034,28 @@ digraph Demo {
 
     #[tokio::test]
     async fn preflight_resolves_model_aliases_from_app_state_catalog() {
-        let llm_catalog_settings: LlmCatalogSettings = toml::from_str(
-            r#"
+        let state = crate::test_support::TestAppStateBuilder::new()
+            .llm_overlay_toml(
+                r#"
 [providers.acme]
 display_name = "Acme"
-adapter = "openai_compatible"
-agent_profile = "openai"
+adapter = "openai-compatible"
+codec = "openai-chat"
 base_url = "https://api.acme.test/v1"
+auth = { type = "bearer" }
+default_model = "acme-large"
 
-[providers.acme.auth]
-credentials = ["env:ACME_API_KEY"]
+[providers.acme.metadata.agent]
+profile = "openai"
 
 [providers.acme.models."acme-large"]
 display_name = "Acme Large"
-family = "acme"
-default = true
 aliases = ["vl"]
-
-[providers.acme.models."acme-large".limits]
-context_window = 128000
-
-[providers.acme.models."acme-large".features]
-tools = true
-vision = false
-reasoning = false
+api_model = "acme-large"
+limits = { context_tokens = 128000, max_output_tokens = 8192 }
+capabilities = { text = true, tools = true }
 "#,
-        )
-        .expect("catalog fixture should parse");
-        let state = crate::test_support::TestAppStateBuilder::new()
-            .llm_catalog_settings(llm_catalog_settings)
+            )
             .build();
         let mut manifest = minimal_manifest();
         manifest.workflows.get_mut("workflow.fabro").unwrap().source = r#"
@@ -3071,7 +3075,7 @@ digraph Demo {
         let llm_result = state.resolve_llm_client().await;
         let ready_providers = llm_result
             .as_ref()
-            .map(LlmClientResult::provider_ids)
+            .map(FabroClient::provider_ids)
             .unwrap_or_default();
         assert!(ready_providers.is_empty());
         let validated = validate_prepared_manifest_for_preflight(
@@ -3293,7 +3297,7 @@ dockerfile = { path = "Dockerfile" }
 
         fn declared(origin: &str, additional: &[&str]) -> (PreparedManifest, RunNamespace) {
             let (prepared, mut resolved) = prepared_and_resolved_for_sandbox(
-                SandboxProviderKind::Local,
+                &SandboxProviderKind::LOCAL,
                 true,
                 Some(git_context(origin, "main")),
             );

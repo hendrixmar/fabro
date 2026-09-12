@@ -30,10 +30,9 @@ pub fn event_payload_from_redacted_json(line: &str, run_id: &RunId) -> Result<Ev
 
 #[cfg(test)]
 mod tests {
-    use ::fabro_types::{ReasoningOutput, fixtures, run_event as fabro_types};
-    use fabro_agent::AgentEvent;
-    use fabro_llm::types::TokenCounts as LlmTokenCounts;
-    use fabro_model::{ModelRef, ProviderId};
+    use ::fabro_types::{fixtures, run_event as fabro_types};
+    use lithos_llm::types::ReasoningOutput;
+    use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, TokenUsage};
 
     use super::*;
     use crate::event::{Event, to_run_event};
@@ -80,26 +79,28 @@ mod tests {
     fn build_redacted_event_payload_redacts_tool_process_output_tails() {
         let secret = "sk-ant-api03-xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA";
         let stored = to_run_event(&fixtures::RUN_8, &Event::Agent {
-            stage:             "code".to_string(),
-            visit:             1,
-            event:             AgentEvent::ToolProcessCompleted {
-                exit_code:             Some(7),
-                termination:           ::fabro_types::CommandTermination::Exited,
-                duration_ms:           12,
-                streams_separated:     true,
-                output_bytes_observed: 100,
-                output_bytes_retained: 100,
-                output_bytes_omitted:  0,
-                exec_output_tail:      Some(fabro_types::ExecOutputTail {
-                    stdout:           Some(format!("stdout {secret}")),
-                    stderr:           Some("plain stderr".to_string()),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                }),
-            },
-            session_id:        Some("ses_child".to_string()),
-            parent_session_id: None,
-            tool_call_id:      Some("call_1".to_string()),
+            stage: "code".to_string(),
+            visit: 1,
+            event: CodingAgentEvent::new(
+                "ses_child".to_string(),
+                CodingEvent::ToolProcessCompleted {
+                    exit_code:             Some(7),
+                    termination:           ::fabro_types::CommandTermination::Exited,
+                    duration_ms:           12,
+                    streams_separated:     true,
+                    output_bytes_observed: 100,
+                    output_bytes_retained: 100,
+                    output_bytes_omitted:  0,
+                    exec_output_tail:      Some(fabro_types::ExecOutputTail {
+                        stdout:           Some(format!("stdout {secret}")),
+                        stderr:           Some("plain stderr".to_string()),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    }),
+                },
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+            .with_tool_call_id("call_1".to_string()),
         });
 
         let payload = build_redacted_event_payload(&stored, &fixtures::RUN_8).unwrap();
@@ -109,7 +110,7 @@ mod tests {
         assert!(payload_text.contains("REDACTED"));
         assert_eq!(payload.as_value()["event"], "agent.tool.process.completed");
         assert_eq!(
-            payload.as_value()["properties"]["exec_output_tail"]["stderr"],
+            payload.as_value()["properties"]["event"]["ToolProcessCompleted"]["exec_output_tail"]["stderr"],
             "plain stderr"
         );
     }
@@ -120,32 +121,29 @@ mod tests {
     fn build_redacted_event_payload_redacts_secrets_inside_reasoning() {
         let secret = "sk-ant-api03-xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA";
         let stored = to_run_event(&fixtures::RUN_8, &Event::Agent {
-            stage:             "code".to_string(),
-            visit:             1,
-            event:             AgentEvent::AssistantMessage {
-                text:            "done".to_string(),
-                model:           ModelRef {
-                    provider: ProviderId::openai(),
-                    model_id: "gpt-5.4".into(),
-                    speed:    None,
+            stage: "code".to_string(),
+            visit: 1,
+            event: CodingAgentEvent::new(
+                "ses_agent".to_string(),
+                CodingEvent::AssistantMessage {
+                    text:            "done".to_string(),
+                    model:           "gpt-5.4".to_string(),
+                    usage:           TokenUsage::default(),
+                    cost_usd_micros: None,
+                    cost_source:     None,
+                    tool_call_count: 0,
+                    context_window:  None,
+                    reasoning:       Some(ReasoningOutput::new(
+                        format!("the key is {secret}"),
+                        format!("reading {secret} from the env"),
+                    )),
                 },
-                usage:           LlmTokenCounts::default(),
-                cost_usd:        None,
-                cost_source:     None,
-                tool_call_count: 0,
-                context_window:  None,
-                reasoning:       Some(ReasoningOutput::new(
-                    format!("the key is {secret}"),
-                    format!("reading {secret} from the env"),
-                )),
-            },
-            session_id:        Some("ses_agent".to_string()),
-            parent_session_id: None,
-            tool_call_id:      None,
+                std::time::SystemTime::UNIX_EPOCH,
+            ),
         });
 
         let payload = build_redacted_event_payload(&stored, &fixtures::RUN_8).unwrap();
-        let reasoning = &payload.as_value()["properties"]["reasoning"];
+        let reasoning = &payload.as_value()["properties"]["event"]["AssistantMessage"]["reasoning"];
         let summary = reasoning["summary"].as_str().unwrap();
         let trace = reasoning["trace"].as_str().unwrap();
 

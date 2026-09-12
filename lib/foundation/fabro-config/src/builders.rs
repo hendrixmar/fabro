@@ -1,8 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use fabro_model::catalog as model_catalog;
 use fabro_types::settings::run::McpServerSettings;
 use fabro_types::settings::{RunNamespace, WorkflowNamespace};
 use fabro_types::{ServerSettings, UserSettings, WorkflowSettings};
@@ -16,9 +15,8 @@ use crate::resolve::{
 };
 use crate::user::load_settings_config;
 use crate::{
-    CliLayer, Combine, CostRates, EnvironmentLayer, Error, LlmLayer, LlmModelFeatures,
-    LlmModelLimits, MergeMap, ModelControls, ModelCostTable, ModelSettings, ProviderSettings,
-    Result, RunLayer, ServerLayer, SettingsLayer, run,
+    CliLayer, Combine, EnvironmentLayer, Error, LlmLayer, MergeMap, Result, RunLayer, ServerLayer,
+    SettingsLayer, run,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +229,8 @@ pub struct ServerRuntimeSettings {
     pub manifest_run_defaults:         RunLayer,
     pub manifest_environment_defaults: crate::MergeMap<crate::EnvironmentLayer>,
     pub manifest_run_settings:         std::result::Result<RunNamespace, SharedError>,
-    pub llm_catalog_settings:          model_catalog::LlmCatalogSettings,
+    /// Operator catalog overlay, applied above the built-in and policy layers.
+    pub llm_overlay:                   LlmLayer,
 }
 
 pub fn load_server_runtime_settings(
@@ -246,12 +245,12 @@ pub fn load_server_runtime_settings(
     resolve_server_runtime_settings(layer, run_overrides, server_overrides)
 }
 
-pub fn load_llm_catalog_settings(path: Option<&Path>) -> Result<model_catalog::LlmCatalogSettings> {
+pub fn load_llm_overlay(path: Option<&Path>) -> Result<LlmLayer> {
     let layer = match path {
         Some(path) => load_settings_path(path, SettingsSource::ActiveSettings)?,
         None => load_settings_config(None)?,
     };
-    Ok(llm_catalog_settings_from_layer(&layer))
+    Ok(llm_overlay_from_layer(&layer))
 }
 
 #[cfg(test)]
@@ -286,7 +285,7 @@ fn resolve_server_runtime_settings(
 
     let manifest_run_defaults = layer.run.clone().unwrap_or_default();
     let manifest_environment_defaults = layer.environments.clone();
-    let llm_catalog_settings = llm_catalog_settings_from_layer(&layer);
+    let llm_overlay = llm_overlay_from_layer(&layer);
     Ok(ServerRuntimeSettings {
         server_settings: ServerSettingsBuilder::from_layer(&layer)?,
         manifest_run_settings: RunSettingsBuilder::from_layer(&SettingsLayer {
@@ -297,162 +296,13 @@ fn resolve_server_runtime_settings(
         .map_err(|err| SharedError::new(anyhow::Error::new(err))),
         manifest_run_defaults,
         manifest_environment_defaults,
-        llm_catalog_settings,
+        llm_overlay,
     })
 }
 
-fn llm_catalog_settings_from_layer(layer: &SettingsLayer) -> model_catalog::LlmCatalogSettings {
+fn llm_overlay_from_layer(layer: &SettingsLayer) -> LlmLayer {
     let layer = layer.clone().combine(DEFAULTS_LAYER.clone());
-    layer
-        .llm
-        .map(llm_layer_to_catalog_settings)
-        .unwrap_or_default()
-}
-
-fn llm_layer_to_catalog_settings(llm: LlmLayer) -> model_catalog::LlmCatalogSettings {
-    model_catalog::LlmCatalogSettings {
-        providers: llm
-            .providers
-            .into_inner()
-            .into_iter()
-            .map(|(id, settings)| (id, provider_settings_to_catalog(settings)))
-            .collect(),
-        models:    llm
-            .models
-            .into_inner()
-            .into_iter()
-            .map(|(id, settings)| (id, model_settings_to_catalog(settings)))
-            .collect(),
-    }
-}
-
-fn provider_settings_to_catalog(
-    settings: ProviderSettings,
-) -> model_catalog::ProviderCatalogSettings {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "collapse the authoring InterpString header values to their catalog source \
-                  strings; they are re-parsed and resolved at the credential boundary"
-    )]
-    let extra_headers = settings.extra_headers.map(|headers| {
-        headers
-            .into_iter()
-            .map(|(name, value)| (name, value.as_source()))
-            .collect()
-    });
-    let models = settings
-        .models
-        .into_inner()
-        .into_iter()
-        .map(|(id, settings)| (id, model_settings_to_catalog(settings)))
-        .collect();
-    model_catalog::ProviderCatalogSettings {
-        display_name: settings.display_name,
-        adapter: settings.adapter,
-        codec: settings.codec,
-        agent_profile: settings.agent_profile,
-        auth: settings.auth,
-        billing_policy: settings.billing_policy,
-        api_key_url: settings.api_key_url,
-        base_url: settings.base_url,
-        extra_headers,
-        priority: settings.priority,
-        enabled: settings.enabled,
-        aliases: settings.aliases,
-        models,
-    }
-}
-
-fn model_settings_to_catalog(settings: ModelSettings) -> model_catalog::ModelCatalogSettings {
-    let ModelSettings {
-        provider,
-        api_id,
-        codec,
-        billing_policy,
-        agent_profile,
-        display_name,
-        family,
-        training,
-        knowledge_cutoff,
-        default,
-        small_default,
-        probe,
-        enabled,
-        aliases,
-        estimated_output_tps,
-        limits,
-        features,
-        controls,
-        costs,
-    } = settings;
-    model_catalog::ModelCatalogSettings {
-        provider,
-        api_id,
-        codec,
-        billing_policy,
-        agent_profile,
-        display_name,
-        family,
-        training,
-        knowledge_cutoff,
-        default,
-        small_default,
-        probe,
-        enabled,
-        aliases,
-        estimated_output_tps,
-        limits: limits.as_ref().map(model_limits_to_catalog),
-        features: features.as_ref().map(model_features_to_catalog),
-        controls: controls.map(model_controls_to_catalog),
-        costs: costs.as_ref().map(model_cost_table_to_catalog),
-    }
-}
-
-fn model_limits_to_catalog(limits: &LlmModelLimits) -> model_catalog::SettingsModelLimits {
-    model_catalog::SettingsModelLimits {
-        context_window: limits.context_window,
-        max_output:     limits.max_output,
-    }
-}
-
-fn model_features_to_catalog(features: &LlmModelFeatures) -> model_catalog::SettingsModelFeatures {
-    model_catalog::SettingsModelFeatures {
-        tools:                     features.tools,
-        vision:                    features.vision,
-        reasoning:                 features.reasoning,
-        reasoning_by_default:      features.reasoning_by_default,
-        reasoning_effort:          features.reasoning_effort,
-        prompt_cache:              features.prompt_cache,
-        cache_control_breakpoints: features.cache_control_breakpoints,
-        sampling_params:           features.sampling_params,
-    }
-}
-
-fn model_controls_to_catalog(controls: ModelControls) -> model_catalog::SettingsModelControls {
-    model_catalog::SettingsModelControls {
-        reasoning_effort: controls.reasoning_effort,
-        speed:            controls.speed,
-    }
-}
-
-fn model_cost_table_to_catalog(costs: &ModelCostTable) -> model_catalog::SettingsModelCostTable {
-    model_catalog::SettingsModelCostTable {
-        base:  cost_rates_to_catalog(&costs.base),
-        speed: costs.speed.as_ref().map(|speed| {
-            speed
-                .iter()
-                .map(|(key, rates)| (key.clone(), cost_rates_to_catalog(rates)))
-                .collect::<BTreeMap<_, _>>()
-        }),
-    }
-}
-
-fn cost_rates_to_catalog(rates: &CostRates) -> model_catalog::CostRates {
-    model_catalog::CostRates {
-        input_cost_per_mtok:       rates.input_cost_per_mtok,
-        output_cost_per_mtok:      rates.output_cost_per_mtok,
-        cache_input_cost_per_mtok: rates.cache_input_cost_per_mtok,
-    }
+    layer.llm.unwrap_or_default()
 }
 
 fn parse_settings_toml(source: &str, kind: SettingsSource) -> Result<SettingsLayer> {
@@ -695,8 +545,9 @@ fn finish_dense_result<T>(
 mod tests {
     use std::collections::HashMap;
 
+    use fabro_types::SandboxProviderKind;
     use fabro_types::settings::cli::OutputVerbosity;
-    use fabro_types::settings::run::{ApprovalMode, EnvironmentProvider, RunMode};
+    use fabro_types::settings::run::{ApprovalMode, RunMode};
 
     use super::{RunSettingsBuilder, WorkflowSettingsBuilder, server_runtime_settings_from_toml};
     use crate::{
@@ -799,7 +650,7 @@ provider = "local"
 
         assert_eq!(
             settings.run.environment.provider,
-            EnvironmentProvider::Local
+            SandboxProviderKind::LOCAL
         );
     }
 
@@ -824,12 +675,12 @@ provider = "docker"
 
         assert_eq!(
             settings.run.environment.provider,
-            EnvironmentProvider::Docker
+            SandboxProviderKind::DOCKER
         );
     }
 
     #[test]
-    fn server_runtime_settings_preserves_llm_catalog_overrides() {
+    fn server_runtime_settings_preserves_llm_overlay() {
         let settings = server_runtime_settings_from_toml(
             r#"
 _version = 1
@@ -839,92 +690,28 @@ methods = ["dev-token"]
 
 [llm.providers.acme]
 display_name = "Acme"
-adapter = "openai_compatible"
+adapter = "openai-compatible"
+codec = "openai-chat"
 base_url = "https://api.acme.test/v1"
-agent_profile = "anthropic"
+auth = { type = "bearer" }
+enabled = true
 
-[llm.providers.acme.auth]
-credentials = ["env:ACME_API_KEY"]
-
-[llm.models."acme-large"]
-provider = "acme"
+[llm.providers.acme.models."acme-large"]
 display_name = "Acme Large"
-family = "acme"
-default = true
-agent_profile = "gemini"
-
-[llm.models."acme-large".limits]
-context_window = 128000
-
-[llm.models."acme-large".features]
-tools = true
-vision = false
-reasoning = false
+api_model = "acme-large"
 "#,
             None,
             None,
         )
         .expect("server runtime settings should resolve");
 
-        let catalog =
-            fabro_model::Catalog::from_builtin_with_overrides(&settings.llm_catalog_settings)
-                .expect("catalog overrides should build");
-
+        let overlay = settings.llm_overlay.0;
+        let acme = &overlay["providers"]["acme"];
+        assert_eq!(acme["display_name"].as_str(), Some("Acme"));
+        assert_eq!(acme["enabled"].as_bool(), Some(true));
         assert_eq!(
-            catalog
-                .get_on_provider(&fabro_model::ProviderId::new("acme"), "acme-large")
-                .map(|model| model.provider.clone()),
-            Some(fabro_model::ProviderId::new("acme"))
-        );
-        assert_eq!(
-            catalog
-                .effective_agent_profile(&fabro_model::ProviderId::new("acme"), Some("acme-large")),
-            Some(fabro_model::AgentProfileKind::Gemini)
-        );
-    }
-
-    #[test]
-    fn server_runtime_settings_preserves_extra_header_sources() {
-        let settings = server_runtime_settings_from_toml(
-            r#"
-_version = 1
-
-[server.auth]
-methods = ["dev-token"]
-
-[llm.providers.acme]
-display_name = "Acme"
-adapter = "openai_compatible"
-base_url = "https://api.acme.test/v1"
-
-[llm.providers.acme.extra_headers]
-x-title = "My App"
-x-api-key = "{{ env.ACME_GATEWAY_API_KEY }}"
-x-team-secret = "Bearer {{ secrets.ACME_GATEWAY_TOKEN }}"
-"#,
-            None,
-            None,
-        )
-        .expect("server runtime settings should resolve");
-
-        let provider = settings
-            .llm_catalog_settings
-            .providers
-            .get("acme")
-            .expect("provider settings should be present");
-        let headers = provider
-            .extra_headers
-            .as_ref()
-            .expect("extra header settings should be present");
-
-        assert_eq!(headers.get("x-title").map(String::as_str), Some("My App"));
-        assert_eq!(
-            headers.get("x-api-key").map(String::as_str),
-            Some("{{ env.ACME_GATEWAY_API_KEY }}")
-        );
-        assert_eq!(
-            headers.get("x-team-secret").map(String::as_str),
-            Some("Bearer {{ secrets.ACME_GATEWAY_TOKEN }}")
+            acme["models"]["acme-large"]["api_model"].as_str(),
+            Some("acme-large")
         );
     }
 }

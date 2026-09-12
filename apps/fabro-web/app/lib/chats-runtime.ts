@@ -5,7 +5,12 @@ import type {
   ThreadMessageLike,
 } from "@assistant-ui/react";
 
-import type { Chat, ChatContentPart, ChatMessage } from "./chats-types";
+import type {
+  Chat,
+  ChatContentPart,
+  ChatMessage,
+  JsonValue,
+} from "./chats-types";
 import { pickReply } from "./chats-script";
 
 const STREAM_CHUNK_CHARS = 28;
@@ -29,29 +34,38 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function toolResultValue(content: readonly ChatContentPart[]): JsonValue {
+  const texts = content.flatMap((part) =>
+    part.type === "text" ? [part.text] : [],
+  );
+  return texts.length === content.length
+    ? texts.join("")
+    : (JSON.parse(JSON.stringify(content)) as JsonValue);
+}
+
 function toAssistantParts(
   content: readonly ChatContentPart[],
 ): ThreadAssistantMessagePart[] {
   const out: ThreadAssistantMessagePart[] = [];
   for (const part of content) {
-    if (part.kind === "text") {
-      out.push({ type: "text", text: part.data.text });
-    } else if (part.kind === "tool_call") {
+    if (part.type === "text") {
+      out.push({ type: "text", text: part.text });
+    } else if (part.type === "tool_call") {
       out.push({
         type: "tool-call",
-        toolCallId: part.data.tool_call_id,
-        toolName: part.data.name,
-        args: part.data.arguments,
-        argsText: JSON.stringify(part.data.arguments),
+        toolCallId: part.id,
+        toolName: part.name,
+        args: part.input.arguments,
+        argsText: JSON.stringify(part.input.arguments),
       });
-    } else if (part.kind === "tool_result") {
+    } else if (part.type === "tool_result") {
       for (let i = out.length - 1; i >= 0; i--) {
         const candidate = out[i];
         if (
           candidate?.type === "tool-call" &&
-          candidate.toolCallId === part.data.tool_call_id
+          candidate.toolCallId === part.tool_call_id
         ) {
-          out[i] = { ...candidate, result: part.data.content };
+          out[i] = { ...candidate, result: toolResultValue(part.content) };
           break;
         }
       }
@@ -71,16 +85,16 @@ export function createScriptedAdapter(args: {
       const accumulated: ChatContentPart[] = [];
 
       for (const part of reply.content) {
-        if (part.kind === "text") {
-          const text = part.data.text;
+        if (part.type === "text") {
+          const text = part.text;
           let cursor = 0;
-          accumulated.push({ kind: "text", data: { text: "" } });
+          accumulated.push({ type: "text", text: "" });
           const accIndex = accumulated.length - 1;
           while (cursor < text.length) {
             cursor = Math.min(cursor + STREAM_CHUNK_CHARS, text.length);
             accumulated[accIndex] = {
-              kind: "text",
-              data: { text: text.slice(0, cursor) },
+              type: "text",
+              text: text.slice(0, cursor),
             };
             yield buildUpdate(accumulated);
             if (cursor < text.length) {
@@ -110,8 +124,8 @@ export function toThreadMessages(
     if (msg.role === "user") {
       const content = [];
       for (const part of msg.content) {
-        if (part.kind === "text") {
-          content.push({ type: "text", text: part.data.text } as const);
+        if (part.type === "text") {
+          content.push({ type: "text", text: part.text } as const);
         }
       }
       return {

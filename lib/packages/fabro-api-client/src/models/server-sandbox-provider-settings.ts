@@ -13,7 +13,11 @@
  */
 
 
+// May contain unused imports in some cases
+// @ts-ignore
+import type { SandboxPluginSettings } from './sandbox-plugin-settings';
 
 export interface ServerSandboxProviderSettings {
     'enabled': boolean;
+    'plugin'?: SandboxPluginSettings;
 }

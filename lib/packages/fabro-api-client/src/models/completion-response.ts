@@ -15,34 +15,39 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { CompletionMessage } from './completion-message';
+import type { CompletionContentPart } from './completion-content-part';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { CompletionCost } from './completion-cost';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { CompletionResponseWarningsInner } from './completion-response-warnings-inner';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { CompletionUsage } from './completion-usage';
 // May contain unused imports in some cases
 // @ts-ignore
-import type { CostSource } from './cost-source';
+import type { ModelHandle } from './model-handle';
 
+/**
+ * A lithos `Response`, returned verbatim. The server is the billing authority: `cost` is the catalog estimate or the provider\'s own figure. When the request carried `schema`, `output` holds the parsed object.
+ */
 export interface CompletionResponse {
-    'id': string;
-    /**
-     * Canonical model ID selected for the request.
-     */
-    'model': string;
-    /**
-     * LLM provider identifier.
-     */
-    'provider': string;
-    'message': CompletionMessage;
-    /**
-     * Why generation stopped (end_turn, max_tokens, tool_calls).
-     */
-    'stop_reason': string;
-    'usage': CompletionUsage;
     'output'?: any;
+    'id'?: string | null;
+    'model': ModelHandle;
+    'content': Array<CompletionContentPart>;
     /**
-     * USD cost of the completion when known: estimated from catalog prices unless the provider returned authoritative billing data.
+     * Tool calls withheld because the turn ended early.
      */
-    'cost_usd'?: number;
-    'cost_source'?: CostSource;
+    'suppressed_tool_calls'?: Array<{ [key: string]: any; }>;
+    /**
+     * Why generation stopped: stop, length, tool_call, content_filter, error, incomplete, or a provider-specific reason.
+     */
+    'finish_reason': string;
+    'usage': CompletionUsage;
+    'cost'?: CompletionCost;
+    'rate_limits'?: { [key: string]: any; };
+    'warnings'?: Array<CompletionResponseWarningsInner>;
+    'raw'?: any;
 }

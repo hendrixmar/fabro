@@ -21,13 +21,18 @@ pub(crate) mod logs;
 pub(crate) mod output;
 pub(crate) mod overrides;
 pub(crate) mod preview;
+mod remote_workflow;
+mod resolution;
 pub(crate) mod resume;
 pub(crate) mod rewind;
 pub(crate) mod run_progress;
 pub(crate) mod runner;
+mod selection;
 pub(crate) mod ssh;
 pub(crate) mod start;
 pub(crate) mod steer;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod wait;
 
 pub(crate) async fn dispatch(
@@ -38,11 +43,19 @@ pub(crate) async fn dispatch(
     let printer = base_ctx.printer();
 
     match cmd {
-        RunCommands::Run(args) => Box::pin(command::execute(args, base_ctx)).await,
+        RunCommands::Run(args) => Box::pin(command::execute(*args, base_ctx)).await,
         RunCommands::Create(args) => {
             let styles: &'static Styles = Box::leak(Box::new(Styles::detect_stderr()));
             let ctx = base_ctx.with_target(&args.target)?;
-            let created_run = Box::pin(create::create_run(&ctx, &args, styles)).await?;
+            let interruption = remote_workflow::Interruption::for_run_args(&args);
+            let created_run = interruption
+                .guard(Box::pin(create::create_run(
+                    &ctx,
+                    &args,
+                    styles,
+                    &interruption,
+                )))
+                .await?;
             if ctx.json_output() {
                 print_json_pretty(&serde_json::json!({ "run_id": created_run.run_id }))?;
             } else {

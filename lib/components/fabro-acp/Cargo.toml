@@ -12,6 +12,7 @@ runtime = [
   "dep:fabro-sandbox",
   "dep:fabro-types",
   "dep:futures",
+  "dep:pebble-coding-agent",
   "dep:tokio",
   "dep:tokio-util",
   "dep:tracing",
@@ -30,6 +31,7 @@ agent-client-protocol-tokio.workspace = true
 fabro-sandbox = { path = "../fabro-sandbox", optional = true }
 fabro-types = { path = "../../foundation/fabro-types", optional = true }
 fabro-util = { path = "../../foundation/fabro-util" }
+pebble-coding-agent = { workspace = true, optional = true }
 serde_json.workspace = true
 shlex = "1"
 thiserror.workspace = true

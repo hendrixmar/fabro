@@ -17,7 +17,10 @@ use fabro_template::{
 use fabro_types::ManifestPath;
 use fabro_types::graph::ReferenceKind;
 
-use crate::{manifest_path_from_absolute, normalize_absolute_path};
+use crate::{
+    WorkflowVersionCollectError, manifest_path_from_absolute, normalize_absolute_path,
+    workflow_version_collector,
+};
 
 pub(super) struct WorkflowBundler<'a> {
     package_root: &'a Path,
@@ -55,7 +58,7 @@ impl<'a> WorkflowBundler<'a> {
         workflow: &Path,
         project_config: Option<(&ManifestPath, &str)>,
     ) -> Result<HashMap<String, types::ManifestWorkflow>> {
-        let root_key = self.collect_workflow_entry(workflow, self.package_root)?;
+        let root_key = self.collect_workflow_entry(workflow, self.package_root, 1)?;
 
         if let Some((config_path, source)) = project_config {
             let mut root = self
@@ -80,7 +83,7 @@ impl<'a> WorkflowBundler<'a> {
         root: &WorkflowLocation,
     ) -> Result<CollectedWorkflowSources> {
         self.workflow_version_projection = true;
-        let root_key = self.collect_workflow_location(root)?;
+        let root_key = self.collect_workflow_location(root, 1)?;
         Ok(CollectedWorkflowSources {
             root_key,
             workflows: self.workflows,
@@ -88,18 +91,38 @@ impl<'a> WorkflowBundler<'a> {
     }
 
     /// Collects the workflow at `location` and returns its manifest key.
-    fn collect_workflow_location(&mut self, location: &WorkflowLocation) -> Result<String> {
+    fn collect_workflow_location(
+        &mut self,
+        location: &WorkflowLocation,
+        depth: usize,
+    ) -> Result<String> {
         let dot_path = manifest_path_from_absolute(&location.graph, self.package_root)?;
         let dot_key = dot_path.to_string();
         if !self.visited_workflows.insert(dot_key.clone()) {
             return Ok(dot_key);
         }
+        if self.workflow_version_projection {
+            workflow_version_collector::check_workflow_depth(depth, &dot_key)?;
+        }
 
         let source = self.read_package_file(&location.graph)?;
         let config = if let Some(workflow_toml_path) = location.toml.as_ref() {
+            let config_path = manifest_path_from_absolute(workflow_toml_path, self.package_root)?;
+            if self.workflow_version_projection {
+                // A version's config is read at run time from the fixed
+                // sibling path only, so a config file under any other name
+                // would be registered and then silently ignored.
+                let expected = dot_path.parent_or_dot().join("workflow.toml");
+                if config_path.as_path() != expected {
+                    bail!(
+                        "workflow configuration `{config_path}` must be `{}` beside its graph \
+                         `{dot_path}`",
+                        expected.display()
+                    );
+                }
+            }
             Some(types::ManifestWorkflowConfig {
-                path:   manifest_path_from_absolute(workflow_toml_path, self.package_root)?
-                    .to_string(),
+                path:   config_path.to_string(),
                 source: self.read_package_file(workflow_toml_path)?,
             })
         } else {
@@ -125,6 +148,7 @@ impl<'a> WorkflowBundler<'a> {
             &mut visited_imports,
             &mut dependency_keys,
             GraphPosition::Entrypoint,
+            depth,
         )?;
 
         self.workflows
@@ -143,9 +167,18 @@ impl<'a> WorkflowBundler<'a> {
     /// Relative workflow references with an extension are lexically
     /// normalized (`..` segments resolved without consulting the filesystem,
     /// `~` rejected) before resolution, so the file read matches the manifest
-    /// key. Returns the collected workflow's manifest key.
-    fn collect_workflow_entry(&mut self, workflow: &Path, resolve_from: &Path) -> Result<String> {
-        let normalized_workflow = if workflow.extension().is_some() && workflow.is_relative() {
+    /// key. Workflow-version projection normalizes every reference and
+    /// resolves it as an exact path inside the package root, with no
+    /// workflow-name lookup. Returns the collected workflow's manifest key.
+    fn collect_workflow_entry(
+        &mut self,
+        workflow: &Path,
+        resolve_from: &Path,
+        depth: usize,
+    ) -> Result<String> {
+        let normalize = self.workflow_version_projection
+            || (workflow.extension().is_some() && workflow.is_relative());
+        let normalized = if normalize {
             normalize_absolute_path(resolve_from, &workflow.to_string_lossy()).ok_or_else(|| {
                 anyhow!(
                     "unsupported manifest workflow reference: {}",
@@ -155,8 +188,23 @@ impl<'a> WorkflowBundler<'a> {
         } else {
             workflow.to_path_buf()
         };
-        let location = WorkflowLocation::resolve(&normalized_workflow, resolve_from)?;
-        self.collect_workflow_location(&location)
+        let location = if self.workflow_version_projection {
+            // Location resolution probes and parses config files, so reject
+            // references that leave the package root before it can touch a
+            // host file. `ManifestPath::from_absolute` accepts `..`-prefixed
+            // results and is not a containment check.
+            if !normalized.starts_with(self.package_root) {
+                bail!(
+                    "workflow reference `{}` escapes source root `{}`",
+                    workflow.display(),
+                    self.package_root.display()
+                );
+            }
+            WorkflowLocation::from_exact_path(&normalized, self.package_root)?
+        } else {
+            WorkflowLocation::resolve(&normalized, resolve_from)?
+        };
+        self.collect_workflow_location(&location, depth)
     }
 
     fn collect_workflow_files(
@@ -166,7 +214,14 @@ impl<'a> WorkflowBundler<'a> {
         visited_imports: &mut HashSet<String>,
         dependency_keys: &mut BTreeSet<String>,
         position: GraphPosition,
+        depth: usize,
     ) -> Result<()> {
+        if self.workflow_version_projection {
+            workflow_version_collector::check_workflow_depth(
+                depth,
+                &workflow.dot_path.to_string(),
+            )?;
+        }
         let graph = parser::parse(&workflow.source)
             .with_context(|| format!("Failed to parse {}", workflow.absolute_dot_path.display()))?;
         let workflow_base_dir = workflow
@@ -264,12 +319,13 @@ impl<'a> WorkflowBundler<'a> {
                     visited_imports,
                     dependency_keys,
                     GraphPosition::Imported,
+                    depth + 1,
                 )?;
             }
         }
         for child in children {
             let dependency_key =
-                self.collect_workflow_entry(Path::new(child), workflow_base_dir)?;
+                self.collect_workflow_entry(Path::new(child), workflow_base_dir, depth + 1)?;
             dependency_keys.insert(dependency_key);
         }
 
@@ -480,11 +536,18 @@ impl<'a> WorkflowBundler<'a> {
             return std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read {}", path.display()));
         }
-        let canonical = path.canonicalize().with_context(|| {
-            format!(
+        let canonical = path.canonicalize().map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                let path = ManifestPath::from_absolute(path, self.package_root)
+                    .map_or_else(|| path.display().to_string(), |path| path.to_string());
+                return anyhow::Error::new(WorkflowVersionCollectError::MissingPackageFile {
+                    path,
+                });
+            }
+            anyhow::Error::new(source).context(format!(
                 "failed to canonicalize workflow package file `{}`",
                 path.display()
-            )
+            ))
         })?;
         if !canonical.starts_with(self.package_root) {
             bail!(

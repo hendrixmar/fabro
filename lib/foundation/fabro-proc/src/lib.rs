@@ -1,3 +1,7 @@
+//! Local subprocess ownership and capture, plus OS process primitives.
+//! Finite commands use [`capture`]; command and credential policy stay with
+//! callers. Process ownership remains private to capture.
+
 #![allow(
     unsafe_code,
     reason = "This crate wraps low-level OS or FFI APIs that require unsafe code."
@@ -24,3 +28,6 @@ pub use signal::{
     sigkill, sigkill_process_group, sigterm, sigterm_process_group, sigusr1, sigusr2,
 };
 pub use title::{init as title_init, set as title_set};
+
+mod process;
+pub use process::{CapturedOutput, ProcessError, capture};
