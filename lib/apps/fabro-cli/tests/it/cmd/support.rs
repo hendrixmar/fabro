@@ -209,6 +209,47 @@ pub(crate) fn mock_workflow_version_registrations_recording(
 
 /// Runs a `git` command in `path` for fixture setup, panicking on failure and
 /// returning trimmed stdout.
+/// Write a minimal `workflow.toml` and `workflow.fabro` pair under
+/// `root/directory`; `graph_name` distinguishes fixtures by content.
+pub(crate) fn write_workflow(root: &Path, directory: &str, graph_name: &str) -> PathBuf {
+    let directory = root.join(directory);
+    std::fs::create_dir_all(&directory).expect("workflow fixture directory should be created");
+    std::fs::write(
+        directory.join("workflow.toml"),
+        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
+    )
+    .expect("workflow fixture manifest should be written");
+    std::fs::write(
+        directory.join("workflow.fabro"),
+        format!(
+            "digraph {graph_name} {{ start [shape=Mdiamond] exit [shape=Msquare] start -> exit }}"
+        ),
+    )
+    .expect("workflow fixture graph should be written");
+    directory.join("workflow.toml")
+}
+
+/// Initialize `path` as a repository on `branch` with one commit of its
+/// current contents, returning the commit SHA.
+pub(crate) fn init_remote_fixture(path: &Path, branch: &str) -> String {
+    let repo = git2::Repository::init_opts(
+        path,
+        git2::RepositoryInitOptions::new().initial_head(branch),
+    )
+    .expect("fixture repository should initialize");
+    let mut index = repo.index().expect("fixture index should open");
+    index
+        .add_all(["."], git2::IndexAddOption::DEFAULT, None)
+        .expect("fixture files should stage");
+    let tree_id = index.write_tree().expect("fixture tree should write");
+    let tree = repo.find_tree(tree_id).expect("fixture tree should exist");
+    let signature = git2::Signature::now("Fixture", "fixture@example.test")
+        .expect("fixture signature should be valid");
+    repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+        .expect("fixture commit should succeed")
+        .to_string()
+}
+
 pub(crate) fn run_git(path: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)

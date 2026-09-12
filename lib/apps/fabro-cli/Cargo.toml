@@ -96,12 +96,11 @@ serde_yaml = "0.9"
 tempfile = "3"
 sha2.workspace = true
 shlex = "1"
-walkdir.workspace = true
 object_store.workspace = true
 bytes.workspace = true
 tokio-util.workspace = true
 libc = "0.2"
-nix = { version = "0.30", features = ["fs"] }
+nix = { version = "0.30", features = ["fs", "signal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { version = "0.9", optional = true }
@@ -118,6 +117,7 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
+walkdir.workspace = true
 fabro-acp = { path = "../../components/fabro-acp", features = ["test-support"] }
 fabro-mcp = { path = "../../components/fabro-mcp", features = ["test-support"] }
 fabro-build-support = { path = "../../foundation/build-support" }

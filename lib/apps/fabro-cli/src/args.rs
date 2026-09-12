@@ -6,9 +6,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use fabro_config::{CliLayer, CliLoggingLayer, CliOutputLayer, CliUpdatesLayer};
 use fabro_server::serve::DEFAULT_TCP_PORT;
 use fabro_static::EnvVars;
-use fabro_types::PermissionLevel;
 use fabro_types::settings::cli::{OutputFormat, OutputVerbosity};
 use fabro_types::settings::run::MergeStrategy;
+use fabro_types::{GitHubRepositorySlug, PermissionLevel};
 use fabro_util::printer::Printer;
 use lithos_llm::catalog::ProviderId;
 use lithos_llm::types::ReasoningEffort;
@@ -233,11 +233,40 @@ pub(crate) struct RunArgs {
     #[command(flatten)]
     pub(crate) inputs: InputOverrideArgs,
 
-    /// Local workflow name, checkout path, .fabro file, or workflow TOML
+    /// Workflow name, path, or OWNER/REPO[@REF]:WORKFLOW
     #[arg(required = true)]
     pub(crate) workflow: Option<PathBuf>,
 
-    /// Execute with simulated LLM backend
+    /// Acquire workflow source locally from a GitHub OWNER/REPO using native
+    /// Git credentials
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) workflow_repo: Option<GitHubRepositorySlug>,
+
+    /// Workflow branch, tag, HEAD (default), or full commit SHA; qualify
+    /// ambiguous names
+    #[arg(long, requires = "workflow_repo", value_name = "REF")]
+    pub(crate) workflow_ref: Option<String>,
+
+    /// Observe this target directory instead of cwd; Folder targets require
+    /// server filesystem access
+    #[arg(long, conflicts_with_all = ["target_repo", "target_repo_selector"], value_name = "PATH")]
+    pub(crate) target_from: Option<PathBuf>,
+
+    /// Target GitHub repository and optional working branch
+    #[arg(long = "target", conflicts_with_all = ["target_repo", "target_branch"], value_name = "OWNER/REPO[@BRANCH]")]
+    pub(crate) target_repo_selector: Option<String>,
+
+    /// Target GitHub OWNER/REPO; the execution sandbox still needs its own
+    /// clone credentials
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) target_repo: Option<GitHubRepositorySlug>,
+
+    /// Target working branch (default: remote default branch), pinned to its
+    /// observed commit
+    #[arg(long, requires = "target_repo", value_name = "BRANCH")]
+    pub(crate) target_branch: Option<String>,
+
+    /// Simulate execution; workflow source may still be fetched and uploaded
     #[arg(long)]
     pub(crate) dry_run: bool,
 
@@ -1243,10 +1272,12 @@ pub(crate) struct UpgradeArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RunCommands {
-    /// Register a local workflow version, create a run, and start it
-    Run(RunArgs),
-    /// Register a local workflow version and create a submitted run
-    Create(RunArgs),
+    // Boxed so `RunArgs` does not dominate the size of the flattened
+    // `Commands` enum (clippy `large_enum_variant`).
+    /// Register a workflow version, create a run, and start it
+    Run(Box<RunArgs>),
+    /// Register a workflow version and create a submitted run
+    Create(Box<RunArgs>),
     /// Start a created workflow run on the server
     Start(StartArgs),
     /// Attach to a running or finished workflow run
@@ -1973,4 +2004,41 @@ fn parse_reasoning_effort_arg(value: &str) -> Result<ReasoningEffort, String> {
                 .join(", ")
         )
     })
+}
+
+#[cfg(test)]
+mod run_selection_grammar_tests {
+    use crate::commands::run::test_support::parse_run_args;
+
+    #[test]
+    fn run_selection_accepts_independent_resource_flags() {
+        for flags in [
+            vec![
+                "review",
+                "--workflow-repo",
+                "acme/workflows",
+                "--workflow-ref",
+                "refs/tags/v1",
+                "--target-repo",
+                "acme/app",
+                "--target-branch",
+                "release/topic",
+            ],
+            vec!["./review.toml", "--target-from", "../app"],
+        ] {
+            assert!(parse_run_args(flags).is_ok());
+        }
+    }
+
+    #[test]
+    fn run_selection_requires_modifier_owners_and_exclusive_targets() {
+        for flags in [
+            vec!["review", "--workflow-ref", "v1"],
+            vec!["review", "--target-branch", "release"],
+            vec!["review", "--target-from", ".", "--target-repo", "acme/app"],
+            vec!["--workflow-repo", "acme/workflows"],
+        ] {
+            assert!(parse_run_args(flags).is_err());
+        }
+    }
 }

@@ -12,8 +12,8 @@ fn help() {
     Usage: fabro [OPTIONS] [COMMAND]
 
     Commands:
-      run         Register a local workflow version, create a run, and start it
-      create      Register a local workflow version and create a submitted run
+      run         Register a workflow version, create a run, and start it
+      create      Register a workflow version and create a submitted run
       start       Start a created workflow run on the server
       attach      Attach to a running or finished workflow run
       events      View the event log of a workflow run

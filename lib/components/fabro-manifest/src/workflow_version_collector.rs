@@ -111,17 +111,6 @@ pub fn collect_workflow_versions(
     checkout_root: &Path,
 ) -> Result<CollectedWorkflowClosure, WorkflowVersionCollectError> {
     let repository_workflow = repository_workflow_path(workflow);
-    let location = crate::resolve_existing_workflow_location(&repository_workflow, checkout_root)
-        .map_err(|source| match source {
-        fabro_config::Error::WorkflowNotFound(_) => WorkflowVersionCollectError::WorkflowNotFound {
-            path: workflow.to_path_buf(),
-        },
-        source => WorkflowVersionCollectError::Collect {
-            path:   workflow.to_path_buf(),
-            source: source.into(),
-        },
-    })?;
-
     let package_root =
         checkout_root
             .canonicalize()
@@ -132,6 +121,21 @@ pub fn collect_workflow_versions(
                     checkout_root.display()
                 )),
             })?;
+    ensure_selection_contained(
+        &checkout_root.join(&repository_workflow),
+        &package_root,
+        workflow,
+    )?;
+    let location = crate::resolve_existing_workflow_location(&repository_workflow, checkout_root)
+        .map_err(|source| match source {
+        fabro_config::Error::WorkflowNotFound(_) => WorkflowVersionCollectError::WorkflowNotFound {
+            path: workflow.to_path_buf(),
+        },
+        source => WorkflowVersionCollectError::Collect {
+            path:   workflow.to_path_buf(),
+            source: source.into(),
+        },
+    })?;
     let location = canonicalize_location(location, |path, source| {
         WorkflowVersionCollectError::Collect {
             path:   workflow.to_path_buf(),
@@ -184,6 +188,51 @@ pub fn collect_workflow_versions_at_location(
                 })
         })?;
     VersionAssembler::new(collected).assemble()
+}
+
+/// Location resolution reads the selected TOML, or a selected graph's sibling
+/// `workflow.toml`, before the bundler's root-checked reads begin. Refuse a
+/// selection whose file resolves outside the package first, so a symlink in an
+/// untrusted checkout never reads host content. Missing files are left for
+/// resolution to report; symlinks elsewhere in the checkout are irrelevant
+/// because every file the bundler reads is checked when it is opened.
+fn ensure_selection_contained(
+    selected: &Path,
+    package_root: &Path,
+    workflow: &Path,
+) -> Result<(), WorkflowVersionCollectError> {
+    let mut candidates = vec![selected.to_path_buf()];
+    if selected
+        .extension()
+        .is_none_or(|extension| extension != "toml")
+    {
+        candidates.push(selected.with_file_name("workflow.toml"));
+    }
+    for path in candidates {
+        if path.symlink_metadata().is_err() {
+            continue;
+        }
+        let canonical =
+            path.canonicalize()
+                .map_err(|source| WorkflowVersionCollectError::Collect {
+                    path:   workflow.to_path_buf(),
+                    source: anyhow::Error::new(source).context(format!(
+                        "failed to canonicalize workflow file {}",
+                        path.display()
+                    )),
+                })?;
+        if !canonical.starts_with(package_root) {
+            return Err(WorkflowVersionCollectError::Collect {
+                path:   workflow.to_path_buf(),
+                source: anyhow::anyhow!(
+                    "workflow file `{}` resolves outside its source root `{}`",
+                    path.display(),
+                    package_root.display()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn repository_workflow_path(workflow: &Path) -> PathBuf {
@@ -423,6 +472,50 @@ dockerfile = { path = "Dockerfile" }
             ".fabro/workflows/child/workflow.fabro",
             "digraph Child {}",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_selected_files_that_resolve_outside_the_package_root() {
+        let host = tempfile::tempdir().unwrap();
+        write(host.path(), "workflow.toml", "_version = 1\n");
+        for selector in ["root", ".fabro/workflows/root/workflow.fabro"] {
+            let temp = tempfile::tempdir().unwrap();
+            write_complete_fixture(temp.path());
+            let toml = temp.path().join(".fabro/workflows/root/workflow.toml");
+            fs::remove_file(&toml).unwrap();
+            std::os::unix::fs::symlink(host.path().join("workflow.toml"), &toml).unwrap();
+            let error = collect_workflow_versions(Path::new(selector), temp.path()).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("outside its source root"),
+                "{selector}: {error:?}"
+            );
+            // A dangling selection is refused rather than reported as missing.
+            fs::remove_file(&toml).unwrap();
+            std::os::unix::fs::symlink(host.path().join("missing.toml"), &toml).unwrap();
+            let error = collect_workflow_versions(Path::new(selector), temp.path()).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("failed to canonicalize workflow file"),
+                "{selector}: {error:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_symlinks_the_selected_workflow_never_reads() {
+        let host = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        write_complete_fixture(temp.path());
+        std::os::unix::fs::symlink(host.path(), temp.path().join("tools")).unwrap();
+        std::os::unix::fs::symlink("../missing", temp.path().join("vendor")).unwrap();
+        std::os::unix::fs::symlink(
+            "/nonexistent/module",
+            temp.path().join(".fabro/workflows/root/unrelated"),
+        )
+        .unwrap();
+        let closure = collect_workflow_versions(Path::new("root"), temp.path()).unwrap();
+        assert_eq!(closure.versions().count(), 2);
     }
 
     #[test]

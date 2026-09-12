@@ -12,10 +12,10 @@ use insta::assert_snapshot;
 use serde_json::json;
 
 use super::support::{
-    created_run_id, environment_json, fixture, mock_environment,
+    created_run_id, environment_json, fixture, init_remote_fixture, mock_environment,
     mock_workflow_version_registrations, mock_workflow_version_registrations_recording,
     output_stderr, output_stdout, remote_run_summary_json, resolve_run, run_count_for_test_case,
-    run_git, run_state,
+    run_git, run_state, write_workflow,
 };
 use crate::support::unique_run_id;
 
@@ -60,24 +60,6 @@ fn mock_intent_create<'a>(
     })
 }
 
-fn write_workflow(root: &std::path::Path, directory: &str, graph_name: &str) -> std::path::PathBuf {
-    let directory = root.join(directory);
-    std::fs::create_dir_all(&directory).expect("workflow fixture directory should be created");
-    std::fs::write(
-        directory.join("workflow.toml"),
-        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
-    )
-    .expect("workflow fixture manifest should be written");
-    std::fs::write(
-        directory.join("workflow.fabro"),
-        format!(
-            "digraph {graph_name} {{ start [shape=Mdiamond] exit [shape=Msquare] start -> exit }}"
-        ),
-    )
-    .expect("workflow fixture graph should be written");
-    directory.join("workflow.toml")
-}
-
 #[test]
 fn help() {
     let context = test_context!();
@@ -87,33 +69,39 @@ fn help() {
     success: true
     exit_code: 0
     ----- stdout -----
-    Register a local workflow version and create a submitted run
+    Register a workflow version and create a submitted run
 
     Usage: fabro create [OPTIONS] <WORKFLOW>
 
     Arguments:
-      <WORKFLOW>  Local workflow name, checkout path, .fabro file, or workflow TOML
+      <WORKFLOW>  Workflow name, path, or OWNER/REPO[@REF]:WORKFLOW
 
     Options:
-          --json                       Output as JSON [env: FABRO_JSON=]
-          --server <SERVER>            Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
-          --debug                      Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
-      -I, --input <KEY=VALUE>          Override a workflow input value (repeatable, format: KEY=VALUE)
-          --dry-run                    Execute with simulated LLM backend
-          --no-upgrade-check           Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
-          --auto-approve               Auto-approve all human gates
-          --quiet                      Suppress non-essential output [env: FABRO_QUIET=]
-          --goal <GOAL>                Override the workflow goal (available as {{ goal }} in prompts)
-          --goal-file <GOAL_FILE>      Read a per-run goal value from a local file
-          --model <MODEL>              Override default LLM model
-          --provider <PROVIDER>        Override default LLM provider
-      -v, --verbose                    Enable verbose output
-          --environment <ENVIRONMENT>  Named environment for agent tools
-          --label <KEY=VALUE>          Attach a label to this run (repeatable, format: KEY=VALUE)
-          --parent <RUN>               Link this run to an existing orchestration parent run
-          --preserve-sandbox           Keep the sandbox alive after the run finishes (for debugging)
-      -d, --detach                     Run the workflow in the background and print the run ID
-      -h, --help                       Print help
+          --json                          Output as JSON [env: FABRO_JSON=]
+          --server <SERVER>               Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
+          --debug                         Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
+      -I, --input <KEY=VALUE>             Override a workflow input value (repeatable, format: KEY=VALUE)
+          --no-upgrade-check              Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
+          --workflow-repo <OWNER/REPO>    Acquire workflow source locally from a GitHub OWNER/REPO using native Git credentials
+          --quiet                         Suppress non-essential output [env: FABRO_QUIET=]
+          --workflow-ref <REF>            Workflow branch, tag, HEAD (default), or full commit SHA; qualify ambiguous names
+          --target-from <PATH>            Observe this target directory instead of cwd; Folder targets require server filesystem access
+          --target <OWNER/REPO[@BRANCH]>  Target GitHub repository and optional working branch
+          --target-repo <OWNER/REPO>      Target GitHub OWNER/REPO; the execution sandbox still needs its own clone credentials
+          --target-branch <BRANCH>        Target working branch (default: remote default branch), pinned to its observed commit
+          --dry-run                       Simulate execution; workflow source may still be fetched and uploaded
+          --auto-approve                  Auto-approve all human gates
+          --goal <GOAL>                   Override the workflow goal (available as {{ goal }} in prompts)
+          --goal-file <GOAL_FILE>         Read a per-run goal value from a local file
+          --model <MODEL>                 Override default LLM model
+          --provider <PROVIDER>           Override default LLM provider
+      -v, --verbose                       Enable verbose output
+          --environment <ENVIRONMENT>     Named environment for agent tools
+          --label <KEY=VALUE>             Attach a label to this run (repeatable, format: KEY=VALUE)
+          --parent <RUN>                  Link this run to an existing orchestration parent run
+          --preserve-sandbox              Keep the sandbox alive after the run finishes (for debugging)
+      -d, --detach                        Run the workflow in the background and print the run ID
+      -h, --help                          Print help
     ----- stderr -----
     ");
 }
@@ -686,6 +674,112 @@ fn create_preserves_named_user_other_checkout_and_loose_file_selection() {
             outside.path().canonicalize().unwrap().to_str().unwrap()
         );
     }
+}
+
+#[test]
+fn create_preserves_configured_repository_inference_but_explicit_target_path_wins() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let environment = mock_environment(&server, "default", "docker");
+    let versions = mock_workflow_version_registrations(&server);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let create = mock_intent_create(&server, &unique_run_id(), Arc::clone(&requests));
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let workflow = write_workflow(&checkout, "workflow", "ConfiguredRepository");
+    std::fs::write(&workflow, "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n[run.scm]\nowner = \"acme\"\nrepository = \"configured\"\n").unwrap();
+    let sha = init_remote_fixture(&checkout, "topic");
+    let origin = root.path().join("origin.git");
+    let bare = git2::Repository::init_bare(&origin).unwrap();
+    run_git(&checkout, &[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/actual.git",
+    ]);
+    run_git(&checkout, &[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        &format!("file://{}", origin.display()),
+    ]);
+    let server_url = format!("{}/api/v1", server.base_url());
+    let inferred = context
+        .create_cmd()
+        .current_dir(&checkout)
+        .args(["--server", &server_url, workflow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!inferred.status.success());
+    assert!(
+        output_stderr(&inferred)
+            .contains("run.scm repository that is not the local checkout's origin")
+    );
+    assert!(
+        bare.find_reference("refs/heads/topic").is_err(),
+        "rejected inference must not publish the branch"
+    );
+    versions.assert_calls(0);
+    create.assert_calls(0);
+
+    let explicit = context
+        .create_cmd()
+        .current_dir(&checkout)
+        .args([
+            "--server",
+            &server_url,
+            workflow.to_str().unwrap(),
+            "--target-from",
+            ".",
+        ])
+        .output()
+        .unwrap();
+    assert!(explicit.status.success(), "{}", output_stderr(&explicit));
+    assert_eq!(
+        requests.lock().unwrap()[0]["target"],
+        json!({
+            "kind": "git", "repo": "acme/actual", "branch": "topic", "sha": sha
+        })
+    );
+    assert_eq!(
+        bare.find_reference("refs/heads/topic")
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string(),
+        sha
+    );
+    let config = root.path().join("gitconfig");
+    std::fs::write(
+        &config,
+        format!(
+            "[url \"file://{}\"]\n insteadOf = https://github.com/acme/actual\n",
+            origin.display()
+        ),
+    )
+    .unwrap();
+    let shorthand = context
+        .create_cmd()
+        .current_dir(&checkout)
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "0")
+        .args([
+            "--server",
+            &server_url,
+            workflow.to_str().unwrap(),
+            "--target",
+            "acme/actual@topic",
+        ])
+        .output()
+        .unwrap();
+    assert!(shorthand.status.success(), "{}", output_stderr(&shorthand));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0]["target"], requests[1]["target"]);
+    environment.assert_calls(3);
+    versions.assert_calls(2);
+    create.assert_calls(2);
 }
 
 #[test]
@@ -1632,4 +1726,279 @@ draft = false
         .expect("workflow.toml should configure pull-request behavior");
     assert!(pull_request.enabled);
     assert!(!pull_request.draft);
+}
+
+#[test]
+fn run_selection_source_target_cross_product_keeps_workflow_goal_and_target_independent() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let local_env = mock_environment(&server, "local", "local");
+    let docker_env = mock_environment(&server, "docker", "docker");
+    let plugin_env = mock_environment(&server, "plugin", "host");
+    let versions = mock_workflow_version_registrations(&server);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let create = mock_intent_create(&server, &unique_run_id(), Arc::clone(&requests));
+    let root = tempfile::tempdir().unwrap();
+    let caller = root.path().join("caller");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    write_workflow(&caller, ".fabro/workflows/review", "Caller");
+    write_workflow(&source, ".fabro/workflows/review", "Remote");
+    write_workflow(&target, ".fabro/workflows/review", "Target");
+    std::fs::write(caller.join("goal.txt"), "Caller goal").unwrap();
+    std::fs::write(target.join("goal.txt"), "Target goal").unwrap();
+    init_remote_fixture(&source, "trunk");
+    let target_sha = init_remote_fixture(&target, "release");
+    let config = root.path().join("gitconfig");
+    std::fs::write(&config, format!("[url \"file://{}\"]\n insteadOf = https://github.com/acme/workflows\n[url \"file://{}\"]\n insteadOf = https://github.com/acme/app\n",source.display(),target.display())).unwrap();
+    let local_id = fabro_manifest::resolve_local_workflow_package(
+        std::path::Path::new("review"),
+        &caller,
+        None,
+    )
+    .unwrap()
+    .closure()
+    .root_id();
+    let remote_id =
+        fabro_manifest::collect_workflow_versions(std::path::Path::new("review"), &source)
+            .unwrap()
+            .root_id();
+    let file_id = fabro_manifest::resolve_local_workflow_package(
+        std::path::Path::new(".fabro/workflows/review/workflow.toml"),
+        &caller,
+        None,
+    )
+    .unwrap()
+    .closure()
+    .root_id();
+    assert_ne!(local_id, remote_id);
+    for source_kind in ["name", "file", "git", "shorthand"] {
+        for target_kind in ["inferred", "path", "git", "git-plugin", "shorthand"] {
+            let mut command = context.create_cmd();
+            command
+                .current_dir(&caller)
+                .env("GIT_CONFIG_GLOBAL", &config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_COUNT", "0");
+            command.args([
+                "--server",
+                &format!("{}/api/v1", server.base_url()),
+                "--goal-file",
+                "goal.txt",
+            ]);
+            command.arg(if source_kind == "shorthand" {
+                "acme/workflows@trunk:review"
+            } else if source_kind == "file" {
+                ".fabro/workflows/review/workflow.toml"
+            } else {
+                "review"
+            });
+            if source_kind == "git" {
+                command.args([
+                    "--workflow-repo",
+                    "acme/workflows",
+                    "--workflow-ref",
+                    "trunk",
+                ]);
+            }
+            match target_kind {
+                "shorthand" => {
+                    command.args(["--target", "acme/app@release", "--environment", "docker"]);
+                }
+                "path" => {
+                    command.args(["--target-from", "../target", "--environment", "local"]);
+                }
+                "git" | "git-plugin" => {
+                    command.args([
+                        "--target-repo",
+                        "acme/app",
+                        "--target-branch",
+                        "release",
+                        "--environment",
+                        if target_kind == "git-plugin" {
+                            "plugin"
+                        } else {
+                            "docker"
+                        },
+                    ]);
+                }
+                _ => {
+                    command.args(["--environment", "docker"]);
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{source_kind}/{target_kind}: {}",
+                output_stderr(&output)
+            );
+            let requests = requests.lock().unwrap();
+            let intent = requests.last().unwrap();
+            assert_eq!(
+                intent["workflow_version_id"],
+                match source_kind {
+                    "git" | "shorthand" => remote_id,
+                    "file" => file_id,
+                    _ => local_id,
+                }
+                .to_string()
+            );
+            assert_eq!(intent["goal"], "Caller goal");
+            assert_eq!(intent["target"], match target_kind {
+                "path" => json!({"kind":"folder","path":target.canonicalize().unwrap()}),
+                "git" | "git-plugin" | "shorthand" =>
+                    json!({"kind":"git","repo":"acme/app","branch":"release","sha":target_sha}),
+                _ => json!({"kind":"none"}),
+            });
+        }
+    }
+    local_env.assert_calls(4);
+    docker_env.assert_calls(12);
+    plugin_env.assert_calls(4);
+    versions.assert_calls(20);
+    create.assert_calls(20);
+}
+
+#[test]
+fn create_leaves_remote_workflow_run_submitted_without_starting() {
+    let context = test_context!();
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    write_workflow(&source, ".fabro/workflows/review", "Remote");
+    init_remote_fixture(&source, "trunk");
+    let config = root.path().join("gitconfig");
+    std::fs::write(
+        &config,
+        format!(
+            "[url \"file://{}\"]\n insteadOf = https://github.com/acme/workflows\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let server = MockServer::start();
+    let environment = mock_environment(&server, "default", "docker");
+    let version = mock_workflow_version_registrations(&server);
+    let run_id = unique_run_id();
+    let create = server.mock(|when, then| {
+        when.method("POST").path("/api/v1/runs");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(run_status_response(&run_id, "submitted").to_string());
+    });
+    let start = server.mock(|when, _then| {
+        when.method("POST")
+            .path(format!("/api/v1/runs/{run_id}/start"));
+    });
+    let trace = root.path().join("trace");
+    let output = context
+        .create_cmd()
+        .current_dir(root.path())
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_TRACE", &trace)
+        .args([
+            "review",
+            "--workflow-repo",
+            "acme/workflows",
+            "--server",
+            &format!("{}/api/v1", server.base_url()),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_stderr(&output));
+    environment.assert();
+    version.assert();
+    create.assert();
+    start.assert_calls(0);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        json!({"run_id":run_id})
+    );
+    let trace = std::fs::read_to_string(&trace).unwrap();
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.contains("built-in: git fetch "))
+            .count(),
+        1,
+        "source fetched more than once"
+    );
+}
+
+#[test]
+fn remote_workflow_explicit_acquisition_failure_has_no_fallback_or_server_mutations() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let environment = mock_environment(&server, "default", "docker");
+    let version = mock_workflow_version_registrations(&server);
+    let create = mock_intent_create(&server, &unique_run_id(), Arc::new(Mutex::new(Vec::new())));
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    write_workflow(&source, ".fabro/workflows/other", "Other");
+    init_remote_fixture(&source, "trunk");
+    // The caller is a GitHub-origin checkout with an unpushed branch, which
+    // Docker target observation would publish if it ran first.
+    let caller = root.path().join("caller");
+    let origin = root.path().join("origin.git");
+    git2::Repository::init_bare(&origin).unwrap();
+    write_workflow(&caller, ".fabro/workflows/review", "Caller");
+    init_remote_fixture(&caller, "main");
+    git2::Repository::open(&caller)
+        .unwrap()
+        .remote("origin", "https://github.com/acme/app")
+        .unwrap();
+    write_workflow(
+        &context.home_dir.join(".fabro/workflows"),
+        "review",
+        "Installed",
+    );
+    let config = root.path().join("gitconfig");
+    std::fs::write(
+        &config,
+        format!(
+            "[url \"file://{}\"]\n insteadOf = https://github.com/acme/workflows\n[url \"file://{}\"]\n insteadOf = https://github.com/acme/app\n",
+            source.display(),
+            origin.display()
+        ),
+    )
+    .unwrap();
+    for reference in [
+        "trunk",
+        "missing",
+        "1111111111111111111111111111111111111111",
+    ] {
+        let output = context
+            .create_cmd()
+            .current_dir(&caller)
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0")
+            .args([
+                "review",
+                "--workflow-repo",
+                "acme/workflows",
+                "--workflow-ref",
+                reference,
+                "--server",
+                &format!("{}/api/v1", server.base_url()),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    environment.assert_calls(3);
+    version.assert_calls(0);
+    create.assert_calls(0);
+    // Acquisition failed before target observation, so nothing was pushed.
+    assert!(
+        git2::Repository::open_bare(&origin)
+            .unwrap()
+            .find_reference("refs/heads/main")
+            .is_err(),
+        "a failed remote workflow acquisition must not publish the target branch"
+    );
 }
