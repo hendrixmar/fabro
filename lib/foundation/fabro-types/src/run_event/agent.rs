@@ -77,6 +77,7 @@ pub fn coding_event_name(event: &CodingEvent) -> &'static str {
         CodingEvent::LoopDetected => "agent.loop.detected",
         CodingEvent::ToolRoundsExhausted { .. } => "agent.tool.rounds.exhausted",
         CodingEvent::RouteFailover { .. } => "agent.route.failover",
+        CodingEvent::RouteFailoverStopped { .. } => "agent.route.failover.stopped",
         CodingEvent::McpServerReady { .. } => "agent.mcp.server.ready",
         CodingEvent::McpServerFailed { .. } => "agent.mcp.server.failed",
         CodingEvent::McpServerDisconnected { .. } => "agent.mcp.server.disconnected",
@@ -125,6 +126,7 @@ pub const CODING_EVENT_NAMES: &[&str] = &[
     "agent.loop.detected",
     "agent.tool.rounds.exhausted",
     "agent.route.failover",
+    "agent.route.failover.stopped",
     "agent.mcp.server.ready",
     "agent.mcp.server.failed",
     "agent.mcp.server.disconnected",
@@ -280,7 +282,7 @@ pub struct AgentMcpDisconnectedProps {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use pebble_coding_agent::events::TokenUsage;
+    use pebble_coding_agent::events::{ErrorData, ErrorKind, FailoverStop, TokenUsage};
     use serde_json::json;
 
     use super::*;
@@ -355,5 +357,17 @@ mod tests {
         }
         assert!(is_coding_event_name("todo.updated"));
         assert!(!is_coding_event_name("agent.session.activated"));
+    }
+
+    #[test]
+    fn a_stopped_failover_has_its_own_name() {
+        let stopped = CodingEvent::RouteFailoverStopped {
+            route:   "anthropic/claude-fable-5".to_string(),
+            attempt: 2,
+            reason:  FailoverStop::Exhausted,
+            error:   ErrorData::new(ErrorKind::Llm, "overloaded"),
+        };
+        assert_eq!(coding_event_name(&stopped), "agent.route.failover.stopped");
+        assert!(is_coding_event_name("agent.route.failover.stopped"));
     }
 }
