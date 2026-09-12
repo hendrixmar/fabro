@@ -10,7 +10,10 @@ use fabro_acp::test_support::fake_acp_agent_script;
 use fabro_test::{TestContext, test_context};
 use fabro_types::{EventBody, GitIdentitySource};
 
-use super::{find_run_dir, read_conclusion, run_events, run_state};
+use super::{
+    dump_export, find_run_dir, read_conclusion, run_events, run_id_for, run_state, sandbox_tests,
+    stage_dump_dir, timeout_for,
+};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -274,5 +277,48 @@ fn acp_agent_launch_env_carries_the_run_identity() {
             "GIT_COMMITTER_NAME": "Fabro",
             "GIT_COMMITTER_EMAIL": "noreply@fabro.sh",
         })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The same contract across sandbox providers: a script stage commits in a
+// repository it initializes inside the sandbox and reports the identity the
+// commit object carries. Runs on the local host, and on the host and Docker
+// sandbox plugins when their executables are on PATH.
+// ---------------------------------------------------------------------------
+
+sandbox_tests!(git_identity_in_sandbox);
+
+fn scenario_git_identity_in_sandbox(context: &TestContext, sandbox: &str) {
+    context.write_temp(
+        "sandbox_identity.fabro",
+        r#"digraph SandboxIdentity {
+  graph [goal="Commit inside the sandbox as the run identity"]
+  start [shape=Mdiamond]
+  work [shape=parallelogram, script="set -e; git init -q identity-probe && cd identity-probe && printf x > x.txt && git add x.txt && git commit -q -m probe && printf 'identity=%s|%s|%s|%s\n' \"$(git log -1 --format=%an)\" \"$(git log -1 --format=%ae)\" \"$(git log -1 --format=%cn)\" \"$(git log -1 --format=%ce)\""]
+  exit [shape=Msquare]
+  start -> work -> exit
+}
+"#,
+    );
+
+    context
+        .run_cmd()
+        .env("GIT_AUTHOR_NAME", "Inherited Host")
+        .env("GIT_COMMITTER_EMAIL", "host@example.com")
+        .args(["--auto-approve", "--environment", sandbox])
+        .arg(context.temp_dir.join("sandbox_identity.fabro"))
+        .timeout(timeout_for(sandbox))
+        .assert()
+        .success();
+
+    let run_dir = find_run_dir(context);
+    assert_eq!(read_conclusion(&run_dir)["status"], "succeeded");
+    let export_dir = dump_export(context, &run_id_for(&run_dir));
+    let output = std::fs::read_to_string(stage_dump_dir(&export_dir, "work@1").join("output.log"))
+        .expect("work output.log should exist");
+    assert!(
+        output.contains("identity=Fabro|noreply@fabro.sh|Fabro|noreply@fabro.sh"),
+        "{sandbox}: the sandbox commit should carry the run identity, got: {output}"
     );
 }
