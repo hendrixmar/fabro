@@ -78,6 +78,7 @@ pub fn event_name(event: &Event) -> Cow<'static, str> {
         Event::SetupCommandStarted { .. } => "setup.command.started",
         Event::SetupCommandCompleted { .. } => "setup.command.completed",
         Event::SetupCompleted { .. } => "setup.completed",
+        Event::GitIdentityResolved { .. } => "git.identity.resolved",
         Event::SetupFailed { .. } => "setup.failed",
         Event::StallWatchdogTimeout { .. } => "watchdog.timeout",
         Event::ArtifactCaptured { .. } => "artifact.captured",

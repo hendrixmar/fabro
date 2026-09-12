@@ -1,6 +1,7 @@
 use std::fmt::Write;
 
 use fabro_config::GitAuthorLayer;
+use fabro_types::GitIdentity;
 use fabro_types::settings::run::GitAuthorSettings;
 
 /// Resolved git author identity for checkpoint commits.
@@ -13,8 +14,8 @@ pub struct GitAuthor {
 impl Default for GitAuthor {
     fn default() -> Self {
         Self {
-            name:  "Fabro".into(),
-            email: "noreply@fabro.sh".into(),
+            name:  GitIdentity::DEFAULT_NAME.into(),
+            email: GitIdentity::DEFAULT_EMAIL.into(),
         }
     }
 }
@@ -59,5 +60,14 @@ impl From<&GitAuthorLayer> for GitAuthor {
 impl From<&GitAuthorSettings> for GitAuthor {
     fn from(value: &GitAuthorSettings) -> Self {
         Self::from_options(value.name.clone(), value.email.clone())
+    }
+}
+
+impl From<&GitIdentity> for GitAuthor {
+    fn from(value: &GitIdentity) -> Self {
+        Self {
+            name:  value.name.clone(),
+            email: value.email.clone(),
+        }
     }
 }

@@ -1219,6 +1219,21 @@ fn attach_json_errors_without_prompting_for_human_input() {
           "kind": "worker",
           "run_id": "[ULID]"
         },
+        "event": "git.identity.resolved",
+        "id": "[EVENT_ID]",
+        "properties": {
+          "email": "noreply@fabro.sh",
+          "name": "Fabro",
+          "source": "default"
+        },
+        "run_id": "[ULID]",
+        "ts": "[TIMESTAMP]"
+      },
+      {
+        "actor": {
+          "kind": "worker",
+          "run_id": "[ULID]"
+        },
         "event": "run.started",
         "id": "[EVENT_ID]",
         "properties": {

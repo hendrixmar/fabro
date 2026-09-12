@@ -617,6 +617,7 @@ mod tests {
             fork_source_ref:  None,
             base_branch:      None,
             display_base_sha: None,
+            git_identity:     None,
             git:              None,
         }
     }

@@ -654,6 +654,18 @@ fn format_event_pretty_value(envelope: &serde_json::Value, styles: &Styles) -> O
                 styles.dim.apply_to(&duration),
             ))
         }
+        "git.identity.resolved" => {
+            let name = prop_str_field(envelope, "name").unwrap_or("?");
+            let email = prop_str_field(envelope, "email").unwrap_or("?");
+            let source = prop_str_field(envelope, "source").unwrap_or("?");
+            Some(format!(
+                "{}   Git identity: {} <{}>  {}",
+                styles.dim.apply_to(&ts),
+                name,
+                email,
+                styles.dim.apply_to(source),
+            ))
+        }
         "sandbox.create.progress" => {
             let code = envelope
                 .pointer("/properties/progress/code")

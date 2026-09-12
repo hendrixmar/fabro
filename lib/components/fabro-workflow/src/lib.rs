@@ -295,6 +295,7 @@ pub mod event;
 pub mod file_resolver;
 pub mod git;
 pub(crate) mod git_bridge;
+pub mod git_identity;
 pub(crate) mod graph;
 pub mod handler;
 mod hook_context;

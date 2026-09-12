@@ -330,12 +330,22 @@ The CLI has its own `[cli.logging]` section.
 
 ### `[run.git.author]` section
 
-Customize the git author identity used for checkpoint commits. When not set, defaults to `fabro` / `fabro@local`.
+Override the Git author and committer identity for every commit a run creates: Fabro's own checkpoint and metadata commits, and any `git commit` a prepare step, command stage, or agent tool runs inside the sandbox. Fabro resolves one identity per run and injects it as `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` into every workflow command, so the primary checkout, additional clones, and repositories a workflow clones itself all commit as the same identity. It does not write to any Git configuration file.
+
+When a field is not set, Fabro derives it from the run's GitHub credential:
+
+| Credential | Name | Email |
+|---|---|---|
+| GitHub App (`strategy = "app"`) | `<slug>[bot]` | `<id>+<slug>[bot]@users.noreply.github.com` |
+| Token (`strategy = "token"`) | the token's user login | `<id>+<login>@users.noreply.github.com` |
+| None | `Fabro` | `noreply@fabro.sh` |
+
+Setting both `name` and `email` skips the credential lookup. Setting one field overlays it on the derived identity. A lookup failure for the selected credential fails the run at setup; Fabro never silently switches to another author. The resolved identity is recorded in the run's event stream as `git.identity.resolved` and in the run state as `git_identity`.
 
 | Key | Description | Default |
 |---|---|---|
-| `name` | Git author name | `"fabro"` |
-| `email` | Git author email | `"fabro@local"` |
+| `name` | Git author and committer name | derived from the run's GitHub credential |
+| `email` | Git author and committer email | derived from the run's GitHub credential |
 
 ### `[server.integrations.github]` section
 

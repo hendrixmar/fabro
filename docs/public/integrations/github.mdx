@@ -313,6 +313,10 @@ The permissions table follows the standard layer-merge order (workflow > project
 
 The upper bound on what Fabro will mint is whatever permissions the GitHub App installation has been granted. Fabro does **not** impose a separate server-side cap on the run-level `permissions` map: any value the App has been granted can be requested by run config. Operators must not run untrusted workflow, project, or user TOML against a broadly-scoped GitHub App installation. Preflight prints the resolved permission set so reviewers can see what each run will request.
 
+### Commit attribution
+
+Every commit a run creates is authored and committed by the run's GitHub credential identity. In App mode that is the App's bot account, `<slug>[bot] <id+slug[bot]@users.noreply.github.com>`, so GitHub attributes checkpoint commits and workflow-created commits to the App. In token mode it is the token's user with their GitHub noreply address. Fabro resolves the identity once per run and passes it to every prepare step, command stage, agent tool, and ACP agent as `GIT_AUTHOR_*` / `GIT_COMMITTER_*` variables, so a workflow that clones or initializes another repository commits as the same identity without configuring Git itself. `[run.git.author]` overrides either field; see [server configuration](/administration/server-configuration#rungitauthor-section).
+
 ### Checkpoint pushing
 
 After each workflow stage, Fabro [checkpoints](/execution/checkpoints) by pushing the run branch and metadata branch to origin. Before a successful run becomes terminal, the publish stage pushes the final commit again and treats failure as a run failure. Inside remote sandboxes, the git remote URL is configured with the Installation Access Token for authenticated pushing.

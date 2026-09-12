@@ -12,6 +12,7 @@ mod command_routing;
 mod conditional_branching;
 mod dry_run_examples;
 mod full_stack;
+mod git_identity;
 mod hooks;
 mod human_gate;
 pub(super) mod plugin;

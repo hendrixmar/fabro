@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ExecOutputTail;
-use crate::{RunSandboxFailure, SandboxProviderKind};
+use crate::{GitIdentity, RunSandboxFailure, SandboxProviderKind};
 
 #[derive(
     Debug,
@@ -28,6 +28,7 @@ pub enum RunNoticeCode {
     CheckpointMetadataWriteFailed,
     DirtyWorktree,
     GitDiffFailed,
+    GitIdentityFallback,
     GitPushFailed,
     GithubTokenFailed,
     GithubTokenRefreshLimited,
@@ -189,6 +190,14 @@ pub struct SetupCommandCompletedProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetupCompletedProps {
     pub duration_ms: u64,
+}
+
+/// The Git author/committer identity the run resolved for every commit it
+/// creates, with the credential it was derived from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitIdentityResolvedProps {
+    #[serde(flatten)]
+    pub identity: GitIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

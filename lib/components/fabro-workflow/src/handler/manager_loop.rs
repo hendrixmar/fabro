@@ -211,6 +211,7 @@ impl Handler for SubWorkflowHandler {
             fork_source_ref:  None,
             base_branch:      None,
             display_base_sha: None,
+            git_identity:     services.git_identity.clone(),
             git:              None,
         };
 
@@ -230,6 +231,7 @@ impl Handler for SubWorkflowHandler {
         let interviewer = Arc::clone(&services.interviewer);
         let base_env = services.base_env.clone();
         let github_token = services.github_token.clone();
+        let git_identity = services.git_identity.clone();
         let inputs = services.inputs.clone();
         let dry_run = services.dry_run;
         let workflow_bundle = services.workflow_bundle.clone();
@@ -259,6 +261,7 @@ impl Handler for SubWorkflowHandler {
                     interviewer,
                     base_env,
                     github_token,
+                    git_identity,
                     inputs,
                     dry_run,
                     workflow_path: child_workflow_path,

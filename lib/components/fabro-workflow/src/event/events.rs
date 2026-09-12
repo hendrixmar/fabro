@@ -564,6 +564,11 @@ pub enum Event {
     SetupCompleted {
         duration_ms: u64,
     },
+    /// The run resolved the Git author/committer identity it uses for every
+    /// commit: engine checkpoints, metadata commits, and workflow commands.
+    GitIdentityResolved {
+        identity: ::fabro_types::GitIdentity,
+    },
     SetupFailed {
         command:          String,
         index:            usize,
@@ -1433,6 +1438,14 @@ impl Event {
             }
             Self::SetupCompleted { duration_ms } => {
                 info!(duration_ms, "Setup completed");
+            }
+            Self::GitIdentityResolved { identity } => {
+                info!(
+                    name = %identity.name,
+                    email = %identity.email,
+                    source = %identity.source,
+                    "Git identity resolved"
+                );
             }
             Self::SetupFailed {
                 command,
