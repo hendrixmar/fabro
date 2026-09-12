@@ -919,6 +919,7 @@ impl RunSession {
             fork_source_ref:  record.fork_source_ref.clone(),
             base_branch:      record.base_branch().map(str::to_string),
             display_base_sha: None,
+            git_identity:     None,
             git:              self.git.clone(),
         };
 

@@ -115,6 +115,7 @@ fn test_run_options(run_dir: &Path, run_id: &str) -> RunOptions {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         workflow_slug:    None,
     }
 }

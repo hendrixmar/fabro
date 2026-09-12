@@ -286,6 +286,7 @@ async fn initialized(
                 interviewer:     Arc::new(AutoApproveInterviewer::engine()),
                 base_env:        options.env,
                 github_token:    None,
+                git_identity:    run_options.git_identity.clone(),
                 inputs:          run_options.settings.run.inputs.clone(),
                 dry_run:         run_options.dry_run_enabled(),
                 workflow_path:   None,
@@ -353,6 +354,33 @@ pub async fn run_graph_with_state(
         .await
         .map_err(|err| Error::engine(err.to_string()))?;
     Ok((outcome, state))
+}
+
+/// Run a graph with a `[run.environment]`-style base env and no hooks.
+pub async fn run_graph_with_env(
+    registry: HandlerRegistry,
+    emitter: Arc<Emitter>,
+    sandbox: Arc<RunSandbox>,
+    graph: &GvGraph,
+    run_options: &RunOptions,
+    env: HashMap<String, String>,
+) -> Result<Outcome> {
+    let initialized = initialized(
+        registry,
+        emitter,
+        sandbox,
+        graph,
+        run_options,
+        InitializedOptions {
+            hook_runner: None,
+            env,
+            checkpoint: None,
+            llm_source: None,
+        },
+    )
+    .await;
+    let executed = execute_and_emit_terminal(initialized).await;
+    executed.outcome
 }
 
 pub async fn run_graph_with_hooks(

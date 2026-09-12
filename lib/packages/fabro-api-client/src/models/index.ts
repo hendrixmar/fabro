@@ -129,6 +129,8 @@ export * from './fork-response';
 export * from './fork-source-ref';
 export * from './git-author-settings';
 export * from './git-context';
+export * from './git-identity';
+export * from './git-identity-source';
 export * from './git-run-target';
 export * from './github-integration-settings';
 export * from './github-integration-strategy';

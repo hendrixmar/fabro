@@ -213,6 +213,7 @@ fn run_options(run_dir: &Path, cancel_token: CancellationToken) -> RunOptions {
         github_app: None,
         base_branch: None,
         display_base_sha: None,
+        git_identity: None,
         pre_run_git: None,
         fork_source_ref: None,
         git: None,

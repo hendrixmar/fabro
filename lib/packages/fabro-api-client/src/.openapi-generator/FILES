@@ -158,6 +158,8 @@ models/fork-response.ts
 models/fork-source-ref.ts
 models/git-author-settings.ts
 models/git-context.ts
+models/git-identity-source.ts
+models/git-identity.ts
 models/git-run-target.ts
 models/github-integration-settings.ts
 models/github-integration-strategy.ts

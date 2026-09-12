@@ -738,6 +738,11 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 duration_ms: *duration_ms,
             })
         }
+        Event::GitIdentityResolved { identity } => {
+            EventBody::GitIdentityResolved(fabro_types::GitIdentityResolvedProps {
+                identity: identity.clone(),
+            })
+        }
         Event::SetupFailed {
             command,
             index,

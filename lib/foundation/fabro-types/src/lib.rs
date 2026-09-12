@@ -14,6 +14,7 @@ pub mod dense;
 pub mod diff;
 pub mod event_envelope;
 pub mod failure_signature;
+pub mod git_identity;
 pub mod graph;
 mod id;
 mod input_scalar;
@@ -73,6 +74,7 @@ pub use dense::{ServerSettings, UserSettings, WorkflowSettings};
 pub use diff::{DiffStats, DiffSummary, RunDiff};
 pub use event_envelope::EventEnvelope;
 pub use failure_signature::FailureSignature;
+pub use git_identity::{GitIdentity, GitIdentitySource};
 pub use graph::{
     AttrValue, AttributeScope, ContextKeyAttr, Edge, Graph, KNOWN_HANDLER_TYPES, Node, OnFailure,
     ResolvedOnFailure, is_known_handler_type, is_llm_handler_type, shape_to_handler_type,

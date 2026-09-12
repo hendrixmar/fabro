@@ -9557,6 +9557,35 @@ components:
         dirty:
           $ref: "#/components/schemas/DirtyStatus"
 
+    GitIdentitySource:
+      description: Where a run's Git author/committer identity came from.
+      type: string
+      enum:
+        - explicit
+        - github_app
+        - github_pat
+        - default
+
+    GitIdentity:
+      description: >
+        The Git author and committer identity a run resolved once and uses for
+        every commit it creates: engine checkpoints, metadata commits, and any
+        commit a workflow command or agent tool runs.
+      type: object
+      required:
+        - name
+        - email
+        - source
+      properties:
+        name:
+          type: string
+          example: "fabro-sh[bot]"
+        email:
+          type: string
+          example: "123456+fabro-sh[bot]@users.noreply.github.com"
+        source:
+          $ref: "#/components/schemas/GitIdentitySource"
+
     ManifestGoal:
       description: Resolved goal kind and content.
       type: object
@@ -11936,6 +11965,13 @@ components:
         retried_from:
           type: ["string", "null"]
           description: Source run ID when this run was created by manual retry.
+        git_identity:
+          oneOf:
+            - $ref: "#/components/schemas/GitIdentity"
+            - type: "null"
+          description: >
+            The Git author/committer identity the run resolved for its
+            commits. Absent until the run's first initialization resolves it.
         pending_interviews:
           type: object
           additionalProperties:

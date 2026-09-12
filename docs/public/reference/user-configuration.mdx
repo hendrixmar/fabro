@@ -355,8 +355,8 @@ email = "fabro-bot@company.com"
 
 | Key | Type / values | Default | Description |
 |---|---|---|---|
-| `email` | string | "fabro@local" | Git author email for checkpoint commits. |
-| `name` | string | "fabro" | Git author name for checkpoint commits. |
+| `email` | string | resolved from the run's GitHub credential | Git author and committer email for every commit the run creates. When<br />unset, the run uses the credential's noreply address, else<br />`noreply@fabro.sh`. |
+| `name` | string | resolved from the run's GitHub credential | Git author and committer name for every commit the run creates. When<br />unset, the run uses its GitHub App bot or PAT user, else `Fabro`. |
 
 ## `[run.pull_request]`
 

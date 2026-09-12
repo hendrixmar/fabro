@@ -252,6 +252,8 @@ pub enum EventBody {
     SetupCommandCompleted(SetupCommandCompletedProps),
     #[serde(rename = "setup.completed")]
     SetupCompleted(SetupCompletedProps),
+    #[serde(rename = "git.identity.resolved")]
+    GitIdentityResolved(GitIdentityResolvedProps),
     #[serde(rename = "setup.failed")]
     SetupFailed(SetupFailedProps),
     #[serde(rename = "watchdog.timeout")]
@@ -518,6 +520,7 @@ impl EventBody {
             Self::SetupCommandStarted(_) => "setup.command.started",
             Self::SetupCommandCompleted(_) => "setup.command.completed",
             Self::SetupCompleted(_) => "setup.completed",
+            Self::GitIdentityResolved(_) => "git.identity.resolved",
             Self::SetupFailed(_) => "setup.failed",
             Self::StallWatchdogTimeout(_) => "watchdog.timeout",
             Self::ArtifactCaptured(_) => "artifact.captured",
@@ -657,6 +660,7 @@ fn is_known_event_name(event: &str) -> bool {
                 | "setup.command.completed"
                 | "setup.completed"
                 | "setup.failed"
+                | "git.identity.resolved"
                 | "watchdog.timeout"
                 | "artifact.captured"
                 | "ssh.ready"

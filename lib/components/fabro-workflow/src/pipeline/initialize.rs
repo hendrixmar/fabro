@@ -17,15 +17,13 @@ use fabro_static::EnvVars;
 use fabro_types::RunSandboxKind;
 use fabro_util::time::elapsed_ms;
 use fabro_vault::Vault;
-use sandbox_driver::{CorrelationId, EventContext, Git as _};
+use sandbox_driver::{CorrelationId, EventContext};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock as AsyncRwLock;
 
 use super::types::{InitOptions, Initialized, LlmSpec, Persisted, SandboxEnvSpec};
 use crate::error::Error;
 use crate::event::{DriverEventRecorder, Event, RunNoticeCode, RunNoticeLevel, SandboxLifecycle};
-use crate::git::GitAuthor;
-use crate::git_bridge;
 use crate::handler::llm::{AgentAcpBackend, BackendRouter, PebbleBackend, routing};
 use crate::handler::{HandlerRegistry, default_registry};
 #[cfg(test)]
@@ -39,6 +37,7 @@ use crate::services::{
 use crate::stage_execution::{StageExecutionSeed, StageExecutionTracker};
 use crate::steering_hub::SteeringHub;
 use crate::web_search::SearchSecrets;
+use crate::{git_bridge, git_identity};
 
 struct BuiltSandboxEnv {
     env:           HashMap<String, String>,
@@ -75,20 +74,47 @@ fn git_setup_intent(run_options: &RunOptions) -> GitSetupIntent {
     }
 }
 
-async fn configure_sandbox_git_identity(
-    sandbox: &RunSandbox,
-    author: &GitAuthor,
-) -> Result<(), Error> {
-    let git = sandbox
-        .git()
-        .map_err(|err| Error::engine_with_source("Sandbox git identity setup failed", err))?;
-    let repo = sandbox.working_directory();
-    for (key, value) in [("user.name", &author.name), ("user.email", &author.email)] {
-        git.config_set(repo, key, value)
-            .await
-            .map_err(|err| Error::engine_with_source("Sandbox git identity setup failed", err))?;
+/// Resolve the run's Git identity once, before anything can commit.
+///
+/// A resumed run reuses the identity it recorded at first initialization so
+/// a token refresh or credential rotation never changes authorship mid-run;
+/// runs recorded before identity tracking resolve on their next execution.
+async fn resolve_run_git_identity(
+    options: &InitOptions,
+    is_resume: bool,
+    github_token: Option<&Arc<InstallationTokenSource>>,
+) -> Result<fabro_types::GitIdentity, Error> {
+    if let Some(identity) = options.run_options.git_identity.clone() {
+        return Ok(identity);
     }
-    Ok(())
+    if is_resume {
+        let recorded = options
+            .run_store
+            .state()
+            .await
+            .map_err(|err| Error::engine_with_anyhow("Failed to load run state", err))?
+            .git_identity;
+        if let Some(identity) = recorded {
+            return Ok(identity);
+        }
+    }
+    let resolved = git_identity::resolve_git_identity(
+        &options.run_options.settings,
+        options.run_options.github_app.as_ref(),
+        github_token,
+    )
+    .await?;
+    if let Some(warning) = resolved.warning {
+        options.emitter.notice(
+            RunNoticeLevel::Warn,
+            RunNoticeCode::GitIdentityFallback,
+            warning,
+        );
+    }
+    options.emitter.emit(&Event::GitIdentityResolved {
+        identity: resolved.identity.clone(),
+    });
+    Ok(resolved.identity)
 }
 
 fn build_sandbox_env(
@@ -547,9 +573,12 @@ pub async fn initialize(
         github_token,
         github_access: _,
     } = built_env;
+    let git_identity = resolve_run_git_identity(&options, is_resume, github_token.as_ref()).await?;
+    options.run_options.git_identity = Some(git_identity.clone());
     let tool_env_provider = Arc::new(WorkflowToolEnvProvider {
         base_env:     base_env.clone(),
         github_token: github_token.clone(),
+        git_identity: Some(git_identity.clone()),
     });
     let github_token_refresh_managed = github_token
         .as_deref()
@@ -633,11 +662,6 @@ pub async fn initialize(
             }
         }
     }
-    if sandbox.origin_url().is_some() {
-        let git_author = options.run_options.git_author();
-        configure_sandbox_git_identity(sandbox.as_ref(), &git_author).await?;
-    }
-
     if !options.lifecycle.setup_commands.is_empty() {
         options.emitter.emit(&Event::SetupStarted {
             command_count: options.lifecycle.setup_commands.len(),
@@ -651,13 +675,14 @@ pub async fn initialize(
             });
             let cmd_start = Instant::now();
             let cancel_token = options.run_options.cancel_token.child_token();
-            let step_env = (!setup.env.is_empty()).then_some(&setup.env);
+            let mut step_env = setup.env.clone();
+            git_identity::apply_git_identity_env(&mut step_env, &git_identity);
             let result = sandbox
                 .exec_command(
                     command,
                     options.lifecycle.setup_command_timeout_ms,
                     None,
-                    step_env,
+                    Some(&step_env),
                     Some(cancel_token.clone()),
                 )
                 .await
@@ -733,6 +758,7 @@ pub async fn initialize(
         interviewer: Arc::clone(&options.interviewer),
         base_env,
         github_token,
+        git_identity: Some(git_identity),
         inputs: options.run_options.settings.run.inputs.clone(),
         dry_run: options.dry_run,
         workflow_path: options.workflow_path.clone(),
@@ -922,6 +948,7 @@ mod tests {
             fork_source_ref:  None,
             base_branch:      None,
             display_base_sha: None,
+            git_identity:     None,
             git:              None,
         }
     }
@@ -1056,28 +1083,181 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configure_sandbox_git_identity_uses_run_author() {
-        let sandbox = fabro_sandbox::test_support::MockSandbox::linux();
-        let author = GitAuthor::from_options(
-            Some("Fabro Bot".to_string()),
-            Some("fabro-bot@example.com".to_string()),
-        );
+    async fn initialize_resolves_the_generic_identity_without_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let (graph, source) = simple_graph();
+        let persisted = test_persisted(graph, source, &run_dir);
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        emitter.on_event({
+            let seen = Arc::clone(&seen);
+            move |event| seen.lock().unwrap().push(event.clone())
+        });
 
-        configure_sandbox_git_identity(&sandbox.sandbox(), &author)
-            .await
-            .expect("git identity should configure");
+        let run_store = memory_store().create_run(&test_run_id()).await.unwrap();
+        let initialized = initialize(
+            persisted,
+            test_init_options(
+                run_store.into(),
+                emitter,
+                std::env::current_dir().unwrap(),
+                test_settings(&run_dir),
+            ),
+        )
+        .await
+        .unwrap();
 
-        let commands = sandbox.driver().scripted_exec().commands();
-        assert_eq!(commands.len(), 2, "{commands:#?}");
+        let expected = fabro_types::GitIdentity::fabro_default();
+        assert_eq!(initialized.run_options.git_identity, Some(expected.clone()));
+        assert_eq!(initialized.engine.git_identity, Some(expected.clone()));
+        assert_eq!(
+            initialized.run_options.git_author(),
+            crate::git::GitAuthor::from(&expected)
+        );
+        let resolved = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|event| match &event.body {
+                fabro_types::EventBody::GitIdentityResolved(props) => Some(props.identity.clone()),
+                _ => None,
+            })
+            .expect("initialize should record the resolved identity");
+        assert_eq!(resolved, expected);
         assert!(
-            commands[0].contains("'config' '--local' '--' 'user.name' 'Fabro Bot'"),
-            "{}",
-            commands[0]
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.event_name() == "run.notice"),
+            "the generic identity without credentials is not a fallback warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_overlays_partial_explicit_author_on_the_generic_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let (graph, source) = simple_graph();
+        let mut settings = WorkflowSettings::default();
+        settings.run.git.author = Some(fabro_types::settings::run::GitAuthorSettings {
+            name:  Some("Release Bot".to_string()),
+            email: None,
+        });
+        let persisted = test_persisted_run(graph, source, &run_dir, settings.clone(), None);
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let mut run_options = test_settings(&run_dir);
+        run_options.settings = settings;
+
+        let run_store = memory_store().create_run(&test_run_id()).await.unwrap();
+        let initialized = initialize(
+            persisted,
+            test_init_options(
+                run_store.into(),
+                emitter,
+                std::env::current_dir().unwrap(),
+                run_options,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            initialized.run_options.git_identity,
+            Some(fabro_types::GitIdentity {
+                name:   "Release Bot".to_string(),
+                email:  fabro_types::GitIdentity::DEFAULT_EMAIL.to_string(),
+                source: fabro_types::GitIdentitySource::Default,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_warns_and_falls_back_for_a_standalone_installation_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let (graph, source) = simple_graph();
+        let persisted = test_persisted(graph, source, &run_dir);
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        emitter.on_event({
+            let seen = Arc::clone(&seen);
+            move |event| seen.lock().unwrap().push(event.clone())
+        });
+        let mut run_options = test_settings(&run_dir);
+        run_options.github_app = Some(fabro_github::GitHubCredentials::Installation(
+            fabro_github::InstallationToken {
+                token:      "ghs_token".to_string(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        ));
+
+        let run_store = memory_store().create_run(&test_run_id()).await.unwrap();
+        let initialized = initialize(
+            persisted,
+            test_init_options(
+                run_store.into(),
+                emitter,
+                std::env::current_dir().unwrap(),
+                run_options,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            initialized.run_options.git_identity,
+            Some(fabro_types::GitIdentity::fabro_default())
+        );
+        let notice = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|event| match &event.body {
+                fabro_types::EventBody::RunNotice(props) => Some(props.clone()),
+                _ => None,
+            })
+            .expect("standalone installation token should warn");
+        assert_eq!(notice.code, RunNoticeCode::GitIdentityFallback.to_string());
+        assert_eq!(notice.level, RunNoticeLevel::Warn);
+    }
+
+    /// The setup step's own env names a different author; the run's identity
+    /// must still win, and it must reach the shell even though the working
+    /// directory has no Git origin.
+    #[tokio::test]
+    async fn initialize_injects_the_git_identity_into_setup_commands() {
+        let setup = crate::run_options::SetupCommand {
+            command: format!(
+                "test \"$GIT_AUTHOR_NAME\" = {name} && test \"$GIT_AUTHOR_EMAIL\" = {email} && \
+                 test \"$GIT_COMMITTER_NAME\" = {name} && test \"$GIT_COMMITTER_EMAIL\" = {email}",
+                name = fabro_types::GitIdentity::DEFAULT_NAME,
+                email = fabro_types::GitIdentity::DEFAULT_EMAIL,
+            ),
+            env:     HashMap::from([
+                ("GIT_AUTHOR_NAME".to_string(), "step-author".to_string()),
+                (
+                    "GIT_COMMITTER_EMAIL".to_string(),
+                    "step@example.com".to_string(),
+                ),
+            ]),
+        };
+
+        let (result, events) = initialize_with_setup_step(setup).await;
+
+        assert!(
+            result.is_ok(),
+            "setup should see the run's Git identity: {:?}",
+            result.err()
         );
         assert!(
-            commands[1].contains("'config' '--local' '--' 'user.email' 'fabro-bot@example.com'"),
-            "{}",
-            commands[1]
+            events
+                .iter()
+                .any(|event| event.event_name() == "setup.completed")
         );
     }
 
@@ -1261,6 +1441,7 @@ mod tests {
         let tool_env_provider = Arc::new(WorkflowToolEnvProvider {
             base_env:     HashMap::new(),
             github_token: None,
+            git_identity: None,
         });
         let (_registry, effective_dry_run) = build_registry(
             &LlmSpec {

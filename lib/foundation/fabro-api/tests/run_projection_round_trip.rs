@@ -51,6 +51,11 @@ fn run_projection_round_trips_populated_projection() {
         },
         "pull_request": null,
         "superseded_by": null,
+        "git_identity": {
+            "name": "fabro-sh[bot]",
+            "email": "123456+fabro-sh[bot]@users.noreply.github.com",
+            "source": "github_app"
+        },
         "pending_interviews": {
             "q-1": {
                 "question": {

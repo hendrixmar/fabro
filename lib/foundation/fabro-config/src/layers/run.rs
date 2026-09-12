@@ -250,13 +250,22 @@ pub struct RunGitLayer {
 )]
 #[serde(deny_unknown_fields)]
 pub struct GitAuthorLayer {
-    /// Git author name for checkpoint commits.
+    /// Git author and committer name for every commit the run creates. When
+    /// unset, the run uses its GitHub App bot or PAT user, else `Fabro`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[option(default = "\"fabro\"", value_type = "string")]
+    #[option(
+        default = "resolved from the run's GitHub credential",
+        value_type = "string"
+    )]
     pub name:  Option<String>,
-    /// Git author email for checkpoint commits.
+    /// Git author and committer email for every commit the run creates. When
+    /// unset, the run uses the credential's noreply address, else
+    /// `noreply@fabro.sh`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[option(default = "\"fabro@local\"", value_type = "string")]
+    #[option(
+        default = "resolved from the run's GitHub credential",
+        value_type = "string"
+    )]
     pub email: Option<String>,
 }
 

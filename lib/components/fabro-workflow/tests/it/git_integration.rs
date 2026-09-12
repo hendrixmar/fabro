@@ -14,10 +14,12 @@ use fabro_types::{RunEvent, WorkflowSettings, fixtures};
 use fabro_workflow::event::Emitter;
 use fabro_workflow::git;
 use fabro_workflow::handler::HandlerRegistry;
+use fabro_workflow::handler::command::CommandHandler;
 use fabro_workflow::handler::exit::ExitHandler;
 use fabro_workflow::handler::start::StartHandler;
+use fabro_workflow::outcome::StageOutcome;
 use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
-use fabro_workflow::test_support::run_graph;
+use fabro_workflow::test_support::{run_graph, run_graph_with_env};
 use sandbox_driver::{
     Capabilities, DirEntry, Exec, FileMetadata, Filesystem, PlatformInfo, SandboxId, SandboxStatus,
 };
@@ -169,6 +171,7 @@ fn test_run_options(run_dir: &Path) -> RunOptions {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         workflow_slug:    None,
     }
 }
@@ -588,4 +591,237 @@ async fn remote_prompt_demotion_stays_outside_checkout_and_survives_checkpoint()
         sandbox.read_file_bytes(&blob_path).await.unwrap(),
         oversized_bytes
     );
+}
+
+// ---------------------------------------------------------------------------
+// One Git identity per run: engine checkpoints and workflow commands agree.
+// ---------------------------------------------------------------------------
+
+fn git_stdout(repo_dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .unwrap_or_else(|err| panic!("git {args:?} should run: {err}"));
+    assert_success(&output, &format!("git {args:?}"));
+    String::from_utf8(output.stdout)
+        .expect("git output should be UTF-8")
+        .trim()
+        .to_string()
+}
+
+/// `author name`, `author email`, `committer name`, `committer email`.
+fn commit_identity(repo_dir: &Path, rev: &str) -> Vec<String> {
+    git_stdout(repo_dir, &[
+        "show",
+        "-s",
+        "--format=%an%n%ae%n%cn%n%ce",
+        rev,
+    ])
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
+fn set_local_identity(repo_dir: &Path, name: &str, email: &str) {
+    for (key, value) in [("user.name", name), ("user.email", email)] {
+        let output = Command::new("git")
+            .args(["config", key, value])
+            .current_dir(repo_dir)
+            .output()
+            .expect("git config should run");
+        assert_success(&output, "git config");
+    }
+}
+
+fn command_node(id: &str, script: &str) -> Node {
+    let mut node = Node::new(id);
+    node.attrs.insert(
+        "shape".to_string(),
+        AttrValue::String("parallelogram".to_string()),
+    );
+    node.attrs
+        .insert("script".to_string(), AttrValue::String(script.to_string()));
+    node
+}
+
+fn identity_registry() -> HandlerRegistry {
+    let mut registry = make_registry();
+    registry.register("command", Box::new(CommandHandler));
+    registry
+}
+
+/// The identity a workflow command sees is the run's, not the checkout's
+/// local config, not an inherited `GIT_*` variable, and not a
+/// `[run.environment]` entry. It reaches the primary checkout, a clone the
+/// workflow creates, and a repository the workflow initializes, and the
+/// engine's own checkpoint commit carries the same identity.
+#[tokio::test]
+async fn run_identity_governs_engine_and_workflow_commits_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    init_repo(&repo_dir);
+    set_local_identity(&repo_dir, "Local Config", "local@example.com");
+    let base_sha = git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let identity = fabro_types::GitIdentity {
+        name:   "fabro-sh[bot]".to_string(),
+        email:  "281434857+fabro-sh[bot]@users.noreply.github.com".to_string(),
+        source: fabro_types::GitIdentitySource::GithubApp,
+    };
+    let expected = vec![
+        identity.name.clone(),
+        identity.email.clone(),
+        identity.name.clone(),
+        identity.email.clone(),
+    ];
+
+    let clone_dir = dir.path().join("clone");
+    let fresh_dir = dir.path().join("fresh");
+    let script = format!(
+        "set -e
+        printf work > work.txt && git add work.txt && git commit -q -m 'workflow commit'
+        git clone -q . {clone} && (cd {clone} && printf x > x.txt && git add x.txt && git commit -q -m 'clone commit')
+        git init -q {fresh} && (cd {fresh} && printf y > y.txt && git add y.txt && git commit -q -m 'fresh commit')",
+        clone = clone_dir.display(),
+        fresh = fresh_dir.display(),
+    );
+
+    let mut graph = simple_graph();
+    graph
+        .nodes
+        .insert("work".to_string(), command_node("work", &script));
+    graph.edges.clear();
+    graph.edges.push(Edge::new("start", "work"));
+    graph.edges.push(Edge::new("work", "exit"));
+
+    let run_tmp = tempfile::tempdir().unwrap();
+    let mut run_options = test_run_options(run_tmp.path());
+    run_options.git_identity = Some(identity.clone());
+    run_options.git = Some(GitCheckpointOptions {
+        base_sha:    Some(base_sha),
+        run_branch:  None,
+        meta_branch: None,
+    });
+
+    // A `[run.environment]` entry and an inherited host variable both name a
+    // different author; the run identity must win over both.
+    let env = HashMap::from([
+        ("GIT_AUTHOR_NAME".to_string(), "Run Env".to_string()),
+        (
+            "GIT_COMMITTER_EMAIL".to_string(),
+            "run-env@example.com".to_string(),
+        ),
+    ]);
+    let outcome = run_graph_with_env(
+        identity_registry(),
+        Arc::new(Emitter::new(fixtures::RUN_2)),
+        local_env(&repo_dir).await,
+        &graph,
+        &run_options,
+        env,
+    )
+    .await
+    .expect("workflow should complete");
+    assert_eq!(outcome.status, StageOutcome::Succeeded, "{outcome:?}");
+
+    // The workflow's own commit in the primary checkout.
+    assert_eq!(
+        commit_identity(&repo_dir, "HEAD~1"),
+        expected,
+        "workflow commit in the primary checkout"
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["log", "-1", "--format=%s", "HEAD~1"]),
+        "workflow commit"
+    );
+    // The engine's checkpoint commit on top of it.
+    assert_eq!(
+        commit_identity(&repo_dir, "HEAD"),
+        expected,
+        "engine checkpoint commit"
+    );
+    assert!(
+        git_stdout(&repo_dir, &["log", "-1", "--format=%s", "HEAD"]).starts_with("fabro("),
+        "HEAD should be the checkpoint commit"
+    );
+    // A clone the workflow created and a repository it initialized.
+    assert_eq!(
+        commit_identity(&clone_dir, "HEAD"),
+        expected,
+        "clone commit"
+    );
+    assert_eq!(
+        commit_identity(&fresh_dir, "HEAD"),
+        expected,
+        "fresh repo commit"
+    );
+
+    // The checkout's own configuration is left alone.
+    assert_eq!(
+        git_stdout(&repo_dir, &["config", "user.name"]),
+        "Local Config"
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["config", "user.email"]),
+        "local@example.com"
+    );
+}
+
+/// Two runs with different identities in the same process do not leak into
+/// each other: each run's commits carry only its own identity.
+#[tokio::test]
+async fn concurrent_runs_keep_their_own_identities() {
+    async fn run_with(name: &str, email: &str) -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        init_repo(&repo_dir);
+        let mut graph = simple_graph();
+        graph.nodes.insert(
+            "work".to_string(),
+            command_node(
+                "work",
+                "for i in 1 2 3; do printf $i > f$i.txt; git add f$i.txt; git commit -q -m c$i; \
+                 sleep 0.05; done",
+            ),
+        );
+        graph.edges.clear();
+        graph.edges.push(Edge::new("start", "work"));
+        graph.edges.push(Edge::new("work", "exit"));
+        let run_tmp = tempfile::tempdir().unwrap();
+        let mut run_options = test_run_options(run_tmp.path());
+        run_options.run_id = fabro_types::RunId::new();
+        run_options.git_identity = Some(fabro_types::GitIdentity {
+            name:   name.to_string(),
+            email:  email.to_string(),
+            source: fabro_types::GitIdentitySource::Explicit,
+        });
+        run_graph(
+            identity_registry(),
+            Arc::new(Emitter::new(run_options.run_id)),
+            local_env(&repo_dir).await,
+            &graph,
+            &run_options,
+        )
+        .await
+        .expect("workflow should complete");
+        let identities = git_stdout(&repo_dir, &["log", "--format=%an <%ae> %cn <%ce>", "-3"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (dir, identities)
+    }
+
+    let (first, second) = tokio::join!(
+        run_with("Run One", "one@example.com"),
+        run_with("Run Two", "two@example.com"),
+    );
+    assert_eq!(first.1, vec![
+        "Run One <one@example.com> Run One <one@example.com>";
+        3
+    ]);
+    assert_eq!(second.1, vec![
+        "Run Two <two@example.com> Run Two <two@example.com>";
+        3
+    ]);
 }

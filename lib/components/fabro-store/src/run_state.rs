@@ -356,6 +356,9 @@ impl RunProjectionReducer for RunProjection {
                     duration_ms: props.duration_ms,
                 }));
             }
+            EventBody::GitIdentityResolved(props) => {
+                self.git_identity = Some(props.identity.clone());
+            }
             EventBody::SandboxInitialized(props) => {
                 let plan = sandbox_plan_from_projection_or_settings(self);
                 self.sandbox = Some(RunSandbox::ready(plan, RunSandboxInstance {

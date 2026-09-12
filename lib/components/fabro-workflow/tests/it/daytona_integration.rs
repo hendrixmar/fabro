@@ -581,6 +581,7 @@ async fn daytona_pipeline_artifact_offload_and_sync() {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         pre_run_git:      None,
         fork_source_ref:  None,
         git:              None,
@@ -769,6 +770,7 @@ async fn daytona_git_checkpoint_remote_emits_events() {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         pre_run_git:      None,
         fork_source_ref:  None,
         git:              Some(GitCheckpointOptions {
@@ -913,6 +915,7 @@ async fn daytona_git_checkpoint_with_shadow_branch() {
         github_app: None,
         base_branch: None,
         display_base_sha: None,
+        git_identity: None,
         pre_run_git: None,
         fork_source_ref: None,
         git: Some(GitCheckpointOptions {
@@ -1071,6 +1074,7 @@ async fn daytona_asset_collection() {
         github_app:       None,
         base_branch:      None,
         display_base_sha: None,
+        git_identity:     None,
         pre_run_git:      None,
         fork_source_ref:  None,
         git:              None,
@@ -1343,6 +1347,7 @@ async fn daytona_git_push_run_branch_to_origin() {
         github_app: None,
         base_branch: None,
         display_base_sha: None,
+        git_identity: None,
         pre_run_git: None,
         fork_source_ref: None,
         git: Some(GitCheckpointOptions {
