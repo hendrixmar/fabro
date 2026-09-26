@@ -157,7 +157,6 @@ impl ListRunsParams {
             workflow: self.workflow.clone(),
             activity: self.activity,
             roots_only: self.roots_only,
-            ..RunSummaryListQuery::default()
         }
     }
 }
