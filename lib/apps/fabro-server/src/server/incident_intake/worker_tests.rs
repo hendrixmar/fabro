@@ -124,6 +124,16 @@ fn build(
     enabled: bool,
     dispatch: bool,
 ) -> Arc<AppState> {
+    builder(dir, bundle, origin, enabled, dispatch).build()
+}
+
+fn builder(
+    dir: &std::path::Path,
+    bundle: &(Arc<fabro_store::Database>, fabro_store::ArtifactStore),
+    origin: &str,
+    enabled: bool,
+    dispatch: bool,
+) -> TestAppStateBuilder {
     let mut settings = default_test_server_settings();
     settings.server.integrations.plane.api_base = Some(format!("{origin}/api/v1"));
     settings.server.integrations.plane.workspace = Some("workspace".into());
@@ -170,7 +180,6 @@ fn build(
              investigate [shape=parallelogram,script=\"true\",goal_gate=true,output_schema=\"routing\"]; \
              exit [shape=Msquare]; start -> investigate -> exit; }",
         ))
-        .build()
 }
 
 async fn automation(state: &AppState) {
@@ -186,6 +195,69 @@ async fn automation(state: &AppState) {
         )
         .await
         .unwrap();
+}
+
+/// A global with no pin anywhere: unpinned target, no workflow source.
+async fn unpinned_automation(state: &AppState) {
+    state
+        .automation_store()
+        .create(
+            serde_json::from_value(json!({
+                "id":"incident-loop","name":"Incident loop","environment_id":"default",
+                "target":{"kind":"git","repo":"example/repository","branch":"main"},
+                "workflow":"incident-loop","triggers":[]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+/// A project link's shape: an unpinned target at the project repo, with the
+/// pin carried on `workflow_source` instead (as link resolution, Task 6,
+/// would have produced).
+async fn linked_automation(state: &AppState) {
+    state
+        .automation_store()
+        .create(
+            serde_json::from_value(json!({
+                "id":"incident-loop","name":"Incident loop","environment_id":"default",
+                "target":{"kind":"git","repo":"artesanos-digitales/tierrapay","branch":"main"},
+                "workflow":"incident-loop",
+                "workflow_source":{"repo":"example/repository","branch":"main","sha":REVISION},
+                "triggers":[]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn startup_validation_pins_on_the_workflow_source_for_a_linked_incident_loop() {
+    // A global with an unpinned target and no workflow source still fails
+    // startup: there is no pin to load the workflow from.
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = test_store_bundle();
+    let initial = build(dir.path(), &bundle, ORIGIN, false, false);
+    unpinned_automation(&initial).await;
+    drop(initial);
+    let error = match builder(dir.path(), &bundle, ORIGIN, true, false).try_build() {
+        Ok(_) => panic!("an unpinned global with no workflow source should fail startup"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("immutable source revision"));
+
+    // A linked incident-loop (unpinned project target, pinned workflow
+    // source) passes: the pin is read from the workflow source.
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = test_store_bundle();
+    let initial = build(dir.path(), &bundle, ORIGIN, false, false);
+    linked_automation(&initial).await;
+    drop(initial);
+    if let Err(error) = builder(dir.path(), &bundle, ORIGIN, true, false).try_build() {
+        panic!("a linked incident-loop pinned via its workflow source should start: {error}");
+    }
 }
 
 async fn ready_observation(state: &AppState) -> (String, uuid::Uuid) {
