@@ -18,6 +18,8 @@ use super::super::{
 };
 use super::automations::resolve_automation_environment;
 use super::{json_with_etag_response, parse_required_if_match};
+use crate::automation_materializer::AutomationRunMaterializeInput;
+use crate::run_intent::lower_workflow_closure;
 
 #[derive(serde::Serialize)]
 struct ProjectListResponse {
@@ -199,16 +201,7 @@ async fn create_project_automation(
     )?;
     let draft =
         project_automation_draft(&instance_id, &request, &project, &source, environment_id)?;
-    if !workflow_declares_project_input(state.as_ref(), &draft).await? {
-        return Err(ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "workflow {} declares no `project` input; add `project = {{ type = \"string\", default = \"\" }}` to its [run.inputs] first",
-                draft.workflow
-            ),
-            "automation_workflow_without_project_input",
-        ));
-    }
+    validate_link_workflow(state.as_ref(), &draft).await?;
     let automation = state.automation_store().create(draft).await?;
     state.notify_automation_scheduler();
     let revision = automation.revision.clone();
@@ -358,18 +351,30 @@ pub(crate) fn validate_link_source(source: &Automation) -> Result<(), ApiError> 
     Ok(())
 }
 
-/// Materialize the source workflow for this project and read its declared
-/// inputs. A link whose workflow cannot receive `inputs.project` would act
-/// on every project, so it is refused.
-pub(crate) async fn workflow_declares_project_input(
+/// Materialize the source workflow for this project and check what its
+/// workflow layer declares. A link fires in a clone-based environment with
+/// `inputs.project`, so a workflow that cannot receive `inputs.project`
+/// (it would act on every project) or that runs on the host (clone disabled,
+/// refused at run admission) is refused here instead of becoming a dead link.
+pub(crate) async fn validate_link_workflow(
     state: &AppState,
     draft: &AutomationDraft,
-) -> Result<bool, ApiError> {
+) -> Result<(), ApiError> {
+    let without_project_input = || {
+        ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "workflow {} declares no `project` input; add `project = {{ type = \"string\", default = \"\" }}` to its [run.inputs] first",
+                draft.workflow
+            ),
+            "automation_workflow_without_project_input",
+        )
+    };
     let fabro_types::RunTarget::Git(target) = &draft.target else {
-        return Ok(false);
+        return Err(without_project_input());
     };
     let materialized = state
-        .materialize_automation_run(crate::automation_materializer::AutomationRunMaterializeInput {
+        .materialize_automation_run(AutomationRunMaterializeInput {
             automation_id:   draft.id.clone(),
             target:          target.clone(),
             workflow_source: draft.workflow_source.clone(),
@@ -382,30 +387,57 @@ pub(crate) async fn workflow_declares_project_input(
         .map_err(|err| {
             ApiError::with_code(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("workflow {} could not be loaded for this project: {err}", draft.workflow),
+                format!(
+                    "workflow {} could not be loaded for this project: {err}",
+                    draft.workflow
+                ),
                 "automation_workflow_unavailable",
             )
         })?;
     let versions = fabro_workflow_version::WorkflowVersionStore::new(state.store_ref().blobs());
-    let internal = || ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "workflow version store failed");
+    let internal = || {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workflow version store failed",
+        )
+    };
     let closure = versions
         .get_closure(&materialized.workflow_version_id)
         .await
         .map_err(|_| internal())?
         .ok_or_else(internal)?;
-    let lowered = crate::run_intent::lower_workflow_closure(&closure).map_err(|err| {
+    let lowered = lower_workflow_closure(&closure).map_err(|err| {
         ApiError::with_code(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("workflow {} is invalid: {err}", draft.workflow),
             "automation_workflow_unavailable",
         )
     })?;
-    Ok(lowered
+    let run = lowered
         .workflow_layer
         .as_ref()
-        .and_then(|layer| layer.run.as_ref())
+        .and_then(|layer| layer.run.as_ref());
+    if !run
         .and_then(|run| run.inputs.as_ref())
-        .is_some_and(|inputs| inputs.contains_key("project")))
+        .is_some_and(|inputs| inputs.contains_key("project"))
+    {
+        return Err(without_project_input());
+    }
+    if run
+        .and_then(|run| run.clone.as_ref())
+        .and_then(|clone| clone.enabled)
+        == Some(false)
+    {
+        return Err(ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "workflow {} runs on the host (clone disabled), so it cannot run as a project automation yet",
+                draft.workflow
+            ),
+            "automation_workflow_host_only",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_project_id(id: String) -> Result<ProjectId, ApiError> {
@@ -601,7 +633,7 @@ mod tests {
         assert!(validate_link_source(&source(Vec::new())).is_ok());
     }
 
-    async fn declares_project(workflow_toml: &str) -> bool {
+    async fn link_workflow_check(workflow_toml: &str) -> Result<(), ApiError> {
         let target = fabro_types::GitRunTarget {
             repo:   "artesanos-digitales/tierrapay".to_string(),
             branch: "main".to_string(),
@@ -627,6 +659,11 @@ mod tests {
             })
             .await
             .unwrap();
+        state
+            .project_store()
+            .set_intake_binding(&created.id, &created.revision, Some("tierrapay"))
+            .await
+            .unwrap();
         let id = AutomationId::new("tierrapay-ticket-loop").unwrap();
         let draft = project_automation_draft(
             &id,
@@ -637,21 +674,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(draft.project_id.as_ref(), Some(&created.id));
-        workflow_declares_project_input(state.as_ref(), &draft)
-            .await
-            .unwrap()
+        validate_link_workflow(state.as_ref(), &draft).await
     }
 
     #[tokio::test]
-    async fn links_require_a_declared_project_input() {
+    async fn links_require_a_declared_project_input_and_a_clone() {
+        let with_project = "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n[run.inputs]\nproject = { type = \"string\", default = \"\" }\n";
+        assert!(link_workflow_check(with_project).await.is_ok());
         assert!(
-            declares_project(
-                "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n[run.inputs]\nproject = { type = \"string\", default = \"\" }\n"
-            )
-            .await
+            link_workflow_check(&format!("{with_project}[run.clone]\nenabled = true\n"))
+                .await
+                .is_ok()
         );
-        assert!(
-            !declares_project("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n").await
+        assert_eq!(
+            link_workflow_check("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n")
+                .await
+                .unwrap_err()
+                .code(),
+            Some("automation_workflow_without_project_input")
+        );
+        // Host-only scanners (clone disabled) cannot run as project
+        // automations on a clone-based environment.
+        assert_eq!(
+            link_workflow_check(&format!("{with_project}[run.clone]\nenabled = false\n"))
+                .await
+                .unwrap_err()
+                .code(),
+            Some("automation_workflow_host_only")
         );
     }
 }
