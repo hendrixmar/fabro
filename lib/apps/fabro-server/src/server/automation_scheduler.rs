@@ -440,6 +440,7 @@ mod tests {
             workflow: "workflow.fabro".to_string(),
             project_id: None,
             available_to_projects: false,
+            source_automation_id: None,
             triggers,
         }
     }
@@ -472,6 +473,7 @@ mod tests {
                 workflow: "workflow.fabro".to_string(),
                 project_id: None,
                 available_to_projects: false,
+                source_automation_id: None,
                 triggers,
             })
             .await

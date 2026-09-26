@@ -8395,6 +8395,13 @@ components:
           description: >-
             Global definitions only: this definition is selectable when adding
             an automation to a project. It never activates a trigger.
+        source_automation_id:
+          type: ["string", "null"]
+          description: >-
+            Project links only: the global automation this project automation
+            runs. Its workflow and workflow source always come from that
+            global definition. Set when the link is created; immutable.
+          example: woodpecker-loop
         triggers:
           type: array
           items:
