@@ -450,6 +450,16 @@ impl TestAutomationRunMaterializer {
         })))
     }
 
+    /// Materialize a workflow whose root carries a `workflow.toml` (this
+    /// source) over the trivial graph, for tests that read declared inputs.
+    pub fn succeed_with_workflow_toml(target: GitRunTarget, workflow_toml: &str) -> Self {
+        Self::new(Ok(Box::new(TestMaterializedWorkflow {
+            version: test_workflow_version_with_toml(workflow_toml),
+            target,
+            store: true,
+        })))
+    }
+
     pub fn return_unstored_version(target: GitRunTarget) -> Self {
         Self::new(Ok(Box::new(TestMaterializedWorkflow {
             version: test_workflow_version(),
@@ -524,6 +534,38 @@ fn test_workflow_version_with_dot(dot: &str) -> fabro_workflow_version::Validate
     let version = fabro_types::WorkflowVersion::new(
         entrypoint.clone(),
         BTreeMap::from([(entrypoint, dot.to_string())]),
+        BTreeMap::new(),
+    )
+    .expect("test workflow version should have a valid shape");
+    fabro_workflow_version::ValidatedWorkflowVersion::new(version)
+        .expect("test workflow version should validate")
+}
+
+/// Materialize a workflow version whose root carries a `workflow.toml`
+/// (config) beside the trivial graph (entrypoint), mirroring how
+/// `fabro_manifest::collect_workflow_versions` shapes a workflow directory:
+/// the entrypoint is the graph, and `workflow.toml` lives at
+/// `entrypoint.resolve_reference("workflow.toml")` next to it.
+fn test_workflow_version_with_toml(
+    workflow_toml: &str,
+) -> fabro_workflow_version::ValidatedWorkflowVersion {
+    use std::collections::BTreeMap;
+
+    let entrypoint = fabro_types::WorkflowPath::new("workflow.fabro")
+        .expect("test workflow entrypoint should be valid");
+    let config = entrypoint
+        .resolve_reference("workflow.toml")
+        .expect("test workflow config path should resolve beside the entrypoint");
+    let version = fabro_types::WorkflowVersion::new(
+        entrypoint.clone(),
+        BTreeMap::from([
+            (
+                entrypoint,
+                "digraph Test { graph [goal=\"Test\"] start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"
+                    .to_string(),
+            ),
+            (config, workflow_toml.to_string()),
+        ]),
         BTreeMap::new(),
     )
     .expect("test workflow version should have a valid shape");
