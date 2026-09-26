@@ -18,6 +18,7 @@ import type {
 } from "@qltysh/fabro-api-client";
 
 import { toRunWithStatus } from "../data/runs";
+import type { RunWithStatus } from "../data/runs";
 import { ApiError, apiData, automationsApi } from "../lib/api-client";
 import {
   UNSUPPORTED_TARGET_LABEL,
@@ -413,16 +414,15 @@ function AutomationRunsList({ automationId }: { automationId: string }) {
   const createdCutoffMs = createdCutoffMsFor(createdFilter);
   // RunsListView no longer filters by repo itself (Task 14 moved repo
   // filtering to the server-side project filter on the global Runs page), so
-  // this automation-scoped page applies its own repo filter before handing
-  // data down.
-  const repoFilteredData = useMemo(() => {
-    if (!runsQuery.data) return undefined;
-    if (repoFilter === "all") return runsQuery.data;
-    return {
-      ...runsQuery.data,
-      data: runsQuery.data.data.filter((run) => toRunWithStatus(run).repo === repoFilter),
-    };
-  }, [runsQuery.data, repoFilter]);
+  // this automation-scoped page passes its own repo filter down as a row
+  // predicate. Unlike pre-filtering `data` before handing it down, this keeps
+  // RunsListView's emptiness check (`apiRunCount`/`isEmptyServerSide`) based
+  // on the unfiltered page, so a repo filter that hides every row still shows
+  // "No matching runs" instead of the server-empty `emptyState`.
+  const repoRowFilter = useCallback(
+    (run: RunWithStatus) => repoFilter === "all" || run.repo === repoFilter,
+    [repoFilter],
+  );
 
   const now = useTickingNow(true, 15_000);
   const updatedAt = useDataUpdatedAt(runsQuery.data);
@@ -503,7 +503,7 @@ function AutomationRunsList({ automationId }: { automationId: string }) {
       </div>
 
       <RunsListView
-        data={repoFilteredData}
+        data={runsQuery.data ?? undefined}
         isLoading={runsQuery.data == null && runsQuery.isLoading}
         emptyState={
           <EmptyState
@@ -523,6 +523,7 @@ function AutomationRunsList({ automationId }: { automationId: string }) {
         workflowFilter="all"
         statusFilter={statusFilter}
         createdCutoffMs={createdCutoffMs}
+        rowFilter={repoRowFilter}
       />
     </div>
   );
