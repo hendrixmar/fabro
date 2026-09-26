@@ -17,11 +17,12 @@ pub type DbPool = sqlx::SqlitePool;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 const SESSION_OWNER_INDEX_MIGRATION_VERSION: i64 = 2_026_083_101;
-const RUN_PROJECT_MIGRATION_VERSION: i64 = 2_026_092_601;
 
-/// Tags runs persisted before `runs.project_id` existed. Idempotent: it only
-/// fills unassigned rows that resolve to a project.
-const RUN_PROJECT_BACKFILL_SQL: &str = include_str!("../backfill/run_projects.sql");
+/// Tags runs persisted before `runs.project_id` existed. sqlx applies it once
+/// as a migration; the SQL itself is idempotent (it only fills unassigned
+/// rows that resolve to a project).
+const RUN_PROJECT_BACKFILL_SQL: &str =
+    include_str!("../migrations/2026092603_backfill_run_projects.sql");
 
 /// The blob-table migration, exposed so fixtures in other crates can install
 /// the production blob schema without a filesystem path into this crate.
@@ -116,12 +117,6 @@ impl Database {
             .run(&self.pool)
             .await
             .context("running SQLite migrations")?;
-        if !applied.contains(&RUN_PROJECT_MIGRATION_VERSION) {
-            let tagged = backfill_run_projects(&self.pool).await?;
-            if tagged > 0 {
-                info!(tagged, "Backfilled run projects");
-            }
-        }
         Ok(())
     }
 
