@@ -17,6 +17,8 @@ import * as AutomationDetail from "./routes/automation-detail";
 import * as Projects from "./routes/projects";
 import * as ProjectsNew from "./routes/projects-new";
 import * as ProjectDetail from "./routes/projects-detail";
+import * as ProjectOverview from "./routes/projects-overview";
+import * as ProjectRuns from "./routes/projects-runs";
 import * as ProjectAutomations from "./routes/projects-automations";
 import * as ProjectAutomationNew from "./routes/projects-automations-new";
 import * as ProjectFeatures from "./routes/projects-features";
@@ -135,7 +137,9 @@ export const routes: RouteObject[] = [
           route("projects/new", ProjectsNew),
           route("projects/:id", ProjectDetail, {
             children: [
-              indexRoute(ProjectAutomations),
+              indexRoute(ProjectOverview),
+              route("overview", ProjectOverview),
+              route("runs", ProjectRuns),
               route("automations", ProjectAutomations),
               route("automations/new", ProjectAutomationNew),
               route("features", ProjectFeatures),
