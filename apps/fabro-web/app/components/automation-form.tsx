@@ -722,7 +722,11 @@ export function AutomationFormFields({
         {values.projectId ? (
           <Row
             title="Owned by this project"
-            help="Project enrollment copied this definition's workflow configuration, not its trigger activation. The instance keeps its own triggers, schedule and run history."
+            help={
+              values.sourceAutomationId
+                ? `This project automation links the global definition ${values.sourceAutomationId}: its workflow always comes from that definition. Its trigger and environment are this project's.`
+                : "This automation belongs to this project. Its workflow, trigger and environment are this project's."
+            }
           >
             <Link
               to={`/projects/${encodeURIComponent(values.projectId)}`}

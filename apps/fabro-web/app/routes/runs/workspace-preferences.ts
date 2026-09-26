@@ -68,8 +68,10 @@ export function useRunsWorkspacePreferences() {
 
   const setQuery = (value: string) =>
     updatePreferences((prev) => ({ ...prev, search: value }));
+  // The project filter is applied server-side, so the current page may not
+  // exist in the new result set.
   const setProjectFilter = (value: string) =>
-    updatePreferences((prev) => ({ ...prev, project: value }));
+    updatePreferences((prev) => ({ ...prev, project: value, page: 1 }));
   const setWorkflowFilter = (value: string) =>
     updatePreferences((prev) => ({ ...prev, workflow: value }));
   const setCreatedFilter = (value: CreatedFilter) =>
