@@ -264,6 +264,7 @@ async fn fire_scheduled_automation_run(
             automation_id: automation_id.clone(),
             target,
             workflow_source: automation.workflow_source,
+            project_id: automation.project_id.clone(),
             workflow: automation.workflow,
             run_id,
             temp_root: state.automation_temp_root(),
@@ -437,6 +438,8 @@ mod tests {
             target: target(),
             workflow_source: None,
             workflow: "workflow.fabro".to_string(),
+            project_id: None,
+            available_to_projects: false,
             triggers,
         }
     }
@@ -467,6 +470,8 @@ mod tests {
                 target: target(),
                 workflow_source,
                 workflow: "workflow.fabro".to_string(),
+                project_id: None,
+                available_to_projects: false,
                 triggers,
             })
             .await

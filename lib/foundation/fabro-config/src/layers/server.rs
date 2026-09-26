@@ -213,6 +213,18 @@ pub struct ServerIntegrationsLayer {
     pub plane:   Option<PlaneIntegrationLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bugsink: Option<BugsinkIntegrationLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake:  Option<IntakeIntegrationLayer>,
+}
+
+/// `[server.integrations.intake]` — private feature-intake bridge socket.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeIntegrationLayer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket:  Option<String>,
 }
 
 /// `[server.integrations.github]` — GitHub App, credentials, and inbound

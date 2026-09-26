@@ -13,13 +13,16 @@ mod billing;
 mod completions;
 mod environments;
 pub(in crate::server) mod events;
+mod github_repositories;
 pub(in crate::server) mod graph;
 mod incidents;
+mod intake;
 pub(in crate::server) mod lifecycle;
 mod llm_sse;
 mod mcp_servers;
 mod models;
 mod pair;
+mod projects;
 pub(in crate::server) mod pull_requests;
 pub(in crate::server) mod runs;
 mod sandbox;
@@ -213,6 +216,9 @@ pub(super) fn real_routes() -> Router<Arc<AppState>> {
         .merge(pull_requests::routes())
         .merge(artifacts::routes())
         .merge(automations::routes())
+        .merge(projects::routes())
+        .merge(intake::routes())
+        .merge(github_repositories::routes())
         .merge(incidents::routes())
         .merge(mcp_servers::routes())
         .merge(environments::routes())

@@ -249,6 +249,8 @@ pub struct ServerIntegrationsSettings {
     pub plane:   PlaneIntegrationSettings,
     #[serde(default)]
     pub bugsink: BugsinkIntegrationSettings,
+    #[serde(default)]
+    pub intake:  IntakeIntegrationSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +284,16 @@ pub struct PlaneIntegrationSettings {
     pub enabled:   bool,
     pub api_base:  Option<String>,
     pub workspace: Option<String>,
+}
+
+/// Private feature-intake bridge. The bridge listens on a Unix-domain socket
+/// owned by the same OS user as the server; no browser traffic reaches it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeIntegrationSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Absolute path of the bridge socket. Required when enabled.
+    pub socket:  Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

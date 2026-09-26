@@ -8,7 +8,7 @@ use sqlx::{Row as _, Sqlite, Transaction};
 use crate::{
     ApiTrigger, Automation, AutomationDraft, AutomationGitWorkflowSource, AutomationId,
     AutomationReplace, AutomationRevision, AutomationStoreError, AutomationTrigger,
-    AutomationTriggerId, PlaneTrigger, ScheduleTrigger,
+    AutomationTriggerId, PlaneTrigger, ProjectId, ScheduleTrigger,
 };
 
 /// Shared projection for loading automations with their schedule triggers.
@@ -33,6 +33,8 @@ macro_rules! select_automations_sql {
                 a.workflow_source_branch,
                 a.workflow_source_tag,
                 a.workflow_source_sha,
+                a.project_id,
+                a.available_to_projects,
                 t.id AS trigger_id,
                 t.enabled AS trigger_enabled,
                 t.expression AS trigger_expression
@@ -62,18 +64,56 @@ impl AutomationStore {
     }
 
     pub async fn list(&self) -> Result<Vec<Automation>, AutomationStoreError> {
-        let rows = sqlx::query(select_automations_sql!("ORDER BY a.id, t.id"))
-            .fetch_all(&self.pool)
-            .await?;
+        self.list_filtered(&AutomationListFilter::default()).await
+    }
+
+    /// List automations under an ownership filter. Defaults reproduce the
+    /// unfiltered API behavior: every definition, global and project-owned.
+    pub async fn list_filtered(
+        &self,
+        filter: &AutomationListFilter,
+    ) -> Result<Vec<Automation>, AutomationStoreError> {
+        let scope = filter.scope.code();
+        let project_id = filter.project_id.as_ref().map(ProjectId::as_str);
+        let available_only = i64::from(filter.available_to_projects);
+
+        let rows = sqlx::query(select_automations_sql!(
+            "WHERE
+                CASE ?
+                    WHEN 0 THEN 1
+                    WHEN 1 THEN a.project_id IS NULL
+                    ELSE a.project_id = ?
+                END
+                AND (? = 0 OR (a.project_id IS NULL AND a.available_to_projects = 1))
+            ORDER BY a.id, t.id"
+        ))
+        .bind(scope)
+        .bind(project_id)
+        .bind(available_only)
+        .fetch_all(&self.pool)
+        .await?;
         let plane_rows = sqlx::query(
             r"
             SELECT automation_id, id, enabled, project_id, ready_state_id, in_progress_state_id,
                    done_state_id, cancelled_state_id, failure_label_id, default_harness,
                    codex_label_id, omp_label_id, poll_interval_seconds, max_concurrency, max_retries
             FROM automation_plane_triggers
+            WHERE automation_id IN (
+                SELECT a.id FROM automations AS a
+                WHERE
+                    CASE ?
+                        WHEN 0 THEN 1
+                        WHEN 1 THEN a.project_id IS NULL
+                        ELSE a.project_id = ?
+                    END
+                    AND (? = 0 OR (a.project_id IS NULL AND a.available_to_projects = 1))
+            )
             ORDER BY automation_id, id
             ",
         )
+        .bind(scope)
+        .bind(project_id)
+        .bind(available_only)
         .fetch_all(&self.pool)
         .await?;
         automations_from_rows(&rows, &plane_rows)
@@ -175,7 +215,9 @@ impl AutomationStore {
                 workflow_source_repository = ?,
                 workflow_source_branch = ?,
                 workflow_source_tag = ?,
-                workflow_source_sha = ?
+                workflow_source_sha = ?,
+                project_id = ?,
+                available_to_projects = ?
             WHERE id = ? AND revision = ?
             ",
         )
@@ -193,6 +235,8 @@ impl AutomationStore {
         .bind(workflow_source.map(|source| source.branch.as_str()))
         .bind(workflow_source.and_then(|source| source.tag.as_deref()))
         .bind(workflow_source.and_then(|source| source.sha.as_deref()))
+        .bind(automation.project_id.as_ref().map(ProjectId::as_str))
+        .bind(automation.available_to_projects)
         .bind(id.as_str())
         .bind(expected.as_str())
         .execute(&mut *transaction)
@@ -234,19 +278,51 @@ impl AutomationStore {
     }
 }
 
+/// Which ownership slice of the automation table a listing asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutomationScope {
+    #[default]
+    All,
+    Global,
+    Project,
+}
+
+impl AutomationScope {
+    /// SQL bind value: 0 = all, 1 = global, 2 = one project.
+    fn code(self) -> i64 {
+        match self {
+            Self::All => 0,
+            Self::Global => 1,
+            Self::Project => 2,
+        }
+    }
+}
+
+/// Ownership filter for automation listings. `available_to_projects` keeps
+/// only global definitions marked shareable, which is the project automation
+/// catalog.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutomationListFilter {
+    pub scope:                 AutomationScope,
+    pub project_id:            Option<ProjectId>,
+    pub available_to_projects: bool,
+}
+
 struct StoredAutomation {
-    id:                AutomationId,
-    revision:          AutomationRevision,
-    name:              String,
-    description:       Option<String>,
-    environment_id:    Option<String>,
-    last_error:        Option<String>,
-    api_enabled:       bool,
-    target:            RunTarget,
-    workflow:          String,
-    workflow_source:   Option<AutomationGitWorkflowSource>,
-    schedule_triggers: Vec<ScheduleTrigger>,
-    plane_triggers:    Vec<PlaneTrigger>,
+    id:                    AutomationId,
+    revision:              AutomationRevision,
+    name:                  String,
+    description:           Option<String>,
+    environment_id:        Option<String>,
+    last_error:            Option<String>,
+    api_enabled:           bool,
+    target:                RunTarget,
+    workflow:              String,
+    workflow_source:       Option<AutomationGitWorkflowSource>,
+    project_id:            Option<ProjectId>,
+    available_to_projects: bool,
+    schedule_triggers:     Vec<ScheduleTrigger>,
+    plane_triggers:        Vec<PlaneTrigger>,
 }
 
 impl StoredAutomation {
@@ -264,6 +340,7 @@ impl StoredAutomation {
                 source,
             })?;
         let workflow_source = stored_workflow_source(row, &id)?;
+        let project_id = stored_project_id(row, &id)?;
         Ok(Self {
             id,
             revision,
@@ -280,6 +357,8 @@ impl StoredAutomation {
             }),
             workflow: row.try_get("target_workflow")?,
             workflow_source,
+            project_id,
+            available_to_projects: row.try_get("available_to_projects")?,
             schedule_triggers: Vec::new(),
             plane_triggers: Vec::new(),
         })
@@ -335,6 +414,8 @@ impl StoredAutomation {
                 target: self.target,
                 workflow: self.workflow,
                 workflow_source: self.workflow_source,
+                project_id: self.project_id,
+                available_to_projects: self.available_to_projects,
                 triggers,
             })
             .map_err(|source| AutomationStoreError::StoredValidation { id, source })?;
@@ -394,13 +475,15 @@ fn automations_from_rows(
         };
         let trigger = plane_trigger_from_row(row, &automation_id)?;
         let mut replace = AutomationReplace {
-            name:            automation.name,
-            description:     automation.description,
-            environment_id:  automation.environment_id,
-            target:          automation.target,
-            workflow:        automation.workflow,
-            workflow_source: automation.workflow_source,
-            triggers:        automation.triggers,
+            name:                  automation.name,
+            description:           automation.description,
+            environment_id:        automation.environment_id,
+            target:                automation.target,
+            workflow:              automation.workflow,
+            workflow_source:       automation.workflow_source,
+            project_id:            automation.project_id,
+            available_to_projects: automation.available_to_projects,
+            triggers:              automation.triggers,
         };
         replace.triggers.push(AutomationTrigger::Plane(trigger));
         let rebuilt = Automation::from_stored(automation_id.clone(), automation.revision, replace)
@@ -483,8 +566,10 @@ pub(crate) async fn insert_automation_ignoring_conflict(
             workflow_source_repository,
             workflow_source_branch,
             workflow_source_tag,
-            workflow_source_sha
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            workflow_source_sha,
+            project_id,
+            available_to_projects
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO NOTHING
         ",
     )
@@ -503,6 +588,8 @@ pub(crate) async fn insert_automation_ignoring_conflict(
     .bind(workflow_source.map(|source| source.branch.as_str()))
     .bind(workflow_source.and_then(|source| source.tag.as_deref()))
     .bind(workflow_source.and_then(|source| source.sha.as_deref()))
+    .bind(automation.project_id.as_ref().map(ProjectId::as_str))
+    .bind(automation.available_to_projects)
     .execute(&mut **transaction)
     .await?;
     if result.rows_affected() == 0 {
@@ -547,6 +634,22 @@ async fn insert_plane_triggers(
     }
     Ok(())
 }
+fn stored_project_id(
+    row: &SqliteRow,
+    id: &AutomationId,
+) -> Result<Option<ProjectId>, AutomationStoreError> {
+    let Some(value) = row.try_get::<Option<String>, _>("project_id")? else {
+        return Ok(None);
+    };
+    match ProjectId::new(value.clone()) {
+        Ok(project_id) => Ok(Some(project_id)),
+        Err(_) => Err(AutomationStoreError::StoredProjectId {
+            id: id.clone(),
+            value,
+        }),
+    }
+}
+
 fn stored_workflow_source(
     row: &SqliteRow,
     id: &AutomationId,

@@ -5447,6 +5447,7 @@ async fn fake_automation_materializer_injection_captures_input_and_returns_versi
             workflow: "demo".to_string(),
             run_id,
             temp_root: temp_root.clone(),
+            project_id: None,
         })
         .await
         .expect("fake materializer should succeed");
@@ -5981,7 +5982,7 @@ async fn subprocess_pre_start_failure_preserves_pending_cancellation() {
     assert_run_failed_before_start(&state, run_id, FailureReason::Cancelled).await;
 }
 
-async fn create_durable_run_with_events(
+pub(super) async fn create_durable_run_with_events(
     state: &Arc<AppState>,
     run_id: RunId,
     events: &[workflow_event::Event],

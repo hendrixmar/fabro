@@ -35,6 +35,10 @@ pub enum AutomationValidationError {
     DuplicateTriggerId { id: String },
     #[error("automation can have at most one API trigger")]
     MultipleApiTriggers,
+    #[error(
+        "available_to_projects is only valid on a global automation; a project instance is already project-scoped"
+    )]
+    AvailableToProjectsRequiresGlobalScope,
     #[error("schedule trigger {trigger_id:?} cron expression {expression:?} must have five fields")]
     InvalidCronFieldCount {
         trigger_id: String,
@@ -107,6 +111,8 @@ pub enum AutomationStoreError {
     StoredTriggerShape { id: AutomationId },
     #[error("stored automation {id} has a partial workflow source coordinate")]
     StoredWorkflowSourceShape { id: AutomationId },
+    #[error("stored automation {id} references invalid project {value:?}")]
+    StoredProjectId { id: AutomationId, value: String },
     #[error("stored automation {id} has an invalid revision")]
     InvalidRevision {
         id:     AutomationId,
@@ -194,6 +200,7 @@ impl AutomationStoreError {
             Self::StoredId { .. } => "stored_id",
             Self::StoredTriggerShape { .. } => "stored_trigger_shape",
             Self::StoredWorkflowSourceShape { .. } => "stored_workflow_source_shape",
+            Self::StoredProjectId { .. } => "stored_project_id",
             Self::InvalidRevision { .. } => "invalid_revision",
             Self::Db { .. } => "db",
             Self::InvalidFilename { .. } => "invalid_filename",

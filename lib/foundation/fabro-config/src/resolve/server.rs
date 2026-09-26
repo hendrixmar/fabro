@@ -2,13 +2,13 @@ use std::path::Path;
 
 use fabro_types::settings::server::{
     BugsinkIntegrationSettings, BugsinkProjectSettings, GithubIntegrationSettings,
-    GithubIntegrationStrategy, IntegrationWebhooksSettings, ObjectStoreProvider,
-    ObjectStoreSettings, PlaneIntegrationSettings, ServerApiSettings, ServerArtifactsSettings,
-    ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings,
-    ServerListenSettings, ServerLoggingSettings, ServerNamespace, ServerSandboxProviderSettings,
-    ServerSandboxProvidersSettings, ServerSandboxSettings, ServerSchedulerSettings,
-    ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
-    WebhookStrategy,
+    GithubIntegrationStrategy, IntakeIntegrationSettings, IntegrationWebhooksSettings,
+    ObjectStoreProvider, ObjectStoreSettings, PlaneIntegrationSettings, ServerApiSettings,
+    ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings,
+    ServerIntegrationsSettings, ServerListenSettings, ServerLoggingSettings, ServerNamespace,
+    ServerSandboxProviderSettings, ServerSandboxProvidersSettings, ServerSandboxSettings,
+    ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings,
+    SlackIntegrationSettings, WebhookStrategy,
 };
 use fabro_types::{ExternalAgentProfile, ExternalAgentsSettings};
 use fabro_util::Home;
@@ -20,10 +20,10 @@ use super::{
 use crate::user::default_storage_dir;
 use crate::{
     BugsinkIntegrationLayer, ExternalAgentProfileLayer, ExternalAgentsLayer,
-    IntegrationWebhooksLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer, PlaneIntegrationLayer,
-    ServerApiLayer, ServerArtifactsLayer, ServerAuthLayer, ServerIntegrationsLayer, ServerLayer,
-    ServerListenLayer, ServerSandboxLayer, ServerSandboxProviderLayer, ServerSlateDbLayer,
-    ServerStorageLayer, ServerWebLayer,
+    IntakeIntegrationLayer, IntegrationWebhooksLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer,
+    PlaneIntegrationLayer, ServerApiLayer, ServerArtifactsLayer, ServerAuthLayer,
+    ServerIntegrationsLayer, ServerLayer, ServerListenLayer, ServerSandboxLayer,
+    ServerSandboxProviderLayer, ServerSlateDbLayer, ServerStorageLayer, ServerWebLayer,
 };
 
 pub fn resolve_server(layer: &ServerLayer, errors: &mut Vec<ResolveError>) -> ServerNamespace {
@@ -390,6 +390,42 @@ fn resolve_integrations(
             .and_then(|integrations| integrations.bugsink.as_ref())
             .map(|bugsink| resolve_bugsink(bugsink, errors))
             .unwrap_or_default(),
+        intake:  layer
+            .and_then(|integrations| integrations.intake.as_ref())
+            .map(|intake| resolve_intake(intake, errors))
+            .unwrap_or_default(),
+    }
+}
+
+/// Resolve the private intake bridge socket. Enabling the integration without
+/// an absolute socket path is a configuration error: the server never guesses
+/// a location for a socket that grants service-to-service trust.
+fn resolve_intake(
+    layer: &IntakeIntegrationLayer,
+    errors: &mut Vec<ResolveError>,
+) -> IntakeIntegrationSettings {
+    let enabled = layer.enabled.unwrap_or(false);
+    let path = "server.integrations.intake";
+    let socket = layer
+        .socket
+        .as_deref()
+        .map(str::trim)
+        .filter(|value: &&str| !value.is_empty());
+    if socket.is_some_and(|socket| !std::path::Path::new(socket).is_absolute()) {
+        errors.push(ResolveError::Invalid {
+            path:   format!("{path}.socket"),
+            reason: "must be an absolute Unix-domain socket path".to_owned(),
+        });
+    }
+    if enabled && socket.is_none() {
+        errors.push(ResolveError::Invalid {
+            path:   format!("{path}.socket"),
+            reason: "is required when the integration is enabled".to_owned(),
+        });
+    }
+    IntakeIntegrationSettings {
+        enabled,
+        socket: socket.map(ToString::to_string),
     }
 }
 
@@ -538,6 +574,31 @@ fn resolve_bugsink(
     }
 }
 
+fn resolve_external_agents(layer: Option<&ExternalAgentsLayer>) -> ExternalAgentsSettings {
+    ExternalAgentsSettings {
+        codex: layer
+            .and_then(|agents| agents.codex.as_ref())
+            .map(resolve_external_agent_profile),
+        omp:   layer
+            .and_then(|agents| agents.omp.as_ref())
+            .map(resolve_external_agent_profile),
+    }
+}
+
+fn resolve_external_agent_profile(layer: &ExternalAgentProfileLayer) -> ExternalAgentProfile {
+    ExternalAgentProfile {
+        command: layer.command.clone().unwrap_or_default(),
+        args:    layer.args.clone().unwrap_or_default(),
+        env:     layer.env.0.clone().into_iter().collect(),
+    }
+}
+
+fn resolve_github_webhooks(layer: &IntegrationWebhooksLayer) -> IntegrationWebhooksSettings {
+    IntegrationWebhooksSettings {
+        strategy: layer.strategy,
+    }
+}
+
 #[cfg(test)]
 mod bugsink_tests {
     use super::*;
@@ -588,13 +649,14 @@ signing_secret = "BUGSINK_SIGNING_7"
                 2 => layer.projects.as_mut().unwrap()[0].project_id = Some(u64::MAX),
                 3 => layer.projects.as_mut().unwrap()[0].automation_id = Some("../other".into()),
                 4 => {
-                    layer.origin = Some("https://user:password@bugsink.example/path?token=x".into())
+                    layer.origin =
+                        Some("https://user:password@bugsink.example/path?token=x".into());
                 }
                 5 => layer.api_token_secret = Some(" ".into()),
                 6 => layer.api_token_secret = Some("bugsink-api".into()),
                 7 => {
                     layer.projects.as_mut().unwrap()[0].signing_secret =
-                        Some("bugsink-signing".into())
+                        Some("bugsink-signing".into());
                 }
                 _ => {
                     layer.enabled = Some(false);
@@ -620,30 +682,5 @@ signing_secret = "BUGSINK_SIGNING_7"
         resolve_bugsink(&combined, &mut errors);
         assert!(errors.iter().any(|error| matches!(error,
             ResolveError::Invalid { path, .. } if path.ends_with(".projects"))));
-    }
-}
-
-fn resolve_external_agents(layer: Option<&ExternalAgentsLayer>) -> ExternalAgentsSettings {
-    ExternalAgentsSettings {
-        codex: layer
-            .and_then(|agents| agents.codex.as_ref())
-            .map(resolve_external_agent_profile),
-        omp:   layer
-            .and_then(|agents| agents.omp.as_ref())
-            .map(resolve_external_agent_profile),
-    }
-}
-
-fn resolve_external_agent_profile(layer: &ExternalAgentProfileLayer) -> ExternalAgentProfile {
-    ExternalAgentProfile {
-        command: layer.command.clone().unwrap_or_default(),
-        args:    layer.args.clone().unwrap_or_default(),
-        env:     layer.env.0.clone().into_iter().collect(),
-    }
-}
-
-fn resolve_github_webhooks(layer: &IntegrationWebhooksLayer) -> IntegrationWebhooksSettings {
-    IntegrationWebhooksSettings {
-        strategy: layer.strategy,
     }
 }

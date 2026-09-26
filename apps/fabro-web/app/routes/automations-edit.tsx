@@ -9,11 +9,9 @@ import { useAutomation, useEnvironments } from "../lib/queries";
 import { queryKeys } from "../lib/query-keys";
 import {
   AutomationFormFields,
+  automationPayloadFromFormValues,
   automationToFormValues,
   isFormValid,
-  targetFromFormValues,
-  triggersFromFormValues,
-  workflowSourceFromFormValues,
   type AutomationFormValues,
 } from "../components/automation-form";
 import { Panel, PanelSkeleton } from "../components/settings-panel";
@@ -104,15 +102,11 @@ function EditAutomationForm({
     const trimmedName = values.name.trim();
     try {
       await apiData(() =>
-        automationsApi.replaceAutomation(automation.id, automation.revision, {
-          name:        trimmedName,
-          description: values.description.trim() || null,
-          environment_id: values.environmentId.trim(),
-          target:      targetFromFormValues(values),
-          workflow:    values.workflow.trim(),
-          workflow_source: workflowSourceFromFormValues(values),
-          triggers: triggersFromFormValues(values),
-        }),
+        automationsApi.replaceAutomation(
+          automation.id,
+          automation.revision,
+          automationPayloadFromFormValues(values),
+        ),
       );
       await mutate(queryKeys.automations.list());
       await mutate(queryKeys.automations.detail(automation.id));

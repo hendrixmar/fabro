@@ -39,12 +39,12 @@ pub use run::{
 };
 pub use server::{
     BugsinkIntegrationLayer, BugsinkProjectLayer, ExternalAgentProfileLayer, ExternalAgentsLayer,
-    GithubIntegrationLayer, IntegrationWebhooksLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer,
-    PlaneIntegrationLayer, ServerApiLayer, ServerArtifactsLayer, ServerAuthGithubLayer,
-    ServerAuthLayer, ServerIntegrationsLayer, ServerLayer, ServerListenLayer, ServerLoggingLayer,
-    ServerSandboxLayer, ServerSandboxProviderLayer, ServerSandboxProvidersLayer,
-    ServerSchedulerLayer, ServerSlateDbLayer, ServerStorageLayer, ServerWebLayer,
-    SlackIntegrationLayer,
+    GithubIntegrationLayer, IntakeIntegrationLayer, IntegrationWebhooksLayer,
+    ObjectStoreLocalLayer, ObjectStoreS3Layer, PlaneIntegrationLayer, ServerApiLayer,
+    ServerArtifactsLayer, ServerAuthGithubLayer, ServerAuthLayer, ServerIntegrationsLayer,
+    ServerLayer, ServerListenLayer, ServerLoggingLayer, ServerSandboxLayer,
+    ServerSandboxProviderLayer, ServerSandboxProvidersLayer, ServerSchedulerLayer,
+    ServerSlateDbLayer, ServerStorageLayer, ServerWebLayer, SlackIntegrationLayer,
 };
 pub use settings::SettingsLayer;
 pub use workflow::WorkflowLayer;

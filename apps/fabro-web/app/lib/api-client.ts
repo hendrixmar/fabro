@@ -9,12 +9,14 @@ import {
   AutomationsApi,
   Configuration,
   EnvironmentsApi,
+  FeatureIntakeApi,
   HumanInTheLoopApi,
   InsightsApi,
   InstallApi,
   IntegrationsApi,
   MCPServersApi,
   ModelsApi,
+  ProjectsApi,
   RunInternalsApi,
   RunOutputsApi,
   RunsApi,
@@ -89,6 +91,11 @@ export const environmentsApi = new EnvironmentsApi(
   "",
   generatedAxios,
 );
+export const featureIntakeApi = new FeatureIntakeApi(
+  generatedApiConfiguration,
+  "",
+  generatedAxios,
+);
 export const humanInTheLoopApi = new HumanInTheLoopApi(
   generatedApiConfiguration,
   "",
@@ -115,6 +122,11 @@ export const integrationsApi = new IntegrationsApi(
   generatedAxios,
 );
 export const modelsApi = new ModelsApi(
+  generatedApiConfiguration,
+  "",
+  generatedAxios,
+);
+export const projectsApi = new ProjectsApi(
   generatedApiConfiguration,
   "",
   generatedAxios,

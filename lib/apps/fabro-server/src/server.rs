@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
 use base64::Engine as _;
@@ -49,7 +49,7 @@ pub use fabro_api::types::{
     UpdateVariableRequest, VariableListResponse, VncPreviewResponse, WriteBlobResponse,
 };
 use fabro_auth::{CredentialSource, SqlVaultCredentialSource, auth_issue_message};
-use fabro_automation::{self, AutomationStore, PlaneDispatchStore};
+use fabro_automation::{self, AutomationStore, PlaneDispatchStore, ProjectId, ProjectStore};
 use fabro_config::daemon::ServerDaemon;
 use fabro_config::{RunLayer, Storage, WorkflowSettingsBuilder};
 use fabro_db::DbPool;
@@ -146,13 +146,13 @@ use crate::automation_materializer::{
     AutomationRunMaterializeInput, AutomationRunMaterialized, AutomationRunMaterializer,
     ProductionAutomationRunMaterializer, RunMaterializeError,
 };
-use crate::bugsink_webhooks;
 use crate::canonical_origin::{canonical_origin_from_effective_web_url, effective_web_url};
 use crate::error::ApiError;
 use crate::git_checkout::GitRepoCache;
 use crate::github_webhooks::{
     WEBHOOK_ROUTE, WEBHOOK_SECRET_ENV, parse_event_metadata, verify_signature,
 };
+use crate::intake_bridge::IntakeBridge;
 use crate::jwt_auth::{self, AuthMode};
 use crate::principal_middleware::{
     AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunManagementTarget,
@@ -169,7 +169,8 @@ use crate::worker_runtime::{
 };
 use crate::worker_token::{WorkerScopeSet, WorkerTokenKeys, issue_worker_token_with_scopes};
 use crate::{
-    canonical_host, demo, diagnostics, run_manifest, security_headers, static_files, web_auth,
+    bugsink_webhooks, canonical_host, demo, diagnostics, run_manifest, security_headers,
+    static_files, web_auth,
 };
 
 mod automation_plane;
@@ -1146,6 +1147,10 @@ pub struct AppState {
     pub(crate) github_api_base_url: String,
     active_config_path: PathBuf,
     http_client: Option<fabro_http::HttpClient>,
+    /// Private feature-intake bridge client, absent when the integration is
+    /// disabled or its socket could not be used. A missing client is a 503 on
+    /// intake routes only and never a server startup failure.
+    intake: Option<IntakeBridge>,
     sandbox_provider_registry: SandboxProviderRegistry,
     shutdown: CancellationToken,
     shutting_down: AtomicBool,
@@ -1158,6 +1163,7 @@ pub struct AppState {
 pub(crate) struct AppStores {
     pub(crate) runs:             Arc<Database>,
     pub(crate) run_summaries:    Arc<RunSummaryStore>,
+    pub(crate) projects:         Arc<ProjectStore>,
     pub(crate) auth_codes:       Arc<AuthCodeStore>,
     pub(crate) auth_sessions:    Arc<AuthSessionStore>,
     pub(crate) automations:      Arc<AutomationStore>,
@@ -1190,6 +1196,26 @@ impl AppState {
         &self.stores.automations
     }
 
+    pub(crate) fn project_store(&self) -> &ProjectStore {
+        &self.stores.projects
+    }
+
+    /// The configured feature-intake bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actionable 503 when the integration is disabled or its
+    /// socket could not be prepared; intake surfaces degrade alone.
+    pub(crate) fn intake_bridge(&self) -> Result<IntakeBridge, ApiError> {
+        self.intake.clone().ok_or_else(|| {
+            ApiError::with_code(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "feature intake is not configured on this server",
+                "intake_not_configured",
+            )
+        })
+    }
+
     pub(crate) fn plane_dispatch_store(&self) -> &PlaneDispatchStore {
         &self.stores.plane_dispatches
     }
@@ -1206,10 +1232,50 @@ impl AppState {
         &self.stores.mcp_servers
     }
 
+    /// Validate a project-scoped automation's owner before any checkout: a
+    /// project that disappeared, or one whose repository no longer matches the
+    /// automation's application target, blocks materialization instead of
+    /// producing a mislabeled run.
+    pub(crate) async fn validate_automation_project(
+        &self,
+        project_id: &ProjectId,
+        target: &fabro_types::GitRunTarget,
+    ) -> Result<ProjectId, RunMaterializeError> {
+        let Some(project) = self.project_store().get(project_id).await? else {
+            return Err(RunMaterializeError::ProjectNotFound {
+                id: project_id.clone(),
+            });
+        };
+        let matches = fabro_types::GitHubRepositorySlug::try_new(&target.repo)
+            .zip(fabro_types::GitHubRepositorySlug::try_new(
+                &project.repository,
+            ))
+            .is_some_and(|(target_repo, project_repo)| target_repo == project_repo);
+        if !matches {
+            return Err(RunMaterializeError::ProjectTargetMismatch {
+                project_id:         project.id,
+                project_repository: project.repository,
+                target_repository:  target.repo.clone(),
+            });
+        }
+        Ok(project.id)
+    }
+
     pub(crate) async fn materialize_automation_run(
         &self,
         input: AutomationRunMaterializeInput,
     ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
+        let project_id = match input.project_id.clone() {
+            Some(project_id) => Some(
+                self.validate_automation_project(&project_id, &input.target)
+                    .await?,
+            ),
+            None => None,
+        };
+        let input = AutomationRunMaterializeInput {
+            project_id,
+            ..input
+        };
         #[cfg(any(test, feature = "test-support"))]
         if let Some(materializer) = self.automation_materializer_override.as_ref() {
             return materializer.materialize(input).await;
@@ -2449,6 +2515,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
     })
     .context("backfill automation environment selectors")?;
     let automation_store = Arc::new(AutomationStore::new(db_pool.clone()));
+    let project_store = Arc::new(ProjectStore::new(db_pool.clone()));
     let plane_dispatch_store = Arc::new(PlaneDispatchStore::new(db_pool.clone()));
     let incident_store = Arc::new(incident_intake::IncidentStore::new(db_pool.clone()));
     let local_provider_enabled = resolved_settings
@@ -2576,6 +2643,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         stores: AppStores {
             runs: store,
             run_summaries,
+            projects: project_store,
             auth_codes,
             auth_sessions,
             automations: automation_store,
@@ -2611,6 +2679,15 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         llm_source,
         manifest_run_defaults: RwLock::new(current_manifest_run_defaults),
         manifest_run_settings: RwLock::new(current_manifest_run_settings),
+        intake: match IntakeBridge::from_settings(
+            &current_server_settings.server.integrations.intake,
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                tracing::warn!(%error, "Feature-intake bridge is unavailable; intake routes will report 503");
+                None
+            }
+        },
         server_settings: RwLock::new(current_server_settings),
         effective_web_url: RwLock::new(current_effective_web_url),
         catalog: RwLock::new(current_catalog),

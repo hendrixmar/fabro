@@ -8,7 +8,6 @@ use fabro_types::{
     AutomationRef, Principal, RunId, RunProjection, RunStatus, StageOutcome, SystemActorKind,
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::time::sleep;
 
@@ -60,10 +59,6 @@ pub(crate) fn spawn_incident_intake(state: Arc<AppState>) {
     });
 }
 
-#[expect(
-    clippy::large_futures,
-    reason = "One dedicated intake task awaits one globally owned Run at a time; retaining its bounded state avoids a per-tick Box allocation"
-)]
 pub(crate) async fn reconcile_once(state: &Arc<AppState>, now_ms: i64) -> anyhow::Result<()> {
     let store = state.incident_store();
     for id in store.active_runs().await? {
@@ -262,9 +257,9 @@ pub(crate) async fn reconcile_run(state: &Arc<AppState>, run_id: RunId) -> anyho
         .list_events_from_with_limit(1, 2)
         .await
         .is_ok_and(|events| {
-            events.iter().any(|event| {
-                matches!(event.event.body, EventBody::RunSubmitted(_))
-            })
+            events
+                .iter()
+                .any(|event| matches!(event.event.body, EventBody::RunSubmitted(_)))
         });
     if !submitted {
         return store
@@ -281,15 +276,12 @@ pub(crate) async fn reconcile_run(state: &Arc<AppState>, run_id: RunId) -> anyho
             .transition_run(&intent, "uncertain", Some("workflow_mapping_changed"))
             .await;
     };
-    let blob = if let Some(hash) = &projection.spec.manifest_blob {
-        run.read_blob(hash).await.ok().flatten()
-    } else {
-        None
-    };
-    let verified = verify_binding(&intent, &projection, &automation).is_ok()
-        && blob.as_ref().is_some_and(|bytes| {
-            intent.manifest_digest.as_deref() == Some(hex::encode(Sha256::digest(bytes)).as_str())
-        });
+    // Admission now submits a `RunIntent`, so the durable evidence that this
+    // run belongs to this incident intent is the run's own identity — run id,
+    // automation reference, exact revision, and the five trusted inputs —
+    // rather than a digest of bytes the run no longer stores. The SQLite
+    // `manifest_digest` still gates one submission per reserved intent.
+    let verified = verify_binding(&intent, &projection, &automation).is_ok();
     if !verified {
         return store
             .transition_run(&intent, "uncertain", Some("run_binding_mismatch"))
@@ -345,26 +337,24 @@ async fn materialize_create(state: &Arc<AppState>, intent: &Intent) -> anyhow::R
             .transition_run(intent, "uncertain", Some("workflow_mapping_changed"))
             .await;
     }
-    let environment_id = match super::super::handler::automations::resolve_automation_environment(
+    let Ok(environment_id) = super::super::handler::automations::resolve_automation_environment(
         state.as_ref(),
         automation.environment_id.as_deref(),
         StatusCode::CONFLICT,
-    ) {
-        Ok(environment_id) => environment_id,
-        Err(_) => {
-            return store
-                .transition_run(intent, "failed", Some("materialization_failed"))
-                .await;
-        }
+    ) else {
+        return store
+            .transition_run(intent, "failed", Some("materialization_failed"))
+            .await;
     };
     let materialized = state
         .materialize_automation_run(AutomationRunMaterializeInput {
-            automation_id:   automation.id.clone(),
+            automation_id: automation.id.clone(),
             target,
             workflow_source: automation.workflow_source.clone(),
-            workflow:        automation.workflow.clone(),
-            run_id:          intent.run_id,
-            temp_root:       state.automation_temp_root(),
+            project_id: automation.project_id.clone(),
+            workflow: automation.workflow.clone(),
+            run_id: intent.run_id,
+            temp_root: state.automation_temp_root(),
         })
         .await;
     let Ok(materialized) = materialized else {

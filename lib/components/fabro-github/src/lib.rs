@@ -12,6 +12,7 @@ use tokio::process::Command;
 use crate::token_source::SecretString;
 
 pub mod access;
+pub mod repositories;
 pub mod token_source;
 
 #[cfg(any(test, feature = "test-support"))]

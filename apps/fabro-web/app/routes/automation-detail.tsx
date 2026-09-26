@@ -175,6 +175,25 @@ function AutomationHeader({ automation }: { automation: Automation }) {
                 Plane · {planeTrigger.default_harness} · {planeTrigger.max_concurrency ?? 3} concurrent
               </Chip>
             ) : null}
+            {automation.project_id ? (
+              <span className="flex items-center gap-1.5 font-mono text-xs text-fg-muted">
+                <RectangleStackIcon className="size-3.5" aria-hidden="true" />
+                Project ·{" "}
+                <Link
+                  to={`/projects/${encodeURIComponent(automation.project_id)}`}
+                  className="text-mint hover:text-fg hover:underline"
+                >
+                  {automation.project_id}
+                </Link>
+              </span>
+            ) : (
+              <Chip icon={RectangleStackIcon}>
+                Global automation
+                {automation.available_to_projects
+                  ? " · Available to projects"
+                  : ""}
+              </Chip>
+            )}
           </div>
           {automation.description ? (
             <p className="mt-3 max-w-prose text-sm leading-relaxed text-fg-3">

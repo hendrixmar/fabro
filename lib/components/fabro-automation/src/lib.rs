@@ -3,6 +3,7 @@ mod error;
 mod id;
 mod migrations;
 mod model;
+mod projects;
 mod store;
 
 pub use dispatch::{
@@ -20,4 +21,8 @@ pub use model::{
     AutomationTrigger, PlaneTrigger, ScheduleTrigger, parse_schedule_expression,
     validate_workflow_source,
 };
-pub use store::AutomationStore;
+pub use projects::{
+    GithubRepositoryId, Project, ProjectDraft, ProjectId, ProjectReplace, ProjectRevision,
+    ProjectRevisionParseError, ProjectStore, ProjectStoreError, ProjectValidationError,
+};
+pub use store::{AutomationListFilter, AutomationScope, AutomationStore};

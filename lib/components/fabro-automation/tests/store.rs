@@ -57,14 +57,16 @@ fn workflow_source(
 
 fn draft(id: &str, api_enabled: bool) -> AutomationDraft {
     AutomationDraft {
-        id:              AutomationId::new(id).unwrap(),
-        name:            "Nightly".to_string(),
-        description:     Some("Runs every night".to_string()),
-        environment_id:  Some("default".to_string()),
-        target:          target(),
-        workflow:        "release".to_string(),
-        workflow_source: None,
-        triggers:        vec![
+        id:                    AutomationId::new(id).unwrap(),
+        name:                  "Nightly".to_string(),
+        description:           Some("Runs every night".to_string()),
+        environment_id:        Some("default".to_string()),
+        target:                target(),
+        workflow:              "release".to_string(),
+        workflow_source:       None,
+        project_id:            None,
+        available_to_projects: false,
+        triggers:              vec![
             schedule("z-last", "0 2 * * *", false),
             AutomationTrigger::Api(ApiTrigger {
                 id:      AutomationTriggerId::new("custom-api-id").unwrap(),
@@ -77,13 +79,15 @@ fn draft(id: &str, api_enabled: bool) -> AutomationDraft {
 
 fn replacement(name: &str, expression: &str) -> AutomationReplace {
     AutomationReplace {
-        name:            name.to_string(),
-        description:     None,
-        environment_id:  Some("default".to_string()),
-        target:          target(),
-        workflow:        "release".to_string(),
-        workflow_source: None,
-        triggers:        vec![
+        name:                  name.to_string(),
+        description:           None,
+        environment_id:        Some("default".to_string()),
+        target:                target(),
+        workflow:              "release".to_string(),
+        workflow_source:       None,
+        project_id:            None,
+        available_to_projects: false,
+        triggers:              vec![
             schedule("nightly", expression, true),
             AutomationTrigger::Api(ApiTrigger {
                 id:      AutomationTriggerId::new("api").unwrap(),
@@ -139,11 +143,16 @@ async fn plane_trigger_round_trips_through_sqlite() {
     let store = AutomationStore::new(database.clone_pool());
     let created = store
         .create(AutomationDraft {
-            id:          AutomationId::new("plane-loop").unwrap(),
-            name:        "Plane Loop".to_string(),
-            description: None,
-            target:      target(),
-            triggers:    vec![
+            id:                    AutomationId::new("plane-loop").unwrap(),
+            name:                  "Plane Loop".to_string(),
+            description:           None,
+            environment_id:        Some("default".to_string()),
+            target:                target(),
+            workflow:              "plane-loop".to_string(),
+            workflow_source:       None,
+            project_id:            None,
+            available_to_projects: false,
+            triggers:              vec![
                 AutomationTrigger::Api(ApiTrigger {
                     id:      AutomationTriggerId::new("manual").unwrap(),
                     enabled: true,
@@ -175,6 +184,9 @@ async fn plane_trigger_round_trips_through_sqlite() {
     assert_eq!(plane.project_id, "proj-1");
     assert_eq!(plane.default_harness, ExternalAgentHarness::Omp);
     assert_eq!(plane.poll_interval_seconds, 45);
+}
+
+#[tokio::test]
 async fn create_requires_an_environment_and_environment_changes_revision() {
     let (_dir, database) = test_database().await;
     let store = AutomationStore::new(database.clone_pool());
@@ -540,13 +552,15 @@ async fn failed_schedule_insert_rolls_back_parent_replace() {
     .await
     .unwrap();
     let replacement = AutomationReplace {
-        name:            "Should roll back".to_string(),
-        description:     None,
-        environment_id:  Some("default".to_string()),
-        target:          target(),
-        workflow:        "release".to_string(),
-        workflow_source: None,
-        triggers:        vec![schedule("blocked", "0 7 * * *", true)],
+        name:                  "Should roll back".to_string(),
+        description:           None,
+        environment_id:        Some("default".to_string()),
+        target:                target(),
+        workflow:              "release".to_string(),
+        workflow_source:       None,
+        project_id:            None,
+        available_to_projects: false,
+        triggers:              vec![schedule("blocked", "0 7 * * *", true)],
     };
 
     let err = store

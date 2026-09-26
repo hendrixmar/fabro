@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap};
+
 use super::client::ScanProgress;
 use super::*;
 
@@ -55,7 +57,7 @@ fn read_budget_parks_on_fifth_failure() {
     assert_eq!(retry_deadline(1, 100), Some(15100));
     assert_eq!(retry_deadline(2, 100), Some(30100));
     assert_eq!(retry_deadline(3, 100), Some(60100));
-    assert_eq!(retry_deadline(4, 100), Some(120100));
+    assert_eq!(retry_deadline(4, 100), Some(120_100));
     assert_eq!(retry_deadline(5, 100), None);
 }
 
@@ -121,17 +123,34 @@ fn build(
             (fabro_static::EnvVars::PLANE_API_KEY, "fixture-plane"),
         ])
         .store_bundle(Arc::clone(&bundle.0), bundle.1.clone())
-        .automation_materializer(TestAutomationRunMaterializer::succeed(
-            manifest(),
-            b"stale submitted bytes".to_vec(),
+        .automation_materializer(TestAutomationRunMaterializer::succeed_with_dot(
+            fabro_types::GitRunTarget {
+                repo:   "example/repository".to_string(),
+                branch: "main".to_string(),
+                tag:    None,
+                sha:    Some(REVISION.to_string()),
+            },
+            // The incident contract requires the gated `investigate` stage.
+            "digraph Incident { graph [goal=\"test\"]; start [shape=Mdiamond]; \
+             investigate [shape=parallelogram,script=\"true\",goal_gate=true,output_schema=\"routing\"]; \
+             exit [shape=Msquare]; start -> investigate -> exit; }",
         ))
         .build()
 }
 
 async fn automation(state: &AppState) {
-    state.automation_store().create(serde_json::from_value(json!({
-        "id":"incident-loop","name":"Incident loop","target":{"repository":"example/repository","ref":REVISION,"workflow":"incident-loop"},"triggers":[]
-    })).unwrap()).await.unwrap();
+    state
+        .automation_store()
+        .create(
+            serde_json::from_value(json!({
+                "id":"incident-loop","name":"Incident loop","environment_id":"default",
+                "target":{"kind":"git","repo":"example/repository","branch":"main","sha":REVISION},
+                "workflow":"incident-loop","triggers":[]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
 async fn ready_observation(state: &AppState) -> (String, uuid::Uuid) {
@@ -202,13 +221,20 @@ async fn real_materialized_run_contains_only_trusted_five_inputs() {
             Some(value.as_str())
         );
     }
-    let blob = run
-        .read_blob(projection.spec.manifest_blob.as_ref().unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    let persisted: fabro_api::types::RunManifest = serde_json::from_slice(&blob).unwrap();
-    assert_eq!(persisted.args.unwrap().input.len(), 5);
+    // Admission submits a RunIntent, so the durable record of what was
+    // submitted is the run's own compiled inputs: exactly the five trusted
+    // incident inputs and nothing else.
+    let run_inputs = &projection.spec.settings.run.inputs;
+    assert_eq!(run_inputs.len(), 5);
+    assert_eq!(
+        run_inputs
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["episode", "event", "incident", "observation", "run_id"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
     for event in [
         fabro_workflow::event::Event::RunStarting,
         fabro_workflow::event::Event::RunRunning,
@@ -226,7 +252,7 @@ async fn real_materialized_run_contains_only_trusted_five_inputs() {
         current_node: "investigate".into(),
         status: "succeeded".into(),
         completed_nodes: vec!["investigate".into()],
-        node_retries: Default::default(),
+        node_retries: BTreeMap::default(),
         context_values: std::collections::BTreeMap::from([(
             "incident_result".into(),
             report.clone(),
@@ -237,9 +263,9 @@ async fn real_materialized_run_contains_only_trusted_five_inputs() {
         )]),
         next_node_id: Some("exit".into()),
         git_commit_sha: None,
-        loop_failure_signatures: Default::default(),
-        restart_failure_signatures: Default::default(),
-        node_visits: Default::default(),
+        loop_failure_signatures: BTreeMap::default(),
+        restart_failure_signatures: BTreeMap::default(),
+        node_visits: BTreeMap::default(),
         diff: None,
         diff_summary: None,
         graph_visit: Some(1),
@@ -343,10 +369,12 @@ async fn submitted_run_resumes_same_identity_after_reconstruction() {
             },
             headers: axum::http::HeaderMap::new(),
             automation: Some(AutomationRef {
-                id:         "incident-loop".into(),
-                name:       None,
-                trigger_id: None,
+                id:              "incident-loop".into(),
+                name:            None,
+                trigger_id:      None,
+                workflow_source: None,
             }),
+            target: None,
         },
     ))
     .await;
@@ -421,22 +449,26 @@ async fn created_only_run_and_missing_create_response_never_recreate() {
     );
     let run = state.stores.runs.create_run(&id).await.unwrap();
     fabro_workflow::event::append_event(&run, &id, &fabro_workflow::event::Event::RunCreated {
-        run_id:           id,
-        title:            None,
-        settings:         serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
-        graph:            serde_json::to_value(fabro_types::Graph::new("partial")).unwrap(),
-        workflow_source:  None,
-        labels:           std::collections::BTreeMap::new(),
-        source_directory: None,
-        workflow_slug:    None,
-        automation:       None,
-        provenance:       fabro_types::test_support::test_run_provenance(),
-        manifest_blob:    None,
-        git:              None,
-        fork_source_ref:  None,
-        retried_from:     None,
-        parent_id:        None,
-        web_url:          None,
+        run_id:              id,
+        title:               None,
+        settings:            serde_json::to_value(fabro_types::WorkflowSettings::default())
+            .unwrap(),
+        graph:               serde_json::to_value(fabro_types::Graph::new("partial")).unwrap(),
+        workflow_source:     None,
+        labels:              std::collections::BTreeMap::new(),
+        source_directory:    None,
+        workflow_slug:       None,
+        workflow_version_id: None,
+        target:              None,
+        automation:          None,
+        provenance:          fabro_types::test_support::test_run_provenance(),
+        manifest_blob:       None,
+        spec_blob:           None,
+        git:                 None,
+        fork_source_ref:     None,
+        retried_from:        None,
+        parent_id:           None,
+        web_url:             None,
     })
     .await
     .unwrap();
@@ -733,11 +765,11 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
     let project = uuid::Uuid::new_v4();
     let ticket = uuid::Uuid::new_v4();
     let source = dir.path().join("legacy.json");
-    std::fs::write(&source, b"{}").unwrap();
+    tokio::fs::write(&source, b"{}").await.unwrap();
     std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
     let config = dir.path().join("bugsink-legacy.json");
     let owner = json!({"state_file":source,"api_origin":remote.base_url(),"token_secret":"BUGSINK_API_TOKEN"});
-    std::fs::write(&config,serde_json::to_vec(&json!({"schema_version":1,"owners":{"laptop":owner,"el-telar":owner},"plane_project_id":project})).unwrap()).unwrap();
+    tokio::fs::write(&config,serde_json::to_vec(&json!({"schema_version":1,"owners":{"laptop":owner,"el-telar":owner},"plane_project_id":project})).unwrap()).await.unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
     remote.mock(|when, then| {
         when.method(httpmock::Method::GET)
@@ -753,19 +785,22 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
     let unrelated = fabro_types::RunProjection::new(
         "Unrelated CI investigation".into(),
         fabro_types::RunSpec {
-            run_id:           unrelated_id,
-            settings:         unrelated_settings,
-            graph:            fabro_types::Graph::new("CIIncidentLoop"),
-            graph_source:     None,
-            workflow_slug:    Some("ci-incident-loop".into()),
-            automation:       None,
-            source_directory: None,
-            labels:           Default::default(),
-            provenance:       fabro_types::test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            git:              None,
-            fork_source_ref:  None,
+            run_id:              unrelated_id,
+            settings:            unrelated_settings,
+            graph:               fabro_types::Graph::new("CIIncidentLoop"),
+            graph_source:        None,
+            workflow_slug:       Some("ci-incident-loop".into()),
+            workflow_version_id: None,
+            target:              None,
+            automation:          None,
+            source_directory:    None,
+            labels:              HashMap::default(),
+            provenance:          fabro_types::test_support::test_run_provenance(),
+            manifest_blob:       None,
+            spec_blob:           None,
+            definition_blob:     None,
+            git:                 None,
+            fork_source_ref:     None,
         },
         chrono::Utc::now(),
     );
@@ -795,11 +830,12 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
             .iter()
             .any(|r| r["ticket_id"] == ticket.to_string() && r["run_id"].is_null())
     );
-    std::fs::write(
+    tokio::fs::write(
         &source,
         serde_json::to_vec(&json!({(incident.clone()):{"status":"spawn-failed","run":null}}))
             .unwrap(),
     )
+    .await
     .unwrap();
     let incomplete = legacy::import(&state).await.unwrap();
     assert_eq!(incomplete["status"], "incomplete");
@@ -813,7 +849,7 @@ async fn baseline_import_reads_actual_sources_and_exposes_only_verified_summary(
         "legacy_spawn_uncertain"
     );
     assert!(snapshot["runs"].as_array().unwrap().is_empty());
-    std::fs::write(&source, b"{}").unwrap();
+    tokio::fs::write(&source, b"{}").await.unwrap();
     assert_eq!(
         legacy::import(&state).await.unwrap()["status"],
         "incomplete"

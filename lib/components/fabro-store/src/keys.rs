@@ -71,14 +71,31 @@ pub(crate) fn run_catalog_key(run_id: &RunId) -> SlateKey {
     run_catalog_root().with(run_id)
 }
 
-/// Extracts the run id from a full catalog marker key, or `None` when the key
-/// is not exactly `runs/_index/by-start/<run_id>`.
+/// Extracts the run id from a retired `runs/_index/by-start` catalog marker.
+///
+/// Two shapes exist in the wild and both are canonical:
+///
+/// * `runs/_index/by-start/<run_id>` — the layout after the id moved to a
+///   single key segment;
+/// * `runs/_index/by-start/<YYYY-MM-DD>/<run_id>` — the older index encoded a
+///   run id as a `created_at` date segment plus the id, so an operator could
+///   scan a date range. Servers upgraded from that layout still hold these
+///   markers, and refusing them aborts the whole activation.
+///
+/// Anything else stays unrecognized so a genuinely unexpected key still fails
+/// closed instead of being silently ignored.
 pub(crate) fn parse_run_catalog_key(raw: &str) -> Option<RunId> {
     let segments = SlateKey::segments(raw).collect::<Vec<_>>();
-    let ["runs", "_index", "by-start", run_id] = segments.as_slice() else {
-        return None;
-    };
-    run_id.parse().ok()
+    match segments.as_slice() {
+        ["runs", "_index", "by-start", run_id] => run_id.parse().ok(),
+        ["runs", "_index", "by-start", date, run_id] => {
+            if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+                return None;
+            }
+            run_id.parse().ok()
+        }
+        _ => None,
+    }
 }
 
 fn run_catalog_root() -> SlateKey {
@@ -193,6 +210,50 @@ mod tests {
         assert!(!contains(
             &session_by_id_key(&fabro_types::SessionId::new())
         ));
+    }
+
+    #[test]
+    fn parse_run_catalog_key_accepts_both_retired_shapes() {
+        let run_id: RunId = "01JT56VE4Z5NZ814GZN2JZD65A".parse().unwrap();
+        let canonical = SlateKey::new("runs")
+            .with("_index")
+            .with("by-start")
+            .with(run_id);
+        assert_eq!(parse_run_catalog_key(canonical.as_str()), Some(run_id));
+
+        // The older index encoded a run id as `<created_at date>/<run_id>`;
+        // servers upgraded from that layout still hold these markers.
+        let dated = SlateKey::new("runs")
+            .with("_index")
+            .with("by-start")
+            .with("2026-09-05")
+            .with(run_id);
+        assert_eq!(parse_run_catalog_key(dated.as_str()), Some(run_id));
+
+        for rejected in [
+            SlateKey::new("runs")
+                .with("_index")
+                .with("by-start")
+                .with("2026-09-05"),
+            SlateKey::new("runs")
+                .with("_index")
+                .with("by-start")
+                .with("not-a-date")
+                .with("01JT56VE4Z5NZ814GZN2JZD65A"),
+            SlateKey::new("runs")
+                .with("_index")
+                .with("by-start")
+                .with("2026-09-05")
+                .with("01JT56VE4Z5NZ814GZN2JZD65A")
+                .with("extra"),
+            SlateKey::new("runs").with("_index").with("other").with("x"),
+        ] {
+            assert_eq!(
+                parse_run_catalog_key(rejected.as_str()),
+                None,
+                "{rejected:?}"
+            );
+        }
     }
 
     #[test]

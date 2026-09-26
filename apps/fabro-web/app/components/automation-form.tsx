@@ -29,6 +29,8 @@ export interface AutomationFormValues {
   name: string;
   description: string;
   environmentId: string;
+  projectId: string;
+  availableToProjects: boolean;
   targetRepository: string;
   targetBranch: string;
   targetTag: string;
@@ -61,6 +63,8 @@ export const EMPTY_AUTOMATION_FORM: AutomationFormValues = {
   name:                       "",
   description:                "",
   environmentId:   "",
+  projectId:                 "",
+  availableToProjects:       false,
   targetRepository:           "",
   targetBranch:               "main",
   targetTag:                  "",
@@ -106,6 +110,8 @@ export function automationToFormValues(automation: Automation): AutomationFormVa
     name:                       automation.name,
     description:                automation.description ?? "",
     environmentId:   automation.environment_id ?? "",
+    projectId:                 automation.project_id ?? "",
+    availableToProjects:       automation.available_to_projects ?? false,
     targetRepository:           target?.repo ?? "",
     targetBranch:               target?.branch ?? EMPTY_AUTOMATION_FORM.targetBranch,
     targetTag:                  target?.tag ?? "",
@@ -214,6 +220,23 @@ export function triggersFromFormValues(values: AutomationFormValues): Automation
     });
   }
   return triggers;
+}
+
+/** Canonical create/replace payload fields shared by every automation form. */
+export function automationPayloadFromFormValues(values: AutomationFormValues) {
+  return {
+    name:                  values.name.trim(),
+    description:           values.description.trim() || null,
+    environment_id:        values.environmentId.trim(),
+    target:                targetFromFormValues(values),
+    workflow:              values.workflow.trim(),
+    workflow_source:       workflowSourceFromFormValues(values),
+    project_id:            values.projectId.trim() || undefined,
+    available_to_projects: values.projectId.trim()
+      ? false
+      : values.availableToProjects,
+    triggers: triggersFromFormValues(values),
+  };
 }
 
 export function isFormValid(values: AutomationFormValues): boolean {
@@ -347,6 +370,7 @@ interface AutomationFormFieldsProps {
   values: AutomationFormValues;
   onChange: (values: AutomationFormValues) => void;
   lockIdAndTarget?: boolean;
+  lockTargetRepoAndBranch?: boolean;
   environments?: Environment[];
   environmentsLoading?: boolean;
   environmentsError?: boolean;
@@ -356,6 +380,7 @@ export function AutomationFormFields({
   values,
   onChange,
   lockIdAndTarget = false,
+  lockTargetRepoAndBranch = false,
   environments = [],
   environmentsLoading = false,
   environmentsError = false,
@@ -489,7 +514,13 @@ export function AutomationFormFields({
       <Panel title="Run target">
         <Row
           title={<Label required>Repository</Label>}
-          help="GitHub repository whose workspace the run changes, in owner/repo form."
+          help={
+            lockTargetRepoAndBranch
+              ? "Fixed to this project's canonical repository. Every automation owned by the project runs against it."
+              : values.projectId
+                ? "GitHub repository whose workspace the run changes, in owner/repo form. Must match this project's canonical repository."
+                : "GitHub repository whose workspace the run changes, in owner/repo form."
+          }
         >
           <input
             type="text"
@@ -497,6 +528,7 @@ export function AutomationFormFields({
             aria-label="Run target repository"
             value={values.targetRepository}
             onChange={(e) => patch({ targetRepository: e.target.value })}
+            disabled={lockTargetRepoAndBranch}
             placeholder="acme/orders-api"
             autoComplete="off"
             spellCheck={false}
@@ -505,7 +537,11 @@ export function AutomationFormFields({
         </Row>
         <Row
           title={<Label required>Working branch</Label>}
-          help="Attached branch retained with the run, including when a tag or exact commit is selected."
+          help={
+            lockTargetRepoAndBranch
+              ? "Fixed to this project's default branch."
+              : "Attached branch retained with the run, including when a tag or exact commit is selected."
+          }
         >
           <input
             type="text"
@@ -513,6 +549,7 @@ export function AutomationFormFields({
             aria-label="Working branch"
             value={values.targetBranch}
             onChange={(e) => patch({ targetBranch: e.target.value })}
+            disabled={lockTargetRepoAndBranch}
             placeholder="main"
             autoComplete="off"
             spellCheck={false}
@@ -662,6 +699,33 @@ export function AutomationFormFields({
             </Row>
           </>
         ) : null}
+      </Panel>
+
+      <Panel title="Projects">
+        {values.projectId ? (
+          <Row
+            title="Owned by this project"
+            help="Project enrollment copied this definition's workflow configuration, not its trigger activation. The instance keeps its own triggers, schedule and run history."
+          >
+            <Link
+              to={`/projects/${encodeURIComponent(values.projectId)}`}
+              className="font-mono text-xs text-mint hover:text-fg"
+            >
+              {values.projectId}
+            </Link>
+          </Row>
+        ) : (
+          <Row
+            title="Available to projects"
+            help="Global definitions only. Project enrollment copies this automation's workflow configuration — never its trigger activation. Each project instance targets that project's repository and starts with every trigger disabled."
+          >
+            <ToggleSwitch
+              checked={values.availableToProjects}
+              onChange={(availableToProjects) => patch({ availableToProjects })}
+              label="Make available to projects"
+            />
+          </Row>
+        )}
       </Panel>
 
       <Panel title="Triggers">
