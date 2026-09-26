@@ -134,10 +134,10 @@ async fn update_project(
     ))
 }
 
-/// Select an available global automation and materialize it as a concrete
-/// instance owned by this project.
+/// Select an available global automation and create a validated link owned
+/// by this project.
 ///
-/// The instance keeps the source definition's workflow selector and workflow
+/// The link keeps the source definition's workflow selector and workflow
 /// source, targets this project's repository and default branch, inherits no
 /// trigger state, and carries no other project's Plane ids.
 async fn create_project_automation(
@@ -181,15 +181,7 @@ async fn create_project_automation(
             "automation not found: {source_id}"
         )));
     };
-    if !source.available_to_projects {
-        return Err(ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "automation {source_id} is not available to projects; enable it on the global definition first"
-            ),
-            "automation_not_available_to_projects",
-        ));
-    }
+    validate_link_source(&source)?;
     if source.revision != source_revision {
         return Err(ApiError::with_code(
             StatusCode::CONFLICT,
@@ -197,13 +189,6 @@ async fn create_project_automation(
                 "automation {source_id} changed since it was selected; reload the definition and retry"
             ),
             "automation_source_revision_stale",
-        ));
-    }
-    if source.project_id.is_some() {
-        return Err(ApiError::with_code(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("automation {source_id} is already owned by a project"),
-            "automation_source_not_global",
         ));
     }
 
@@ -214,6 +199,16 @@ async fn create_project_automation(
     )?;
     let draft =
         project_automation_draft(&instance_id, &request, &project, &source, environment_id)?;
+    if !workflow_declares_project_input(state.as_ref(), &draft).await? {
+        return Err(ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "workflow {} declares no `project` input; add `project = {{ type = \"string\", default = \"\" }}` to its [run.inputs] first",
+                draft.workflow
+            ),
+            "automation_workflow_without_project_input",
+        ));
+    }
     let automation = state.automation_store().create(draft).await?;
     state.notify_automation_scheduler();
     let revision = automation.revision.clone();
@@ -264,7 +259,8 @@ async fn retry_or_conflict(
         && existing.target == draft.target
         && existing.workflow == draft.workflow
         && existing.workflow_source == draft.workflow_source
-        && existing.triggers.is_empty();
+        && existing.triggers.is_empty()
+        && existing.source_automation_id == draft.source_automation_id;
     if identical {
         let revision = existing.revision.clone();
         return Ok(json_with_etag_response(
@@ -284,7 +280,7 @@ async fn retry_or_conflict(
     ))
 }
 
-/// Build the project-owned instance from the selected global definition.
+/// Build the project-owned link from the selected global definition.
 ///
 /// The application target always comes from the project (repository and
 /// default branch), never from the source definition or its tag/SHA. The
@@ -298,6 +294,16 @@ fn project_automation_draft(
     source: &Automation,
     environment_id: String,
 ) -> Result<AutomationDraft, ApiError> {
+    if project.intake_binding_id.is_none() {
+        return Err(ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "project {} has no registry binding, so it cannot receive inputs.project",
+                project.id
+            ),
+            "project_not_registered",
+        ));
+    }
     let source_target = source.git_target().ok_or_else(|| {
         ApiError::with_code(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -324,11 +330,82 @@ fn project_automation_draft(
         workflow_source:       Some(workflow_source),
         project_id:            Some(project.id.clone()),
         available_to_projects: false,
-        // Task 8 sets this when the endpoint creates a link instead.
-        source_automation_id:  None,
+        source_automation_id:  Some(source.id.clone()),
         // A newly enrolled instance never inherits trigger activation.
         triggers:              Vec::new(),
     })
+}
+
+/// A link source must be a global definition an operator made available.
+pub(crate) fn validate_link_source(source: &Automation) -> Result<(), ApiError> {
+    if source.project_id.is_some() {
+        return Err(ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("automation {} is already owned by a project", source.id),
+            "automation_source_not_global",
+        ));
+    }
+    if !source.available_to_projects {
+        return Err(ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "automation {} is not available to projects; enable it on the global definition first",
+                source.id
+            ),
+            "automation_not_available_to_projects",
+        ));
+    }
+    Ok(())
+}
+
+/// Materialize the source workflow for this project and read its declared
+/// inputs. A link whose workflow cannot receive `inputs.project` would act
+/// on every project, so it is refused.
+pub(crate) async fn workflow_declares_project_input(
+    state: &AppState,
+    draft: &AutomationDraft,
+) -> Result<bool, ApiError> {
+    let fabro_types::RunTarget::Git(target) = &draft.target else {
+        return Ok(false);
+    };
+    let materialized = state
+        .materialize_automation_run(crate::automation_materializer::AutomationRunMaterializeInput {
+            automation_id:   draft.id.clone(),
+            target:          target.clone(),
+            workflow_source: draft.workflow_source.clone(),
+            workflow:        draft.workflow.clone(),
+            run_id:          fabro_types::RunId::new(),
+            temp_root:       state.automation_temp_root(),
+            project_id:      draft.project_id.clone(),
+        })
+        .await
+        .map_err(|err| {
+            ApiError::with_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("workflow {} could not be loaded for this project: {err}", draft.workflow),
+                "automation_workflow_unavailable",
+            )
+        })?;
+    let versions = fabro_workflow_version::WorkflowVersionStore::new(state.store_ref().blobs());
+    let internal = || ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "workflow version store failed");
+    let closure = versions
+        .get_closure(&materialized.workflow_version_id)
+        .await
+        .map_err(|_| internal())?
+        .ok_or_else(internal)?;
+    let lowered = crate::run_intent::lower_workflow_closure(&closure).map_err(|err| {
+        ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("workflow {} is invalid: {err}", draft.workflow),
+            "automation_workflow_unavailable",
+        )
+    })?;
+    Ok(lowered
+        .workflow_layer
+        .as_ref()
+        .and_then(|layer| layer.run.as_ref())
+        .and_then(|run| run.inputs.as_ref())
+        .is_some_and(|inputs| inputs.contains_key("project")))
 }
 
 fn parse_project_id(id: String) -> Result<ProjectId, ApiError> {
@@ -392,13 +469,13 @@ mod tests {
                 "42",
                 "artesanos-digitales/tierrapay",
                 "main",
-                None,
+                Some("tierrapay"),
             ),
             name:                 "TierraPay".to_string(),
             github_repository_id: GithubRepositoryId::new("42").unwrap(),
             repository:           "artesanos-digitales/tierrapay".to_string(),
             default_branch:       "main".to_string(),
-            intake_binding_id:    None,
+            intake_binding_id:    Some("tierrapay".to_string()),
         }
     }
 
@@ -472,5 +549,109 @@ mod tests {
         let workflow_source = draft.workflow_source.expect("workflow source is preserved");
         assert_eq!(workflow_source.repo, "fabro-sh/fabro");
         assert_eq!(workflow_source.tag.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn link_draft_names_its_source() {
+        let id = AutomationId::new("tierrapay-ticket-loop").unwrap();
+        let draft = project_automation_draft(
+            &id,
+            &request(),
+            &project(),
+            &source(Vec::new()),
+            "intake-author".to_string(),
+        )
+        .expect("the link drafts");
+        assert_eq!(
+            draft.source_automation_id.as_ref().map(AutomationId::as_str),
+            Some("ticket-loop")
+        );
+    }
+
+    #[test]
+    fn unregistered_projects_cannot_link() {
+        let mut project = project();
+        project.intake_binding_id = None;
+        let id = AutomationId::new("tierrapay-ticket-loop").unwrap();
+        let error = project_automation_draft(
+            &id,
+            &request(),
+            &project,
+            &source(Vec::new()),
+            "intake-author".to_string(),
+        )
+        .expect_err("a project without a registry binding cannot receive inputs.project");
+        assert_eq!(error.code(), Some("project_not_registered"));
+    }
+
+    #[test]
+    fn only_available_global_sources_link() {
+        let mut unavailable = source(Vec::new());
+        unavailable.available_to_projects = false;
+        assert_eq!(
+            validate_link_source(&unavailable).unwrap_err().code(),
+            Some("automation_not_available_to_projects")
+        );
+        let mut owned = source(Vec::new());
+        owned.project_id = Some(ProjectId::new("mafeva").unwrap());
+        assert_eq!(
+            validate_link_source(&owned).unwrap_err().code(),
+            Some("automation_source_not_global")
+        );
+        assert!(validate_link_source(&source(Vec::new())).is_ok());
+    }
+
+    async fn declares_project(workflow_toml: &str) -> bool {
+        let target = fabro_types::GitRunTarget {
+            repo:   "artesanos-digitales/tierrapay".to_string(),
+            branch: "main".to_string(),
+            tag:    None,
+            sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        };
+        let state = crate::test_support::TestAppStateBuilder::new()
+            .automation_materializer(
+                crate::automation_materializer::TestAutomationRunMaterializer::succeed_with_workflow_toml(
+                    target,
+                    workflow_toml,
+                ),
+            )
+            .build();
+        let created = state
+            .project_store()
+            .create(fabro_automation::ProjectDraft {
+                id:                   ProjectId::new("tierrapay").unwrap(),
+                name:                 "TierraPay".to_string(),
+                github_repository_id: GithubRepositoryId::new("42").unwrap(),
+                repository:           "artesanos-digitales/tierrapay".to_string(),
+                default_branch:       "main".to_string(),
+            })
+            .await
+            .unwrap();
+        let id = AutomationId::new("tierrapay-ticket-loop").unwrap();
+        let draft = project_automation_draft(
+            &id,
+            &request(),
+            &project(),
+            &source(Vec::new()),
+            "intake-author".to_string(),
+        )
+        .unwrap();
+        assert_eq!(draft.project_id.as_ref(), Some(&created.id));
+        workflow_declares_project_input(state.as_ref(), &draft)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn links_require_a_declared_project_input() {
+        assert!(
+            declares_project(
+                "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n[run.inputs]\nproject = { type = \"string\", default = \"\" }\n"
+            )
+            .await
+        );
+        assert!(
+            !declares_project("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n").await
+        );
     }
 }
