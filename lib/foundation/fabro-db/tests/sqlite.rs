@@ -766,7 +766,7 @@ async fn runs_schema_creates_indexes_and_rejects_invalid_rows() -> anyhow::Resul
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(index_count, 5);
+    assert_eq!(index_count, 6);
 
     insert_minimal_run(database.pool(), "submitted", 0, r#"{"id":"run"}"#).await?;
     for (status, input_tokens, summary_json) in [
@@ -795,7 +795,7 @@ async fn session_owner_schema_has_final_shape_constraints_and_indexes() -> anyho
         .await?;
     assert_eq!(
         run_columns.len(),
-        24,
+        25,
         "the existing runs row must stay unchanged"
     );
 
