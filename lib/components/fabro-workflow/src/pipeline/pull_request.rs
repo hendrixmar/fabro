@@ -402,15 +402,23 @@ async fn build_pr_content_with_client(
         .system(PR_BODY_SYSTEM_PROMPT)
         .prompt(prompt);
 
-    let result = generate_object(params, PR_CONTENT_SCHEMA.clone())
+    let generated: PrContent = generate_object(params, PR_CONTENT_SCHEMA.clone())
         .await
-        .map_err(|e| format!("LLM generation failed: {e}"))?;
-
-    let output = result
-        .output
-        .ok_or_else(|| "LLM generation returned no structured output".to_string())?;
-    let generated: PrContent = serde_json::from_value(output)
-        .map_err(|e| format!("Failed to deserialize PR content: {e}"))?;
+        .map_err(|e| format!("LLM generation failed: {e}"))
+        .and_then(|result| {
+            let output = result
+                .output
+                .ok_or_else(|| "LLM generation returned no structured output".to_string())?;
+            serde_json::from_value(output)
+                .map_err(|e| format!("Failed to deserialize PR content: {e}"))
+        })
+        .unwrap_or_else(|err| {
+            warn!(model = %model, %err, "Using fallback PR content");
+            PrContent {
+                title: fallback_pr_title(goal),
+                body: EMPTY_BODY_NOTICE.to_string(),
+            }
+        });
 
     let title = if generated.title.trim().is_empty() {
         fallback_pr_title(goal)
@@ -1090,6 +1098,28 @@ mod tests {
         assert!(body.contains("### Fabro Details"));
         assert!(body.contains("Ran 3 stages in 2m 30s for $0.42"));
         assert!(body.contains("| **Total** | **2m 30s** | **$0.42** | **0** |"));
+    }
+
+    #[tokio::test]
+    async fn build_pr_content_falls_back_when_model_returns_invalid_json() {
+        let store = test_store();
+        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        let content = build_pr_content_with_client(
+            "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
+            "Implement feature",
+            "mock-model",
+            &run_store.into(),
+            Catalog::builtin(),
+            None,
+            None,
+            explicit_client("mock", "not json"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content.title, "Implement feature");
+        assert!(content.body.contains("The LLM did not produce a description"));
+        assert!(content.body.contains("Generated with [Fabro](https://fabro.sh)"));
     }
 
     #[tokio::test]

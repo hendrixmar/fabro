@@ -47,7 +47,7 @@ pub fn reported_model_usage(
     reported_cost: Option<UsdMicros>,
 ) -> BilledModelUsage {
     BilledModelUsage {
-        input: ModelBillingInput {
+        input:            ModelBillingInput {
             usage: ModelUsage { model, tokens },
             facts: ModelBillingFacts::Reported,
         },
@@ -182,8 +182,8 @@ mod tests {
         let usage = reported_model_usage(
             model_ref(ProviderId::new("omp"), "deepseek", None),
             TokenCounts {
-                input_tokens:      10,
-                output_tokens:     3,
+                input_tokens: 10,
+                output_tokens: 3,
                 cache_read_tokens: 5,
                 ..TokenCounts::default()
             },
@@ -192,8 +192,8 @@ mod tests {
 
         assert_eq!(usage.tokens().total_tokens(), 18);
         assert_eq!(usage.tokens(), &TokenCounts {
-            input_tokens:      10,
-            output_tokens:     3,
+            input_tokens: 10,
+            output_tokens: 3,
             cache_read_tokens: 5,
             ..TokenCounts::default()
         });

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Launches codex-acp with credentials injected from Fabro sandbox env vars.
+# Preference: OPENAI_API_KEY (used by codex directly), else CODEX_AUTH_JSON
+# (OAuth auth.json content produced by `codex login` on a trusted machine).
+set -e
+export NO_BROWSER=1
+if [ -n "$CODEX_AUTH_B64" ]; then
+  mkdir -p ~/.codex
+  printf '%s' "$CODEX_AUTH_B64" | base64 -d > ~/.codex/auth.json
+  chmod 600 ~/.codex/auth.json
+fi
+exec codex-acp "$@"

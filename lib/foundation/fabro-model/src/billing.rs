@@ -169,10 +169,11 @@ pub struct ModelRef {
 /// Token counts for one LLM call.
 ///
 /// All five fields are disjoint: each token is counted in exactly one bucket,
-/// and `total_tokens()` is their saturating sum. Provider mappings normalize their wire
-/// formats into this shape. For example, OpenAI's nested cached tokens are
-/// subtracted out of `input_tokens`, while Anthropic thinking tokens remain in
-/// `output_tokens` because Anthropic does not expose a separate billed count.
+/// and `total_tokens()` is their saturating sum. Provider mappings normalize
+/// their wire formats into this shape. For example, OpenAI's nested cached
+/// tokens are subtracted out of `input_tokens`, while Anthropic thinking tokens
+/// remain in `output_tokens` because Anthropic does not expose a separate
+/// billed count.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TokenCounts {
     pub input_tokens:       i64,
@@ -842,10 +843,7 @@ mod tests {
         assigned += ones;
         assert_eq!(assigned, maximum);
 
-        let billed = [
-            billed_usage(i64::MAX, 0, None),
-            billed_usage(1, 0, None),
-        ];
+        let billed = [billed_usage(i64::MAX, 0, None), billed_usage(1, 0, None)];
         let rolled_up = BilledTokenCounts::from_billed_usage(&billed);
         assert_eq!(rolled_up.input_tokens, i64::MAX);
         assert_eq!(rolled_up.total_tokens, i64::MAX);
@@ -1097,7 +1095,7 @@ cache_input_cost_per_mtok = 0.3
             usage: ModelUsage {
                 model:  model.clone(),
                 tokens: TokenCounts {
-                    input_tokens:  100,
+                    input_tokens: 100,
                     output_tokens: 20,
                     ..TokenCounts::default()
                 },

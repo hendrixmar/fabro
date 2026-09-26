@@ -1054,7 +1054,7 @@ fn session_activity_callback(
                         is_error,
                         output_bytes_observed: 0,
                         output_bytes_retained: 0,
-                        output_bytes_omitted:  0,
+                        output_bytes_omitted: 0,
                     },
                     session_id:        Some(session_id.clone()),
                     parent_session_id: None,

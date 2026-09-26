@@ -15,6 +15,10 @@ WORKDIR /opt/fabro-debugger
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 COPY gateway.mjs ./
+COPY codex-acp-wrapper /usr/local/bin/codex-acp-wrapper
+RUN chmod +x /usr/local/bin/codex-acp-wrapper \
+    && command -v codex-acp-wrapper \
+    && codex-acp --version
 WORKDIR /workspace
 ENV NO_BROWSER=1
 CMD ["sleep", "infinity"]

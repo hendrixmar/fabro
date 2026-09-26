@@ -8,7 +8,8 @@ use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, Tool
 use fabro_agent::{
     AgentEvent, AgentProfile, AgentProfileBuilder, CompletionCoordinator, Message as AgentMessage,
     Sandbox, Session, SessionOptions, SessionShutdownReason, StaticEnvProvider, ToolEnvProvider,
-    ToolSecrets, WebFetchSummarizer, canonical_tool_name, register_question_tools,
+    ToolAccess, ToolAccessPolicy, ToolSecrets, WebFetchSummarizer, canonical_tool_name,
+    register_question_tools,
 };
 use fabro_auth::CredentialSource;
 use fabro_graphviz::graph::{AttrValue, Node};
@@ -391,6 +392,34 @@ pub(crate) fn effective_request_controls(
 
 fn control_attr<'a>(node: &'a Node, key: &str) -> Option<&'a str> {
     node.attrs.get(key).and_then(AttrValue::as_str)
+}
+
+struct SelectedToolPolicy(HashSet<String>);
+
+impl ToolAccessPolicy for SelectedToolPolicy {
+    fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
+        if self.0.contains(tool_name) {
+            ToolAccess::Allowed
+        } else {
+            ToolAccess::Denied
+        }
+    }
+}
+
+fn selected_tools(node: &Node) -> Result<Option<Arc<dyn ToolAccessPolicy>>, Error> {
+    let Some(value) = node.attrs.get("allowed_tools") else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(|| Error::handler("allowed_tools must be a string"))?;
+    const KNOWN: &[&str] = &[
+        "read_file", "read_many_files", "list_dir", "grep", "glob", "write_file", "edit_file",
+        "shell",
+    ];
+    let names = raw.split(',').map(str::trim).map(str::to_string).collect::<HashSet<_>>();
+    if names.iter().any(|name| !KNOWN.contains(&name.as_str())) {
+        return Err(Error::handler(format!("invalid allowed_tools for node {}", node.id)));
+    }
+    Ok(Some(Arc::new(SelectedToolPolicy(names))))
 }
 
 fn parse_reasoning_effort(node: &Node, value: &str) -> Result<ReasoningEffort, Error> {
@@ -1106,18 +1135,24 @@ impl AgentApiBackend {
             }
         }
 
+        let tool_access_policy = selected_tools(node)?;
+        let permission_level = match control_attr(node, "allowed_tools") {
+            Some(raw) if raw.split(',').any(|name| name.trim() == "shell") => PermissionLevel::Full,
+            Some(raw) if raw.split(',').any(|name| matches!(name.trim(), "write_file" | "edit_file")) => {
+                PermissionLevel::ReadWrite
+            }
+            Some(_) => PermissionLevel::ReadOnly,
+            None => PermissionLevel::Full,
+        };
         let config = SessionOptions {
             max_tokens: node.max_tokens(),
             reasoning_effort: controls.reasoning_effort,
             speed: controls.speed,
             tool_hooks,
             mcp_servers,
-            // Workflow agents run with no `tool_access_policy`, which exposes
-            // the entire tool registry (read, write, shell, subagent, MCP) and
-            // skips approval gating. Report that truthfully so the UI doesn't
-            // render "Unknown" for every workflow stage. Override per-stage if
-            // a future workflow attribute narrows the scope.
-            permission_level: Some(PermissionLevel::Full),
+            tool_access_policy,
+            max_subagent_depth: if node.attrs.contains_key("allowed_tools") { 0 } else { 1 },
+            permission_level: Some(permission_level),
             skill_dirs,
             skill_allowlist,
             ..SessionOptions::default()
@@ -1127,9 +1162,7 @@ impl AgentApiBackend {
         let supervisor_for_session = supervisor.clone();
 
         // Build factory that creates child sessions WITHOUT subagent tools.
-        // Child sessions inherit the parent's tool hooks: blocking
-        // pre_tool_use hooks are the only policy boundary workflow agents
-        // have, so a subagent's tool calls must pass through them too.
+        // Child sessions inherit both static tool access and dynamic hooks.
         let factory_client = client.clone();
         let factory_profile_builder = profile_builder;
         let factory_env = Arc::clone(sandbox);
@@ -1137,6 +1170,7 @@ impl AgentApiBackend {
         let factory_fabro_run_tools = fabro_run_tools.clone();
         let factory_permission_level = config.permission_level;
         let factory_tool_hooks = config.tool_hooks.clone();
+        let factory_tool_access_policy = config.tool_access_policy.clone();
         let factory: SessionFactory = Arc::new(move || {
             let mut child_profile = factory_profile_builder.build();
             if let Some(services) = factory_fabro_run_tools.clone() {
@@ -1151,6 +1185,7 @@ impl AgentApiBackend {
                     reasoning_effort: controls.reasoning_effort,
                     speed: controls.speed,
                     tool_hooks: factory_tool_hooks.clone(),
+                    tool_access_policy: factory_tool_access_policy.clone(),
                     permission_level: factory_permission_level,
                     ..SessionOptions::default()
                 },
@@ -3161,6 +3196,21 @@ enabled = true
         let provider = backend.resolve_provider_context("gpt-5.4", None).unwrap();
 
         assert_eq!(provider.provider_id, ProviderId::from("openrouter"));
+    }
+
+    #[test]
+    fn selected_tools_deny_unlisted_calls_and_reject_unknown_names() {
+        let mut node = Node::new("repair-role");
+        node.attrs.insert(
+            "allowed_tools".into(),
+            AttrValue::String("read_file,grep".into()),
+        );
+        let policy = selected_tools(&node).unwrap().unwrap();
+        assert_eq!(policy.access_for_tool("read_file"), ToolAccess::Allowed);
+        assert_eq!(policy.access_for_tool("shell"), ToolAccess::Denied);
+        assert_eq!(policy.access_for_tool("spawn_agent"), ToolAccess::Denied);
+        node.attrs.insert("allowed_tools".into(), AttrValue::String("read_file,typo".into()));
+        assert!(selected_tools(&node).is_err());
     }
 
     #[test]

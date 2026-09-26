@@ -104,11 +104,7 @@ const OMP_BUILTINS: &[(&str, &str, AgentToolCategory)] = &[
         "Spawn parallel subagents.",
         AgentToolCategory::Subagent,
     ),
-    (
-        "todo",
-        "Track phased tasks.",
-        AgentToolCategory::Other,
-    ),
+    ("todo", "Track phased tasks.", AgentToolCategory::Other),
     (
         "web_search",
         "Run a web search through the configured provider.",
@@ -141,8 +137,8 @@ impl AcpToolInventory {
             0
         };
         let mut inventory = Self {
-            harness: harness.map(str::to_owned),
-            tools: Vec::with_capacity(capacity),
+            harness:    harness.map(str::to_owned),
+            tools:      Vec::with_capacity(capacity),
             name_index: HashMap::with_capacity(capacity),
         };
 
@@ -231,13 +227,13 @@ fn identifies_todo_or_plan(text: &str) -> bool {
 fn raw_input_identifies_todo_or_plan(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(text) => identifies_todo_or_plan(text),
-        serde_json::Value::Array(items) => {
-            items.iter().any(raw_input_identifies_todo_or_plan)
-        }
+        serde_json::Value::Array(items) => items.iter().any(raw_input_identifies_todo_or_plan),
         serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
             identifies_todo_or_plan(key) || raw_input_identifies_todo_or_plan(value)
         }),
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
     }
 }
 
@@ -287,138 +283,127 @@ mod tests {
         let snapshot = inventory.snapshot();
         let actual = snapshot
             .iter()
-            .map(|tool| {
-                (
-                    tool.name.as_str(),
-                    tool.description.as_str(),
-                    tool.category,
-                )
-            })
+            .map(|tool| (tool.name.as_str(), tool.description.as_str(), tool.category))
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            actual,
-            vec![
-                (
-                    "ast_edit",
-                    "Structural codemod via ast-grep patterns; preview-staged before write.",
-                    AgentToolCategory::Write,
-                ),
-                (
-                    "ast_grep",
-                    "Structural code search via ast-grep patterns.",
-                    AgentToolCategory::Read,
-                ),
-                (
-                    "bash",
-                    "Run shell commands in a persistent session.",
-                    AgentToolCategory::Shell,
-                ),
-                (
-                    "browser",
-                    "Drive a real Chromium tab via Puppeteer.",
-                    AgentToolCategory::Other,
-                ),
-                (
-                    "debug",
-                    "DAP-driven breakpoints, stepping, and locals inspection.",
-                    AgentToolCategory::Other,
-                ),
-                (
-                    "edit",
-                    "Line-anchored patches verified against file snapshots.",
-                    AgentToolCategory::Write,
-                ),
-                (
-                    "eval",
-                    "Run Python or JavaScript cells in a persistent kernel.",
-                    AgentToolCategory::Shell,
-                ),
-                (
-                    "find",
-                    "Fast file-name lookup by glob.",
-                    AgentToolCategory::Read,
-                ),
-                (
-                    "generate_image",
-                    "Structured image generation.",
-                    AgentToolCategory::Other,
-                ),
-                (
-                    "github",
-                    "GitHub repository, pull request, search, and Actions operations.",
-                    AgentToolCategory::Other,
-                ),
-                (
-                    "inspect_image",
-                    "Inspect a local image with a vision model.",
-                    AgentToolCategory::Read,
-                ),
-                (
-                    "irc",
-                    "Short messages between peer agents.",
-                    AgentToolCategory::Subagent,
-                ),
-                (
-                    "job",
-                    "List, wait on, or cancel background jobs.",
-                    AgentToolCategory::Subagent,
-                ),
-                (
-                    "lsp",
-                    "Language-server navigation, refactoring, actions, and diagnostics.",
-                    AgentToolCategory::Read,
-                ),
-                (
-                    "read",
-                    "Read files, directories, archives, data, documents, images, and URLs.",
-                    AgentToolCategory::Read,
-                ),
-                (
-                    "recipe",
-                    "Run a target from the project task runner.",
-                    AgentToolCategory::Shell,
-                ),
-                (
-                    "report_tool_issue",
-                    "Report unexpected tool behavior for QA tracking.",
-                    AgentToolCategory::Other,
-                ),
-                (
-                    "resolve",
-                    "Apply or discard a pending preview action.",
-                    AgentToolCategory::Write,
-                ),
-                (
-                    "search",
-                    "Regex content search across project data.",
-                    AgentToolCategory::Read,
-                ),
-                (
-                    "task",
-                    "Spawn parallel subagents.",
-                    AgentToolCategory::Subagent,
-                ),
-                (
-                    "todo",
-                    "Track phased tasks.",
-                    AgentToolCategory::Other,
-                ),
-                (
-                    "web_search",
-                    "Run a web search through the configured provider.",
-                    AgentToolCategory::Read,
-                ),
-                (
-                    "write",
-                    "Create or overwrite files and supported data targets.",
-                    AgentToolCategory::Write,
-                ),
-            ]
+        assert_eq!(actual, vec![
+            (
+                "ast_edit",
+                "Structural codemod via ast-grep patterns; preview-staged before write.",
+                AgentToolCategory::Write,
+            ),
+            (
+                "ast_grep",
+                "Structural code search via ast-grep patterns.",
+                AgentToolCategory::Read,
+            ),
+            (
+                "bash",
+                "Run shell commands in a persistent session.",
+                AgentToolCategory::Shell,
+            ),
+            (
+                "browser",
+                "Drive a real Chromium tab via Puppeteer.",
+                AgentToolCategory::Other,
+            ),
+            (
+                "debug",
+                "DAP-driven breakpoints, stepping, and locals inspection.",
+                AgentToolCategory::Other,
+            ),
+            (
+                "edit",
+                "Line-anchored patches verified against file snapshots.",
+                AgentToolCategory::Write,
+            ),
+            (
+                "eval",
+                "Run Python or JavaScript cells in a persistent kernel.",
+                AgentToolCategory::Shell,
+            ),
+            (
+                "find",
+                "Fast file-name lookup by glob.",
+                AgentToolCategory::Read,
+            ),
+            (
+                "generate_image",
+                "Structured image generation.",
+                AgentToolCategory::Other,
+            ),
+            (
+                "github",
+                "GitHub repository, pull request, search, and Actions operations.",
+                AgentToolCategory::Other,
+            ),
+            (
+                "inspect_image",
+                "Inspect a local image with a vision model.",
+                AgentToolCategory::Read,
+            ),
+            (
+                "irc",
+                "Short messages between peer agents.",
+                AgentToolCategory::Subagent,
+            ),
+            (
+                "job",
+                "List, wait on, or cancel background jobs.",
+                AgentToolCategory::Subagent,
+            ),
+            (
+                "lsp",
+                "Language-server navigation, refactoring, actions, and diagnostics.",
+                AgentToolCategory::Read,
+            ),
+            (
+                "read",
+                "Read files, directories, archives, data, documents, images, and URLs.",
+                AgentToolCategory::Read,
+            ),
+            (
+                "recipe",
+                "Run a target from the project task runner.",
+                AgentToolCategory::Shell,
+            ),
+            (
+                "report_tool_issue",
+                "Report unexpected tool behavior for QA tracking.",
+                AgentToolCategory::Other,
+            ),
+            (
+                "resolve",
+                "Apply or discard a pending preview action.",
+                AgentToolCategory::Write,
+            ),
+            (
+                "search",
+                "Regex content search across project data.",
+                AgentToolCategory::Read,
+            ),
+            (
+                "task",
+                "Spawn parallel subagents.",
+                AgentToolCategory::Subagent,
+            ),
+            ("todo", "Track phased tasks.", AgentToolCategory::Other,),
+            (
+                "web_search",
+                "Run a web search through the configured provider.",
+                AgentToolCategory::Read,
+            ),
+            (
+                "write",
+                "Create or overwrite files and supported data targets.",
+                AgentToolCategory::Write,
+            ),
+        ]);
+        assert!(
+            snapshot
+                .iter()
+                .all(|tool| { tool.source == AgentToolSource::Native && !tool.invoked })
         );
-        assert!(snapshot.iter().all(|tool| {
-            tool.source == AgentToolSource::Native && !tool.invoked
-        }));
     }
 
     #[test]
@@ -466,9 +451,12 @@ mod tests {
         );
 
         assert!(inventory.observe(observed("my_plugin_action", AcpToolKind::Other)));
-        assert!(inventory.snapshot().iter().any(|tool| {
-            tool.name == "my_plugin_action" && tool.invoked
-        }));
+        assert!(
+            inventory
+                .snapshot()
+                .iter()
+                .any(|tool| { tool.name == "my_plugin_action" && tool.invoked })
+        );
     }
 
     #[test]
@@ -478,7 +466,13 @@ mod tests {
         assert!(inventory.observe(observed("Plan next steps", AcpToolKind::Think)));
 
         let snapshot = inventory.snapshot();
-        assert!(snapshot.iter().find(|tool| tool.name == "todo").unwrap().invoked);
+        assert!(
+            snapshot
+                .iter()
+                .find(|tool| tool.name == "todo")
+                .unwrap()
+                .invoked
+        );
         assert!(!snapshot.iter().any(|tool| tool.name == "plan_next_steps"));
     }
 
@@ -488,13 +482,19 @@ mod tests {
         let raw_input = serde_json::json!({"operation": "update_todo", "items": []});
 
         assert!(inventory.observe(AcpObservedTool {
-            title: "Think",
-            kind: AcpToolKind::Think,
+            title:     "Think",
+            kind:      AcpToolKind::Think,
             raw_input: &raw_input,
         }));
 
         let snapshot = inventory.snapshot();
-        assert!(snapshot.iter().find(|tool| tool.name == "todo").unwrap().invoked);
+        assert!(
+            snapshot
+                .iter()
+                .find(|tool| tool.name == "todo")
+                .unwrap()
+                .invoked
+        );
         assert!(!snapshot.iter().any(|tool| tool.name == "think"));
     }
 
@@ -504,29 +504,31 @@ mod tests {
         let raw_input = serde_json::json!({"question": "Which approach is safer?"});
 
         assert!(inventory.observe(AcpObservedTool {
-            title: "Analyze architecture",
-            kind: AcpToolKind::Think,
+            title:     "Analyze architecture",
+            kind:      AcpToolKind::Think,
             raw_input: &raw_input,
         }));
 
         let snapshot = inventory.snapshot();
-        assert!(!snapshot.iter().find(|tool| tool.name == "todo").unwrap().invoked);
-        assert!(snapshot.iter().any(|tool| {
-            tool.name == "analyze_architecture" && tool.invoked
-        }));
+        assert!(
+            !snapshot
+                .iter()
+                .find(|tool| tool.name == "todo")
+                .unwrap()
+                .invoked
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|tool| { tool.name == "analyze_architecture" && tool.invoked })
+        );
     }
 
     #[test]
     fn unknown_titles_normalize_to_stable_snake_case_names() {
         let mut inventory = AcpToolInventory::for_harness(Some("codex"));
-        assert!(inventory.observe(observed(
-            "  Deploy!!! Stage @ PROD  ",
-            AcpToolKind::Other,
-        )));
-        assert!(!inventory.observe(observed(
-            "deploy stage -- prod",
-            AcpToolKind::Other,
-        )));
+        assert!(inventory.observe(observed("  Deploy!!! Stage @ PROD  ", AcpToolKind::Other,)));
+        assert!(!inventory.observe(observed("deploy stage -- prod", AcpToolKind::Other,)));
         assert!(inventory.observe(observed(" !!! ", AcpToolKind::Other)));
 
         let snapshot = inventory.snapshot();

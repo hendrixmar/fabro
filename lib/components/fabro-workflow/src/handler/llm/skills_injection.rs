@@ -74,9 +74,7 @@ pub async fn resolve_sandbox_home(sandbox: &dyn Sandbox) -> String {
         )
         .await
     {
-        Ok(result)
-            if result.exit_code == Some(0) && !result.stdout.trim().is_empty() =>
-        {
+        Ok(result) if result.exit_code == Some(0) && !result.stdout.trim().is_empty() => {
             result.stdout.trim().to_string()
         }
         _ => {
@@ -229,11 +227,7 @@ async fn upload_dir(
     Ok(())
 }
 
-fn collect_files(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<(String, String)>,
-) -> std::io::Result<()> {
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -314,10 +308,10 @@ mod tests {
             &home,
         )
         .await;
-        assert_eq!(
-            materialized,
-            vec!["tdd".to_string(), "code-review".to_string()]
-        );
+        assert_eq!(materialized, vec![
+            "tdd".to_string(),
+            "code-review".to_string()
+        ]);
 
         let tdd_skill = fake_home.path().join(".codex/skills/tdd/SKILL.md");
         assert_eq!(
@@ -329,10 +323,7 @@ mod tests {
             .join(".codex/skills/tdd/references/guide.md");
         assert_eq!(std::fs::read_to_string(&guide).unwrap(), "# guide\n");
         let review = fake_home.path().join(".codex/skills/code-review/SKILL.md");
-        assert_eq!(
-            std::fs::read_to_string(&review).unwrap(),
-            "# code review\n"
-        );
+        assert_eq!(std::fs::read_to_string(&review).unwrap(), "# code review\n");
 
         // Omp target: same sources land under ~/.omp/agent/skills.
         let materialized = materialize_skills_at(
