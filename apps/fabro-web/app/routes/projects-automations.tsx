@@ -260,12 +260,13 @@ function SelectAutomationDialog({
               Select an automation for {project.name}
             </DialogTitle>
             <p className="text-xs/5 text-fg-3">
-              Project enrollment copies the workflow configuration, not the
-              trigger activation: the new instance targets{" "}
+              The link always runs the global definition's current workflow
+              against{" "}
               <span className="font-mono text-fg-2">{project.repository}</span>{" "}
               on{" "}
-              <span className="font-mono text-fg-2">{project.default_branch}</span>{" "}
-              and starts with every trigger disabled.
+              <span className="font-mono text-fg-2">{project.default_branch}</span>.
+              Linking never enables a trigger; set one up after adding the
+              automation.
             </p>
 
             {sourcesQuery.isLoading && !sourcesQuery.data ? (
