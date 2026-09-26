@@ -101,10 +101,7 @@ pub(crate) async fn reconcile_once(state: &Arc<AppState>, now_ms: i64) -> anyhow
             .reserve(
                 &client.origin,
                 mapping.project_id,
-                automation
-                    .git_target()
-                    .and_then(|target| target.sha.as_deref())
-                    .unwrap_or(""),
+                pinned_workflow_sha(&automation).unwrap_or(""),
             )
             .await?
         {
@@ -172,10 +169,7 @@ pub(crate) async fn operator_retry(
             event,
             actor,
             allow_additional_run,
-            automation
-                .git_target()
-                .and_then(|target| target.sha.as_deref())
-                .unwrap_or(""),
+            pinned_workflow_sha(&automation).unwrap_or(""),
             generation,
             now,
         )
@@ -202,12 +196,7 @@ pub(super) async fn mapped_automation(
         .context("automation_missing")?;
     ensure!(
         automation.workflow == "incident-loop"
-            && pinned_revision(
-                automation
-                    .git_target()
-                    .and_then(|target| target.sha.as_deref())
-                    .unwrap_or("")
-            ),
+            && pinned_revision(pinned_workflow_sha(&automation).unwrap_or("")),
         "workflow_source_not_pinned"
     );
     Ok(automation)
@@ -218,6 +207,17 @@ pub(super) fn pinned_revision(value: &str) -> bool {
         && value
             .bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// The pinned revision an incident run's workflow loads from: the workflow
+/// source when the automation declares one (always, for a project link),
+/// else its own target.
+pub(super) fn pinned_workflow_sha(automation: &Automation) -> Option<&str> {
+    automation
+        .workflow_source
+        .as_ref()
+        .or_else(|| automation.git_target())
+        .and_then(|coordinate| coordinate.sha.as_deref())
 }
 
 pub(crate) async fn reconcile_run(state: &Arc<AppState>, run_id: RunId) -> anyhow::Result<()> {
@@ -332,7 +332,7 @@ async fn materialize_create(state: &Arc<AppState>, intent: &Intent) -> anyhow::R
             .transition_run(intent, "uncertain", Some("workflow_mapping_changed"))
             .await;
     };
-    if target.sha.as_deref() != Some(intent.revision.as_str()) {
+    if pinned_workflow_sha(&automation) != Some(intent.revision.as_str()) {
         return store
             .transition_run(intent, "uncertain", Some("workflow_mapping_changed"))
             .await;
@@ -362,7 +362,12 @@ async fn materialize_create(state: &Arc<AppState>, intent: &Intent) -> anyhow::R
             .transition_run(intent, "failed", Some("materialization_failed"))
             .await;
     };
-    if materialized.target.sha.as_deref() != Some(intent.revision.as_str()) {
+    let materialized_sha = materialized
+        .workflow_source
+        .as_ref()
+        .map(|source| source.resolved_sha.as_str())
+        .or(materialized.target.sha.as_deref());
+    if materialized_sha != Some(intent.revision.as_str()) {
         return store
             .transition_run(intent, "failed", Some("workflow_source_mismatch"))
             .await;
@@ -417,14 +422,14 @@ fn verify_binding(
                     && reference.trigger_id.is_none()),
         "run_identity_mismatch"
     );
-    ensure!(
-        projection
-            .spec
-            .git
-            .as_ref()
-            .is_some_and(|git| git.sha.as_deref() == Some(intent.revision.as_str())),
-        "run_source_mismatch"
-    );
+    let run_sha = projection
+        .spec
+        .automation
+        .as_ref()
+        .and_then(|reference| reference.workflow_source.as_ref())
+        .map(|source| source.resolved_sha.as_str())
+        .or_else(|| projection.spec.git.as_ref().and_then(|git| git.sha.as_deref()));
+    ensure!(run_sha == Some(intent.revision.as_str()), "run_source_mismatch");
     for (key, value) in intent.inputs() {
         ensure!(
             projection
