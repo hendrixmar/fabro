@@ -180,10 +180,7 @@ mod tests {
 
     #[test]
     fn harness_and_skills_not_overridden_by_stylesheet() {
-        let ss = parse_stylesheet(
-            ".builder { harness: omp; skills: code-review; }",
-        )
-        .unwrap();
+        let ss = parse_stylesheet(".builder { harness: omp; skills: code-review; }").unwrap();
         let mut graph = Graph::new("test");
 
         let mut node = Node::new("build");
@@ -201,10 +198,7 @@ mod tests {
             attrs.get("harness"),
             Some(&AttrValue::String("codex".into()))
         );
-        assert_eq!(
-            attrs.get("skills"),
-            Some(&AttrValue::String("tdd".into()))
-        );
+        assert_eq!(attrs.get("skills"), Some(&AttrValue::String("tdd".into())));
     }
 
     #[test]

@@ -752,11 +752,11 @@ pub enum Event {
         duration_ms: u64,
     },
     AgentSkillsMaterialized {
-        node_id:     String,
-        visit:       u32,
-        names:       Vec<String>,
-        target_dir:  String,
-        harness:     String,
+        node_id:    String,
+        visit:      u32,
+        names:      Vec<String>,
+        target_dir: String,
+        harness:    String,
     },
     PullRequestCreationRequested {
         creation_id: PullRequestCreationId,

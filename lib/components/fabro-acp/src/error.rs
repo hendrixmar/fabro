@@ -51,9 +51,7 @@ pub enum AcpError {
     },
 
     #[error("ACP agent reported an in-band error: {excerpt}")]
-    InBandError {
-        excerpt: String,
-    },
+    InBandError { excerpt: String },
 }
 
 impl AcpError {
