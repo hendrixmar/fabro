@@ -62,10 +62,8 @@ mod tests {
     use crate::{LintRule, Severity};
 
     fn temp_skills_root(tag: &str, skill_names: &[&str]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "fabro-skills-known-{tag}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fabro-skills-known-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp skills root");
         for name in skill_names {
@@ -93,7 +91,9 @@ mod tests {
             node_with_attrs("build", &[("skills", "tdd, diagnosing-bugs")]),
         );
 
-        let rule = Rule { skills_root: root.clone() };
+        let rule = Rule {
+            skills_root: root.clone(),
+        };
         assert!(rule.apply(&graph).is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -107,7 +107,9 @@ mod tests {
             node_with_attrs("build", &[("skills", "tdd,no-such-skill")]),
         );
 
-        let rule = Rule { skills_root: root.clone() };
+        let rule = Rule {
+            skills_root: root.clone(),
+        };
         let diagnostics = rule.apply(&graph);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Severity::Warning);
@@ -128,7 +130,9 @@ mod tests {
             node_with_attrs("build", &[("skills", "tdd,, ")]),
         );
 
-        let rule = Rule { skills_root: root.clone() };
+        let rule = Rule {
+            skills_root: root.clone(),
+        };
         assert!(rule.apply(&graph).is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
