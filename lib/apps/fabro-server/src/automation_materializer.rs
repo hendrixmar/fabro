@@ -18,7 +18,7 @@ use crate::git_checkout::{
 
 /// Server-owned run label carrying the owning project of a project-scoped
 /// automation run. Written only from server state, never from a caller.
-pub(crate) const PROJECT_LABEL: &str = "fabro_project_id";
+pub(crate) use fabro_types::PROJECT_LABEL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AutomationRunMaterializeInput {

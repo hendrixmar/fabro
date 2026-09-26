@@ -51,6 +51,21 @@ pub const RUN_SESSION_RECORDS_MIGRATION_SQL: &str =
 pub const RUN_HISTORY_ACTIVATION_MIGRATION_SQL: &str =
     include_str!("../migrations/2026082802_run_history_activation.sql");
 
+/// The automations migration, exposed so fixtures in other crates can
+/// install the `automations` table the projects migration alters.
+pub const AUTOMATIONS_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026071103_automations.sql");
+
+/// The native-projects migration, exposed so fixtures in other crates can
+/// resolve a run's owning project without a filesystem path into this crate.
+pub const PROJECTS_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026092101_projects_and_automation_scope.sql");
+
+/// The `runs.project_id` migration, exposed so fixtures in other crates can
+/// install the production schema without a filesystem path into this crate.
+pub const RUN_PROJECT_ID_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026092601_run_project_id.sql");
+
 #[derive(Clone)]
 pub struct Database {
     pool: DbPool,

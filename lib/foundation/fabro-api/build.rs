@@ -201,6 +201,7 @@ fn main() {
             &[],
         ),
         ("Run", "fabro_types::Run", &[]),
+        ("RunProjectRef", "fabro_types::RunProjectRef", &[]),
         ("RunApproval", "fabro_types::RunApproval", &[]),
         ("RunApprovalState", "fabro_types::RunApprovalState", &[]),
         ("RunRunnableSource", "fabro_types::RunRunnableSource", &[]),

@@ -446,6 +446,7 @@ mod tests {
             },
             automation:       None,
             repository:       None,
+            project:          None,
             created_by:       test_support::test_principal(),
             origin:           RunOrigin::default(),
             labels:           HashMap::from([("group".to_string(), group.to_string())]),
