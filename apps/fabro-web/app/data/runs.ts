@@ -22,6 +22,7 @@ export interface CheckRun {
 export interface RunItem {
   id: string;
   repo: string;
+  projectName: string | null;
   title: string;
   workflow: string;
   column?: BoardColumn;
@@ -97,6 +98,7 @@ export function mapRunListItem(item: Run): RunItem {
   return {
     id: item.id,
     repo: displayRepoName(item.repository?.name ?? "unknown"),
+    projectName: item.project?.name ?? null,
     title: displayRunTitle(item.title),
     workflow: item.workflow.name ?? item.workflow.graph_name ?? item.workflow.slug ?? "unknown",
     column: columnForRun(item) ?? undefined,

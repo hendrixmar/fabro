@@ -10,20 +10,20 @@ import {
 } from "../../components/runs-list/preferences";
 import { StatusFilterButton } from "../../components/runs-list/status-filter-button";
 import type { ToggleableColumn } from "../../components/runs-list/toggleable-column";
+import { useProjects } from "../../lib/queries";
 
 interface RunsToolbarProps {
   query: string;
-  repoFilter: string;
+  projectFilter: string;
   workflowFilter: string;
   createdFilter: CreatedFilter;
   statusFilter: Set<BoardColumn>;
   includeArchived: boolean;
   view: ViewMode;
   hiddenColumns: Set<ToggleableColumn>;
-  allRepos: string[];
   allWorkflows: string[];
   onQueryChange: (value: string) => void;
-  onRepoFilterChange: (value: string) => void;
+  onProjectFilterChange: (value: string) => void;
   onWorkflowFilterChange: (value: string) => void;
   onCreatedFilterChange: (value: CreatedFilter) => void;
   onStatusFilterChange: (value: Set<BoardColumn>) => void;
@@ -34,17 +34,16 @@ interface RunsToolbarProps {
 
 export function RunsToolbar({
   query,
-  repoFilter,
+  projectFilter,
   workflowFilter,
   createdFilter,
   statusFilter,
   includeArchived,
   view,
   hiddenColumns,
-  allRepos,
   allWorkflows,
   onQueryChange,
-  onRepoFilterChange,
+  onProjectFilterChange,
   onWorkflowFilterChange,
   onCreatedFilterChange,
   onStatusFilterChange,
@@ -52,6 +51,12 @@ export function RunsToolbar({
   onViewChange,
   onHiddenColumnsChange,
 }: RunsToolbarProps) {
+  const projects = useProjects();
+  const projectOptions = [
+    { value: "all", label: "All projects" },
+    { value: "none", label: "Unassigned" },
+    ...(projects.data?.data ?? []).map((project) => ({ value: project.id, label: project.name })),
+  ];
   return (
     <div className="flex flex-wrap items-center gap-2">
       <div className="relative w-64">
@@ -76,14 +81,11 @@ export function RunsToolbar({
         onChange={onCreatedFilterChange}
       />
       <FilterButton
-        label="Repo"
-        value={repoFilter}
+        label="Project"
+        value={projectFilter}
         allValue="all"
-        options={[
-          { value: "all", label: "All repos" },
-          ...allRepos.map((repo) => ({ value: repo, label: repo })),
-        ]}
-        onChange={onRepoFilterChange}
+        options={projectOptions}
+        onChange={onProjectFilterChange}
       />
       <FilterButton
         label="Workflow"

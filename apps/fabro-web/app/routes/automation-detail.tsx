@@ -411,6 +411,18 @@ function AutomationRunsList({ automationId }: { automationId: string }) {
     return Array.from(repos).sort();
   }, [runsQuery.data]);
   const createdCutoffMs = createdCutoffMsFor(createdFilter);
+  // RunsListView no longer filters by repo itself (Task 14 moved repo
+  // filtering to the server-side project filter on the global Runs page), so
+  // this automation-scoped page applies its own repo filter before handing
+  // data down.
+  const repoFilteredData = useMemo(() => {
+    if (!runsQuery.data) return undefined;
+    if (repoFilter === "all") return runsQuery.data;
+    return {
+      ...runsQuery.data,
+      data: runsQuery.data.data.filter((run) => toRunWithStatus(run).repo === repoFilter),
+    };
+  }, [runsQuery.data, repoFilter]);
 
   const now = useTickingNow(true, 15_000);
   const updatedAt = useDataUpdatedAt(runsQuery.data);
@@ -491,7 +503,7 @@ function AutomationRunsList({ automationId }: { automationId: string }) {
       </div>
 
       <RunsListView
-        data={runsQuery.data ?? undefined}
+        data={repoFilteredData}
         isLoading={runsQuery.data == null && runsQuery.isLoading}
         emptyState={
           <EmptyState
@@ -508,7 +520,6 @@ function AutomationRunsList({ automationId }: { automationId: string }) {
         onPageChange={setPage}
         onPageSizeChange={setPageSize}
         query={lowerQuery}
-        repoFilter={repoFilter}
         workflowFilter="all"
         statusFilter={statusFilter}
         createdCutoffMs={createdCutoffMs}

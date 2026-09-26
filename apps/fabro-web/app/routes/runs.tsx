@@ -147,7 +147,7 @@ export function buildFilterOptions(
 ): string[] {
   const values = new Set(items.map(pick));
   // Keep the active selection visible even when no loaded run matches it,
-  // e.g. a stored repo filter while paginating the list view.
+  // e.g. a stored workflow filter while paginating the list view.
   if (selected !== "all") values.add(selected);
   return Array.from(values).sort();
 }
@@ -733,7 +733,7 @@ export default function Runs() {
   const {
     hydratedSearch,
     query,
-    repoFilter,
+    projectFilter,
     workflowFilter,
     createdFilter,
     statusFilter,
@@ -745,7 +745,7 @@ export default function Runs() {
     pageSize,
     hiddenColumns,
     setQuery,
-    setRepoFilter,
+    setProjectFilter,
     setWorkflowFilter,
     setCreatedFilter,
     setStatusFilter,
@@ -757,10 +757,12 @@ export default function Runs() {
     handleSortClick,
   } = useRunsWorkspacePreferences();
 
-  const boardRuns = useAllRuns({ includeArchived }, view === "columns");
+  const projectId = projectFilter === "all" ? undefined : projectFilter;
+  const boardRuns = useAllRuns({ includeArchived, projectId }, view === "columns");
   const listRunsPage = useRunsPage(
     {
       includeArchived,
+      projectId,
       sort,
       direction,
       limit:  pageSize,
@@ -789,7 +791,6 @@ export default function Runs() {
     view === "list"
       ? (listRunsPage.data?.data ?? []).map(mapRunListItem)
       : initialColumns.flatMap((col: Column) => col.items);
-  const allRepos = buildFilterOptions(filterSourceItems, (item) => item.repo, repoFilter);
   const allWorkflows = buildFilterOptions(
     filterSourceItems,
     (item) => item.workflow,
@@ -831,7 +832,6 @@ export default function Runs() {
     ...col,
     items: col.items.filter(
       (item) =>
-        (repoFilter === "all" || item.repo === repoFilter) &&
         (workflowFilter === "all" || item.workflow === workflowFilter) &&
         (createdCutoffMs == null ||
           (item.createdAt != null && Date.parse(item.createdAt) >= createdCutoffMs)) &&
@@ -863,17 +863,16 @@ export default function Runs() {
         <div className="flex h-full min-h-0 flex-col gap-4">
           <RunsToolbar
             query={query}
-            repoFilter={repoFilter}
+            projectFilter={projectFilter}
             workflowFilter={workflowFilter}
             createdFilter={createdFilter}
             statusFilter={statusFilter}
             includeArchived={includeArchived}
             view={view}
             hiddenColumns={hiddenColumns}
-            allRepos={allRepos}
             allWorkflows={allWorkflows}
             onQueryChange={setQuery}
-            onRepoFilterChange={setRepoFilter}
+            onProjectFilterChange={setProjectFilter}
             onWorkflowFilterChange={setWorkflowFilter}
             onCreatedFilterChange={setCreatedFilter}
             onStatusFilterChange={setStatusFilter}
@@ -904,7 +903,7 @@ export default function Runs() {
                 <div className="py-8">
                   <EmptyState
                     title="No matching runs"
-                    description="Try clearing the search or repo filter."
+                    description="Try clearing the search or project filter."
                   />
                 </div>
               ) : null}
@@ -926,7 +925,6 @@ export default function Runs() {
                 onPageChange={setPage}
                 onPageSizeChange={setPageSize}
                 query={lowerQuery}
-                repoFilter={repoFilter}
                 workflowFilter={workflowFilter}
                 statusFilter={statusFilter}
                 createdCutoffMs={createdCutoffMs}
