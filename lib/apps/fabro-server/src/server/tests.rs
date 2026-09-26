@@ -5121,6 +5121,12 @@ async fn create_run_from_intent_admits_project_scoped_automation_run() {
         })
         .await
         .expect("project should be created");
+    // A project automation only materializes for a registered project.
+    state
+        .project_store()
+        .set_intake_binding(&project.id, &project.revision, Some("tierrapay"))
+        .await
+        .expect("project should be registered");
 
     let automation_id = AutomationId::new("tierrapay-nightly").unwrap();
     state
@@ -5643,6 +5649,252 @@ async fn project_automation_materializes_with_its_registry_project_input() {
         .await
         .unwrap();
     assert_eq!(materialized.project_input.as_deref(), Some("tierrapay"));
+}
+
+/// A project automation runs for exactly one registered project: without a
+/// registry binding there is no `inputs.project`, and running without it
+/// would act on every project, so materialization fails closed.
+#[tokio::test]
+async fn project_automation_without_a_registry_binding_does_not_materialize() {
+    let target = fabro_types::GitRunTarget {
+        repo:   "artesanos-digitales/tierrapay".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+    };
+    let fake =
+        crate::automation_materializer::TestAutomationRunMaterializer::succeed(target.clone());
+    let state = crate::test_support::TestAppStateBuilder::new()
+        .automation_materializer(fake.clone())
+        .build();
+    let project = state
+        .project_store()
+        .create(fabro_automation::ProjectDraft {
+            id:                   fabro_automation::ProjectId::new("tierrapay").unwrap(),
+            name:                 "TierraPay".to_string(),
+            github_repository_id: fabro_automation::GithubRepositoryId::new("42").unwrap(),
+            repository:           "artesanos-digitales/tierrapay".to_string(),
+            default_branch:       "main".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let error = state
+        .materialize_automation_run(
+            crate::automation_materializer::AutomationRunMaterializeInput {
+                automation_id:   fabro_automation::AutomationId::new("tierrapay-woodpecker")
+                    .unwrap(),
+                target:          fabro_types::GitRunTarget {
+                    sha: None,
+                    ..target
+                },
+                workflow_source: None,
+                workflow:        "woodpecker-loop".to_string(),
+                run_id:          RunId::new(),
+                temp_root:       state.automation_temp_root(),
+                project_id:      Some(project.id.clone()),
+            },
+        )
+        .await
+        .expect_err("an unregistered project cannot pass inputs.project");
+    assert!(
+        matches!(
+            &error,
+            crate::automation_materializer::RunMaterializeError::ProjectNotRegistered { id } if *id == project.id
+        ),
+        "{error}"
+    );
+    assert!(fake.captured_inputs().is_empty(), "nothing is checked out");
+}
+
+/// A project link fires end to end through the real handlers: linking
+/// validates the global's workflow, and firing the link runs that workflow
+/// against the project with `inputs.project` set to its registry binding.
+#[tokio::test]
+async fn project_link_fires_the_global_workflow_for_its_project() {
+    let target = GitRunTarget {
+        repo:   "artesanos-digitales/tierrapay".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+    };
+    let fake = TestAutomationRunMaterializer::succeed_with_workflow_toml(
+        target,
+        "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n[run.inputs]\nproject = { type = \"string\", default = \"\" }\n[run.clone]\nenabled = true\n",
+    );
+    // One SQLite pool for runs and projects, as a real server has, so the
+    // run's project overlay resolves.
+    let temp = tempfile::tempdir().expect("test tempdir should be created");
+    let vault_path = temp.path().join("vault.json");
+    let db_pool = crate::test_support::test_db_pool_for_vault_path(&vault_path)
+        .expect("shared test db pool should build");
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let store = Arc::new(fabro_store::test_support::test_database_with_stores(
+        Arc::clone(&object_store),
+        "",
+        std::time::Duration::from_millis(1),
+        None,
+        fabro_store::test_support::test_blob_store(),
+        Arc::new(fabro_store::RunSummaryStore::new(db_pool)),
+    ));
+    let state = TestAppStateBuilder::new()
+        .store_bundle(
+            store,
+            fabro_store::ArtifactStore::new(object_store, "artifacts"),
+        )
+        .vault_path(vault_path)
+        .automation_materializer(fake.clone())
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
+    let app = build_test_router(Arc::clone(&state));
+
+    let project = state
+        .project_store()
+        .create(fabro_automation::ProjectDraft {
+            id:                   ProjectId::new("tierrapay").unwrap(),
+            name:                 "TierraPay".to_string(),
+            github_repository_id: fabro_automation::GithubRepositoryId::new("42").unwrap(),
+            repository:           "artesanos-digitales/tierrapay".to_string(),
+            default_branch:       "main".to_string(),
+        })
+        .await
+        .unwrap();
+    state
+        .project_store()
+        .set_intake_binding(&project.id, &project.revision, Some("tierrapay"))
+        .await
+        .unwrap();
+    let global_source = GitRunTarget {
+        repo:   "fabro-sh/workflows".to_string(),
+        branch: "main".to_string(),
+        tag:    Some("v1".to_string()),
+        sha:    None,
+    };
+    let global = state
+        .automation_store()
+        .create(fabro_automation::AutomationDraft {
+            id:                    AutomationId::new("ticket-loop").unwrap(),
+            name:                  "Ticket loop".to_string(),
+            description:           None,
+            environment_id:        Some("default".to_string()),
+            target:                RunTarget::Git(global_source.clone()),
+            workflow:              "ticket-loop".to_string(),
+            workflow_source:       None,
+            project_id:            None,
+            available_to_projects: true,
+            source_automation_id:  None,
+            triggers:              Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/projects/tierrapay/automations",
+            &json!({
+                "id": "tierrapay-ticket-loop",
+                "name": "TierraPay ticket loop",
+                "source_automation_id": "ticket-loop",
+                "source_revision": global.revision.as_str(),
+                "environment_id": "default"
+            }),
+        ))
+        .await
+        .unwrap();
+    let link = response_json!(response, StatusCode::CREATED).await;
+    assert_eq!(link["source_automation_id"], "ticket-loop", "{link}");
+
+    // Linking never enables a trigger; turn on the link's API trigger.
+    let link_id = AutomationId::new("tierrapay-ticket-loop").unwrap();
+    let stored = state
+        .automation_store()
+        .get(&link_id)
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .automation_store()
+        .replace(
+            &link_id,
+            &stored.revision,
+            fabro_automation::AutomationReplace {
+                name:                  stored.name.clone(),
+                description:           None,
+                environment_id:        stored.environment_id.clone(),
+                target:                stored.target.clone(),
+                workflow:              stored.workflow.clone(),
+                workflow_source:       stored.workflow_source.clone(),
+                project_id:            stored.project_id.clone(),
+                available_to_projects: false,
+                triggers:              vec![fabro_automation::AutomationTrigger::Api(
+                    fabro_automation::ApiTrigger {
+                        id:      fabro_automation::AutomationTriggerId::new("manual").unwrap(),
+                        enabled: true,
+                    },
+                )],
+            },
+        )
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(api("/automations/tierrapay-ticket-loop/runs"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let run = response_json!(response, StatusCode::CREATED).await;
+    assert_eq!(run["project"]["id"], "tierrapay", "{run}");
+    let run_id = run["id"].as_str().unwrap().parse::<RunId>().unwrap();
+    let projection = state
+        .stores
+        .runs
+        .open_run(&run_id)
+        .await
+        .unwrap()
+        .state()
+        .await
+        .unwrap();
+    assert_eq!(
+        projection
+            .spec
+            .settings
+            .run
+            .inputs
+            .get("project")
+            .and_then(toml::Value::as_str),
+        Some("tierrapay")
+    );
+    let fired = fake.captured_inputs().pop().expect("the fire materialized");
+    assert_eq!(fired.automation_id, link_id);
+    assert_eq!(fired.workflow, "ticket-loop");
+    assert_eq!(fired.workflow_source, Some(global_source));
+    assert_eq!(fired.target.repo, "artesanos-digitales/tierrapay");
+
+    // The linked global cannot be deleted while the link exists.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(api("/automations/ticket-loop"))
+                .header(header::IF_MATCH, global.revision.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let error = response_json!(response, StatusCode::CONFLICT).await;
+    assert_eq!(error["errors"][0]["code"], "automation_in_use", "{error}");
 }
 
 async fn mock_openai_title_response<'a>(

@@ -130,6 +130,8 @@ pub(crate) enum RunMaterializeError {
     },
     #[error("automation project {id} no longer exists")]
     ProjectNotFound { id: ProjectId },
+    #[error("project {id} has no registry binding; cannot pass inputs.project")]
+    ProjectNotRegistered { id: ProjectId },
     #[error(
         "automation project {project_id} owns repository {project_repository}, but the automation targets {target_repository}"
     )]

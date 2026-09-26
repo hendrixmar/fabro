@@ -1265,20 +1265,24 @@ impl AppState {
         &self,
         input: AutomationRunMaterializeInput,
     ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
-        let project = match &input.project_id {
-            Some(project_id) => Some(
-                self.validate_automation_project(project_id, &input.target)
-                    .await?,
-            ),
+        // A project automation runs its workflow for exactly one registered
+        // project. Without a registry binding there is no `inputs.project`,
+        // and running without it would act on every project: fail closed.
+        let project_input = match &input.project_id {
+            Some(project_id) => {
+                let project = self
+                    .validate_automation_project(project_id, &input.target)
+                    .await?;
+                Some(
+                    project
+                        .intake_binding_id
+                        .ok_or(RunMaterializeError::ProjectNotRegistered { id: project.id })?,
+                )
+            }
             None => None,
         };
-        let input = AutomationRunMaterializeInput {
-            project_id: project.as_ref().map(|project| project.id.clone()),
-            ..input
-        };
         let mut materialized = self.materialize_validated_automation_run(input).await?;
-        // A project automation runs its workflow for exactly this project.
-        materialized.project_input = project.and_then(|project| project.intake_binding_id);
+        materialized.project_input = project_input;
         Ok(materialized)
     }
 
