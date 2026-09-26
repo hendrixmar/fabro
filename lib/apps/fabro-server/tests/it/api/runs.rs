@@ -498,3 +498,27 @@ async fn parent_link_validation_rejects_missing_self_and_cycles() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn callers_cannot_set_the_project_label() {
+    let app = fabro_server::test_support::build_test_router(crate::helpers::test_app_state());
+    let mut manifest = minimal_manifest_json(MINIMAL_DOT);
+    manifest["args"] = serde_json::json!({ "label": ["fabro_project_id=tierrapay"] });
+    manifest["configs"] = serde_json::json!([]);
+    let request = Request::builder()
+        .method("POST")
+        .uri(api("/runs"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&manifest).unwrap()))
+        .unwrap();
+    let body = response_json(
+        app.clone().oneshot(request).await.unwrap(),
+        StatusCode::CONFLICT,
+        "POST /api/v1/runs with a project label",
+    )
+    .await;
+    assert_eq!(
+        body["errors"][0]["code"], "run_project_binding_invalid",
+        "{body}"
+    );
+}

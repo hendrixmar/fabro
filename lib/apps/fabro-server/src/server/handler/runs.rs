@@ -613,6 +613,21 @@ pub(crate) struct CreateRunFromIntentRequest {
     pub(crate) automation:      Option<AutomationRef>,
 }
 
+/// `fabro_project_id` is server-owned. Whatever layer a label came from
+/// (caller args, workflow TOML, user config), it may only carry the project
+/// admission verified for an automation run.
+fn carries_unverified_project_label(
+    prepared: &run_compiler::PreparedRun,
+    verified: Option<&str>,
+) -> bool {
+    prepared
+        .settings()
+        .combined_labels()
+        .get(PROJECT_LABEL)
+        .map(String::as_str)
+        != verified
+}
+
 /// Re-verify the server-derived project label of an automation run against
 /// the persisted automation and project rows.
 ///
@@ -742,6 +757,7 @@ pub(crate) async fn create_run_from_intent(
     {
         return response;
     }
+    let verified_project = intent.args.labels.get(PROJECT_LABEL).cloned();
     // Validate the pure, in-memory request facts before paying for
     // blob-store reads and closure lowering.
     let ValidatedRunTarget { target, git } = match intent.target.validate() {
@@ -884,6 +900,13 @@ pub(crate) async fn create_run_from_intent(
         Err(error) => return run_intent_admission_error(error.into()),
     };
     prepared = prepared.with_target_and_git(target, git);
+    if carries_unverified_project_label(&prepared, verified_project.as_deref()) {
+        return intent_error(
+            StatusCode::CONFLICT,
+            "fabro_project_id is set by the server, not by callers",
+            "run_project_binding_invalid",
+        );
+    }
     let (prepared, run_id) = prepared.resolve_run_id();
     if let Err(response) = validate_optional_parent(&state, run_id, prepared.parent_id()).await {
         return response;
@@ -1489,6 +1512,14 @@ pub(crate) async fn create_run_from_manifest(
         Ok(prepared) => prepared,
         Err(err) => return run_compiler_error_response(err),
     };
+    if carries_unverified_project_label(&prepared, None) {
+        return ApiError::with_code(
+            StatusCode::CONFLICT,
+            "fabro_project_id is set by the server, not by callers",
+            "run_project_binding_invalid",
+        )
+        .into_response();
+    }
     let identity = match manifest_run_identity(&manifest, explicit_run_id) {
         Ok(identity) => identity,
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
