@@ -424,6 +424,14 @@ impl From<AutomationStoreError> for ApiError {
             AutomationStoreError::Validation { source } => {
                 Self::new(StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
             }
+            err @ AutomationStoreError::InUse { .. } => {
+                Self::with_code(StatusCode::CONFLICT, err.to_string(), "automation_in_use")
+            }
+            err @ AutomationStoreError::LinkRequiresProject { .. } => Self::with_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                err.to_string(),
+                "automation_link_requires_project",
+            ),
             err => {
                 tracing::error!(error = ?err, "Automation store operation failed");
                 Self::new(
