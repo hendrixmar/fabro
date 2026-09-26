@@ -61,6 +61,41 @@ fn read_budget_parks_on_fifth_failure() {
     assert_eq!(retry_deadline(5, 100), None);
 }
 
+#[test]
+fn the_pinned_revision_is_where_the_workflow_loads_from() {
+    let pinned = "1e930e021b91bfebfd0b9362300b39717ffa6d6b";
+    let git = |repo: &str, sha: Option<&str>| fabro_types::GitRunTarget {
+        repo:   repo.to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    sha.map(str::to_string),
+    };
+    let mut global = fabro_automation::Automation {
+        id:                    fabro_automation::AutomationId::new("incident-loop").unwrap(),
+        revision:              fabro_automation::AutomationRevision::from_bytes(b"incident-loop"),
+        name:                  "Incident loop".to_string(),
+        description:           None,
+        environment_id:        Some("reliability-host".to_string()),
+        last_error:            None,
+        target:                fabro_types::RunTarget::Git(git(
+            "hendrixmar/fabro-demo",
+            Some(pinned),
+        )),
+        workflow:              "incident-loop".to_string(),
+        workflow_source:       None,
+        project_id:            None,
+        available_to_projects: true,
+        source_automation_id:  None,
+        triggers:              Vec::new(),
+    };
+    assert_eq!(worker::pinned_workflow_sha(&global), Some(pinned));
+
+    // A link targets the project and loads the workflow from the global's pin.
+    global.target = fabro_types::RunTarget::Git(git("artesanos-digitales/tierrapay", None));
+    global.workflow_source = Some(git("hendrixmar/fabro-demo", Some(pinned)));
+    assert_eq!(worker::pinned_workflow_sha(&global), Some(pinned));
+}
+
 use std::sync::Arc;
 
 use fabro_types::{AutomationRef, Principal, RunId, RunStatus, SystemActorKind};
