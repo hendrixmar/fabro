@@ -14259,6 +14259,11 @@ components:
           oneOf:
             - $ref: "#/components/schemas/RepositoryRef"
             - type: "null"
+        project:
+          description: Owning project, decided when the run was admitted. Absent or null when unassigned.
+          oneOf:
+            - $ref: "#/components/schemas/RunProjectRef"
+            - type: "null"
         created_by:
           $ref: "#/components/schemas/Principal"
         origin:
@@ -14371,6 +14376,17 @@ components:
           oneOf:
             - $ref: "#/components/schemas/ResolvedAutomationGitWorkflowSource"
             - type: "null"
+
+    RunProjectRef:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          example: tierrapay
+        name:
+          type: string
+          example: TierraPay
 
     RunOrigin:
       type: object

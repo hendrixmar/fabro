@@ -159,9 +159,10 @@ pub use run_sandbox::{
     RunSandboxRuntime,
 };
 pub use run_summary::{
-    AskFabro, AskFabroUnavailableReason, AutomationRef, ResolvedAutomationGitWorkflowSource, Run,
-    RunApproval, RunApprovalState, RunBillingSummary, RunError, RunLifecycle, RunLinks, RunModel,
-    RunOrigin, RunOriginKind, RunSize, RunTimestamps, WorkflowRef,
+    AskFabro, AskFabroUnavailableReason, AutomationRef, PROJECT_LABEL,
+    ResolvedAutomationGitWorkflowSource, Run, RunApproval, RunApprovalState, RunBillingSummary,
+    RunError, RunLifecycle, RunLinks, RunModel, RunOrigin, RunOriginKind, RunProjectRef, RunSize,
+    RunTimestamps, WorkflowRef,
 };
 pub use run_title::{
     MAX_RUN_TITLE_CHARS, RunTitleError, infer_run_title, normalize_explicit_run_title,

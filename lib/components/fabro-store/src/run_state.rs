@@ -1449,6 +1449,7 @@ pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> Run {
             repo_origin_url,
             source_directory.as_deref(),
         )),
+        project: None,
         created_by,
         origin: RunOrigin::default(),
         labels: state.spec.labels.clone(),

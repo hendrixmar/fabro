@@ -1206,6 +1206,7 @@ mod runs {
                 repo_origin_url,
                 source_directory.as_deref(),
             )),
+            project: None,
             created_by: DEMO_PRINCIPAL.clone(),
             origin: RunOrigin::default(),
             labels: labels(entries),
