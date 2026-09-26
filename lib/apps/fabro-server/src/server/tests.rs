@@ -50,7 +50,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{Layer, Registry};
 
 use super::*;
-use crate::automation_materializer::AutomationRunMaterializeInput;
+use crate::automation_materializer::{AutomationRunMaterializeInput, PROJECT_LABEL};
 use crate::github_webhooks::compute_signature;
 use crate::jwt_auth::{AuthMode, ConfiguredAuth};
 use crate::test_support::*;
@@ -5065,6 +5065,139 @@ async fn create_run_from_intent_helper_persists_automation_version_and_exact_tar
             .map(|event| event.event.event_name())
             .collect::<Vec<_>>(),
         ["run.created", "run.submitted"]
+    );
+}
+
+/// A project-scoped automation's run must be admitted end to end: this
+/// exercises the real `validate_automation_project` + `into_run_intent` path
+/// (not a hand-built label) so a round-trip mismatch between how the label is
+/// written and how `carries_unverified_project_label` reads it back via
+/// `combined_labels()` would show up as a spurious 409 here.
+#[tokio::test]
+async fn create_run_from_intent_admits_project_scoped_automation_run() {
+    let target = GitRunTarget {
+        repo:   "artesanos-digitales/tierrapay".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    None,
+    };
+    let fake = TestAutomationRunMaterializer::succeed(target.clone());
+    // The run-summary store's project overlay joins against a `projects`
+    // table on its own SQLite pool, separate by default from the control
+    // plane pool `project_store`/`automation_store` use. Wire both to one
+    // shared pool so this test can actually observe the overlay, the way a
+    // real server (one SQLite file for everything) does.
+    let temp = tempfile::tempdir().expect("test tempdir should be created");
+    let vault_path = temp.path().join("vault.json");
+    let db_pool = crate::test_support::test_db_pool_for_vault_path(&vault_path)
+        .expect("shared test db pool should build");
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let store = Arc::new(fabro_store::test_support::test_database_with_stores(
+        Arc::clone(&object_store),
+        "",
+        std::time::Duration::from_millis(1),
+        None,
+        fabro_store::test_support::test_blob_store(),
+        Arc::new(fabro_store::RunSummaryStore::new(db_pool)),
+    ));
+    let artifact_store = fabro_store::ArtifactStore::new(object_store, "artifacts");
+    let state = TestAppStateBuilder::new()
+        .store_bundle(store, artifact_store)
+        .vault_path(vault_path)
+        .automation_materializer(fake.clone())
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
+
+    let project = state
+        .project_store()
+        .create(fabro_automation::ProjectDraft {
+            id:                   ProjectId::new("tierrapay").unwrap(),
+            name:                 "TierraPay".to_string(),
+            github_repository_id: fabro_automation::GithubRepositoryId::new("42").unwrap(),
+            repository:           "artesanos-digitales/tierrapay".to_string(),
+            default_branch:       "main".to_string(),
+        })
+        .await
+        .expect("project should be created");
+
+    let automation_id = AutomationId::new("tierrapay-nightly").unwrap();
+    state
+        .automation_store()
+        .create(fabro_automation::AutomationDraft {
+            id:                    automation_id.clone(),
+            name:                  "Nightly".to_string(),
+            description:           None,
+            environment_id:        Some("default".to_string()),
+            target:                RunTarget::Git(target.clone()),
+            workflow:              "demo".to_string(),
+            workflow_source:       None,
+            project_id:            Some(project.id.clone()),
+            available_to_projects: false,
+            triggers:              Vec::new(),
+        })
+        .await
+        .expect("project-owned automation should be created");
+
+    let run_id = RunId::new();
+    let materialized = state
+        .materialize_automation_run(AutomationRunMaterializeInput {
+            automation_id: automation_id.clone(),
+            target: target.clone(),
+            workflow_source: None,
+            workflow: "demo".to_string(),
+            run_id,
+            temp_root: PathBuf::from("/tmp/fabro/automation"),
+            project_id: Some(project.id.clone()),
+        })
+        .await
+        .expect("project-owned automation should materialize");
+    let intent = materialized.into_run_intent("default".to_string());
+    assert_eq!(
+        intent.args.labels.get(PROJECT_LABEL).map(String::as_str),
+        Some("tierrapay"),
+        "materialized intent should carry the server-verified project label"
+    );
+
+    let automation_ref = fabro_types::AutomationRef {
+        id:              automation_id.as_str().to_string(),
+        name:            Some("Nightly".to_string()),
+        trigger_id:      None,
+        workflow_source: None,
+    };
+
+    let response = Box::pin(handler::runs::create_run_from_intent(
+        Arc::clone(&state),
+        handler::runs::CreateRunFromIntentRequest {
+            intent,
+            explicit_run_id: Some(run_id),
+            actor: Principal::System {
+                system_kind: SystemActorKind::Engine,
+            },
+            headers: HeaderMap::new(),
+            automation: Some(automation_ref),
+        },
+    ))
+    .await;
+
+    let body = response_json!(response, StatusCode::CREATED).await;
+    assert_eq!(body["project"]["id"], "tierrapay", "{body}");
+
+    let summary = state
+        .stores
+        .run_summaries
+        .get(&run_id, Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        summary.project,
+        Some(fabro_types::RunProjectRef {
+            id:   "tierrapay".to_string(),
+            name: "TierraPay".to_string(),
+        }),
+        "the run summary should resolve the project from the server-verified label"
     );
 }
 
