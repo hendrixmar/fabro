@@ -1240,7 +1240,7 @@ impl AppState {
         &self,
         project_id: &ProjectId,
         target: &fabro_types::GitRunTarget,
-    ) -> Result<ProjectId, RunMaterializeError> {
+    ) -> Result<fabro_automation::Project, RunMaterializeError> {
         let Some(project) = self.project_store().get(project_id).await? else {
             return Err(RunMaterializeError::ProjectNotFound {
                 id: project_id.clone(),
@@ -1258,24 +1258,34 @@ impl AppState {
                 target_repository:  target.repo.clone(),
             });
         }
-        Ok(project.id)
+        Ok(project)
     }
 
     pub(crate) async fn materialize_automation_run(
         &self,
         input: AutomationRunMaterializeInput,
     ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
-        let project_id = match input.project_id.clone() {
+        let project = match &input.project_id {
             Some(project_id) => Some(
-                self.validate_automation_project(&project_id, &input.target)
+                self.validate_automation_project(project_id, &input.target)
                     .await?,
             ),
             None => None,
         };
         let input = AutomationRunMaterializeInput {
-            project_id,
+            project_id: project.as_ref().map(|project| project.id.clone()),
             ..input
         };
+        let mut materialized = self.materialize_validated_automation_run(input).await?;
+        // A project automation runs its workflow for exactly this project.
+        materialized.project_input = project.and_then(|project| project.intake_binding_id);
+        Ok(materialized)
+    }
+
+    async fn materialize_validated_automation_run(
+        &self,
+        input: AutomationRunMaterializeInput,
+    ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(materializer) = self.automation_materializer_override.as_ref() {
             return materializer.materialize(input).await;

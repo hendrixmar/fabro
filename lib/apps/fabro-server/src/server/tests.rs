@@ -5600,6 +5600,51 @@ async fn fake_automation_materializer_injection_captures_input_and_returns_versi
     assert_eq!(captured[0].temp_root, temp_root);
 }
 
+#[tokio::test]
+async fn project_automation_materializes_with_its_registry_project_input() {
+    let target = fabro_types::GitRunTarget {
+        repo:   "artesanos-digitales/tierrapay".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+    };
+    let state = crate::test_support::TestAppStateBuilder::new()
+        .automation_materializer(crate::automation_materializer::TestAutomationRunMaterializer::succeed(
+            target.clone(),
+        ))
+        .build();
+    let project = state
+        .project_store()
+        .create(fabro_automation::ProjectDraft {
+            id:                   fabro_automation::ProjectId::new("tierrapay").unwrap(),
+            name:                 "TierraPay".to_string(),
+            github_repository_id: fabro_automation::GithubRepositoryId::new("42").unwrap(),
+            repository:           "artesanos-digitales/tierrapay".to_string(),
+            default_branch:       "main".to_string(),
+        })
+        .await
+        .unwrap();
+    state
+        .project_store()
+        .set_intake_binding(&project.id, &project.revision, Some("tierrapay"))
+        .await
+        .unwrap();
+
+    let materialized = state
+        .materialize_automation_run(crate::automation_materializer::AutomationRunMaterializeInput {
+            automation_id:   fabro_automation::AutomationId::new("tierrapay-woodpecker").unwrap(),
+            target:          fabro_types::GitRunTarget { sha: None, ..target },
+            workflow_source: None,
+            workflow:        "woodpecker-loop".to_string(),
+            run_id:          RunId::new(),
+            temp_root:       state.automation_temp_root(),
+            project_id:      Some(project.id.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(materialized.project_input.as_deref(), Some("tierrapay"));
+}
+
 async fn mock_openai_title_response<'a>(
     server: &'a MockServer,
     title: &str,
