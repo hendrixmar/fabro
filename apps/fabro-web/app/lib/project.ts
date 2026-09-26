@@ -1,4 +1,4 @@
-import type { Automation, GithubRepository } from "@qltysh/fabro-api-client";
+import type { Automation, GithubRepository, Run } from "@qltysh/fabro-api-client";
 
 import type { ApiError } from "./api-client";
 
@@ -115,4 +115,40 @@ export function connectedProjectIdFromConflict(error: ApiError): string | null {
   const detail = typeof entry.detail === "string" ? entry.detail : "";
   const match = detail.match(/ as project ([a-z0-9][a-z0-9-]*)$/);
   return match ? match[1] : null;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const FAILED_KINDS = new Set(["failed", "dead"]);
+const ACTIVE_KINDS = new Set(["submitted", "pending", "runnable", "starting", "running", "blocked", "paused"]);
+
+export interface ProjectRunStats {
+  running:   number;
+  failed24h: number;
+  lastRunAt: string | null;
+}
+
+/** Tiles for a project: active runs, failures in the last day, latest start. */
+export function projectRunStats(runs: Run[], nowMs: number): ProjectRunStats {
+  let running = 0;
+  let failed24h = 0;
+  let lastRunAt: string | null = null;
+  for (const run of runs) {
+    const kind = run.lifecycle.status.kind;
+    const createdAt = run.timestamps.created_at;
+    if (ACTIVE_KINDS.has(kind)) running += 1;
+    if (FAILED_KINDS.has(kind) && nowMs - Date.parse(createdAt) <= DAY_MS) failed24h += 1;
+    if (lastRunAt == null || Date.parse(createdAt) > Date.parse(lastRunAt)) lastRunAt = createdAt;
+  }
+  return { running, failed24h, lastRunAt };
+}
+
+/** Which projects link each global automation, sorted by project id. */
+export function usedByProjects(automations: Automation[]): Map<string, string[]> {
+  const used = new Map<string, string[]>();
+  for (const automation of automations) {
+    const source = automation.source_automation_id;
+    if (!source || !automation.project_id) continue;
+    used.set(source, [...(used.get(source) ?? []), automation.project_id].sort());
+  }
+  return used;
 }
