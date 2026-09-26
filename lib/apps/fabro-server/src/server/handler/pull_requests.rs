@@ -230,7 +230,14 @@ pub(in crate::server) async fn verified_draft_for_run(
             }
         }
     }
-    if !has_gate {
+    // Older workflows used a successful `verify` stage before goal_gate was
+    // marked explicitly. Keep their completed runs eligible for PR handoff.
+    if !has_gate
+        && !checkpoint
+            .node_outcomes
+            .get("verify")
+            .is_some_and(|outcome| outcome.status == fabro_types::StageOutcome::Succeeded)
+    {
         return Ok(None);
     }
     let Some(record) = projection.pull_request.as_ref() else {

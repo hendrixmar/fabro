@@ -260,12 +260,15 @@ export const AutomationsApiAxiosParamCreator = function (configuration?: Configu
             };
         },
         /**
-         * Returns all configured automation definitions.
+         * Returns automation definitions, optionally filtered by ownership scope.
          * @summary List automations
+         * @param {ListAutomationsScopeEnum} [scope] Ownership filter. &#x60;all&#x60; (default) returns global and project-owned definitions, &#x60;global&#x60; returns definitions with no project, and &#x60;project&#x60; requires &#x60;project_id&#x60;.
+         * @param {string} [projectId] Project identifier required by &#x60;scope&#x3D;project&#x60;.
+         * @param {boolean} [availableToProjects] When true, returns only global definitions marked as selectable for projects.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        listAutomations: async (options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        listAutomations: async (scope?: ListAutomationsScopeEnum, projectId?: string, availableToProjects?: boolean, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             const localVarPath = `/api/v1/automations`;
             // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
@@ -283,6 +286,18 @@ export const AutomationsApiAxiosParamCreator = function (configuration?: Configu
             // authentication BearerAuth required
             // http bearer authentication required
             await setBearerAuthToObject(localVarHeaderParameter, configuration)
+
+            if (scope !== undefined) {
+                localVarQueryParameter['scope'] = scope;
+            }
+
+            if (projectId !== undefined) {
+                localVarQueryParameter['project_id'] = projectId;
+            }
+
+            if (availableToProjects !== undefined) {
+                localVarQueryParameter['available_to_projects'] = availableToProjects;
+            }
 
             localVarHeaderParameter['Accept'] = 'application/json';
 
@@ -464,13 +479,16 @@ export const AutomationsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Returns all configured automation definitions.
+         * Returns automation definitions, optionally filtered by ownership scope.
          * @summary List automations
+         * @param {ListAutomationsScopeEnum} [scope] Ownership filter. &#x60;all&#x60; (default) returns global and project-owned definitions, &#x60;global&#x60; returns definitions with no project, and &#x60;project&#x60; requires &#x60;project_id&#x60;.
+         * @param {string} [projectId] Project identifier required by &#x60;scope&#x3D;project&#x60;.
+         * @param {boolean} [availableToProjects] When true, returns only global definitions marked as selectable for projects.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async listAutomations(options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<AutomationListResponse>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.listAutomations(options);
+        async listAutomations(scope?: ListAutomationsScopeEnum, projectId?: string, availableToProjects?: boolean, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<AutomationListResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.listAutomations(scope, projectId, availableToProjects, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['AutomationsApi.listAutomations']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
@@ -566,13 +584,16 @@ export const AutomationsApiFactory = function (configuration?: Configuration, ba
             return localVarFp.listAutomationRuns(id, pageLimit, pageOffset, options).then((request) => request(axios, basePath));
         },
         /**
-         * Returns all configured automation definitions.
+         * Returns automation definitions, optionally filtered by ownership scope.
          * @summary List automations
+         * @param {ListAutomationsScopeEnum} [scope] Ownership filter. &#x60;all&#x60; (default) returns global and project-owned definitions, &#x60;global&#x60; returns definitions with no project, and &#x60;project&#x60; requires &#x60;project_id&#x60;.
+         * @param {string} [projectId] Project identifier required by &#x60;scope&#x3D;project&#x60;.
+         * @param {boolean} [availableToProjects] When true, returns only global definitions marked as selectable for projects.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        listAutomations(options?: RawAxiosRequestConfig): AxiosPromise<AutomationListResponse> {
-            return localVarFp.listAutomations(options).then((request) => request(axios, basePath));
+        listAutomations(scope?: ListAutomationsScopeEnum, projectId?: string, availableToProjects?: boolean, options?: RawAxiosRequestConfig): AxiosPromise<AutomationListResponse> {
+            return localVarFp.listAutomations(scope, projectId, availableToProjects, options).then((request) => request(axios, basePath));
         },
         /**
          * Replaces an automation definition when `If-Match` matches the current automation revision.
@@ -662,13 +683,16 @@ export class AutomationsApi extends BaseAPI {
     }
 
     /**
-     * Returns all configured automation definitions.
+     * Returns automation definitions, optionally filtered by ownership scope.
      * @summary List automations
+     * @param {ListAutomationsScopeEnum} [scope] Ownership filter. &#x60;all&#x60; (default) returns global and project-owned definitions, &#x60;global&#x60; returns definitions with no project, and &#x60;project&#x60; requires &#x60;project_id&#x60;.
+     * @param {string} [projectId] Project identifier required by &#x60;scope&#x3D;project&#x60;.
+     * @param {boolean} [availableToProjects] When true, returns only global definitions marked as selectable for projects.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */
-    public listAutomations(options?: RawAxiosRequestConfig) {
-        return AutomationsApiFp(this.configuration).listAutomations(options).then((request) => request(this.axios, this.basePath));
+    public listAutomations(scope?: ListAutomationsScopeEnum, projectId?: string, availableToProjects?: boolean, options?: RawAxiosRequestConfig) {
+        return AutomationsApiFp(this.configuration).listAutomations(scope, projectId, availableToProjects, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**
@@ -695,3 +719,10 @@ export class AutomationsApi extends BaseAPI {
         return AutomationsApiFp(this.configuration).retrieveAutomation(id, options).then((request) => request(this.axios, this.basePath));
     }
 }
+
+export const ListAutomationsScopeEnum = {
+    ALL: 'all',
+    GLOBAL: 'global',
+    PROJECT: 'project'
+} as const;
+export type ListAutomationsScopeEnum = typeof ListAutomationsScopeEnum[keyof typeof ListAutomationsScopeEnum];

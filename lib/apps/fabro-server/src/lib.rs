@@ -29,6 +29,7 @@ pub mod error;
 mod git_checkout;
 pub mod github_webhooks;
 pub mod install;
+mod intake_bridge;
 mod interp;
 pub mod jwt_auth;
 pub mod manifest_validation;

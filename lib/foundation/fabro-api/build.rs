@@ -333,6 +333,11 @@ fn main() {
             &[],
         ),
         (
+            "IntakeIntegrationSettings",
+            "fabro_types::settings::server::IntakeIntegrationSettings",
+            &[],
+        ),
+        (
             "BugsinkIntegrationSettings",
             "fabro_types::settings::server::BugsinkIntegrationSettings",
             &[],
@@ -697,6 +702,7 @@ fn main() {
         ("SandboxTimestamps", "fabro_types::SandboxTimestamps", &[]),
         ("AskFabro", "fabro_types::AskFabro", &[]),
         ("Automation", "fabro_automation::Automation", &[]),
+        ("Project", "fabro_automation::Project", &[]),
         (
             "AutomationGitWorkflowSource",
             "fabro_types::GitRunTarget",

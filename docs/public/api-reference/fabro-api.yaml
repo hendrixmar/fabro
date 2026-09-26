@@ -17,6 +17,10 @@ tags:
     description: Run management operations
   - name: Automations
     description: Server-managed automation definitions and automation-triggered runs
+  - name: Projects
+    description: GitHub repositories connected to this Fabro server, with per-project automation scope
+  - name: Feature intake
+    description: Feature-request authoring, approvals and supervised execution for a connected project
   - name: Environments
     description: Server-managed execution environment catalog
   - name: MCP Servers
@@ -4157,7 +4161,11 @@ paths:
       operationId: listAutomations
       tags: [Automations]
       summary: List automations
-      description: Returns all configured automation definitions.
+      description: Returns automation definitions, optionally filtered by ownership scope.
+      parameters:
+        - $ref: "#/components/parameters/AutomationScope"
+        - $ref: "#/components/parameters/AutomationProjectId"
+        - $ref: "#/components/parameters/AutomationAvailableToProjects"
       responses:
         "200":
           description: Automation definitions
@@ -4450,6 +4458,1356 @@ paths:
                 $ref: "#/components/schemas/PlaneDispatchListResponse"
         "404":
           description: Automation not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  # ── Projects ─────────────────────────────────────────────────────────
+
+  /api/v1/projects:
+    get:
+      operationId: listProjects
+      tags: [Projects]
+      summary: List projects
+      description: Returns every GitHub repository connected to this Fabro server.
+      responses:
+        "200":
+          description: Connected projects
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectListResponse"
+    post:
+      operationId: createProject
+      tags: [Projects]
+      summary: Connect a project
+      description: >-
+        Connects an existing accessible GitHub repository as a Fabro project.
+        The server re-reads repository identity and the default branch with its
+        own server credentials; caller-supplied permission or default-branch
+        claims are ignored. Connecting performs no clone, Plane mutation,
+        trigger activation, or deployment.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectRequest"
+      responses:
+        "201":
+          description: Project connected
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          description: Malformed JSON request body
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Repository already connected (the response identifies the existing project)
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Repository is not accessible with the server's GitHub credentials
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}:
+    get:
+      operationId: retrieveProject
+      tags: [Projects]
+      summary: Retrieve project
+      description: Returns one connected project by id.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Connected project
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "404":
+          description: Project not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      operationId: updateProject
+      tags: [Projects]
+      summary: Update project
+      description: >-
+        Updates the project display name when `If-Match` matches the current
+        project revision. Repository identity and the intake binding are not
+        mutable here.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProjectRequest"
+      responses:
+        "200":
+          description: Project updated
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          description: Malformed JSON request body or invalid revision header
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project revision mismatch
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Project failed domain validation
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "428":
+          description: Missing required `If-Match` header
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/automations:
+    post:
+      operationId: createProjectAutomation
+      tags: [Projects]
+      summary: Add an automation to a project
+      description: >-
+        Creates a concrete automation instance owned by the project from a
+        global definition marked available to projects. The instance keeps the
+        source workflow selector and workflow source, targets the project's
+        repository and default branch, and starts with every trigger disabled.
+        Repeating the exact request returns the existing instance.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectAutomationRequest"
+      responses:
+        "201":
+          description: Project automation created
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Automation"
+        "200":
+          description: Identical instance already exists with this id and configuration
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Automation"
+        "400":
+          description: Malformed JSON request body
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Automation id conflicts with a different instance, or the source revision changed
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Source automation is not available to projects or failed validation
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/repos/github:
+    get:
+      operationId: listGithubRepositories
+      tags: [Projects]
+      summary: List repositories available to this server
+      description: >-
+        Enumerates repositories visible to the Fabro server's configured GitHub
+        credentials. The cursor is opaque and server-issued; callers cannot
+        supply a repository URL. A failed upstream page is never reported as an
+        empty result.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of repositories
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GithubRepositoryListResponse"
+        "400":
+          description: Invalid or expired cursor
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: GitHub credentials are unavailable, unauthorized, or rate limited
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # ── Feature intake ───────────────────────────────────────────────────
+
+  /api/v1/projects/{id}/intake:
+    get:
+      operationId: retrieveProjectIntake
+      tags: [Feature intake]
+      summary: Retrieve a project's feature-intake capability
+      description: >-
+        Returns the project's registered intake binding, pause state, authoring
+        and execution readiness, and whether feature-intake setup is still
+        required. An unbound project reports `setup_required: true` rather than
+        a fake configured state.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Feature-intake capability
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeSetupStatus"
+        "404":
+          description: Project not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: The intake bridge returned an unusable response
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      operationId: detachProjectIntake
+      tags: [Feature intake]
+      summary: Detach feature intake from a project
+      description: >-
+        Detaches the capability only after the bridge confirms intake is paused.
+        Plane issues, Git branches, run history and registry resources are kept.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Capability detached; the project remains connected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "404":
+          description: Project or binding not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Intake is not paused, or the binding did not confirm the detach
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/setup:
+    post:
+      operationId: setupProjectIntake
+      tags: [Feature intake]
+      summary: Set up feature intake for a project
+      description: >-
+        Registers an authoring binding for this project's repository and Plane
+        project. Registry resources are created before the local link, and an
+        uncertain response is reconciled against the existing binding instead of
+        being retried.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeSetupRequest"
+      responses:
+        "200":
+          description: Feature intake bound
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          description: Malformed request body or missing/invalid revision header
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project revision is stale, or setup conflicts with existing resources
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "428":
+          description: Missing required `If-Match` header
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: The intake bridge returned an unusable response
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/execution:
+    put:
+      operationId: configureProjectIntakeExecution
+      tags: [Feature intake]
+      summary: Configure supervised execution
+      description: >-
+        Upgrades an authoring binding to the factory profile. Repository and
+        Plane identity are immutable here, and nothing is provisioned or filed
+        until **Prepare execution** is separately confirmed.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeExecutionSetupRequest"
+      responses:
+        "200":
+          description: Execution configuration recorded
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          description: Malformed request body or missing/invalid revision header
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project revision is stale, or the factory configuration is incomplete
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "428":
+          description: Missing required `If-Match` header
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: The intake bridge returned an unusable response
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/template:
+    get:
+      operationId: retrieveProjectIntakeTemplate
+      tags: [Feature intake]
+      summary: Retrieve the feature-request template
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Template headings and Markdown body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeTemplate"
+        "404":
+          description: Project or binding not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives:
+    get:
+      operationId: listProjectIntakeInitiatives
+      tags: [Feature intake]
+      summary: List feature requests
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Feature requests, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IntakeInitiativeSummary"
+        "404":
+          description: Project or binding not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      operationId: createProjectIntakeInitiative
+      tags: [Feature intake]
+      summary: Create a feature request
+      description: >-
+        Creates the initiative from the template fields and dispatches document
+        authoring. Authoring readiness is required; nothing is provisioned.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeCreateRequest"
+      responses:
+        "200":
+          description: Authoring dispatched
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeCreateResponse"
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+        "400":
+          description: Malformed or empty request body
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project or binding not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project paused, submission already in flight, or unknown outcome
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Not authoring-ready
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}:
+    get:
+      operationId: retrieveProjectIntakeInitiative
+      tags: [Feature intake]
+      summary: Retrieve one feature request
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      responses:
+        "200":
+          description: Feature request detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeInitiativeDetail"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}/history:
+    get:
+      operationId: listProjectIntakeInitiativeHistory
+      tags: [Feature intake]
+      summary: List one feature request's dispatch history
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      responses:
+        "200":
+          description: Append-only dispatch history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IntakeRunRecord"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}/comments:
+    post:
+      operationId: commentProjectIntakeInitiative
+      tags: [Feature intake]
+      summary: Post a comment on a feature request
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeCommentRequest"
+      responses:
+        "200":
+          description: Comment posted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeActionResponse"
+        "400":
+          description: Empty comment
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project paused
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}/approve:
+    post:
+      operationId: approveProjectIntakeInitiative
+      tags: [Feature intake]
+      summary: Approve the current document and draft the next one
+      description: >-
+        PRD and spec approval dispatch the next document; design approval stops
+        in Approved Design and provisions nothing.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeSupervisedRequest"
+      responses:
+        "200":
+          description: Approval dispatched
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeActionResponse"
+        "400":
+          description: Approval not legal in the current state
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project paused, submission in flight, or unknown outcome
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}/revise:
+    post:
+      operationId: reviseProjectIntakeInitiative
+      tags: [Feature intake]
+      summary: Revise a document with operator feedback
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeReviseRequest"
+      responses:
+        "200":
+          description: Revision dispatched
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeActionResponse"
+        "400":
+          description: Empty revision text
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project paused, submission in flight, or unknown outcome
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}/cancel:
+    post:
+      operationId: cancelProjectIntakeInitiative
+      tags: [Feature intake]
+      summary: Cancel a feature request
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeSupervisedRequest"
+      responses:
+        "200":
+          description: Cancellation dispatched
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeActionResponse"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project paused, submission in flight, or unknown outcome
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}/run:
+    post:
+      operationId: runProjectIntakeStage
+      tags: [Feature intake]
+      summary: Run or retry one authoring stage
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeStageRequest"
+      responses:
+        "200":
+          description: Stage dispatched
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeActionResponse"
+        "400":
+          description: Unknown stage
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project paused, submission in flight, or unknown outcome
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Stage is not ready under the current readiness
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}/reconcile:
+    post:
+      operationId: reconcileProjectIntakeInitiative
+      tags: [Feature intake]
+      summary: Reconcile an unknown submission outcome
+      description: >-
+        Verifies an interrupted submission against authoritative state. Recovery
+        never repeats an ambiguous effect.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      responses:
+        "200":
+          description: Reconciliation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeActionResponse"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project paused
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/initiatives/{issue}/execute:
+    post:
+      operationId: executeProjectIntakeInitiative
+      tags: [Feature intake]
+      summary: Prepare execution
+      description: >-
+        Explicitly provisions staging/CI and files implementation tickets for an
+        approved design. It requires the approved current design digest, a
+        completed document-only freeze, and execution readiness.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeIssueId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeSupervisedRequest"
+      responses:
+        "200":
+          description: Execution preparation dispatched
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeActionResponse"
+        "400":
+          description: Design digest or freeze marker missing or stale
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project, binding or initiative not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Project paused, in flight, unknown outcome, or unresolved prior effects
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Execution is not ready for this project
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/readiness/recheck:
+    post:
+      operationId: recheckProjectIntakeReadiness
+      tags: [Feature intake]
+      summary: Re-probe authoring and execution readiness
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200":
+          description: Fresh readiness snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeReadinessReport"
+        "404":
+          description: Project or binding not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/pause:
+    post:
+      operationId: setProjectIntakePause
+      tags: [Feature intake]
+      summary: Pause or resume feature intake
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakePauseRequest"
+      responses:
+        "200":
+          description: Pause state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakePauseStatus"
+        "400":
+          description: Missing reason or malformed body
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project or binding not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/{id}/intake/chat/{key}:
+    post:
+      operationId: streamProjectIntakeChat
+      tags: [Feature intake]
+      summary: Stream the read-only refinement advisor
+      description: >-
+        Server-sent advisor output for the authenticated user's own session.
+        Closing the stream approves and publishes nothing.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeChatKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IntakeChatRequest"
+      responses:
+        "200":
+          description: Server-sent advisor stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          description: Empty message or invalid session key
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Project or binding not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      operationId: closeProjectIntakeChat
+      tags: [Feature intake]
+      summary: Close an advisor session
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IntakeChatKey"
+      responses:
+        "200":
+          description: Session closed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeOkResponse"
+        "400":
+          description: Invalid session key
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/projects/import-intake:
+    post:
+      operationId: importProjectIntakeBindings
+      tags: [Feature intake]
+      summary: Import existing intake bindings as projects
+      description: >-
+        Resolves each registered intake binding's canonical GitHub repository and
+        inserts or attaches only exact matches. Conflicts and inaccessible
+        repositories are reported per row; nothing is enabled or altered in the
+        Python registry.
+      responses:
+        "200":
+          description: Per-binding import results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IntakeImportResponse"
+        "503":
+          description: Feature intake is not configured or the bridge is unreachable
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -5997,6 +7355,80 @@ components:
         pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
       example: sentry
 
+    ProjectId:
+      name: id
+      in: path
+      required: true
+      description: Unique project identifier.
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+      example: tierrapay
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor returned by a previous page of results.
+      schema:
+        type: string
+      example: eyJwYWdlIjoyLCJpbnN0YWxsYXRpb24iOm51bGx9
+
+    AutomationScope:
+      name: scope
+      in: query
+      required: false
+      description: >-
+        Ownership filter. `all` (default) returns global and project-owned
+        definitions, `global` returns definitions with no project, and
+        `project` requires `project_id`.
+      schema:
+        type: string
+        enum: [all, global, project]
+        default: all
+      example: project
+
+    AutomationProjectId:
+      name: project_id
+      in: query
+      required: false
+      description: Project identifier required by `scope=project`.
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+      example: tierrapay
+
+    AutomationAvailableToProjects:
+      name: available_to_projects
+      in: query
+      required: false
+      description: >-
+        When true, returns only global definitions marked as selectable for
+        projects.
+      schema:
+        type: boolean
+        default: false
+      example: true
+
+    IntakeIssueId:
+      name: issue
+      in: path
+      required: true
+      description: Feature-request issue identifier.
+      schema:
+        type: string
+      example: 0194e43b-252a-7ad2-a50e-7d6f5fb47db3
+
+    IntakeChatKey:
+      name: key
+      in: path
+      required: true
+      description: Advisor session key, namespaced per project and authenticated user.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9._-]{1,64}$"
+      example: draft
+
     IfMatch:
       name: If-Match
       in: header
@@ -6902,6 +8334,19 @@ components:
           example: dependency-update
         workflow_source:
           $ref: "#/components/schemas/AutomationGitWorkflowSource"
+        project_id:
+          type: ["string", "null"]
+          description: >-
+            Owning project. Absent or null means a global definition; otherwise
+            this automation is a concrete per-project instance. Scope changes
+            are only accepted while every trigger is disabled.
+          example: tierrapay
+        available_to_projects:
+          type: boolean
+          default: false
+          description: >-
+            Global definitions only: this definition is selectable when adding
+            an automation to a project. It never activates a trigger.
         triggers:
           type: array
           items:
@@ -7075,6 +8520,19 @@ components:
           example: dependency-update
         workflow_source:
           $ref: "#/components/schemas/AutomationGitWorkflowSource"
+        project_id:
+          type: ["string", "null"]
+          description: >-
+            Owning project. Absent or null means a global definition; otherwise
+            this automation is a concrete per-project instance. Scope changes
+            are only accepted while every trigger is disabled.
+          example: tierrapay
+        available_to_projects:
+          type: boolean
+          default: false
+          description: >-
+            Global definitions only: this definition is selectable when adding
+            an automation to a project. It never activates a trigger.
         triggers:
           type: array
           items:
@@ -7112,6 +8570,19 @@ components:
           example: dependency-update
         workflow_source:
           $ref: "#/components/schemas/AutomationGitWorkflowSource"
+        project_id:
+          type: ["string", "null"]
+          description: >-
+            Owning project. Absent or null means a global definition; otherwise
+            this automation is a concrete per-project instance. Scope changes
+            are only accepted while every trigger is disabled.
+          example: tierrapay
+        available_to_projects:
+          type: boolean
+          default: false
+          description: >-
+            Global definitions only: this definition is selectable when adding
+            an automation to a project. It never activates a trigger.
         triggers:
           type: array
           items:
@@ -7144,6 +8615,635 @@ components:
           format: int64
           minimum: 0
           description: Total number of configured automation definitions.
+
+    Project:
+      description: >-
+        An existing GitHub repository connected to this Fabro server.
+        `github_repository_id` is the immutable numeric GitHub id as a decimal
+        string; `repository` and `default_branch` are server-read metadata.
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - revision
+        - name
+        - github_repository_id
+        - repository
+        - default_branch
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+          example: tierrapay
+        revision:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Stable revision used with `If-Match` for optimistic concurrency.
+        name:
+          type: string
+          example: TierraPay
+        github_repository_id:
+          type: string
+          pattern: "^[0-9]{1,20}$"
+          description: Immutable numeric GitHub repository id, decimal-encoded.
+          example: "812345678"
+        repository:
+          type: string
+          description: Canonical `owner/repo` slug as last read from GitHub.
+          example: artesanos-digitales/tierrapay
+        default_branch:
+          type: string
+          description: Default branch as last read from GitHub.
+          example: main
+        intake_binding_id:
+          type: ["string", "null"]
+          description: Registered feature-intake binding, when feature intake is connected.
+
+    ProjectListResponse:
+      description: List envelope for connected projects.
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        meta:
+          $ref: "#/components/schemas/ProjectListMeta"
+
+    ProjectListMeta:
+      description: Metadata for project list responses.
+      type: object
+      additionalProperties: false
+      required:
+        - total
+      properties:
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total number of connected projects.
+
+    CreateProjectRequest:
+      description: Request body for connecting an existing GitHub repository.
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - repository
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+          example: tierrapay
+        name:
+          type: string
+          example: TierraPay
+        repository:
+          type: string
+          description: Existing GitHub `owner/repo` slug. The server re-reads its identity.
+          example: artesanos-digitales/tierrapay
+
+    UpdateProjectRequest:
+      description: Request body for updating a project.
+      type: object
+      additionalProperties: false
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          example: TierraPay
+
+    CreateProjectAutomationRequest:
+      description: Request body for adding a global automation to a project.
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - source_automation_id
+        - source_revision
+        - environment_id
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+          description: Id of the new project-owned automation instance.
+          example: tierrapay-ticket-loop
+        name:
+          type: string
+          example: TierraPay ticket loop
+        source_automation_id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+          description: Global automation definition marked available to projects.
+          example: ticket-loop
+        source_revision:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Revision of the source definition the caller selected.
+        environment_id:
+          type: string
+          description: Server-managed environment for the project instance.
+          example: docker
+        description:
+          type: ["string", "null"]
+          example: Tierrapay project tickets.
+
+    GithubRepository:
+      description: One repository available to the Fabro server's GitHub credentials.
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - full_name
+        - default_branch
+        - private
+        - archived
+        - disabled
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9]{1,20}$"
+          description: Immutable numeric GitHub repository id, decimal-encoded.
+          example: "812345678"
+        full_name:
+          type: string
+          example: artesanos-digitales/tierrapay
+        default_branch:
+          type: ["string", "null"]
+          description: Default branch, null for an empty repository.
+          example: main
+        private:
+          type: boolean
+          example: true
+        archived:
+          type: boolean
+          example: false
+        disabled:
+          type: boolean
+          example: false
+
+    GithubRepositoryListResponse:
+      description: One page of repositories available to the server.
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/GithubRepository"
+        next_cursor:
+          type: ["string", "null"]
+          description: Opaque server-issued cursor; absent when the list is exhausted.
+
+    IntakeReadinessCheck:
+      description: One readiness probe result. A flag is only ready when every check passes.
+      type: object
+      additionalProperties: true
+      required: [key, outcome, message, next_action]
+      properties:
+        key:
+          type: string
+          example: repository
+        outcome:
+          type: string
+          enum: [pass, fail, not_applicable, not_configured, unknown]
+        message:
+          type: string
+        next_action:
+          type: string
+
+    IntakeReadinessReport:
+      description: >-
+        Authoring and execution readiness. Unknown, missing, stale or failed
+        checks never count as ready.
+      type: object
+      additionalProperties: true
+      required: [checks, authoring_ready, execution_ready]
+      properties:
+        checked_at:
+          type: ["integer", "null"]
+          description: Epoch seconds of the stored snapshot, null when never checked.
+        authoring_ready:
+          type: boolean
+        execution_ready:
+          type: boolean
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/IntakeReadinessCheck"
+
+    IntakeSetupStatus:
+      description: Feature-intake capability of one project.
+      type: object
+      additionalProperties: true
+      required: [binding, paused, setup_required]
+      properties:
+        binding:
+          type: ["string", "null"]
+          description: Registered intake binding id, null when feature intake is not set up.
+        paused:
+          type: boolean
+        setup_required:
+          type: boolean
+        readiness:
+          oneOf:
+            - $ref: "#/components/schemas/IntakeReadinessReport"
+            - type: "null"
+
+    IntakeTemplate:
+      description: Feature-request template headings and Markdown body.
+      type: object
+      additionalProperties: true
+      required: [headings, template]
+      properties:
+        headings:
+          type: array
+          items:
+            type: string
+        template:
+          type: string
+
+    IntakeRunRecord:
+      description: >-
+        One append-only dispatch record. Rows carry the bridge's persisted
+        columns; `outcome` is the verified verification result, never optimism.
+      type: object
+      additionalProperties: true
+      required: [stage, event, kind, outcome, message]
+      properties:
+        id:
+          type: integer
+          format: int64
+        stage:
+          type: string
+        event:
+          type: string
+        kind:
+          type: string
+        outcome:
+          type: string
+        node:
+          type: ["string", "null"]
+        message:
+          type: string
+        run:
+          type: ["string", "null"]
+          description: Durable Fabro run id once a run was submitted.
+        actor:
+          type: ["string", "null"]
+        ts:
+          type: ["number", "null"]
+          format: double
+
+    IntakeInitiativeSummary:
+      description: One feature request in list order.
+      type: object
+      additionalProperties: true
+      required: [id, name, state, stage]
+      properties:
+        id:
+          type: string
+        seq:
+          type: ["integer", "null"]
+          format: int64
+        name:
+          type: string
+        state:
+          type: string
+          description: Plane state key, or `unknown` when the issue state is not mapped.
+        stage:
+          type: ["string", "null"]
+        updated_at:
+          type: ["string", "null"]
+        run:
+          oneOf:
+            - $ref: "#/components/schemas/IntakeRunRecord"
+            - type: "null"
+
+    IntakeDocument:
+      description: One authored document at its approved commit.
+      type: object
+      additionalProperties: true
+      required: [meta, body]
+      properties:
+        meta:
+          type: object
+          additionalProperties: true
+        body:
+          type: string
+
+    IntakeComment:
+      type: object
+      additionalProperties: true
+      required: [who, text, factory]
+      properties:
+        id:
+          type: ["string", "null"]
+        at:
+          type: ["string", "null"]
+        who:
+          type: string
+        text:
+          type: string
+        factory:
+          type: boolean
+          description: True when the comment was written by the automated pipeline.
+
+    IntakeInitiativeDetail:
+      description: >-
+        Full feature-request projection: current state, documents, comments,
+        questions, assumptions and verified run history.
+      type: object
+      additionalProperties: true
+      required: [id, name, state, comments, questions, supuestos, history]
+      properties:
+        id:
+          type: string
+        seq:
+          type: ["integer", "null"]
+          format: int64
+        name:
+          type: string
+        state:
+          type: string
+        stage:
+          type: ["string", "null"]
+        updated_at:
+          type: ["string", "null"]
+        run:
+          oneOf:
+            - $ref: "#/components/schemas/IntakeRunRecord"
+            - type: "null"
+        description:
+          type: ["string", "null"]
+        needs_operator:
+          type: boolean
+        pr_url:
+          type: ["string", "null"]
+          description: Draft pull request opened by document authoring, when one exists.
+        docs:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/IntakeDocument"
+        features:
+          type: ["object", "null"]
+          additionalProperties: true
+        block:
+          type: ["object", "null"]
+          additionalProperties: true
+          description: Machine block from the issue description (commit, stage, PR).
+        project:
+          type: ["object", "null"]
+          additionalProperties: true
+        provisioning:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        comments:
+          type: array
+          items:
+            $ref: "#/components/schemas/IntakeComment"
+        questions:
+          type: array
+          items:
+            type: string
+        supuestos:
+          type: array
+          items:
+            type: string
+        history:
+          type: array
+          items:
+            $ref: "#/components/schemas/IntakeRunRecord"
+
+    IntakePauseStatus:
+      type: object
+      additionalProperties: true
+      required: [paused]
+      properties:
+        paused:
+          type: boolean
+        reason:
+          type: ["string", "null"]
+        actor:
+          type: ["string", "null"]
+        ts:
+          type: ["number", "null"]
+          format: double
+        cancellation_supported:
+          type: boolean
+
+    IntakeOkResponse:
+      type: object
+      additionalProperties: true
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    IntakeActionResponse:
+      description: Result of a dispatched intake action.
+      type: object
+      additionalProperties: true
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        run:
+          oneOf:
+            - $ref: "#/components/schemas/IntakeRunRecord"
+            - type: "null"
+
+    IntakeCreateResponse:
+      description: Result of creating a feature request; `issue` is the created
+        initiative's Plane issue id, also returned unchanged when an identical
+        request is retried after a lost response.
+      type: object
+      additionalProperties: true
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        issue:
+          oneOf:
+            - type: string
+            - type: "null"
+
+    IntakeCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, fields]
+      properties:
+        name:
+          type: string
+        fields:
+          type: object
+          additionalProperties:
+            type: string
+          description: Template heading values.
+        supervised:
+          type: boolean
+          default: false
+
+    IntakeCommentRequest:
+      type: object
+      additionalProperties: false
+      required: [text]
+      properties:
+        text:
+          type: string
+
+    IntakeReviseRequest:
+      type: object
+      additionalProperties: false
+      required: [text]
+      properties:
+        text:
+          type: string
+        supervised:
+          type: boolean
+          default: false
+
+    IntakeSupervisedRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        supervised:
+          type: boolean
+          default: false
+
+    IntakeStageRequest:
+      type: object
+      additionalProperties: false
+      required: [stage]
+      properties:
+        stage:
+          type: string
+          enum: [prd, spec, design, freeze, cancel, execute]
+        supervised:
+          type: boolean
+          default: false
+
+    IntakePauseRequest:
+      type: object
+      additionalProperties: false
+      required: [paused, reason]
+      properties:
+        paused:
+          type: boolean
+        reason:
+          type: string
+
+    IntakeChatRequest:
+      type: object
+      additionalProperties: false
+      required: [text]
+      properties:
+        text:
+          type: string
+
+    IntakeSetupRequest:
+      description: >-
+        Authoring setup. Plane identity is resolved from the server's Plane
+        integration; the credential reference stays in the bridge's private
+        configuration and is never supplied by the browser.
+      type: object
+      additionalProperties: false
+      required: [plane_project_id]
+      properties:
+        plane_project_id:
+          type: string
+          description: Existing Plane project the feature requests belong to.
+
+    IntakeExecutionSetupRequest:
+      description: >-
+        Factory configuration for supervised execution. Secrets are write-only
+        credential references, never values.
+      type: object
+      additionalProperties: true
+      properties:
+        staging_slug:
+          type: string
+        zone:
+          type: string
+        commands:
+          type: object
+          additionalProperties:
+            type: string
+        staging:
+          type: object
+          additionalProperties: true
+        adopted:
+          type: object
+          additionalProperties: true
+        credentials:
+          type: object
+          additionalProperties:
+            type: string
+          description: Provider credential references resolved by the bridge.
+
+    IntakeBindingSummary:
+      description: Public projection of one registered intake binding.
+      type: object
+      additionalProperties: true
+      required: [id, name, github, default_branch, profile, paused, execution_configured]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        github:
+          type: string
+        default_branch:
+          type: string
+        plane_project_id:
+          type: ["string", "null"]
+        plane_workspace:
+          type: ["string", "null"]
+        profile:
+          type: string
+          enum: [intake, agency-web]
+        paused:
+          type: boolean
+        execution_configured:
+          type: boolean
+
+    IntakeImportRow:
+      type: object
+      additionalProperties: true
+      required: [binding, status]
+      properties:
+        binding:
+          type: string
+        repository:
+          type: ["string", "null"]
+        project_id:
+          type: ["string", "null"]
+        status:
+          type: string
+          enum: [imported, attached, conflict, error]
+        message:
+          type: ["string", "null"]
+
+    IntakeImportResponse:
+      type: object
+      additionalProperties: true
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/IntakeImportRow"
 
     # ── MCP Servers ──────────────────────────────────────────────────────
 
@@ -14763,7 +16863,7 @@ components:
 
     ServerIntegrationsSettings:
       type: object
-      required: [github, slack, plane, bugsink]
+      required: [github, slack, plane, bugsink, intake]
       properties:
         github:
           $ref: "#/components/schemas/GithubIntegrationSettings"
@@ -14773,6 +16873,22 @@ components:
           $ref: "#/components/schemas/PlaneIntegrationSettings"
         bugsink:
           $ref: "#/components/schemas/BugsinkIntegrationSettings"
+        intake:
+          $ref: "#/components/schemas/IntakeIntegrationSettings"
+
+    IntakeIntegrationSettings:
+      description: >-
+        Private feature-intake bridge. The bridge listens on a Unix-domain
+        socket owned by the same OS user as the server; no browser traffic
+        reaches it directly.
+      type: object
+      required: [enabled, socket]
+      properties:
+        enabled:
+          type: boolean
+        socket:
+          description: Absolute path of the bridge socket, required when enabled.
+          type: ["string", "null"]
 
     PlaneIntegrationSettings:
       type: object

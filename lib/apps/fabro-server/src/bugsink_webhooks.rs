@@ -189,10 +189,14 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use fabro_automation::{AutomationDraft, AutomationId, AutomationStore, AutomationTarget};
+    use fabro_automation::{AutomationDraft, AutomationId, AutomationStore};
+    use fabro_model::catalog::LlmCatalogSettings;
     use fabro_types::settings::server::{BugsinkIntegrationSettings, BugsinkProjectSettings};
+    use fabro_types::{GitRunTarget, RunTarget};
     use fabro_vault::{SecretStore, SecretType};
     use tower::ServiceExt as _;
 
@@ -241,6 +245,14 @@ mod tests {
             .await
             .unwrap();
         database.migrate().await.unwrap();
+        // Automations carry a real environment id, so the fixture seeds the
+        // built-in Docker environment the way a provisioned server has one.
+        fabro_environment::seed_default_environment(
+            database.pool(),
+            fabro_types::settings::run::EnvironmentProvider::Docker,
+        )
+        .await
+        .unwrap();
         let pool = database.clone_pool();
         let vault = SecretStore::new(pool.clone());
         for (name, value) in [
@@ -255,15 +267,22 @@ mod tests {
         }
         AutomationStore::new(pool.clone())
             .create(AutomationDraft {
-                id:          AutomationId::new("incident-loop").unwrap(),
-                name:        "Incident intake".into(),
-                description: None,
-                target:      AutomationTarget {
-                    repository:   "test/incident-workflows".into(),
-                    ref_selector: "a".repeat(40),
-                    workflow:     "incident-loop".into(),
-                },
-                triggers:    vec![],
+                id:                    AutomationId::new("incident-loop").unwrap(),
+                name:                  "Incident intake".into(),
+                description:           None,
+                environment_id:        Some("default".to_string()),
+                target:                RunTarget::Git(GitRunTarget {
+                    repo:   "test/incident-workflows".into(),
+                    branch: "main".into(),
+                    tag:    None,
+                    sha:    Some("a".repeat(40)),
+                }),
+                workflow:              "incident-loop".into(),
+                workflow_source:       None,
+                project_id:            None,
+                available_to_projects: false,
+                source_automation_id: None,
+                triggers:              vec![],
             })
             .await
             .unwrap();
@@ -291,7 +310,7 @@ mod tests {
             resolved_settings: resolved_runtime_settings_for_tests(
                 settings,
                 fabro_config::RunLayer::default(),
-                Default::default(),
+                LlmCatalogSettings::default(),
             ),
             registry_factory_override: None,
             max_concurrent_runs: 5,
@@ -301,7 +320,7 @@ mod tests {
             preloaded_vault: test_secret_snapshot(pool.clone()).unwrap(),
             server_secrets: load_test_server_secrets(
                 dir.path().join("server.env"),
-                Default::default(),
+                HashMap::default(),
             ),
             env_lookup: Arc::new(|_| None),
             github_api_base_url: None,
@@ -334,10 +353,14 @@ mod tests {
         assert!(
             state
                 .stores
-                .runs
-                .list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now())
+                .run_summaries
+                .list(
+                    &fabro_store::RunSummaryListQuery::default(),
+                    chrono::Utc::now()
+                )
                 .await
                 .unwrap()
+                .data
                 .is_empty()
         );
     }
@@ -376,7 +399,7 @@ mod tests {
             r#"{"id":"497f6eca-6276-4993-bfeb-53cbbbba6f08","project":25.0,"alert_reason":"NEW"}"#,
             r#"{"id":"497f6eca-6276-4993-bfeb-53cbbbba6f08","project":25,"alert_reason":"UNKNOWN"}"#,
             r#"{"project":25,"alert_reason":"TEST"}"#,
-            r#"{}{}"#,
+            "{}{}",
             r#"[25,"497f6eca-6276-4993-bfeb-53cbbbba6f08","TEST"]"#,
         ] {
             assert_eq!(
@@ -477,10 +500,14 @@ mod tests {
         assert!(
             f.state
                 .stores
-                .runs
-                .list_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now())
+                .run_summaries
+                .list(
+                    &fabro_store::RunSummaryListQuery::default(),
+                    chrono::Utc::now()
+                )
                 .await
                 .unwrap()
+                .data
                 .is_empty()
         );
     }

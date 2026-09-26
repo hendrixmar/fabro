@@ -11,10 +11,8 @@ import {
   AutomationFormFields,
   EMPTY_AUTOMATION_FORM,
   automationFormValuesFromRun,
+  automationPayloadFromFormValues,
   isFormValid,
-  targetFromFormValues,
-  triggersFromFormValues,
-  workflowSourceFromFormValues,
   type AutomationFormValues,
 } from "../components/automation-form";
 import {
@@ -132,14 +130,8 @@ function AutomationCreateForm({
     try {
       await apiData(() =>
         automationsApi.createAutomation({
-          id:          values.id.trim(),
-          name:        trimmedName,
-          description: values.description.trim() || null,
-          environment_id: values.environmentId.trim(),
-          target:      targetFromFormValues(values),
-          workflow:    values.workflow.trim(),
-          workflow_source: workflowSourceFromFormValues(values),
-          triggers: triggersFromFormValues(values),
+          id: values.id.trim(),
+          ...automationPayloadFromFormValues(values),
         }),
       );
       await mutate(queryKeys.automations.list());

@@ -16,7 +16,7 @@ import {
 } from "@heroicons/react/24/outline";
 import { FilterButton } from "../components/runs-list/filter-button";
 import type { Automation, AutomationListResponse } from "@qltysh/fabro-api-client";
-import { Link, useNavigate } from "react-router";
+import { Link, useNavigate, useSearchParams } from "react-router";
 import { ApiError, apiData, automationsApi } from "../lib/api-client";
 import {
   RUN_TARGET_CHECKOUT_LABEL,
@@ -26,8 +26,8 @@ import {
   hasEnabledApiTrigger,
   workflowSourceSummary,
 } from "../lib/automation";
-import { useAutomations } from "../lib/queries";
-import { queryKeys } from "../lib/query-keys";
+import { useAutomations, useProjects } from "../lib/queries";
+import { type AutomationScope } from "../lib/query-keys";
 import { ConfirmDialog, PRIMARY_BUTTON_CLASS } from "../components/ui";
 import { EmptyState, ErrorState, LoadingState } from "../components/state";
 import { useToast } from "../components/toast";
@@ -60,6 +60,8 @@ interface AutomationRow {
   workflowSource?: string;
   schedule?: string;
   apiEnabled: boolean;
+  projectId: string | null;
+  availableToProjects: boolean;
   icon: ComponentType<{ className?: string }>;
   color: string;
 }
@@ -104,6 +106,8 @@ function mapAutomations(result: AutomationListResponse | undefined): AutomationR
         : undefined,
       schedule:   findScheduleTrigger(a)?.expression,
       apiEnabled: hasEnabledApiTrigger(a),
+      projectId:  a.project_id ?? null,
+      availableToProjects: a.available_to_projects === true,
       icon:       slugIconMap[a.workflow] ?? CodeBracketIcon,
       color:      slugColorMap[a.workflow] ?? "var(--color-teal-500)",
     };
@@ -162,6 +166,23 @@ function AutomationCard({
           </p>
           <p className="mt-0.5 truncate text-xs text-fg-muted">
             Workflow source · {automation.workflowSource ?? RUN_TARGET_CHECKOUT_LABEL}
+          </p>
+          <p className="mt-0.5 truncate text-xs text-fg-muted">
+            {automation.projectId ? (
+              <>
+                Project ·{" "}
+                <span className="font-mono text-fg-3">{automation.projectId}</span>
+              </>
+            ) : (
+              <>
+                Global automation
+                {automation.availableToProjects ? (
+                  <span className="ml-1.5 text-teal-300">
+                    · Available to projects
+                  </span>
+                ) : null}
+              </>
+            )}
           </p>
         </div>
       </Link>
@@ -261,17 +282,61 @@ const TRIGGER_FILTER_OPTIONS: { value: TriggerFilter; label: string }[] = [
   { value: "manual",    label: "Manual" },
 ];
 
+const SCOPE_FILTER_OPTIONS: { value: AutomationScope; label: string }[] = [
+  { value: "all",     label: "All automations" },
+  { value: "global",  label: "Global only" },
+  { value: "project", label: "Project only" },
+];
+
+function parseScope(value: string | null): AutomationScope {
+  return value === "global" || value === "project" ? value : "all";
+}
+
 export default function Automations() {
   const { mutate } = useSWRConfig();
   const toast = useToast();
   const navigate = useNavigate();
-  const automationsQuery = useAutomations();
+  const [urlSearchParams, setSearchParams] = useSearchParams();
+  const scope = parseScope(urlSearchParams.get("scope"));
+  const selectedProjectId = urlSearchParams.get("project") ?? "";
+  const projectsQuery = useProjects();
+  const projects = projectsQuery.data?.data ?? [];
+  const automationsQuery = useAutomations({
+    scope,
+    projectId: scope === "project" ? selectedProjectId || undefined : undefined,
+  });
   const automations = mapAutomations(automationsQuery.data);
   const [query, setQuery] = useState("");
   const [triggerFilter, setTriggerFilter] = useState<TriggerFilter>("all");
   const [pendingDelete, setPendingDelete] = useState<AutomationRow | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [runningId, setRunningId] = useState<string | null>(null);
+
+  function onScopeChange(next: AutomationScope) {
+    setSearchParams((current) => {
+      const params = new URLSearchParams(current);
+      if (next === "all") params.delete("scope");
+      else params.set("scope", next);
+      if (next !== "project") params.delete("project");
+      return params;
+    });
+  }
+
+  function onProjectChange(next: string) {
+    setSearchParams((current) => {
+      const params = new URLSearchParams(current);
+      if (next === "") params.delete("project");
+      else params.set("project", next);
+      return params;
+    });
+  }
+
+  function refreshCatalog() {
+    return mutate(
+      (key) =>
+        Array.isArray(key) && key[0] === "automations" && key[1] === "list",
+    );
+  }
 
   async function runAutomation(automation: AutomationRow) {
     if (runningId) return;
@@ -310,7 +375,7 @@ export default function Automations() {
     setDeleting(true);
     try {
       await apiData(() => automationsApi.deleteAutomation(id, revision));
-      await mutate(queryKeys.automations.list());
+      await refreshCatalog();
       toast.push({ message: `Automation “${name}” deleted.` });
       setPendingDelete(null);
     } catch (cause) {
@@ -328,69 +393,117 @@ export default function Automations() {
 
   return (
     <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative w-64">
+          <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-fg-muted" />
+          <input
+            type="text"
+            aria-label="Search automations"
+            placeholder="Search automations…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="w-full rounded-md border border-line bg-panel/80 py-2 pl-9 pr-3 text-sm text-fg-2 placeholder-fg-muted outline-none transition-colors focus:border-focus focus:ring-0"
+          />
+        </div>
+        <FilterButton<AutomationScope>
+          label="Scope"
+          value={scope}
+          allValue="all"
+          options={SCOPE_FILTER_OPTIONS}
+          onChange={onScopeChange}
+        />
+        <FilterButton<TriggerFilter>
+          label="Trigger"
+          value={triggerFilter}
+          allValue="all"
+          options={TRIGGER_FILTER_OPTIONS}
+          onChange={(next) => setTriggerFilter(next)}
+        />
+        {scope === "project" ? (
+          <select
+            aria-label="Project"
+            value={selectedProjectId}
+            onChange={(event) => onProjectChange(event.target.value)}
+            className="rounded-md border border-line bg-panel/80 px-3 py-2 text-xs text-fg-2 outline-none transition-colors focus:border-focus"
+          >
+            <option value="">Select a project…</option>
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name} · {project.repository}
+              </option>
+            ))}
+          </select>
+        ) : null}
+        {projectsQuery.error ? (
+          <span role="alert" className="text-xs text-coral">
+            Couldn&apos;t load projects, so the project filter is unavailable.
+          </span>
+        ) : null}
+        <div className="ml-auto">
+          <CreateAutomationButton />
+        </div>
+      </div>
+
       {automationsQuery.isLoading ? (
         <LoadingState label="Loading automations…" />
       ) : automationsQuery.error ? (
         <ErrorState
           title="Couldn't load automations"
           description="Something went wrong while loading your automations."
-          onRetry={() => mutate(queryKeys.automations.list())}
+          onRetry={() => refreshCatalog()}
         />
-      ) : automations.length === 0 ? (
+      ) : scope === "project" && selectedProjectId === "" ? (
         <EmptyState
           icon={RocketLaunchIcon}
-          title="Create your first automation"
-          description="Automations run a workflow on a schedule or on demand, so recurring work happens without you kicking it off by hand."
-          action={
-            <Link to="/automations/new" className={PRIMARY_BUTTON_CLASS}>
-              <PlusIcon className="size-4" aria-hidden="true" />
-              Create Automation
-            </Link>
-          }
+          title="Choose a project"
+          description="Project instances are listed one project at a time. Pick a project above to see the automations it owns."
         />
+      ) : automations.length === 0 ? (
+        scope === "project" ? (
+          <EmptyState
+            icon={RocketLaunchIcon}
+            title="No automations for this project"
+            description="Enroll a global definition marked available to projects, or create a custom workflow that targets this repository."
+            action={
+              <Link
+                to={`/projects/${encodeURIComponent(selectedProjectId)}/automations`}
+                className={PRIMARY_BUTTON_CLASS}
+              >
+                Open project automations
+              </Link>
+            }
+          />
+        ) : (
+          <EmptyState
+            icon={RocketLaunchIcon}
+            title="Create your first automation"
+            description="Automations run a workflow on a schedule or on demand, so recurring work happens without you kicking it off by hand."
+            action={
+              <Link to="/automations/new" className={PRIMARY_BUTTON_CLASS}>
+                <PlusIcon className="size-4" aria-hidden="true" />
+                Create Automation
+              </Link>
+            }
+          />
+        )
       ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative w-64">
-              <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-fg-muted" />
-              <input
-                type="text"
-                aria-label="Search automations"
-                placeholder="Search automations…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                className="w-full rounded-md border border-line bg-panel/80 py-2 pl-9 pr-3 text-sm text-fg-2 placeholder-fg-muted outline-none transition-colors focus:border-focus focus:ring-0"
-              />
-            </div>
-            <FilterButton<TriggerFilter>
-              label="Trigger"
-              value={triggerFilter}
-              allValue="all"
-              options={TRIGGER_FILTER_OPTIONS}
-              onChange={(next) => setTriggerFilter(next)}
+        <div className="space-y-3">
+          {filtered.map((automation) => (
+            <AutomationCard
+              key={automation.id}
+              automation={automation}
+              busy={deleting || (runningId !== null && runningId !== automation.id)}
+              running={runningId === automation.id}
+              onRun={() => runAutomation(automation)}
+              onDelete={() => setPendingDelete(automation)}
             />
-            <div className="ml-auto">
-              <CreateAutomationButton />
-            </div>
-          </div>
-          <div className="space-y-3">
-            {filtered.map((automation) => (
-              <AutomationCard
-                key={automation.id}
-                automation={automation}
-                busy={deleting || (runningId !== null && runningId !== automation.id)}
-                running={runningId === automation.id}
-                onRun={() => runAutomation(automation)}
-                onDelete={() => setPendingDelete(automation)}
-              />
-            ))}
-            {filtered.length === 0 && (
-              <p className="py-8 text-center text-sm text-fg-muted">
-                No automations match your filters.
-              </p>
-            )}
-          </div>
-        </>
+          ))}
+          {filtered.length === 0 && (
+            <p className="py-8 text-center text-sm text-fg-muted">
+              No automations match your filters.
+            </p>
+          )}
+        </div>
       )}
       <ConfirmDialog
         open={pendingDelete !== null}

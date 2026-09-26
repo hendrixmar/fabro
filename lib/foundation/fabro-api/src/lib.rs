@@ -16,7 +16,7 @@ mod generated {
 pub mod types {
     pub use fabro_automation::{
         Automation, AutomationDraft as CreateAutomationRequest,
-        AutomationReplace as ReplaceAutomationRequest, AutomationTrigger,
+        AutomationReplace as ReplaceAutomationRequest, AutomationTrigger, Project,
     };
     pub use fabro_environment::Environment;
     pub use fabro_types::run_event::AgentSessionActivatedProps;
@@ -26,13 +26,13 @@ pub mod types {
     };
     pub use fabro_types::settings::server::{
         BugsinkIntegrationSettings, BugsinkProjectSettings, GithubIntegrationSettings,
-        GithubIntegrationStrategy, IntegrationWebhooksSettings, LogDestination,
-        ObjectStoreSettings, PlaneIntegrationSettings, ServerApiSettings, ServerArtifactsSettings,
-        ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings,
-        ServerListenSettings, ServerLoggingSettings, ServerSandboxProviderSettings,
-        ServerSandboxProvidersSettings, ServerSandboxSettings, ServerSchedulerSettings,
-        ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
-        WebhookStrategy,
+        GithubIntegrationStrategy, IntakeIntegrationSettings, IntegrationWebhooksSettings,
+        LogDestination, ObjectStoreSettings, PlaneIntegrationSettings, ServerApiSettings,
+        ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings,
+        ServerIntegrationsSettings, ServerListenSettings, ServerLoggingSettings,
+        ServerSandboxProviderSettings, ServerSandboxProvidersSettings, ServerSandboxSettings,
+        ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings,
+        SlackIntegrationSettings, WebhookStrategy,
     };
     pub use fabro_types::settings::{McpTransport, ServerNamespace};
     pub use fabro_types::status::{

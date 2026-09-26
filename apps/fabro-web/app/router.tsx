@@ -14,6 +14,15 @@ import * as Automations from "./routes/automations";
 import * as AutomationsNew from "./routes/automations-new";
 import * as AutomationsEdit from "./routes/automations-edit";
 import * as AutomationDetail from "./routes/automation-detail";
+import * as Projects from "./routes/projects";
+import * as ProjectsNew from "./routes/projects-new";
+import * as ProjectDetail from "./routes/projects-detail";
+import * as ProjectAutomations from "./routes/projects-automations";
+import * as ProjectAutomationNew from "./routes/projects-automations-new";
+import * as ProjectFeatures from "./routes/projects-features";
+import * as ProjectFeatureNew from "./routes/projects-features-new";
+import * as ProjectFeatureDetail from "./routes/projects-features-detail";
+import * as ProjectSetup from "./routes/projects-setup";
 import * as Runs from "./routes/runs";
 import * as RunDetail from "./routes/run-detail";
 import * as RunOverview from "./routes/run-overview";
@@ -122,6 +131,19 @@ export const routes: RouteObject[] = [
           route("automations/:id", AutomationDetail),
           // Backwards-compatible singular automation route used by older links.
           route("automation/:id", AutomationDetail),
+          route("projects", Projects),
+          route("projects/new", ProjectsNew),
+          route("projects/:id", ProjectDetail, {
+            children: [
+              indexRoute(ProjectAutomations),
+              route("automations", ProjectAutomations),
+              route("automations/new", ProjectAutomationNew),
+              route("features", ProjectFeatures),
+              route("features/new", ProjectFeatureNew),
+              route("features/:issue", ProjectFeatureDetail),
+              route("setup", ProjectSetup),
+            ],
+          }),
           route("runs", Runs),
           route("runs/:id", RunDetail, {
             children: [

@@ -34,6 +34,7 @@ base64.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+parking_lot.workspace = true
 fabro-macros = { path = "../../foundation/fabro-macros" }
 fabro-test = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }

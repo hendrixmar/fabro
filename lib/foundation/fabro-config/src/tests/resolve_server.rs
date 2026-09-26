@@ -133,6 +133,17 @@ fn resolved_server_integrations_disable_slack_when_config_is_absent() {
                 "api_base": null,
                 "workspace": null,
             },
+            "bugsink": {
+                "enabled": false,
+                "dispatch_enabled": false,
+                "origin": null,
+                "api_token_secret": null,
+                "projects": [],
+            },
+            "intake": {
+                "enabled": false,
+                "socket": null,
+            },
         })
     );
 }

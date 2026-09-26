@@ -13,6 +13,15 @@ export function runFileScopeSelection(
   return { kind: "scope", scope };
 }
 
+/** Ownership filter for the automation catalog. */
+export type AutomationScope = "all" | "global" | "project";
+
+export interface AutomationListFilters {
+  scope?: AutomationScope;
+  projectId?: string;
+  availableToProjects?: boolean;
+}
+
 function pathSegment(value: string): string {
   return encodeURIComponent(value);
 }
@@ -91,11 +100,29 @@ export const queryKeys = {
     runs: (name: string) => ["workflows", "runs", name] as const,
   },
   automations: {
-    list: () => ["automations", "list"] as const,
+    list: (filters: AutomationListFilters = {}) =>
+      ["automations", "list", filters] as const,
     detail: (id: string) => ["automations", "detail", id] as const,
     runs: (id: string, opts: { limit?: number; offset?: number } = {}) =>
       ["automations", "runs", id, opts.limit ?? null, opts.offset ?? null] as const,
     planeDispatches: (id: string) => ["automations", "plane-dispatches", id] as const,
+  },
+  projects: {
+    list: () => ["projects", "list"] as const,
+    detail: (id: string) => ["projects", "detail", id] as const,
+    repositories: (cursor: string | null = null) =>
+      ["projects", "github-repositories", cursor] as const,
+  },
+  intake: {
+    status: (projectId: string) => ["intake", "status", projectId] as const,
+    template: (projectId: string) => ["intake", "template", projectId] as const,
+    initiatives: (projectId: string) => ["intake", "initiatives", projectId] as const,
+    initiative: (projectId: string, issue: string) =>
+      ["intake", "initiative", projectId, issue] as const,
+    history: (projectId: string, issue: string) =>
+      ["intake", "history", projectId, issue] as const,
+    /** Advisor session state, namespaced per project like the session itself. */
+    chat: (projectId: string) => ["intake", "chat", projectId] as const,
   },
   plane: {
     projects: () => ["plane", "projects"] as const,

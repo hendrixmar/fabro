@@ -939,12 +939,13 @@ impl RunPort for LiveRunPort {
         let run_id = RunId::new();
         self.state
             .materialize_automation_run(AutomationRunMaterializeInput {
-                automation_id:   automation.id.clone(),
+                automation_id: automation.id.clone(),
                 target,
                 workflow_source: automation.workflow_source.clone(),
-                workflow:        automation.workflow.clone(),
+                project_id: automation.project_id.clone(),
+                workflow: automation.workflow.clone(),
                 run_id,
-                temp_root:       self.state.automation_temp_root(),
+                temp_root: self.state.automation_temp_root(),
             })
             .await
             .context("materializing automation target")?;
@@ -1003,12 +1004,13 @@ impl RunPort for LiveRunPort {
         let materialized = self
             .state
             .materialize_automation_run(AutomationRunMaterializeInput {
-                automation_id:   automation.id.clone(),
+                automation_id: automation.id.clone(),
                 target,
                 workflow_source: automation.workflow_source.clone(),
-                workflow:        automation.workflow.clone(),
+                project_id: automation.project_id.clone(),
+                workflow: automation.workflow.clone(),
                 run_id,
-                temp_root:       self.state.automation_temp_root(),
+                temp_root: self.state.automation_temp_root(),
             })
             .await?;
         let mut run_intent = materialized.clone().into_run_intent(environment_id);
@@ -1068,7 +1070,7 @@ impl RunPort for LiveRunPort {
             None
         };
         Ok(ObservedRun {
-            status: projection.status.clone(),
+            status: projection.status,
             pull_request_url,
             pr_pending,
             pr_failed,
@@ -1194,11 +1196,11 @@ mod tests {
     use std::sync::Mutex;
 
     use fabro_automation::{
-        AutomationDraft, AutomationId, AutomationStore, AutomationTarget, AutomationTrigger,
-        AutomationTriggerId, PlaneTrigger,
+        AutomationDraft, AutomationId, AutomationStore, AutomationTrigger, AutomationTriggerId,
+        PlaneTrigger,
     };
     use fabro_db::Database;
-    use fabro_types::{ExternalAgentHarness, SuccessReason};
+    use fabro_types::{ExternalAgentHarness, GitRunTarget, RunTarget, SuccessReason};
 
     use super::*;
 
@@ -1410,18 +1412,31 @@ mod tests {
             .await
             .unwrap();
         database.migrate().await.unwrap();
+        fabro_environment::seed_default_environment(
+            database.pool(),
+            fabro_types::settings::run::EnvironmentProvider::Docker,
+        )
+        .await
+        .unwrap();
         let automations = AutomationStore::new(database.clone_pool());
         let created = automations
             .create(AutomationDraft {
-                id:          AutomationId::new("tierra").unwrap(),
-                name:        "Tierra".to_string(),
-                description: None,
-                target:      AutomationTarget {
-                    repository:   "owner/repo".to_string(),
-                    ref_selector: "main".to_string(),
-                    workflow:     "ticket".to_string(),
-                },
-                triggers:    vec![AutomationTrigger::Plane(sample_trigger())],
+                id:                    AutomationId::new("tierra").unwrap(),
+                name:                  "Tierra".to_string(),
+                description:           None,
+                environment_id:        Some("default".to_string()),
+                target:                RunTarget::Git(GitRunTarget {
+                    repo:   "owner/repo".to_string(),
+                    branch: "main".to_string(),
+                    tag:    None,
+                    sha:    None,
+                }),
+                workflow:              "ticket".to_string(),
+                workflow_source:       None,
+                project_id:            None,
+                available_to_projects: false,
+                source_automation_id: None,
+                triggers:              vec![AutomationTrigger::Plane(sample_trigger())],
             })
             .await
             .unwrap();
@@ -1852,9 +1867,12 @@ mod tests {
                 labels: BTreeMap::new(),
                 source_directory: None,
                 workflow_slug: None,
+                workflow_version_id: None,
+                target: None,
                 automation: None,
                 provenance: fabro_types::test_support::test_run_provenance(),
                 manifest_blob: None,
+                spec_blob: None,
                 fork_source_ref: None,
                 retried_from: None,
                 parent_id: None,

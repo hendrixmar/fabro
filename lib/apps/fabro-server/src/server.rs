@@ -146,7 +146,6 @@ use crate::automation_materializer::{
     AutomationRunMaterializeInput, AutomationRunMaterialized, AutomationRunMaterializer,
     ProductionAutomationRunMaterializer, RunMaterializeError,
 };
-use crate::bugsink_webhooks;
 use crate::canonical_origin::{canonical_origin_from_effective_web_url, effective_web_url};
 use crate::error::ApiError;
 use crate::git_checkout::GitRepoCache;

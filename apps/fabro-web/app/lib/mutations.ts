@@ -1,7 +1,15 @@
 import useSWRMutation from "swr/mutation";
 import { useSWRConfig, type ScopedMutator } from "swr";
 import type {
+  IntakeActionResponse,
+  IntakeCreateRequest,
+  IntakeCreateResponse,
+  IntakeImportResponse,
+  IntakePauseStatus,
+  IntakeReadinessReport,
+  IntakeStageRequest,
   PreviewUrlResponse,
+  Project,
   Run,
   SteerRunRequest,
   SubmitAnswerRequest,
@@ -11,6 +19,7 @@ import type {
 import {
   apiData,
   authApi,
+  featureIntakeApi,
   humanInTheLoopApi,
   runsApi,
 } from "./api-client";
@@ -203,6 +212,242 @@ export function useSteerRun(runId: string | undefined) {
       onSuccess: () => {
         if (!runId) return;
         void mutate(queryKeys.runs.detail(runId));
+      },
+    },
+  );
+}
+
+// Feature intake. Every mutation invalidates only the intake keys it can
+// change, plus the project it belongs to, so a provider error elsewhere on the
+// page never drops the global project or automation lists.
+
+function invalidateIntakeStatus(mutate: ScopedMutator, projectId: string) {
+  void mutate(queryKeys.intake.status(projectId));
+}
+
+function invalidateIntakeProject(mutate: ScopedMutator, projectId: string) {
+  invalidateIntakeStatus(mutate, projectId);
+  void mutate(queryKeys.intake.initiatives(projectId));
+}
+
+function invalidateIntakeInitiative(
+  mutate: ScopedMutator,
+  projectId: string,
+  issue: string,
+) {
+  void mutate(queryKeys.intake.initiative(projectId, issue));
+  void mutate(queryKeys.intake.history(projectId, issue));
+  void mutate(queryKeys.intake.initiatives(projectId));
+}
+
+function useIntakeAction<TArg, TResult>(
+  key: readonly unknown[],
+  run: (arg: TArg) => Promise<TResult>,
+  invalidate: (mutate: ScopedMutator) => void,
+) {
+  const { mutate } = useSWRConfig();
+  return useSWRMutation(key, (_key, { arg }: { arg: TArg }) => run(arg), {
+    onSuccess: () => invalidate(mutate),
+  });
+}
+
+export interface SetupProjectIntakeArgs {
+  plane_project_id: string;
+  /** Current project revision, sent as `If-Match`. */
+  revision: string;
+}
+
+/**
+ * Set up feature intake. The server re-reads GitHub and Plane identity and
+ * links the binding only after it can read the registration back, so a stale
+ * `If-Match` fails with the project untouched.
+ */
+export function useSetupProjectIntake(projectId: string | undefined) {
+  const { mutate } = useSWRConfig();
+  return useIntakeAction<SetupProjectIntakeArgs, Project>(
+    projectId ? queryKeys.intake.status(projectId) : [],
+    (arg) =>
+      apiData(() =>
+        featureIntakeApi.setupProjectIntake(projectId!, arg.revision, {
+          plane_project_id: arg.plane_project_id,
+        }),
+      ),
+    () => {
+      if (!projectId) return;
+      void mutate(queryKeys.projects.detail(projectId));
+      invalidateIntakeStatus(mutate, projectId);
+    },
+  );
+}
+
+export function useDetachProjectIntake(projectId: string | undefined) {
+  const { mutate } = useSWRConfig();
+  return useIntakeAction<void, Project>(
+    projectId ? [...queryKeys.intake.status(projectId), "detach"] : [],
+    () => apiData(() => featureIntakeApi.detachProjectIntake(projectId!)),
+    () => {
+      if (!projectId) return;
+      void mutate(queryKeys.projects.detail(projectId));
+      invalidateIntakeStatus(mutate, projectId);
+    },
+  );
+}
+
+export function useSetProjectIntakePause(projectId: string | undefined) {
+  return useIntakeAction<{ paused: boolean; reason: string }, IntakePauseStatus>(
+    projectId ? [...queryKeys.intake.status(projectId), "pause"] : [],
+    (arg) =>
+      apiData(() => featureIntakeApi.setProjectIntakePause(projectId!, arg)),
+    (mutate) => {
+      if (projectId) invalidateIntakeStatus(mutate, projectId);
+    },
+  );
+}
+
+export function useRecheckProjectIntakeReadiness(projectId: string | undefined) {
+  return useIntakeAction<void, IntakeReadinessReport>(
+    projectId ? [...queryKeys.intake.status(projectId), "recheck"] : [],
+    () => apiData(() => featureIntakeApi.recheckProjectIntakeReadiness(projectId!)),
+    (mutate) => {
+      if (projectId) invalidateIntakeStatus(mutate, projectId);
+    },
+  );
+}
+
+export function useCreateProjectIntakeInitiative(projectId: string | undefined) {
+  return useIntakeAction<IntakeCreateRequest, IntakeCreateResponse>(
+    projectId ? [...queryKeys.intake.initiatives(projectId), "create"] : [],
+    (arg) =>
+      apiData(() => featureIntakeApi.createProjectIntakeInitiative(projectId!, arg)),
+    (mutate) => {
+      if (projectId) invalidateIntakeProject(mutate, projectId);
+    },
+  );
+}
+
+export function useCommentProjectIntakeInitiative(
+  projectId: string | undefined,
+  issue: string | undefined,
+) {
+  return useIntakeAction<{ text: string }, IntakeActionResponse>(
+    projectId && issue ? queryKeys.intake.initiative(projectId, issue) : [],
+    (arg) =>
+      apiData(() =>
+        featureIntakeApi.commentProjectIntakeInitiative(projectId!, issue!, arg),
+      ),
+    (mutate) => {
+      if (projectId && issue) invalidateIntakeInitiative(mutate, projectId, issue);
+    },
+  );
+}
+
+export function useApproveProjectIntakeInitiative(
+  projectId: string | undefined,
+  issue: string | undefined,
+) {
+  return useIntakeAction<{ supervised: boolean }, IntakeActionResponse>(
+    projectId && issue ? [...queryKeys.intake.initiative(projectId, issue), "approve"] : [],
+    (arg) =>
+      apiData(() =>
+        featureIntakeApi.approveProjectIntakeInitiative(projectId!, issue!, arg),
+      ),
+    (mutate) => {
+      if (projectId && issue) invalidateIntakeInitiative(mutate, projectId, issue);
+    },
+  );
+}
+
+export function useReviseProjectIntakeInitiative(
+  projectId: string | undefined,
+  issue: string | undefined,
+) {
+  return useIntakeAction<{ text: string; supervised?: boolean }, IntakeActionResponse>(
+    projectId && issue ? [...queryKeys.intake.initiative(projectId, issue), "revise"] : [],
+    (arg) =>
+      apiData(() =>
+        featureIntakeApi.reviseProjectIntakeInitiative(projectId!, issue!, arg),
+      ),
+    (mutate) => {
+      if (projectId && issue) invalidateIntakeInitiative(mutate, projectId, issue);
+    },
+  );
+}
+
+export function useCancelProjectIntakeInitiative(
+  projectId: string | undefined,
+  issue: string | undefined,
+) {
+  return useIntakeAction<{ supervised: boolean }, IntakeActionResponse>(
+    projectId && issue ? [...queryKeys.intake.initiative(projectId, issue), "cancel"] : [],
+    (arg) =>
+      apiData(() =>
+        featureIntakeApi.cancelProjectIntakeInitiative(projectId!, issue!, arg),
+      ),
+    (mutate) => {
+      if (projectId && issue) invalidateIntakeInitiative(mutate, projectId, issue);
+    },
+  );
+}
+
+export function useRunProjectIntakeStage(
+  projectId: string | undefined,
+  issue: string | undefined,
+) {
+  return useIntakeAction<IntakeStageRequest, IntakeActionResponse>(
+    projectId && issue ? [...queryKeys.intake.initiative(projectId, issue), "run"] : [],
+    (arg) =>
+      apiData(() => featureIntakeApi.runProjectIntakeStage(projectId!, issue!, arg)),
+    (mutate) => {
+      if (projectId && issue) invalidateIntakeInitiative(mutate, projectId, issue);
+    },
+  );
+}
+
+export function useReconcileProjectIntakeInitiative(
+  projectId: string | undefined,
+  issue: string | undefined,
+) {
+  return useIntakeAction<void, IntakeActionResponse>(
+    projectId && issue ? [...queryKeys.intake.initiative(projectId, issue), "reconcile"] : [],
+    () =>
+      apiData(() =>
+        featureIntakeApi.reconcileProjectIntakeInitiative(projectId!, issue!),
+      ),
+    (mutate) => {
+      if (projectId && issue) invalidateIntakeInitiative(mutate, projectId, issue);
+    },
+  );
+}
+
+/**
+ * Explicit provisioning. Never implied by a document approval: it may configure
+ * staging and CI and create implementation tickets.
+ */
+export function useExecuteProjectIntakeInitiative(
+  projectId: string | undefined,
+  issue: string | undefined,
+) {
+  return useIntakeAction<{ supervised: boolean }, IntakeActionResponse>(
+    projectId && issue ? [...queryKeys.intake.initiative(projectId, issue), "execute"] : [],
+    (arg) =>
+      apiData(() =>
+        featureIntakeApi.executeProjectIntakeInitiative(projectId!, issue!, arg),
+      ),
+    (mutate) => {
+      if (projectId && issue) invalidateIntakeInitiative(mutate, projectId, issue);
+    },
+  );
+}
+
+export function useImportProjectIntakeBindings() {
+  const { mutate } = useSWRConfig();
+  return useSWRMutation(
+    ["intake", "import"] as const,
+    async (): Promise<IntakeImportResponse> =>
+      apiData(() => featureIntakeApi.importProjectIntakeBindings()),
+    {
+      onSuccess: () => {
+        void mutate(queryKeys.projects.list());
       },
     },
   );

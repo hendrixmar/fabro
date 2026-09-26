@@ -51,6 +51,7 @@ use super::super::{
     delete_run_internal, load_pending_interview, managed_run, parse_run_id_path,
     parse_stage_id_path, reject_if_archived, submit_pending_interview_answer, workflow_event,
 };
+use crate::automation_materializer::PROJECT_LABEL;
 use crate::error::ApiError;
 use crate::principal_middleware::{
     RequireCommandLog, RequireRunManagementTarget, RequireRunScoped, RequireRunStageScoped,
@@ -613,6 +614,115 @@ pub(crate) struct CreateRunFromIntentRequest {
     pub(crate) automation:      Option<AutomationRef>,
 }
 
+/// Re-verify the server-derived project label of an automation run against
+/// the persisted automation and project rows.
+///
+/// Global runs carry no project label and keep their existing behavior. A
+/// project-scoped run whose automation moved scope, disappeared, or whose
+/// project no longer owns the run target repository is rejected before
+/// anything is queued.
+async fn verify_admitted_project_binding(
+    state: &AppState,
+    intent: &fabro_types::RunIntent,
+    automation: Option<&fabro_types::AutomationRef>,
+) -> Result<(), Response> {
+    let Some(project_id) = intent.args.labels.get(PROJECT_LABEL) else {
+        return Ok(());
+    };
+    let Some(automation) = automation else {
+        return Err(intent_error(
+            StatusCode::CONFLICT,
+            "run carries a project label but no owning automation",
+            "run_project_binding_invalid",
+        ));
+    };
+    let Ok(automation_id) = fabro_automation::AutomationId::new(automation.id.as_str()) else {
+        return Err(intent_error(
+            StatusCode::CONFLICT,
+            "run carries an invalid owning automation id",
+            "run_project_binding_invalid",
+        ));
+    };
+    let stored = match state.automation_store().get(&automation_id).await {
+        Ok(stored) => stored,
+        Err(err) => {
+            tracing::error!(error = ?err, "Loading automation for project admission failed");
+            return Err(intent_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "automation store operation failed",
+                "automation_store_failed",
+            ));
+        }
+    };
+    let Some(stored) = stored else {
+        return Err(intent_error(
+            StatusCode::CONFLICT,
+            format!("automation {automation_id} no longer exists"),
+            "run_project_binding_stale",
+        ));
+    };
+    if stored
+        .project_id
+        .as_ref()
+        .map(fabro_automation::ProjectId::as_str)
+        != Some(project_id.as_str())
+    {
+        return Err(intent_error(
+            StatusCode::CONFLICT,
+            format!("automation {automation_id} is no longer owned by project {project_id}"),
+            "run_project_binding_stale",
+        ));
+    }
+    let fabro_types::RunTarget::Git(target) = &intent.target else {
+        return Err(intent_error(
+            StatusCode::CONFLICT,
+            "project-scoped automation run must target a Git repository",
+            "run_project_binding_invalid",
+        ));
+    };
+    let Ok(typed_project_id) = fabro_automation::ProjectId::new(project_id.clone()) else {
+        return Err(intent_error(
+            StatusCode::CONFLICT,
+            "run carries an invalid project label",
+            "run_project_binding_invalid",
+        ));
+    };
+    let project = match state.project_store().get(&typed_project_id).await {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            return Err(intent_error(
+                StatusCode::CONFLICT,
+                format!("project {project_id} no longer exists"),
+                "run_project_binding_stale",
+            ));
+        }
+        Err(err) => {
+            tracing::error!(error = ?err, "Loading project for run admission failed");
+            return Err(intent_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "project store operation failed",
+                "project_store_failed",
+            ));
+        }
+    };
+    let matches = fabro_types::GitHubRepositorySlug::try_new(&target.repo)
+        .zip(fabro_types::GitHubRepositorySlug::try_new(
+            &project.repository,
+        ))
+        .is_some_and(|(target_repo, project_repo)| target_repo == project_repo);
+    if !matches {
+        return Err(intent_error(
+            StatusCode::CONFLICT,
+            format!(
+                "project {project_id} owns {}, but this run targets {}",
+                project.repository, target.repo
+            ),
+            "run_project_binding_stale",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn create_run_from_intent(
     state: Arc<AppState>,
     request: CreateRunFromIntentRequest,
@@ -625,6 +735,14 @@ pub(crate) async fn create_run_from_intent(
         automation,
     } = request;
     let explicit_title_supplied = intent.title.is_some();
+    // Server-owned project attribution is re-verified here, at admission: a
+    // scope move or repository rebinding between materialization and this
+    // write must block the queue rather than persist a stale label.
+    if let Err(response) =
+        verify_admitted_project_binding(&state, &intent, automation.as_ref()).await
+    {
+        return response;
+    }
     // Validate the pure, in-memory request facts before paying for
     // blob-store reads and closure lowering.
     let ValidatedRunTarget { target, git } = match intent.target.validate() {
