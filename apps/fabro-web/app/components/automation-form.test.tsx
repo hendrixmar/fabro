@@ -1,12 +1,48 @@
 import { describe, expect, test } from "bun:test";
+import TestRenderer, { act } from "react-test-renderer";
+import { MemoryRouter } from "react-router";
 
 import {
+  AutomationFormFields,
   EMPTY_AUTOMATION_FORM,
   automationFormValuesFromRun,
   automationToFormValues,
   isFormValid,
   workflowSourceFromFormValues,
+  type AutomationFormValues,
 } from "./automation-form";
+
+const defaultValues: AutomationFormValues = {
+  ...EMPTY_AUTOMATION_FORM,
+  id:               "nightly",
+  name:             "Nightly",
+  environmentId:    "daytona-smoke",
+  targetRepository: "fabro-sh/app",
+  targetBranch:     "main",
+  workflow:         "release",
+};
+
+/** Render `AutomationFormFields` and flatten it to its visible text. */
+function renderForm(values: AutomationFormValues): string {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  let tree!: TestRenderer.ReactTestRenderer;
+  act(() => {
+    tree = TestRenderer.create(
+      <MemoryRouter>
+        <AutomationFormFields values={values} onChange={() => {}} />
+      </MemoryRouter>,
+    );
+  });
+  return textOf(tree.toJSON());
+}
+
+function textOf(node: unknown): string {
+  if (!node) return "";
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  const element = node as { children?: unknown[] };
+  return (element.children ?? []).map(textOf).join("");
+}
 
 describe("automation workflow source form values", () => {
   test("the default and create-from-run forms inherit the target checkout", () => {
@@ -94,5 +130,11 @@ describe("automation workflow source form values", () => {
       ...values,
       usesRemoteWorkflow: false,
     })).toBeUndefined();
+  });
+
+  test("a linked automation shows its global workflow read-only", () => {
+    const text = renderForm({ ...defaultValues, sourceAutomationId: "woodpecker-loop", workflow: "woodpecker-loop" });
+    expect(text).toContain("Runs the global woodpecker-loop workflow");
+    expect(text).not.toContain("Workflow slug");
   });
 });

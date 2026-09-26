@@ -27,6 +27,7 @@ import {
   workflowSourceSummary,
 } from "../lib/automation";
 import { useAutomations, useProjects } from "../lib/queries";
+import { usedByProjects } from "../lib/project";
 import { type AutomationScope } from "../lib/query-keys";
 import { ConfirmDialog, PRIMARY_BUTTON_CLASS } from "../components/ui";
 import { EmptyState, ErrorState, LoadingState } from "../components/state";
@@ -61,7 +62,9 @@ interface AutomationRow {
   schedule?: string;
   apiEnabled: boolean;
   projectId: string | null;
+  sourceAutomationId: string | null;
   availableToProjects: boolean;
+  usedBy: string[];
   icon: ComponentType<{ className?: string }>;
   color: string;
 }
@@ -90,7 +93,10 @@ const MENU_ITEM_CLASS =
 const MENU_ITEM_DANGER_CLASS =
   "flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-coral transition-colors data-focus:bg-coral/10 data-focus:text-coral data-focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-60";
 
-function mapAutomations(result: AutomationListResponse | undefined): AutomationRow[] {
+function mapAutomations(
+  result: AutomationListResponse | undefined,
+  usedBy: Map<string, string[]>,
+): AutomationRow[] {
   const automations = result?.data ?? [];
   return automations.map((a) => {
     const target = gitTarget(a.target);
@@ -107,7 +113,9 @@ function mapAutomations(result: AutomationListResponse | undefined): AutomationR
       schedule:   findScheduleTrigger(a)?.expression,
       apiEnabled: hasEnabledApiTrigger(a),
       projectId:  a.project_id ?? null,
+      sourceAutomationId: a.source_automation_id ?? null,
       availableToProjects: a.available_to_projects === true,
+      usedBy:     usedBy.get(a.id) ?? [],
       icon:       slugIconMap[a.workflow] ?? CodeBracketIcon,
       color:      slugColorMap[a.workflow] ?? "var(--color-teal-500)",
     };
@@ -172,6 +180,9 @@ function AutomationCard({
               <>
                 Project ·{" "}
                 <span className="font-mono text-fg-3">{automation.projectId}</span>
+                {automation.sourceAutomationId ? (
+                  <> · linked to {automation.sourceAutomationId}</>
+                ) : null}
               </>
             ) : (
               <>
@@ -180,6 +191,9 @@ function AutomationCard({
                   <span className="ml-1.5 text-teal-300">
                     · Available to projects
                   </span>
+                ) : null}
+                {automation.usedBy.length > 0 ? (
+                  <span className="ml-1.5 text-fg-3">· Used by {automation.usedBy.join(", ")}</span>
                 ) : null}
               </>
             )}
@@ -305,7 +319,9 @@ export default function Automations() {
     scope,
     projectId: scope === "project" ? selectedProjectId || undefined : undefined,
   });
-  const automations = mapAutomations(automationsQuery.data);
+  const everything = useAutomations({});
+  const usedBy = usedByProjects(everything.data?.data ?? []);
+  const automations = mapAutomations(automationsQuery.data, usedBy);
   const [query, setQuery] = useState("");
   const [triggerFilter, setTriggerFilter] = useState<TriggerFilter>("all");
   const [pendingDelete, setPendingDelete] = useState<AutomationRow | null>(null);
