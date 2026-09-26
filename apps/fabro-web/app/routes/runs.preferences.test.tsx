@@ -4,7 +4,11 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import type { PaginatedRunList, Run } from "@qltysh/fabro-api-client";
 
 import { ToastProvider } from "../components/toast";
-import { CHILD_RUNS_LIST_PREFERENCES_STORAGE_KEY } from "../components/runs-list/preferences";
+import {
+  CHILD_RUNS_LIST_PREFERENCES_STORAGE_KEY,
+  runsWorkspacePreferencesFromSearchParams,
+  runsWorkspacePreferencesToSearchParams,
+} from "../components/runs-list/preferences";
 import { TEST_PRINCIPAL } from "../lib/test-fixtures";
 import { setupReactTestEnv } from "../lib/test-utils";
 
@@ -127,6 +131,7 @@ mock.module("../lib/queries", () => ({
   },
   useAuthConfig: () => ({ data: { methods: ["github"] } }),
   useSystemInfo: () => ({ data: { server_url: "http://127.0.0.1:32276" } }),
+  useProjects: () => ({ data: { data: [{ id: "proj-docs", name: "qlty/docs" }] } }),
 }));
 
 mock.module("../lib/board-events", () => ({
@@ -363,7 +368,7 @@ describe("Runs workspace preference restoration", () => {
       });
     });
     await act(async () => {
-      compositeByName(renderer, "FilterButton", (props) => props.label === "Repo").props.onChange("qlty/docs");
+      compositeByName(renderer, "FilterButton", (props) => props.label === "Project").props.onChange("proj-docs");
     });
     await act(async () => {
       compositeByName(renderer, "FilterButton", (props) => props.label === "Workflow").props.onChange("docs");
@@ -384,12 +389,22 @@ describe("Runs workspace preference restoration", () => {
     expect(JSON.parse(storage.getItem(RUNS_PREFERENCES_STORAGE_KEY) ?? "{}")).toMatchObject({
       view:     "list",
       search:   "release fix",
-      repo:     "qlty/docs",
+      project:  "proj-docs",
       workflow: "docs",
       created:  "7d",
       status:   "running,blocked",
       archived: true,
       hide:     "repo,workflow",
     });
+  });
+});
+
+describe("Runs workspace project preference", () => {
+  test("project filter round-trips through the URL, including unassigned", () => {
+    const prefs = runsWorkspacePreferencesFromSearchParams(new URLSearchParams("project=none"));
+    expect(prefs.project).toBe("none");
+    expect(
+      runsWorkspacePreferencesToSearchParams({ ...prefs, project: "tierrapay" }).get("project"),
+    ).toBe("tierrapay");
   });
 });

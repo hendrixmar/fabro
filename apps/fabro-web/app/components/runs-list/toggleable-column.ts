@@ -1,5 +1,6 @@
 export const TOGGLEABLE_COLUMNS = [
   "created_by",
+  "project",
   "repo",
   "workflow",
   "created",
@@ -15,6 +16,7 @@ const TOGGLEABLE_COLUMN_SET = new Set<string>(TOGGLEABLE_COLUMNS);
 export type ToggleableColumn = (typeof TOGGLEABLE_COLUMNS)[number];
 
 export const toggleableColumnLabels: Record<ToggleableColumn, string> = {
+  project:    "Project",
   repo:       "Repo",
   workflow:   "Workflow",
   created_by: "Created by",

@@ -213,7 +213,6 @@ export default function RunChildren() {
           onPageChange={setPage}
           onPageSizeChange={setPageSize}
           query={lowerQuery}
-          repoFilter="all"
           workflowFilter="all"
           createdCutoffMs={null}
         />

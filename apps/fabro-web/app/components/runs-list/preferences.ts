@@ -135,7 +135,7 @@ export const RUNS_PREFERENCES_STORAGE_KEY = "fabro:runs-preferences:v1";
 const RUNS_WORKSPACE_PARAM_KEYS = [
   "view",
   "search",
-  "repo",
+  "project",
   "workflow",
   "created",
   "status",
@@ -152,7 +152,8 @@ export interface RunsWorkspacePreferences {
   version: typeof RUNS_PREFERENCES_VERSION;
   view: ViewMode;
   search: string;
-  repo: string;
+  /** "all", "none" (unassigned) or a project id; filtered by the server. */
+  project: string;
   workflow: string;
   created: CreatedFilter;
   status: Set<BoardColumn>;
@@ -170,7 +171,7 @@ export function defaultRunsWorkspacePreferences(): RunsWorkspacePreferences {
     version:   RUNS_PREFERENCES_VERSION,
     view:      "columns",
     search:    "",
-    repo:      "all",
+    project:   "all",
     workflow:  "all",
     created:   "all",
     status:    new Set<BoardColumn>(),
@@ -222,7 +223,7 @@ function normalizeStoredRunsWorkspacePreferences(value: unknown): RunsWorkspaceP
     version:   RUNS_PREFERENCES_VERSION,
     view:      parseView(stringValue(record.view)),
     search:    stringValue(record.search) ?? "",
-    repo:      filterPreference(stringValue(record.repo)),
+    project:   filterPreference(stringValue(record.project)),
     workflow:  filterPreference(stringValue(record.workflow)),
     created:   parseCreatedFilter(stringValue(record.created)),
     status,
@@ -270,7 +271,7 @@ export function runsWorkspacePreferencesFromSearchParams(
     version:   RUNS_PREFERENCES_VERSION,
     view:      parseView(searchParams.get("view")),
     search:    searchParams.get("search") ?? "",
-    repo:      filterPreference(searchParams.get("repo")),
+    project:   filterPreference(searchParams.get("project")),
     workflow:  filterPreference(searchParams.get("workflow")),
     created:   parseCreatedFilter(searchParams.get("created")),
     status:    rawStatus == null ? new Set<BoardColumn>() : parseStatusFilter(rawStatus),
@@ -289,7 +290,7 @@ export function runsWorkspacePreferencesToSearchParams(
   const params = new URLSearchParams();
   if (preferences.view === "list") params.set("view", "list");
   if (preferences.search !== "") params.set("search", preferences.search);
-  if (preferences.repo !== "all") params.set("repo", preferences.repo);
+  if (preferences.project !== "all") params.set("project", preferences.project);
   if (preferences.workflow !== "all") params.set("workflow", preferences.workflow);
   if (preferences.created !== "all") params.set("created", preferences.created);
   if (!statusFilterIsTrivial(preferences.status)) {

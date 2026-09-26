@@ -106,6 +106,17 @@ export function RunDetailHeader({
       >
         <Link to="/runs" className="text-fg-3 hover:text-fg">Runs</Link>
         <ChevronRightIcon className="size-3" />
+        {summary.project ? (
+          <>
+            <Link
+              to={`/projects/${encodeURIComponent(summary.project.id)}`}
+              className="text-fg-3 hover:text-fg"
+            >
+              {summary.project.name}
+            </Link>
+            <ChevronRightIcon className="size-3" />
+          </>
+        ) : null}
         <Link
           to={`/runs?workflow=${encodeURIComponent(run.workflow)}`}
           className="text-fg-3 hover:text-fg"
