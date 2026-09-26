@@ -167,6 +167,11 @@ impl Default for RunSummaryVisibility {
 pub struct RunSummaryListQuery {
     pub parent_id:     Option<RunId>,
     pub automation_id: Option<String>,
+    pub project:       Option<RunProjectFilter>,
+    pub workflow:      Option<String>,
+    /// Only runs that did something: not succeeded, changed files, or have children.
+    pub activity:      bool,
+    pub roots_only:    bool,
     pub visibility:    RunSummaryVisibility,
     pub sort:          RunSummarySort,
     pub direction:     RunSummarySortDirection,
@@ -179,6 +184,10 @@ impl Default for RunSummaryListQuery {
         Self {
             parent_id:     None,
             automation_id: None,
+            project:       None,
+            workflow:      None,
+            activity:      false,
+            roots_only:    false,
             visibility:    RunSummaryVisibility::default(),
             sort:          RunSummarySort::default(),
             direction:     RunSummarySortDirection::default(),
@@ -186,6 +195,14 @@ impl Default for RunSummaryListQuery {
             offset:        0,
         }
     }
+}
+
+/// Project scope of a run listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunProjectFilter {
+    /// Runs no project owns.
+    Unassigned,
+    Project(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1410,6 +1427,32 @@ fn push_filters(builder: &mut QueryBuilder<Sqlite>, query: &RunSummaryListQuery)
             .push(" AND automation_id = ")
             .push_bind(automation_id.clone());
     }
+    match &query.project {
+        None => {}
+        Some(RunProjectFilter::Unassigned) => {
+            builder.push(" AND project_id IS NULL");
+        }
+        Some(RunProjectFilter::Project(project_id)) => {
+            builder
+                .push(" AND project_id = ")
+                .push_bind(project_id.clone());
+        }
+    }
+    if let Some(workflow) = &query.workflow {
+        builder
+            .push(" AND workflow_slug = ")
+            .push_bind(workflow.clone());
+    }
+    if query.activity {
+        builder.push(format!(
+            " AND (status <> '{}' OR diff_files_changed > 0 OR EXISTS \
+             (SELECT 1 FROM runs AS activity_child WHERE activity_child.parent_id = runs.id))",
+            RunStatusKind::Succeeded
+        ));
+    }
+    if query.roots_only {
+        builder.push(" AND parent_id IS NULL");
+    }
 
     match &query.visibility {
         RunSummaryVisibility::All => {}
@@ -1576,8 +1619,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::{
-        INSERT_EVENT_SQL, RunSummaryListQuery, RunSummarySort, RunSummarySortDirection,
-        RunSummaryStore, RunSummaryVisibility, decode_event_row,
+        INSERT_EVENT_SQL, RunProjectFilter, RunSummaryListQuery, RunSummarySort,
+        RunSummarySortDirection, RunSummaryStore, RunSummaryVisibility, decode_event_row,
     };
     use crate::run_state::ProjectedRun;
     use crate::{Error, EventPayload, RunProjectionReducer, test_support as store_test_support};
@@ -1707,6 +1750,78 @@ mod tests {
 
         let runs = store.list_all(at).await.unwrap();
         assert_eq!(project_of(&runs, "moving").as_deref(), Some("tierrapay"));
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_project_workflow_activity_and_roots() {
+        let (_directory, store) = store().await;
+        seed_project(&store, "tierrapay", "1", "artesanos-digitales/tierrapay").await;
+        let at = dt("2026-09-26T12:00:00Z");
+        let ms = at.timestamp_millis().cast_unsigned();
+        let run = |n: u128, title: &str, repository: &str, workflow: &str, kind: RunStatusKind| {
+            let mut projected = projection(run_id(ms + u64::try_from(n).unwrap(), n), title, at);
+            projected.spec.git = origin(repository);
+            projected.spec.workflow_slug = Some(workflow.to_string());
+            projected.status = sample_status(kind);
+            projected
+        };
+        let quiet = run(1, "quiet", "artesanos-digitales/tierrapay", "scan", RunStatusKind::Succeeded);
+        let failed = run(2, "failed", "artesanos-digitales/tierrapay", "scan", RunStatusKind::Failed);
+        let parent = run(3, "parent", "artesanos-digitales/tierrapay", "ticket", RunStatusKind::Succeeded);
+        let mut child = run(4, "child", "hendrixmar/fabro-demo", "repair", RunStatusKind::Succeeded);
+        child.parent_id = Some(parent.spec.run_id);
+        let stray = run(5, "stray", "hendrixmar/fabro-demo", "scan", RunStatusKind::Running);
+        for projected in [quiet, failed, parent, child, stray] {
+            store.upsert_projection(&entry(projected, 1)).await.unwrap();
+        }
+
+        let titles = |query: RunSummaryListQuery| {
+            let store = &store;
+            async move {
+                let mut titles: Vec<String> = store
+                    .list(&query, at)
+                    .await
+                    .unwrap()
+                    .data
+                    .into_iter()
+                    .map(|run| run.title)
+                    .collect();
+                titles.sort();
+                titles
+            }
+        };
+        let tierrapay = Some(RunProjectFilter::Project("tierrapay".to_string()));
+        assert_eq!(
+            titles(RunSummaryListQuery { project: tierrapay.clone(), ..Default::default() }).await,
+            ["child", "failed", "parent", "quiet"],
+        );
+        assert_eq!(
+            titles(RunSummaryListQuery {
+                project: Some(RunProjectFilter::Unassigned),
+                ..Default::default()
+            })
+            .await,
+            ["stray"],
+        );
+        assert_eq!(
+            titles(RunSummaryListQuery {
+                project: tierrapay.clone(),
+                workflow: Some("scan".to_string()),
+                ..Default::default()
+            })
+            .await,
+            ["failed", "quiet"],
+        );
+        assert_eq!(
+            titles(RunSummaryListQuery {
+                project: tierrapay,
+                activity: true,
+                roots_only: true,
+                ..Default::default()
+            })
+            .await,
+            ["failed", "parent"],
+        );
     }
 
     fn sql_event_payload(

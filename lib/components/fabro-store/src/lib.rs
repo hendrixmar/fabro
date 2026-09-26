@@ -48,7 +48,7 @@ pub use run_sessions::{
 };
 pub use run_state::RunProjectionReducer;
 pub use run_summary_store::{
-    RunSummaryIdentity, RunSummaryListQuery, RunSummaryPage, RunSummarySort,
+    RunProjectFilter, RunSummaryIdentity, RunSummaryListQuery, RunSummaryPage, RunSummarySort,
     RunSummarySortDirection, RunSummaryStore, RunSummaryVisibility,
 };
 pub use serializable_projection::SerializableProjection;
