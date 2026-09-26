@@ -12,10 +12,10 @@ import {
   PRIMARY_BUTTON_CLASS,
   SECONDARY_BUTTON_CLASS,
 } from "../components/ui";
-import { projectAutomationAttention } from "../lib/project";
+import { projectAutomationAttention, projectRunStats } from "../lib/project";
 import { intakeErrorMessage } from "../lib/intake";
 import { useImportProjectIntakeBindings } from "../lib/mutations";
-import { useAutomations, useProjects } from "../lib/queries";
+import { useAutomations, useProjects, useRunsPage } from "../lib/queries";
 import { queryKeys } from "../lib/query-keys";
 import { plural } from "../lib/plural";
 
@@ -186,6 +186,10 @@ function ProjectRow({
   instances: Automation[];
 }) {
   const attention = projectAutomationAttention(instances);
+  const runs = useRunsPage({ projectId: project.id, rootsOnly: true, limit: 100, offset: 0 }).data?.data ?? [];
+  const stats = projectRunStats(runs, Date.now());
+  const enabled = instances.filter((automation) => automation.triggers.some((trigger) => trigger.enabled)).length;
+
   return (
     <Row
       title={
@@ -209,8 +213,10 @@ function ProjectRow({
           {project.repository}
         </a>
         <p className="text-xs/5 text-fg-3">
-          {instances.length}{" "}
-          {plural(instances.length, "automation", "automations")}
+          <span>{stats.running} running</span>
+          <span>· {stats.failed24h} failed in 24h</span>
+          <span>· {stats.lastRunAt ? `last ran ${new Date(stats.lastRunAt).toLocaleString()}` : "never ran"}</span>
+          <span>· {enabled}/{instances.length} automations enabled</span>
           <span className="text-fg-muted"> · </span>
           {project.intake_binding_id
             ? "Feature intake connected"
