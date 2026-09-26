@@ -102,6 +102,13 @@ export interface RunsListFilters {
   sort?: ListRunsSortEnum;
   direction?: ListRunsDirectionEnum;
   includeArchived?: boolean;
+  /** Project id, or "none" for runs no project owns. */
+  projectId?:    string;
+  automationId?: string;
+  workflow?:     string;
+  /** Only runs that did something: not succeeded, changed files, or have children. */
+  activity?:     boolean;
+  rootsOnly?:    boolean;
 }
 
 export interface RunsPageOptions extends RunsListFilters {
@@ -157,22 +164,29 @@ export function useSystemResources() {
   );
 }
 
+function listRuns(filters: RunsListFilters, limit?: number, offset?: number, parentId?: string) {
+  return runsApi.listRuns(
+    limit,
+    offset,
+    filters.includeArchived ?? false,
+    parentId,
+    filters.status,
+    filters.sort,
+    filters.direction,
+    filters.projectId,
+    filters.automationId,
+    filters.workflow,
+    filters.activity,
+    filters.rootsOnly,
+  );
+}
+
 export function useAllRuns(filters: RunsListFilters = {}, enabled = true) {
   return useSWR<PaginatedEnvelope<Run>>(
     enabled ? queryKeys.runs.all(filters) : null,
     () =>
       fetchAllPages("runs", (limit, offset) =>
-        apiData(() =>
-          runsApi.listRuns(
-            limit,
-            offset,
-            filters.includeArchived ?? false,
-            undefined,
-            filters.status,
-            filters.sort,
-            filters.direction,
-          ),
-        ),
+        apiData(() => listRuns(filters, limit, offset)),
       ),
   );
 }
@@ -180,18 +194,7 @@ export function useAllRuns(filters: RunsListFilters = {}, enabled = true) {
 export function useRunsPage(opts: RunsPageOptions = {}, enabled = true) {
   return useSWR<PaginatedRunList>(
     enabled ? queryKeys.runs.page(opts) : null,
-    () =>
-      apiData(() =>
-        runsApi.listRuns(
-          opts.limit,
-          opts.offset,
-          opts.includeArchived ?? false,
-          opts.parentId,
-          opts.status,
-          opts.sort,
-          opts.direction,
-        ),
-      ),
+    () => apiData(() => listRuns(opts, opts.limit, opts.offset, opts.parentId)),
     { keepPreviousData: true },
   );
 }
