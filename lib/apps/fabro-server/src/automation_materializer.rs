@@ -40,6 +40,9 @@ pub(crate) struct AutomationRunMaterialized {
     pub workflow_source:     Option<Box<ResolvedAutomationGitWorkflowSource>>,
     /// Project identity, already validated against the application target.
     pub project_id:          Option<ProjectId>,
+    /// Registry id handed to the workflow as `inputs.project`; set only for
+    /// a project automation whose project has a feature-intake binding.
+    pub project_input:       Option<String>,
 }
 
 impl AutomationRunMaterialized {
@@ -51,6 +54,12 @@ impl AutomationRunMaterialized {
         if let Some(project_id) = &self.project_id {
             args.labels
                 .insert(PROJECT_LABEL.to_string(), project_id.as_str().to_string());
+        }
+        if let Some(project) = &self.project_input {
+            args.inputs.insert(
+                "project".to_string(),
+                serde_json::Value::String(project.clone()),
+            );
         }
         RunIntent {
             workflow_version_id: self.workflow_version_id,
@@ -367,6 +376,7 @@ impl AutomationRunMaterializer for ProductionAutomationRunMaterializer {
             target: exact_target,
             workflow_source: resolved_workflow_source,
             project_id,
+            project_input: None,
         })
     }
 }
@@ -565,6 +575,7 @@ impl AutomationRunMaterializer for TestAutomationRunMaterializer {
             target: materialized.target,
             workflow_source,
             project_id,
+            project_input: None,
         })
     }
 }
@@ -1338,5 +1349,33 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, RunMaterializeError::Package { .. }));
+    }
+
+    #[test]
+    fn project_automation_intent_carries_the_project_input_and_label() {
+        let materialized = AutomationRunMaterialized {
+            workflow_version_id: test_workflow_version()
+                .version()
+                .id()
+                .expect("test workflow version should have an id"),
+            target:              GitRunTarget {
+                repo:   "artesanos-digitales/tierrapay".to_string(),
+                branch: "main".to_string(),
+                tag:    None,
+                sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            },
+            workflow_source:     None,
+            project_id:          Some(ProjectId::new("tierrapay").unwrap()),
+            project_input:       Some("tierrapay".to_string()),
+        };
+        let intent = materialized.into_run_intent("default".to_string());
+        assert_eq!(
+            intent.args.inputs.get("project"),
+            Some(&serde_json::Value::String("tierrapay".to_string()))
+        );
+        assert_eq!(
+            intent.args.labels.get(PROJECT_LABEL).map(String::as_str),
+            Some("tierrapay")
+        );
     }
 }
