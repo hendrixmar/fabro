@@ -137,12 +137,7 @@ pub(super) async fn validate_enablement(state: &super::AppState) -> anyhow::Resu
             "Bugsink incident workflow supports projects 25 and 26 only"
         );
         ensure!(
-            worker::pinned_revision(
-                automation
-                    .git_target()
-                    .and_then(|target| target.sha.as_deref())
-                    .unwrap_or("")
-            ),
+            worker::pinned_revision(worker::pinned_workflow_sha(&automation).unwrap_or("")),
             "Bugsink workflow requires an immutable source revision"
         );
     }
