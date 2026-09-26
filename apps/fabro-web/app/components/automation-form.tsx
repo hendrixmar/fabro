@@ -30,6 +30,7 @@ export interface AutomationFormValues {
   description: string;
   environmentId: string;
   projectId: string;
+  sourceAutomationId: string;
   availableToProjects: boolean;
   targetRepository: string;
   targetBranch: string;
@@ -64,6 +65,7 @@ export const EMPTY_AUTOMATION_FORM: AutomationFormValues = {
   description:                "",
   environmentId:   "",
   projectId:                 "",
+  sourceAutomationId:        "",
   availableToProjects:       false,
   targetRepository:           "",
   targetBranch:               "main",
@@ -111,6 +113,7 @@ export function automationToFormValues(automation: Automation): AutomationFormVa
     description:                automation.description ?? "",
     environmentId:   automation.environment_id ?? "",
     projectId:                 automation.project_id ?? "",
+    sourceAutomationId:        automation.source_automation_id ?? "",
     availableToProjects:       automation.available_to_projects ?? false,
     targetRepository:           target?.repo ?? "",
     targetBranch:               target?.branch ?? EMPTY_AUTOMATION_FORM.targetBranch,
@@ -596,109 +599,123 @@ export function AutomationFormFields({
       </Panel>
 
       <Panel title="Workflow">
-        <Row
-          title={<Label required>Workflow slug</Label>}
-          help={
-            values.usesRemoteWorkflow
-              ? "Dash-separated identifier resolved in the remote workflow checkout."
-              : "Dash-separated identifier resolved in the run target checkout."
-          }
-        >
-          <input
-            type="text"
-            name="workflow_slug"
-            aria-label="Workflow slug"
-            value={values.workflow}
-            onChange={(e) => patch({ workflow: kebabify(e.target.value) })}
-            placeholder="patch-cves"
-            autoComplete="off"
-            spellCheck={false}
-            className={`${INPUT_CLASS} font-mono`}
-          />
-        </Row>
-        <Row
-          title="Remote workflow"
-          help="Load workflow files from a GitHub repository and revision instead of the run target checkout. The repository may match the run target."
-        >
-          <ToggleSwitch
-            checked={values.usesRemoteWorkflow}
-            onChange={(usesRemoteWorkflow) => patch({ usesRemoteWorkflow })}
-            label="Use a remote workflow"
-          />
-        </Row>
-        {values.usesRemoteWorkflow ? (
+        {values.sourceAutomationId ? (
+          <Row title="Workflow" help="A linked automation always runs the global definition's current workflow.">
+            <p className="text-sm text-fg-3">
+              Runs the global{" "}
+              <Link to={`/automations/${encodeURIComponent(values.sourceAutomationId)}`} className="font-mono underline">
+                {values.sourceAutomationId}
+              </Link>{" "}
+              workflow
+            </p>
+          </Row>
+        ) : (
           <>
             <Row
-              title={<Label required>Workflow repository</Label>}
-              help="GitHub owner/repo containing the workflow files."
-            >
-              <input
-                type="text"
-                name="workflow_source_repository"
-                aria-label="Remote workflow repository"
-                value={values.workflowSourceRepository}
-                onChange={(e) => patch({ workflowSourceRepository: e.target.value })}
-                placeholder="acme/automation-workflows"
-                autoComplete="off"
-                spellCheck={false}
-                className={`${INPUT_CLASS} font-mono`}
-              />
-            </Row>
-            <Row
-              title={<Label required>Branch</Label>}
-              help="Fallback revision and audit context. An exact SHA does not need to be reachable from this branch."
-            >
-              <input
-                type="text"
-                name="workflow_source_branch"
-                aria-label="Remote workflow branch"
-                value={values.workflowSourceBranch}
-                onChange={(e) => patch({ workflowSourceBranch: e.target.value })}
-                placeholder="main"
-                autoComplete="off"
-                spellCheck={false}
-                className={`${INPUT_CLASS} font-mono`}
-              />
-            </Row>
-            <Row
-              title={<Label optional>Tag</Label>}
-              help="Bare tag name resolved when the automation fires. Used only when exact SHA is empty."
-            >
-              <input
-                type="text"
-                name="workflow_source_tag"
-                aria-label="Remote workflow tag"
-                value={values.workflowSourceTag}
-                onChange={(e) => patch({ workflowSourceTag: e.target.value })}
-                placeholder="v1.2.3"
-                autoComplete="off"
-                spellCheck={false}
-                className={`${INPUT_CLASS} font-mono`}
-              />
-            </Row>
-            <Row
-              title={<Label optional>Exact SHA</Label>}
+              title={<Label required>Workflow slug</Label>}
               help={
-                workflowSourceShaValid
-                  ? "A 40-character commit SHA takes precedence over tag and branch. It is fetched directly and need not be reachable from the named branch."
-                  : <span className="text-coral">Enter exactly 40 hexadecimal characters.</span>
+                values.usesRemoteWorkflow
+                  ? "Dash-separated identifier resolved in the remote workflow checkout."
+                  : "Dash-separated identifier resolved in the run target checkout."
               }
             >
               <input
                 type="text"
-                name="workflow_source_sha"
-                aria-label="Remote workflow exact commit SHA"
-                aria-invalid={!workflowSourceShaValid}
-                value={values.workflowSourceSha}
-                onChange={(e) => patch({ workflowSourceSha: e.target.value })}
-                placeholder="0123456789abcdef0123456789abcdef01234567"
+                name="workflow_slug"
+                aria-label="Workflow slug"
+                value={values.workflow}
+                onChange={(e) => patch({ workflow: kebabify(e.target.value) })}
+                placeholder="patch-cves"
                 autoComplete="off"
                 spellCheck={false}
                 className={`${INPUT_CLASS} font-mono`}
               />
             </Row>
+            <Row
+              title="Remote workflow"
+              help="Load workflow files from a GitHub repository and revision instead of the run target checkout. The repository may match the run target."
+            >
+              <ToggleSwitch
+                checked={values.usesRemoteWorkflow}
+                onChange={(usesRemoteWorkflow) => patch({ usesRemoteWorkflow })}
+                label="Use a remote workflow"
+              />
+            </Row>
+            {values.usesRemoteWorkflow ? (
+              <>
+                <Row
+                  title={<Label required>Workflow repository</Label>}
+                  help="GitHub owner/repo containing the workflow files."
+                >
+                  <input
+                    type="text"
+                    name="workflow_source_repository"
+                    aria-label="Remote workflow repository"
+                    value={values.workflowSourceRepository}
+                    onChange={(e) => patch({ workflowSourceRepository: e.target.value })}
+                    placeholder="acme/automation-workflows"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </Row>
+                <Row
+                  title={<Label required>Branch</Label>}
+                  help="Fallback revision and audit context. An exact SHA does not need to be reachable from this branch."
+                >
+                  <input
+                    type="text"
+                    name="workflow_source_branch"
+                    aria-label="Remote workflow branch"
+                    value={values.workflowSourceBranch}
+                    onChange={(e) => patch({ workflowSourceBranch: e.target.value })}
+                    placeholder="main"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </Row>
+                <Row
+                  title={<Label optional>Tag</Label>}
+                  help="Bare tag name resolved when the automation fires. Used only when exact SHA is empty."
+                >
+                  <input
+                    type="text"
+                    name="workflow_source_tag"
+                    aria-label="Remote workflow tag"
+                    value={values.workflowSourceTag}
+                    onChange={(e) => patch({ workflowSourceTag: e.target.value })}
+                    placeholder="v1.2.3"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </Row>
+                <Row
+                  title={<Label optional>Exact SHA</Label>}
+                  help={
+                    workflowSourceShaValid
+                      ? "A 40-character commit SHA takes precedence over tag and branch. It is fetched directly and need not be reachable from the named branch."
+                      : <span className="text-coral">Enter exactly 40 hexadecimal characters.</span>
+                  }
+                >
+                  <input
+                    type="text"
+                    name="workflow_source_sha"
+                    aria-label="Remote workflow exact commit SHA"
+                    aria-invalid={!workflowSourceShaValid}
+                    value={values.workflowSourceSha}
+                    onChange={(e) => patch({ workflowSourceSha: e.target.value })}
+                    placeholder="0123456789abcdef0123456789abcdef01234567"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </Row>
+              </>
+            ) : null}
           </>
-        ) : null}
+        )}
       </Panel>
 
       <Panel title="Projects">
@@ -717,7 +734,7 @@ export function AutomationFormFields({
         ) : (
           <Row
             title="Available to projects"
-            help="Global definitions only. Project enrollment copies this automation's workflow configuration — never its trigger activation. Each project instance targets that project's repository and starts with every trigger disabled."
+            help="Global definitions only. Projects link this automation: edits to its workflow reach every project that uses it. Linking never enables a trigger. Each project instance targets that project's repository and starts with every trigger disabled."
           >
             <ToggleSwitch
               checked={values.availableToProjects}

@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Link, useParams } from "react-router";
+import { Link, useNavigate, useParams } from "react-router";
 import { useSWRConfig } from "swr";
 import { PlusIcon } from "@heroicons/react/20/solid";
 import { Dialog, DialogPanel, DialogTitle } from "@headlessui/react";
@@ -63,15 +63,9 @@ export default function ProjectAutomations() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-prose text-sm text-fg-3">
-          Automations owned by this project run against{" "}
-          <span className="font-mono text-xs text-fg-2">
-            {project.repository}
-          </span>{" "}
-          on{" "}
-          <span className="font-mono text-xs text-fg-2">
-            {project.default_branch}
-          </span>
-          . Each instance keeps its own triggers, schedule, and run history.
+          Linked automations run a global definition against this project.
+          Edits to the global reach every project; each project keeps its own
+          trigger and environment.
         </p>
         <div className="flex shrink-0 items-center gap-2">
           <button
@@ -150,7 +144,9 @@ function InstanceRow({ automation }: { automation: Automation }) {
             ? `${target.repo} · ${target.branch}`
             : "unsupported run target"}
           {" · "}
-          {workflowSourceLabel(automation.workflow_source)}
+          {automation.source_automation_id
+            ? `Linked to ${automation.source_automation_id}`
+            : "Custom"}
         </p>
         <p className="mt-1 text-xs/5 text-fg-muted">
           {automation.environment_id
@@ -185,6 +181,7 @@ function SelectAutomationDialog({
 }) {
   const { mutate } = useSWRConfig();
   const toast = useToast();
+  const navigate = useNavigate();
   const sourcesQuery = useAutomations({
     scope: "global",
     availableToProjects: true,
@@ -236,7 +233,7 @@ function SelectAutomationDialog({
       );
       await mutate(queryKeys.projects.detail(project.id));
       toast.push({ message: `Automation “${trimmedName}” added to ${project.name}.` });
-      onClose();
+      navigate(`/automations/${encodeURIComponent(trimmedId)}/edit`);
     } catch (cause) {
       setError(
         cause instanceof ApiError && cause.message
