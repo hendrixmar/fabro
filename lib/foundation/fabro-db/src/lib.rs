@@ -17,6 +17,11 @@ pub type DbPool = sqlx::SqlitePool;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 const SESSION_OWNER_INDEX_MIGRATION_VERSION: i64 = 2_026_083_101;
+const RUN_PROJECT_MIGRATION_VERSION: i64 = 2_026_092_601;
+
+/// Tags runs persisted before `runs.project_id` existed. Idempotent: it only
+/// fills unassigned rows that resolve to a project.
+const RUN_PROJECT_BACKFILL_SQL: &str = include_str!("../backfill/run_projects.sql");
 
 /// The blob-table migration, exposed so fixtures in other crates can install
 /// the production blob schema without a filesystem path into this crate.
@@ -83,7 +88,12 @@ impl Database {
         MIGRATOR
             .run(&self.pool)
             .await
-            .context("running SQLite migrations")
+            .context("running SQLite migrations")?;
+        if !applied.contains(&RUN_PROJECT_MIGRATION_VERSION) {
+            let tagged = backfill_run_projects(&self.pool).await?;
+            info!(tagged, "Backfilled run projects");
+        }
+        Ok(())
     }
 
     /// Refuse the unique owner index when old event history contains
@@ -221,6 +231,15 @@ FROM (
     pub fn clone_pool(&self) -> DbPool {
         self.pool.clone()
     }
+}
+
+/// Tag pre-existing runs with their project; returns how many were tagged.
+pub async fn backfill_run_projects(pool: &DbPool) -> anyhow::Result<u64> {
+    let result = sqlx::query(RUN_PROJECT_BACKFILL_SQL)
+        .execute(pool)
+        .await
+        .context("backfilling run projects")?;
+    Ok(result.rows_affected())
 }
 
 /// Parse an RFC 3339 timestamp column value into UTC.
@@ -566,6 +585,78 @@ mod tests {
             .await?;
         assert_eq!(value, "kept");
         snapshot.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_project_backfill_follows_rule_order_and_is_idempotent() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = Database::connect(root.path().join("fabro.sqlite3")).await?;
+        database.migrate().await?;
+        let pool = database.pool();
+        for (id, github_id, repository, binding) in [
+            ("tierrapay", "1", "artesanos-digitales/tierrapay", "tierrapay"),
+            ("mafeva", "2", "artesanos-digitales/mafeva", "mafeva-intake"),
+        ] {
+            sqlx::query(
+                "INSERT INTO projects (id, revision, name, github_repository_id, repository, \
+                 repository_key, default_branch, intake_binding_id) \
+                 VALUES (?, ?, ?, ?, ?, lower(?), 'main', ?)",
+            )
+            .bind(id)
+            .bind("0".repeat(64))
+            .bind(id)
+            .bind(github_id)
+            .bind(repository)
+            .bind(repository)
+            .bind(binding)
+            .execute(pool)
+            .await?;
+        }
+        // (id, parent, repository_name, labels)
+        let rows: [(&str, Option<&str>, Option<&str>, &str); 6] = [
+            ("label", None, Some("hendrixmar/fabro-demo"), r#"{"fabro_project_id":"mafeva"}"#),
+            ("legacy", None, Some("workspace"), r#"{"project":"mafeva-intake"}"#),
+            ("repo", None, Some("artesanos-digitales/tierrapay"), "{}"),
+            ("child", Some("legacy"), Some("artesanos-digitales/tierrapay"), "{}"),
+            ("grandchild", Some("child"), None, "{}"),
+            ("stray", None, Some("hendrixmar/fabro-demo"), r#"{"project":"unknown"}"#),
+        ];
+        for (id, parent, repository, labels) in rows {
+            sqlx::query(
+                "INSERT INTO runs (id, source_last_seq, created_at_ms, last_event_at_ms, status, \
+                 parent_id, title, repository_name, summary_json) \
+                 VALUES (?, 1, 0, 0, 'succeeded', ?, ?, ?, json_object('labels', json(?)))",
+            )
+            .bind(id)
+            .bind(parent)
+            .bind(id)
+            .bind(repository)
+            .bind(labels)
+            .execute(pool)
+            .await?;
+        }
+
+        assert_eq!(backfill_run_projects(pool).await?, 5);
+        assert_eq!(backfill_run_projects(pool).await?, 0, "a second run changes nothing");
+
+        let tagged: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, project_id FROM runs ORDER BY id")
+                .fetch_all(pool)
+                .await?;
+        let tagged: Vec<(&str, Option<&str>)> = tagged
+            .iter()
+            .map(|(id, project)| (id.as_str(), project.as_deref()))
+            .collect();
+        assert_eq!(tagged, vec![
+            // The parent's project wins over the child's own repository.
+            ("child", Some("mafeva")),
+            ("grandchild", Some("mafeva")),
+            ("label", Some("mafeva")),
+            ("legacy", Some("mafeva")),
+            ("repo", Some("tierrapay")),
+            ("stray", None),
+        ]);
         Ok(())
     }
 }
