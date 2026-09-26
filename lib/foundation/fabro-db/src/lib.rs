@@ -106,7 +106,9 @@ impl Database {
             .context("running SQLite migrations")?;
         if !applied.contains(&RUN_PROJECT_MIGRATION_VERSION) {
             let tagged = backfill_run_projects(&self.pool).await?;
-            info!(tagged, "Backfilled run projects");
+            if tagged > 0 {
+                info!(tagged, "Backfilled run projects");
+            }
         }
         Ok(())
     }
