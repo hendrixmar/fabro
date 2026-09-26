@@ -25,7 +25,8 @@ use fabro_llm::Client as LlmClient;
 use fabro_manifest::RunOverrideInput;
 use fabro_static::EnvVars;
 use fabro_store::{
-    RunSummaryListQuery, RunSummarySort, RunSummarySortDirection, RunSummaryVisibility,
+    RunProjectFilter, RunSummaryListQuery, RunSummarySort, RunSummarySortDirection,
+    RunSummaryVisibility,
 };
 use fabro_types::{
     AutomationRef, ContextWindowStaleness, ManifestPath, Principal, Run, RunClientProvenance,
@@ -124,6 +125,16 @@ struct ListRunsParams {
     sort:             RunSummarySort,
     #[serde(default)]
     direction:        RunSummarySortDirection,
+    #[serde(default)]
+    project_id:       Option<String>,
+    #[serde(default)]
+    automation_id:    Option<String>,
+    #[serde(default)]
+    workflow:         Option<String>,
+    #[serde(default)]
+    activity:         bool,
+    #[serde(default)]
+    roots_only:       bool,
 }
 
 impl ListRunsParams {
@@ -135,6 +146,17 @@ impl ListRunsParams {
             direction: self.direction,
             limit: clamp_page_limit(self.limit),
             offset: clamp_page_offset(self.offset),
+            project: self.project_id.as_deref().map(|id| {
+                if id == "none" {
+                    RunProjectFilter::Unassigned
+                } else {
+                    RunProjectFilter::Project(id.to_string())
+                }
+            }),
+            automation_id: self.automation_id.clone(),
+            workflow: self.workflow.clone(),
+            activity: self.activity,
+            roots_only: self.roots_only,
             ..RunSummaryListQuery::default()
         }
     }

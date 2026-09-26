@@ -1168,6 +1168,11 @@ paths:
         - $ref: "#/components/parameters/RunStatusFilter"
         - $ref: "#/components/parameters/RunsSort"
         - $ref: "#/components/parameters/RunsSortDirection"
+        - $ref: "#/components/parameters/RunProjectFilter"
+        - $ref: "#/components/parameters/RunAutomationFilter"
+        - $ref: "#/components/parameters/RunWorkflowFilter"
+        - $ref: "#/components/parameters/RunActivityFilter"
+        - $ref: "#/components/parameters/RunRootsOnlyFilter"
       responses:
         "200":
           description: Paginated durable run summaries
@@ -7624,6 +7629,49 @@ components:
       schema:
         type: string
       example: 01JNQVR7M0EJ5GKAT2SC4ERS1Z
+
+    RunProjectFilter:
+      name: project_id
+      in: query
+      required: false
+      description: Return only runs owned by this project. `none` returns runs no project owns.
+      schema:
+        type: string
+      example: tierrapay
+
+    RunAutomationFilter:
+      name: automation_id
+      in: query
+      required: false
+      description: Return only runs fired by this automation.
+      schema:
+        type: string
+
+    RunWorkflowFilter:
+      name: workflow
+      in: query
+      required: false
+      description: Return only runs of this workflow slug.
+      schema:
+        type: string
+
+    RunActivityFilter:
+      name: activity
+      in: query
+      required: false
+      description: Return only runs that did something — not succeeded, changed files, or started children.
+      schema:
+        type: boolean
+        default: false
+
+    RunRootsOnlyFilter:
+      name: roots_only
+      in: query
+      required: false
+      description: Return only runs without a parent.
+      schema:
+        type: boolean
+        default: false
 
     RunStatusFilter:
       name: status

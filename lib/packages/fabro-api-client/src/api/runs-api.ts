@@ -808,10 +808,15 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
          * @param {Array<BoardColumn>} [status] Filter runs by status bucket. Repeatable. When omitted, runs in the &#x60;removing&#x60; bucket are hidden; pass &#x60;status&#x3D;removing&#x60; to include them. Archived runs are hidden unless &#x60;include_archived&#x3D;true&#x60; or &#x60;status&#x3D;archived&#x60; is passed.
          * @param {ListRunsSortEnum} [sort] Field to sort by. Defaults to &#x60;created_at&#x60;.
          * @param {ListRunsDirectionEnum} [direction] Sort direction. Defaults to &#x60;desc&#x60;.
+         * @param {string} [projectId] Return only runs owned by this project. &#x60;none&#x60; returns runs no project owns.
+         * @param {string} [automationId] Return only runs fired by this automation.
+         * @param {string} [workflow] Return only runs of this workflow slug.
+         * @param {boolean} [activity] Return only runs that did something — not succeeded, changed files, or started children.
+         * @param {boolean} [rootsOnly] Return only runs without a parent.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        listRuns: async (pageLimit?: number, pageOffset?: number, includeArchived?: boolean, parentId?: string, status?: Array<BoardColumn>, sort?: ListRunsSortEnum, direction?: ListRunsDirectionEnum, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        listRuns: async (pageLimit?: number, pageOffset?: number, includeArchived?: boolean, parentId?: string, status?: Array<BoardColumn>, sort?: ListRunsSortEnum, direction?: ListRunsDirectionEnum, projectId?: string, automationId?: string, workflow?: string, activity?: boolean, rootsOnly?: boolean, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             const localVarPath = `/api/v1/runs`;
             // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
@@ -856,6 +861,26 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
 
             if (direction !== undefined) {
                 localVarQueryParameter['direction'] = direction;
+            }
+
+            if (projectId !== undefined) {
+                localVarQueryParameter['project_id'] = projectId;
+            }
+
+            if (automationId !== undefined) {
+                localVarQueryParameter['automation_id'] = automationId;
+            }
+
+            if (workflow !== undefined) {
+                localVarQueryParameter['workflow'] = workflow;
+            }
+
+            if (activity !== undefined) {
+                localVarQueryParameter['activity'] = activity;
+            }
+
+            if (rootsOnly !== undefined) {
+                localVarQueryParameter['roots_only'] = rootsOnly;
             }
 
             localVarHeaderParameter['Accept'] = 'application/json';
@@ -1822,11 +1847,16 @@ export const RunsApiFp = function(configuration?: Configuration) {
          * @param {Array<BoardColumn>} [status] Filter runs by status bucket. Repeatable. When omitted, runs in the &#x60;removing&#x60; bucket are hidden; pass &#x60;status&#x3D;removing&#x60; to include them. Archived runs are hidden unless &#x60;include_archived&#x3D;true&#x60; or &#x60;status&#x3D;archived&#x60; is passed.
          * @param {ListRunsSortEnum} [sort] Field to sort by. Defaults to &#x60;created_at&#x60;.
          * @param {ListRunsDirectionEnum} [direction] Sort direction. Defaults to &#x60;desc&#x60;.
+         * @param {string} [projectId] Return only runs owned by this project. &#x60;none&#x60; returns runs no project owns.
+         * @param {string} [automationId] Return only runs fired by this automation.
+         * @param {string} [workflow] Return only runs of this workflow slug.
+         * @param {boolean} [activity] Return only runs that did something — not succeeded, changed files, or started children.
+         * @param {boolean} [rootsOnly] Return only runs without a parent.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async listRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, parentId?: string, status?: Array<BoardColumn>, sort?: ListRunsSortEnum, direction?: ListRunsDirectionEnum, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PaginatedRunList>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.listRuns(pageLimit, pageOffset, includeArchived, parentId, status, sort, direction, options);
+        async listRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, parentId?: string, status?: Array<BoardColumn>, sort?: ListRunsSortEnum, direction?: ListRunsDirectionEnum, projectId?: string, automationId?: string, workflow?: string, activity?: boolean, rootsOnly?: boolean, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PaginatedRunList>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.listRuns(pageLimit, pageOffset, includeArchived, parentId, status, sort, direction, projectId, automationId, workflow, activity, rootsOnly, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['RunsApi.listRuns']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
@@ -2252,11 +2282,16 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
          * @param {Array<BoardColumn>} [status] Filter runs by status bucket. Repeatable. When omitted, runs in the &#x60;removing&#x60; bucket are hidden; pass &#x60;status&#x3D;removing&#x60; to include them. Archived runs are hidden unless &#x60;include_archived&#x3D;true&#x60; or &#x60;status&#x3D;archived&#x60; is passed.
          * @param {ListRunsSortEnum} [sort] Field to sort by. Defaults to &#x60;created_at&#x60;.
          * @param {ListRunsDirectionEnum} [direction] Sort direction. Defaults to &#x60;desc&#x60;.
+         * @param {string} [projectId] Return only runs owned by this project. &#x60;none&#x60; returns runs no project owns.
+         * @param {string} [automationId] Return only runs fired by this automation.
+         * @param {string} [workflow] Return only runs of this workflow slug.
+         * @param {boolean} [activity] Return only runs that did something — not succeeded, changed files, or started children.
+         * @param {boolean} [rootsOnly] Return only runs without a parent.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        listRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, parentId?: string, status?: Array<BoardColumn>, sort?: ListRunsSortEnum, direction?: ListRunsDirectionEnum, options?: RawAxiosRequestConfig): AxiosPromise<PaginatedRunList> {
-            return localVarFp.listRuns(pageLimit, pageOffset, includeArchived, parentId, status, sort, direction, options).then((request) => request(axios, basePath));
+        listRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, parentId?: string, status?: Array<BoardColumn>, sort?: ListRunsSortEnum, direction?: ListRunsDirectionEnum, projectId?: string, automationId?: string, workflow?: string, activity?: boolean, rootsOnly?: boolean, options?: RawAxiosRequestConfig): AxiosPromise<PaginatedRunList> {
+            return localVarFp.listRuns(pageLimit, pageOffset, includeArchived, parentId, status, sort, direction, projectId, automationId, workflow, activity, rootsOnly, options).then((request) => request(axios, basePath));
         },
         /**
          * Merges the stored pull request for a run on GitHub.
@@ -2643,11 +2678,16 @@ export class RunsApi extends BaseAPI {
      * @param {Array<BoardColumn>} [status] Filter runs by status bucket. Repeatable. When omitted, runs in the &#x60;removing&#x60; bucket are hidden; pass &#x60;status&#x3D;removing&#x60; to include them. Archived runs are hidden unless &#x60;include_archived&#x3D;true&#x60; or &#x60;status&#x3D;archived&#x60; is passed.
      * @param {ListRunsSortEnum} [sort] Field to sort by. Defaults to &#x60;created_at&#x60;.
      * @param {ListRunsDirectionEnum} [direction] Sort direction. Defaults to &#x60;desc&#x60;.
+     * @param {string} [projectId] Return only runs owned by this project. &#x60;none&#x60; returns runs no project owns.
+     * @param {string} [automationId] Return only runs fired by this automation.
+     * @param {string} [workflow] Return only runs of this workflow slug.
+     * @param {boolean} [activity] Return only runs that did something — not succeeded, changed files, or started children.
+     * @param {boolean} [rootsOnly] Return only runs without a parent.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */
-    public listRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, parentId?: string, status?: Array<BoardColumn>, sort?: ListRunsSortEnum, direction?: ListRunsDirectionEnum, options?: RawAxiosRequestConfig) {
-        return RunsApiFp(this.configuration).listRuns(pageLimit, pageOffset, includeArchived, parentId, status, sort, direction, options).then((request) => request(this.axios, this.basePath));
+    public listRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, parentId?: string, status?: Array<BoardColumn>, sort?: ListRunsSortEnum, direction?: ListRunsDirectionEnum, projectId?: string, automationId?: string, workflow?: string, activity?: boolean, rootsOnly?: boolean, options?: RawAxiosRequestConfig) {
+        return RunsApiFp(this.configuration).listRuns(pageLimit, pageOffset, includeArchived, parentId, status, sort, direction, projectId, automationId, workflow, activity, rootsOnly, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**
