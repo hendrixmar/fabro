@@ -51,15 +51,13 @@ export default function ProjectDetail() {
 
   const project = query.data;
   const basePath = `/projects/${encodeURIComponent(project.id)}`;
+  const section = pathname.slice(basePath.length).split("/")[1] ?? "";
   const tabs = [
-    {
-      name:        "Automations",
-      path:        `${basePath}/automations`,
-      active:      !pathname.startsWith(`${basePath}/features`) &&
-        !pathname.startsWith(`${basePath}/setup`),
-    },
-    { name: "Feature requests", path: `${basePath}/features`, active: pathname.startsWith(`${basePath}/features`) },
-    { name: "Setup", path: `${basePath}/setup`, active: pathname.startsWith(`${basePath}/setup`) },
+    { name: "Overview", path: basePath, active: section === "" || section === "overview" },
+    { name: "Runs", path: `${basePath}/runs`, active: section === "runs" },
+    { name: "Automations", path: `${basePath}/automations`, active: section === "automations" },
+    { name: "Feature requests", path: `${basePath}/features`, active: section === "features" },
+    { name: "Setup", path: `${basePath}/setup`, active: section === "setup" },
   ];
 
   return (
