@@ -5,7 +5,8 @@ use axum::http::{HeaderMap, StatusCode};
 use fabro_automation::{Automation, AutomationId};
 use fabro_types::run_event::EventBody;
 use fabro_types::{
-    AutomationRef, Principal, RunId, RunProjection, RunStatus, StageOutcome, SystemActorKind,
+    AutomationRef, Principal, ResolvedAutomationGitWorkflowSource, RunId, RunProjection, RunStatus,
+    StageOutcome, SystemActorKind,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -209,15 +210,36 @@ pub(super) fn pinned_revision(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-/// The pinned revision an incident run's workflow loads from: the workflow
-/// source when the automation declares one (always, for a project link),
-/// else its own target.
+/// The pinned revision incident runs are held to. A global is pinned by its
+/// own target, whose checkout the incident scripts run from; a workflow
+/// source never pins a global. A project link (`source_automation_id` set)
+/// is pinned by the workflow source it reads from its global.
+///
+/// For links the pin covers the graph loaded from the workflow source, not
+/// scripts in the project's target checkout; revisit when scanner execution
+/// is redesigned.
 pub(super) fn pinned_workflow_sha(automation: &Automation) -> Option<&str> {
-    automation
-        .workflow_source
-        .as_ref()
-        .or_else(|| automation.git_target())
-        .and_then(|coordinate| coordinate.sha.as_deref())
+    if automation.source_automation_id.is_some() {
+        automation.workflow_source.as_ref()
+    } else {
+        automation.git_target()
+    }
+    .and_then(|coordinate| coordinate.sha.as_deref())
+}
+
+/// The revision a materialized or created run actually resolved, read by the
+/// same rule as [`pinned_workflow_sha`]: a link's workflow source, a global's
+/// target.
+fn resolved_pin<'a>(
+    automation: &Automation,
+    workflow_source: Option<&'a ResolvedAutomationGitWorkflowSource>,
+    target_sha: Option<&'a str>,
+) -> Option<&'a str> {
+    if automation.source_automation_id.is_some() {
+        workflow_source.map(|source| source.resolved_sha.as_str())
+    } else {
+        target_sha
+    }
 }
 
 pub(crate) async fn reconcile_run(state: &Arc<AppState>, run_id: RunId) -> anyhow::Result<()> {
@@ -362,11 +384,11 @@ async fn materialize_create(state: &Arc<AppState>, intent: &Intent) -> anyhow::R
             .transition_run(intent, "failed", Some("materialization_failed"))
             .await;
     };
-    let materialized_sha = materialized
-        .workflow_source
-        .as_ref()
-        .map(|source| source.resolved_sha.as_str())
-        .or(materialized.target.sha.as_deref());
+    let materialized_sha = resolved_pin(
+        &automation,
+        materialized.workflow_source.as_deref(),
+        materialized.target.sha.as_deref(),
+    );
     if materialized_sha != Some(intent.revision.as_str()) {
         return store
             .transition_run(intent, "failed", Some("workflow_source_mismatch"))
@@ -422,14 +444,23 @@ fn verify_binding(
                     && reference.trigger_id.is_none()),
         "run_identity_mismatch"
     );
-    let run_sha = projection
-        .spec
-        .automation
-        .as_ref()
-        .and_then(|reference| reference.workflow_source.as_ref())
-        .map(|source| source.resolved_sha.as_str())
-        .or_else(|| projection.spec.git.as_ref().and_then(|git| git.sha.as_deref()));
-    ensure!(run_sha == Some(intent.revision.as_str()), "run_source_mismatch");
+    let run_sha = resolved_pin(
+        automation,
+        projection
+            .spec
+            .automation
+            .as_ref()
+            .and_then(|reference| reference.workflow_source.as_deref()),
+        projection
+            .spec
+            .git
+            .as_ref()
+            .and_then(|git| git.sha.as_deref()),
+    );
+    ensure!(
+        run_sha == Some(intent.revision.as_str()),
+        "run_source_mismatch"
+    );
     for (key, value) in intent.inputs() {
         ensure!(
             projection
