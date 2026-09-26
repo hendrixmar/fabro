@@ -842,3 +842,70 @@ async fn a_link_to_a_global_without_workflow_source_loads_from_the_global_target
     let Some(RunTarget::Git(global_target)) = Some(&global.target) else { unreachable!() };
     assert_eq!(loaded.workflow_source.as_ref(), Some(global_target));
 }
+
+#[tokio::test]
+async fn link_guards_are_typed_and_replace_returns_the_stored_link() {
+    let (_dir, database) = test_database().await;
+    insert_project(
+        database.pool(),
+        "tierrapay",
+        "artesanos-digitales/tierrapay",
+    )
+    .await;
+    let store = AutomationStore::new(database.clone_pool());
+    let tierrapay = fabro_automation::ProjectId::new("tierrapay").unwrap();
+    let mut global = draft("scanner", true);
+    global.workflow = "scanner".to_string();
+    global.available_to_projects = true;
+    let global = store.create(global).await.unwrap();
+    let mut link = draft("tierrapay-scanner", true);
+    link.project_id = Some(tierrapay.clone());
+    link.source_automation_id = Some(global.id.clone());
+    let link = store.create(link).await.unwrap();
+
+    // Replacing a link answers with the stored view: still linked, and the
+    // workflow is the global's, not whatever the caller sent.
+    let mut edit = replacement("Renamed", "0 4 * * *");
+    edit.project_id = Some(tierrapay.clone());
+    edit.workflow = "caller-workflow".to_string();
+    let replaced = store
+        .replace(&link.id, &link.revision, edit.clone())
+        .await
+        .unwrap();
+    assert_eq!(replaced.source_automation_id.as_ref(), Some(&global.id));
+    assert_eq!(replaced.workflow, "scanner");
+    assert_eq!(replaced.name, "Renamed");
+
+    // A link cannot become a global.
+    let mut unscoped = edit;
+    unscoped.project_id = None;
+    let error = store
+        .replace(&link.id, &replaced.revision, unscoped)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AutomationStoreError::LinkRequiresProject { .. }),
+        "{error:?}"
+    );
+
+    // A linked global can neither be deleted nor moved into a project.
+    let error = store
+        .delete(&global.id, &global.revision)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AutomationStoreError::InUse { .. }),
+        "{error:?}"
+    );
+    let mut scoped = replacement("Scanner", "0 1 * * *");
+    scoped.workflow = "scanner".to_string();
+    scoped.project_id = Some(tierrapay);
+    let error = store
+        .replace(&global.id, &global.revision, scoped)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AutomationStoreError::InUse { .. }),
+        "{error:?}"
+    );
+}

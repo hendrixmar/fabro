@@ -90,6 +90,10 @@ pub enum AutomationStoreError {
         expected: AutomationRevision,
         actual:   AutomationRevision,
     },
+    #[error("automation {id} is used by project links; remove the links first")]
+    InUse { id: AutomationId },
+    #[error("automation {id} links a global definition, so it must stay owned by a project")]
+    LinkRequiresProject { id: AutomationId },
     #[error("automation validation failed")]
     Validation {
         #[from]
@@ -195,6 +199,8 @@ impl AutomationStoreError {
             Self::AlreadyExists { .. } => "already_exists",
             Self::MissingRevision { .. } => "missing_revision",
             Self::StaleRevision { .. } => "stale_revision",
+            Self::InUse { .. } => "in_use",
+            Self::LinkRequiresProject { .. } => "link_requires_project",
             Self::Validation { .. } => "validation",
             Self::StoredValidation { .. } => "stored_validation",
             Self::StoredId { .. } => "stored_id",

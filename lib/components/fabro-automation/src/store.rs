@@ -209,7 +209,29 @@ impl AutomationStore {
         let (automation, _) = Automation::from_replace(id.clone(), draft)?;
         let target = stored_git_target(&automation);
         let workflow_source = automation.workflow_source.as_ref();
-        let mut transaction = self.pool.begin().await?;
+        // IMMEDIATE: the link checks below read before writing, and a
+        // deferred read transaction cannot wait to upgrade to a writer.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // A link must stay project-owned (its source is only meaningful
+        // there), and a linked global must stay global so every link keeps
+        // following a global definition.
+        let links = sqlx::query_as::<_, (bool, bool)>(
+            "SELECT a.source_automation_id IS NOT NULL, \
+             EXISTS(SELECT 1 FROM automations WHERE source_automation_id = a.id) \
+             FROM automations AS a WHERE a.id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        match (links, &automation.project_id) {
+            (Some((true, _)), None) => {
+                return Err(AutomationStoreError::LinkRequiresProject { id: id.clone() });
+            }
+            (Some((_, true)), Some(_)) => {
+                return Err(AutomationStoreError::InUse { id: id.clone() });
+            }
+            _ => {}
+        }
         let result = sqlx::query(
             r"
             UPDATE automations SET
@@ -268,7 +290,10 @@ impl AutomationStore {
         insert_schedule_triggers(&mut transaction, &automation).await?;
         insert_plane_triggers(&mut transaction, &automation).await?;
         transaction.commit().await?;
-        Ok(automation)
+        // The stored view: a link's workflow and source come from its global.
+        self.get(id)
+            .await?
+            .ok_or_else(|| AutomationStoreError::NotFound { id: id.clone() })
     }
 
     pub async fn delete(
@@ -276,7 +301,16 @@ impl AutomationStore {
         id: &AutomationId,
         expected: &AutomationRevision,
     ) -> Result<(), AutomationStoreError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let in_use = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM automations WHERE source_automation_id = ?)",
+        )
+        .bind(id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if in_use {
+            return Err(AutomationStoreError::InUse { id: id.clone() });
+        }
         let result = sqlx::query("DELETE FROM automations WHERE id = ? AND revision = ?")
             .bind(id.as_str())
             .bind(expected.as_str())

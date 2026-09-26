@@ -51,10 +51,13 @@ pub struct ProjectId(String);
 impl ProjectId {
     pub fn new(value: impl Into<String>) -> Result<Self, ProjectValidationError> {
         let value = value.into();
-        if is_valid_id(&value, false) {
-            Ok(Self(value))
-        } else {
+        if !is_valid_id(&value, false) {
             Err(ProjectValidationError::InvalidProjectId { value })
+        } else if value == "none" {
+            // `GET /runs?project_id=none` means "no project".
+            Err(ProjectValidationError::ReservedProjectId { value })
+        } else {
+            Ok(Self(value))
         }
     }
 
@@ -752,9 +755,10 @@ fn validate_default_branch(branch: &str) -> Result<(), ProjectValidationError> {
     }
 }
 
+/// Binding ids are project-id slugs: they reach workflows as
+/// `inputs.project`, which scripts splice into shell commands.
 fn validate_intake_binding(binding_id: &str) -> Result<(), ProjectValidationError> {
-    let trimmed = binding_id.trim();
-    if trimmed.is_empty() || trimmed.len() > 63 || trimmed != binding_id {
+    if !is_valid_id(binding_id, false) {
         return Err(ProjectValidationError::InvalidIntakeBinding {
             value: binding_id.to_string(),
         });
@@ -766,6 +770,8 @@ fn validate_intake_binding(binding_id: &str) -> Result<(), ProjectValidationErro
 pub enum ProjectValidationError {
     #[error("project id {value:?} must match [a-z0-9][a-z0-9-]{{0,62}}")]
     InvalidProjectId { value: String },
+    #[error("project id {value:?} is reserved")]
+    ReservedProjectId { value: String },
     #[error("GitHub repository id {value:?} must be a canonical decimal string")]
     InvalidGithubRepositoryId { value: String },
     #[error("project name {value:?} must be non-empty and at most 200 characters")]
@@ -774,7 +780,7 @@ pub enum ProjectValidationError {
     InvalidRepository { value: String },
     #[error("project default branch {value:?} is not a valid Git branch name")]
     InvalidDefaultBranch { value: String },
-    #[error("project intake binding {value:?} is not a valid binding id")]
+    #[error("project intake binding {value:?} must match [a-z0-9][a-z0-9-]{{0,62}}")]
     InvalidIntakeBinding { value: String },
 }
 
@@ -1001,5 +1007,46 @@ mod tests {
         let other = Project::revision_for("a", "1", "o/r", "main", Some("b"));
         assert_eq!(left, right);
         assert_ne!(left, other);
+    }
+
+    #[test]
+    fn none_is_reserved_for_unassigned_runs() {
+        assert!(matches!(
+            ProjectId::new("none"),
+            Err(super::ProjectValidationError::ReservedProjectId { .. })
+        ));
+        assert!(ProjectId::new("none-such").is_ok());
+    }
+
+    #[tokio::test]
+    async fn intake_bindings_are_project_id_slugs() {
+        let (_dir, store) = store().await;
+        let mut project = store
+            .create(draft("tierrapay", "artesanos-digitales/tierrapay", "1234"))
+            .await
+            .expect("create");
+        // `inputs.project` is spliced into shell commands: slugs only.
+        for bad in [
+            "Tierrapay",
+            "tierra pay",
+            "tierra'pay",
+            "-tierrapay",
+            "tierra_pay",
+        ] {
+            let error = store
+                .set_intake_binding(&project.id, &project.revision, Some(bad))
+                .await
+                .expect_err(bad);
+            assert!(
+                matches!(error, ProjectStoreError::Validation { .. }),
+                "{bad}: {error:?}"
+            );
+        }
+        for live in ["tierrapay", "mafeva", "scratch-intake"] {
+            project = store
+                .set_intake_binding(&project.id, &project.revision, Some(live))
+                .await
+                .expect(live);
+        }
     }
 }
