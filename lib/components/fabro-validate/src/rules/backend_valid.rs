@@ -419,8 +419,10 @@ mod tests {
         let mut node = Node::new("build");
         node.attrs
             .insert("backend".to_string(), AttrValue::String("acp".to_string()));
-        node.attrs
-            .insert("harness".to_string(), AttrValue::String("codex".to_string()));
+        node.attrs.insert(
+            "harness".to_string(),
+            AttrValue::String("codex".to_string()),
+        );
         graph.nodes.insert("build".to_string(), node);
 
         // The harness profile is resolved server-side at runtime; validate
@@ -444,10 +446,8 @@ mod tests {
         );
         node.attrs
             .insert("max_tokens".to_string(), AttrValue::Integer(4096));
-        node.attrs.insert(
-            "speed".to_string(),
-            AttrValue::String("fast".to_string()),
-        );
+        node.attrs
+            .insert("speed".to_string(), AttrValue::String("fast".to_string()));
         graph.nodes.insert("work".to_string(), node);
 
         let diagnostics = Rule.apply(&graph);

@@ -64,7 +64,6 @@ impl LintRule for Rule {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use fabro_graphviz::graph::AttrValue;
@@ -85,14 +84,11 @@ mod tests {
             let mut graph = minimal_graph();
             graph.nodes.insert(
                 "work".to_string(),
-                node_with_attrs(
-                    "work",
-                    &[
-                        ("backend", "acp"),
-                        ("harness", harness),
-                        ("acp.command", "codex-acp"),
-                    ],
-                ),
+                node_with_attrs("work", &[
+                    ("backend", "acp"),
+                    ("harness", harness),
+                    ("acp.command", "codex-acp"),
+                ]),
             );
             assert!(Rule.apply(&graph).is_empty(), "harness: {harness}");
         }
@@ -121,16 +117,17 @@ mod tests {
         let mut graph = minimal_graph();
         graph.nodes.insert(
             "work".to_string(),
-            node_with_attrs(
-                "work",
-                &[("backend", "acp"), ("harness", "claude")],
-            ),
+            node_with_attrs("work", &[("backend", "acp"), ("harness", "claude")]),
         );
 
         let diagnostics = Rule.apply(&graph);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Severity::Error);
-        assert!(diagnostics[0].message.contains("unknown harness \"claude\""));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("unknown harness \"claude\"")
+        );
         assert!(
             diagnostics[0]
                 .fix
