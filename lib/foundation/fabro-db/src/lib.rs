@@ -60,6 +60,12 @@ pub const PROJECTS_MIGRATION_SQL: &str =
 pub const RUN_PROJECT_ID_MIGRATION_SQL: &str =
     include_str!("../migrations/2026092601_run_project_id.sql");
 
+/// The automation-source-link migration, exposed so fixtures in other crates
+/// can install the production schema without a filesystem path into this
+/// crate.
+pub const AUTOMATION_SOURCE_LINKS_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026092602_automation_source_links.sql");
+
 #[derive(Clone)]
 pub struct Database {
     pool: DbPool,

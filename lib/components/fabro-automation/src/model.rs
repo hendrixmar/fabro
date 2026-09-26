@@ -65,6 +65,11 @@ pub struct Automation {
     /// Never activates a trigger by itself.
     #[serde(default, skip_serializing_if = "is_false")]
     pub available_to_projects: bool,
+    /// Project links only: the global automation this project automation
+    /// runs. Its workflow and workflow source are read from that definition
+    /// on every load. Immutable after creation and outside the revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_automation_id:  Option<AutomationId>,
     pub triggers:              Vec<AutomationTrigger>,
 }
 
@@ -179,6 +184,7 @@ impl Automation {
             workflow_source: replace.workflow_source,
             project_id: replace.project_id,
             available_to_projects: replace.available_to_projects,
+            source_automation_id: None,
             triggers: replace.triggers,
         }
     }
@@ -326,6 +332,9 @@ pub struct AutomationDraft {
     pub project_id:            Option<ProjectId>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub available_to_projects: bool,
+    /// Set only by the project-linking endpoint; never accepted from callers.
+    #[serde(skip)]
+    pub source_automation_id:  Option<AutomationId>,
     pub triggers:              Vec<AutomationTrigger>,
 }
 

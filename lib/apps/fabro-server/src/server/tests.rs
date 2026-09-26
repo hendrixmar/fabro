@@ -5135,6 +5135,7 @@ async fn create_run_from_intent_admits_project_scoped_automation_run() {
             workflow_source:       None,
             project_id:            Some(project.id.clone()),
             available_to_projects: false,
+            source_automation_id: None,
             triggers:              Vec::new(),
         })
         .await

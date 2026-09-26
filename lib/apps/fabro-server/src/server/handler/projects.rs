@@ -324,6 +324,8 @@ fn project_automation_draft(
         workflow_source:       Some(workflow_source),
         project_id:            Some(project.id.clone()),
         available_to_projects: false,
+        // Task 8 sets this when the endpoint creates a link instead.
+        source_automation_id:  None,
         // A newly enrolled instance never inherits trigger activation.
         triggers:              Vec::new(),
     })
@@ -418,6 +420,7 @@ mod tests {
             workflow_source: None,
             project_id: None,
             available_to_projects: true,
+            source_automation_id: None,
             triggers,
         }
     }

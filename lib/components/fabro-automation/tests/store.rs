@@ -66,6 +66,7 @@ fn draft(id: &str, api_enabled: bool) -> AutomationDraft {
         workflow_source:       None,
         project_id:            None,
         available_to_projects: false,
+        source_automation_id:  None,
         triggers:              vec![
             schedule("z-last", "0 2 * * *", false),
             AutomationTrigger::Api(ApiTrigger {
@@ -152,6 +153,7 @@ async fn plane_trigger_round_trips_through_sqlite() {
             workflow_source:       None,
             project_id:            None,
             available_to_projects: false,
+            source_automation_id:  None,
             triggers:              vec![
                 AutomationTrigger::Api(ApiTrigger {
                     id:      AutomationTriggerId::new("manual").unwrap(),
@@ -748,4 +750,95 @@ expression = "0 3 * * *"
 "#
     )
     .into_bytes()
+}
+
+async fn insert_project(pool: &fabro_db::DbPool, id: &str, repository: &str) {
+    sqlx::query(
+        "INSERT INTO projects (id, revision, name, github_repository_id, repository, \
+         repository_key, default_branch) VALUES (?, ?, ?, '7', ?, lower(?), 'main')",
+    )
+    .bind(id)
+    .bind("0".repeat(64))
+    .bind(id)
+    .bind(repository)
+    .bind(repository)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_link_reads_the_global_workflow_and_source_on_every_load() {
+    let (_dir, database) = test_database().await;
+    insert_project(database.pool(), "tierrapay", "artesanos-digitales/tierrapay").await;
+    let store = AutomationStore::new(database.clone_pool());
+
+    let mut global = draft("woodpecker-loop", true);
+    global.target = RunTarget::Git(GitRunTarget {
+        repo:   "hendrixmar/fabro-demo".to_string(),
+        branch: "master".to_string(),
+        tag:    None,
+        sha:    Some("a895cf55d318edb1496591ed849a46c295cccf0b".to_string()),
+    });
+    global.workflow = "woodpecker-loop".to_string();
+    global.available_to_projects = true;
+    let global = store.create(global).await.unwrap();
+
+    let mut link = draft("tierrapay-woodpecker-loop", true);
+    link.target = RunTarget::Git(GitRunTarget {
+        repo:   "artesanos-digitales/tierrapay".to_string(),
+        branch: "main".to_string(),
+        tag:    None,
+        sha:    None,
+    });
+    link.workflow = "woodpecker-loop".to_string();
+    link.project_id = Some(fabro_automation::ProjectId::new("tierrapay").unwrap());
+    link.source_automation_id = Some(global.id.clone());
+    store.create(link).await.unwrap();
+
+    // Editing the global reaches the link.
+    let mut edited = replacement("Woodpecker", "0 1 * * *");
+    edited.target = global.target.clone();
+    edited.workflow = "woodpecker-loop-v2".to_string();
+    edited.workflow_source = Some(workflow_source("main", None, Some("1e930e021b91bfebfd0b9362300b39717ffa6d6b")));
+    edited.available_to_projects = true;
+    store.replace(&global.id, &global.revision, edited).await.unwrap();
+
+    let loaded = store
+        .get(&AutomationId::new("tierrapay-woodpecker-loop").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.source_automation_id.as_ref(), Some(&global.id));
+    assert_eq!(loaded.workflow, "woodpecker-loop-v2");
+    assert_eq!(
+        loaded.workflow_source,
+        Some(workflow_source("main", None, Some("1e930e021b91bfebfd0b9362300b39717ffa6d6b")))
+    );
+    let Some(RunTarget::Git(target)) = Some(&loaded.target) else { unreachable!() };
+    assert_eq!(target.repo, "artesanos-digitales/tierrapay", "the link keeps its own target");
+
+    // A linked global cannot be deleted.
+    let current = store.get(&global.id).await.unwrap().unwrap();
+    assert!(store.delete(&global.id, &current.revision).await.is_err());
+}
+
+#[tokio::test]
+async fn a_link_to_a_global_without_workflow_source_loads_from_the_global_target() {
+    let (_dir, database) = test_database().await;
+    insert_project(database.pool(), "tierrapay", "artesanos-digitales/tierrapay").await;
+    let store = AutomationStore::new(database.clone_pool());
+    let global = store.create(draft("scanner", true)).await.unwrap();
+    let mut link = draft("tierrapay-scanner", true);
+    link.project_id = Some(fabro_automation::ProjectId::new("tierrapay").unwrap());
+    link.source_automation_id = Some(global.id.clone());
+    store.create(link).await.unwrap();
+
+    let loaded = store
+        .get(&AutomationId::new("tierrapay-scanner").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(RunTarget::Git(global_target)) = Some(&global.target) else { unreachable!() };
+    assert_eq!(loaded.workflow_source.as_ref(), Some(global_target));
 }

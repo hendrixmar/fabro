@@ -281,6 +281,7 @@ mod tests {
                 workflow_source:       None,
                 project_id:            None,
                 available_to_projects: false,
+                source_automation_id: None,
                 triggers:              vec![],
             })
             .await

@@ -28,17 +28,27 @@ macro_rules! select_automations_sql {
                 a.target_branch,
                 a.target_tag,
                 a.target_sha,
-                a.target_workflow,
-                a.workflow_source_repository,
-                a.workflow_source_branch,
-                a.workflow_source_tag,
-                a.workflow_source_sha,
+                COALESCE(src.target_workflow, a.target_workflow) AS target_workflow,
+                CASE WHEN src.id IS NULL THEN a.workflow_source_repository
+                     WHEN src.workflow_source_repository IS NOT NULL THEN src.workflow_source_repository
+                     ELSE src.target_repository END AS workflow_source_repository,
+                CASE WHEN src.id IS NULL THEN a.workflow_source_branch
+                     WHEN src.workflow_source_repository IS NOT NULL THEN src.workflow_source_branch
+                     ELSE src.target_branch END AS workflow_source_branch,
+                CASE WHEN src.id IS NULL THEN a.workflow_source_tag
+                     WHEN src.workflow_source_repository IS NOT NULL THEN src.workflow_source_tag
+                     ELSE src.target_tag END AS workflow_source_tag,
+                CASE WHEN src.id IS NULL THEN a.workflow_source_sha
+                     WHEN src.workflow_source_repository IS NOT NULL THEN src.workflow_source_sha
+                     ELSE src.target_sha END AS workflow_source_sha,
                 a.project_id,
                 a.available_to_projects,
+                a.source_automation_id,
                 t.id AS trigger_id,
                 t.enabled AS trigger_enabled,
                 t.expression AS trigger_expression
             FROM automations AS a
+            LEFT JOIN automations AS src ON src.id = a.source_automation_id
             LEFT JOIN automation_triggers AS t ON t.automation_id = a.id
             ",
             $suffix
@@ -178,8 +188,10 @@ impl AutomationStore {
     }
 
     pub async fn create(&self, draft: AutomationDraft) -> Result<Automation, AutomationStoreError> {
+        let source_automation_id = draft.source_automation_id.clone();
         let (id, replace) = draft.into();
-        let (automation, _) = Automation::from_replace(id.clone(), replace)?;
+        let (mut automation, _) = Automation::from_replace(id.clone(), replace)?;
+        automation.source_automation_id = source_automation_id;
         let mut transaction = self.pool.begin().await?;
         if !insert_automation_ignoring_conflict(&mut transaction, &automation).await? {
             return Err(AutomationStoreError::AlreadyExists { id });
@@ -321,6 +333,7 @@ struct StoredAutomation {
     workflow_source:       Option<AutomationGitWorkflowSource>,
     project_id:            Option<ProjectId>,
     available_to_projects: bool,
+    source_automation_id:  Option<AutomationId>,
     schedule_triggers:     Vec<ScheduleTrigger>,
     plane_triggers:        Vec<PlaneTrigger>,
 }
@@ -341,6 +354,13 @@ impl StoredAutomation {
             })?;
         let workflow_source = stored_workflow_source(row, &id)?;
         let project_id = stored_project_id(row, &id)?;
+        let source_automation_id = row
+            .try_get::<Option<String>, _>("source_automation_id")?
+            .map(|value| {
+                AutomationId::new(value.clone())
+                    .map_err(|source| AutomationStoreError::StoredId { value, source })
+            })
+            .transpose()?;
         Ok(Self {
             id,
             revision,
@@ -359,6 +379,7 @@ impl StoredAutomation {
             workflow_source,
             project_id,
             available_to_projects: row.try_get("available_to_projects")?,
+            source_automation_id,
             schedule_triggers: Vec::new(),
             plane_triggers: Vec::new(),
         })
@@ -420,6 +441,7 @@ impl StoredAutomation {
             })
             .map_err(|source| AutomationStoreError::StoredValidation { id, source })?;
         automation.last_error = self.last_error;
+        automation.source_automation_id = self.source_automation_id;
         Ok(automation)
     }
 }
@@ -486,11 +508,13 @@ fn automations_from_rows(
             triggers:              automation.triggers,
         };
         replace.triggers.push(AutomationTrigger::Plane(trigger));
-        let rebuilt = Automation::from_stored(automation_id.clone(), automation.revision, replace)
-            .map_err(|source| AutomationStoreError::StoredValidation {
-                id: automation_id.clone(),
-                source,
-            })?;
+        let mut rebuilt =
+            Automation::from_stored(automation_id.clone(), automation.revision, replace)
+                .map_err(|source| AutomationStoreError::StoredValidation {
+                    id: automation_id.clone(),
+                    source,
+                })?;
+        rebuilt.source_automation_id = automation.source_automation_id;
         by_id.insert(automation_id, rebuilt);
     }
 
@@ -568,8 +592,9 @@ pub(crate) async fn insert_automation_ignoring_conflict(
             workflow_source_tag,
             workflow_source_sha,
             project_id,
-            available_to_projects
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            available_to_projects,
+            source_automation_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO NOTHING
         ",
     )
@@ -590,6 +615,7 @@ pub(crate) async fn insert_automation_ignoring_conflict(
     .bind(workflow_source.and_then(|source| source.sha.as_deref()))
     .bind(automation.project_id.as_ref().map(ProjectId::as_str))
     .bind(automation.available_to_projects)
+    .bind(automation.source_automation_id.as_ref().map(AutomationId::as_str))
     .execute(&mut **transaction)
     .await?;
     if result.rows_affected() == 0 {
