@@ -5,7 +5,7 @@ COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && apt-get update && apt-get install -y --no-install-recommends \
-       bash util-linux git ca-certificates curl gcc libpq-dev libcairo2 libffi-dev \
+       bash util-linux git gh ca-certificates curl gcc libpq-dev libcairo2 libffi-dev \
        libgdk-pixbuf-2.0-0 libpango-1.0-0 libpangocairo-1.0-0 libxml2 \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv==0.12.10 debugpy==1.8.16 \
