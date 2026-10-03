@@ -7,6 +7,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && apt-get update && apt-get install -y --no-install-recommends \
        bash util-linux git gh ca-certificates curl gcc libpq-dev libcairo2 libffi-dev \
        libgdk-pixbuf-2.0-0 libpango-1.0-0 libpangocairo-1.0-0 libxml2 \
+       tesseract-ocr tesseract-ocr-spa \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv==0.12.10 debugpy==1.8.16 \
     && npm install --global --no-audit --no-fund bun@1.3.14 \
