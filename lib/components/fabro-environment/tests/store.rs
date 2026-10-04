@@ -5,12 +5,11 @@ use fabro_environment::{
     EnvironmentDraft, EnvironmentId, EnvironmentStore, EnvironmentStoreError,
     import_legacy_directory_once, seed_default_environment, seed_environments,
 };
-use fabro_types::SandboxProviderKind;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
-    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentResourcesSettings,
-    EnvironmentSettings,
+    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentProvider,
+    EnvironmentResourcesSettings, EnvironmentSettings,
 };
 use tokio::fs;
 
@@ -29,10 +28,11 @@ async fn test_store(local_enabled: bool) -> anyhow::Result<TestStore> {
     Ok(TestStore { dir, pool, store })
 }
 
-fn settings(provider: SandboxProviderKind) -> EnvironmentSettings {
+fn settings(provider: EnvironmentProvider) -> EnvironmentSettings {
     EnvironmentSettings {
         provider,
         cwd: None,
+        codex_oauth_profile: None,
         image: EnvironmentImageSettings::default(),
         resources: EnvironmentResourcesSettings::default(),
         network: EnvironmentNetworkSettings::default(),
@@ -42,7 +42,7 @@ fn settings(provider: SandboxProviderKind) -> EnvironmentSettings {
     }
 }
 
-fn draft(id: &str, provider: SandboxProviderKind) -> EnvironmentDraft {
+fn draft(id: &str, provider: EnvironmentProvider) -> EnvironmentDraft {
     EnvironmentDraft {
         id:       EnvironmentId::new(id).expect("test environment id should be valid"),
         settings: settings(provider),
@@ -82,10 +82,13 @@ async fn seed_default_is_idempotent_and_reopen_loads_sql_rows() -> anyhow::Resul
 #[tokio::test]
 async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    let created = test
-        .store
-        .create(draft("custom", SandboxProviderKind::DOCKER))
-        .await?;
+    let mut managed = draft("custom", EnvironmentProvider::Docker);
+    managed.settings.codex_oauth_profile = Some("subscription".to_string());
+    let created = test.store.create(managed).await?;
+    assert_eq!(
+        created.settings.codex_oauth_profile.as_deref(),
+        Some("subscription")
+    );
 
     assert_eq!(created.id.as_str(), "custom");
     assert_eq!(
@@ -99,13 +102,22 @@ async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::R
     let reopened = EnvironmentStore::load(test.pool.clone(), true).await?;
     assert_eq!(
         reopened
+            .get(&created.id)
+            .expect("persisted environment")
+            .settings
+            .codex_oauth_profile
+            .as_deref(),
+        Some("subscription"),
+    );
+    assert_eq!(
+        reopened
             .get(&EnvironmentId::new("custom").expect("valid id"))
             .expect("created environment should reload")
             .revision,
         created.revision
     );
 
-    let mut replacement = settings(SandboxProviderKind::LOCAL);
+    let mut replacement = settings(EnvironmentProvider::Local);
     replacement.cwd = Some("/workspace/custom".to_string());
     replacement
         .labels
@@ -116,13 +128,14 @@ async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::R
         .await?;
     assert_ne!(replaced.revision, created.revision);
     assert_eq!(replaced.settings.cwd.as_deref(), Some("/workspace/custom"));
+    assert!(replaced.settings.codex_oauth_profile.is_none());
 
     let stale = test
         .store
         .replace(
             &created.id,
             &created.revision,
-            settings(SandboxProviderKind::DOCKER),
+            settings(EnvironmentProvider::Docker),
         )
         .await
         .expect_err("stale revision should be rejected");
@@ -143,7 +156,7 @@ async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::R
 #[tokio::test]
 async fn default_is_deletable() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    seed_default_environment(&test.pool, SandboxProviderKind::DOCKER).await?;
+    seed_default_environment(&test.pool, EnvironmentProvider::Docker).await?;
     let store = EnvironmentStore::load(test.pool.clone(), true).await?;
     let default = store
         .get(&EnvironmentId::new("default").expect("valid id"))
@@ -160,7 +173,7 @@ async fn default_is_deletable() -> anyhow::Result<()> {
 #[tokio::test]
 async fn maps_network_lifecycle_and_inline_dockerfile_round_trip() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    let mut settings = settings(SandboxProviderKind::DAYTONA);
+    let mut settings = settings(EnvironmentProvider::Daytona);
     settings.image.dockerfile = Some(DockerfileSource::Inline("FROM alpine\n".to_string()));
     settings.resources.cpu = Some(4);
     settings.resources.memory = Some("8GB".parse()?);
@@ -198,7 +211,7 @@ async fn maps_network_lifecycle_and_inline_dockerfile_round_trip() -> anyhow::Re
 #[tokio::test]
 async fn direct_create_rejects_dockerfile_path_without_reading_it() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    let mut settings = settings(SandboxProviderKind::DOCKER);
+    let mut settings = settings(EnvironmentProvider::Docker);
     settings.image.dockerfile = Some(DockerfileSource::Path {
         path: test.dir.path().join("Dockerfile").display().to_string(),
     });
@@ -288,7 +301,7 @@ cpu = 99
 async fn legacy_import_keeps_existing_sql_row_and_inlines_dockerfile_path() -> anyhow::Result<()> {
     let test = test_store(true).await?;
     test.store
-        .create(draft("existing", SandboxProviderKind::LOCAL))
+        .create(draft("existing", EnvironmentProvider::Local))
         .await?;
     let environment_dir = test.dir.path().join("environments");
     fs::create_dir(&environment_dir).await?;
@@ -329,7 +342,7 @@ path = "Dockerfile"
             .expect("existing row should win")
             .settings
             .provider,
-        SandboxProviderKind::LOCAL
+        EnvironmentProvider::Local
     );
     assert_eq!(
         store
@@ -363,7 +376,7 @@ async fn legacy_import_invalid_input_leaves_source_directory_in_place() -> anyho
     assert_invalid_legacy_import_leaves_source_directory(
         "invalid settings",
         "invalid-settings.toml",
-        r#"provider = "Bogus Provider""#,
+        r#"provider = "bogus""#,
         "validation",
     )
     .await?;

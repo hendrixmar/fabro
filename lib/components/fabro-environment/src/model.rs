@@ -108,6 +108,9 @@ pub(crate) fn canonical_bytes(layer: &EnvironmentLayer) -> String {
     if let Some(cwd) = layer.cwd.as_deref() {
         doc["cwd"] = value(cwd);
     }
+    if let Some(profile) = layer.codex_oauth_profile.as_deref() {
+        doc["codex_oauth_profile"] = value(profile);
+    }
     if let Some(image) = layer.image.as_ref() {
         append_image(doc.as_table_mut(), image);
     }
@@ -176,14 +179,15 @@ fn reject_dockerfile_paths(
 
 fn environment_settings_to_layer(settings: &EnvironmentSettings) -> EnvironmentLayer {
     EnvironmentLayer {
-        provider:  Some(settings.provider.to_string()),
-        cwd:       settings.cwd.clone(),
-        image:     image_settings_to_layer(&settings.image),
-        resources: resources_settings_to_layer(&settings.resources),
-        network:   network_settings_to_layer(&settings.network),
-        lifecycle: lifecycle_settings_to_layer(&settings.lifecycle),
-        labels:    StickyMap::from(settings.labels.clone()),
-        env:       StickyMap::from(settings.env.clone()),
+        provider:            Some(settings.provider.to_string()),
+        cwd:                 settings.cwd.clone(),
+        codex_oauth_profile: settings.codex_oauth_profile.clone(),
+        image:               image_settings_to_layer(&settings.image),
+        resources:           resources_settings_to_layer(&settings.resources),
+        network:             network_settings_to_layer(&settings.network),
+        lifecycle:           lifecycle_settings_to_layer(&settings.lifecycle),
+        labels:              StickyMap::from(settings.labels.clone()),
+        env:                 StickyMap::from(settings.env.clone()),
     }
 }
 

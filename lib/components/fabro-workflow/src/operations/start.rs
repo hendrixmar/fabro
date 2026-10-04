@@ -430,6 +430,19 @@ impl RunSession {
         let resolved = &settings.run;
         let configured_sandbox_provider = resolve_sandbox_provider(resolved);
         let sandbox_provider = configured_sandbox_provider.effective_for(resolved.execution.mode);
+        fabro_types::settings::run::validate_codex_oauth_profile(
+            resolved.environment.provider,
+            resolved.environment.codex_oauth_profile.as_deref(),
+            resolved.environment.env.keys().map(String::as_str),
+        )
+        .map_err(Error::engine)?;
+        if resolved.environment.codex_oauth_profile.is_some()
+            && sandbox_provider != SandboxProviderKind::Docker
+        {
+            return Err(Error::engine(
+                "codex_oauth_profile requires the effective Docker sandbox provider",
+            ));
+        }
         let clone_source = if dry_run_clone_target {
             CloneSourceForRun {
                 origin_url: None,

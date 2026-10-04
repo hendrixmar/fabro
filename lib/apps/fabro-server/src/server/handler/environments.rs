@@ -3,13 +3,12 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use fabro_environment::{Environment, EnvironmentDraft, EnvironmentId, EnvironmentStoreError};
-use fabro_types::SandboxProviderKind;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
-    EnvironmentNetworkSettings, EnvironmentResourcesSettings, EnvironmentSettings,
+    EnvironmentNetworkSettings, EnvironmentProvider, EnvironmentResourcesSettings,
+    EnvironmentSettings,
 };
-use fabro_util::error::{collect_chain, render_with_causes};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
@@ -33,28 +32,30 @@ struct EnvironmentListMeta {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateEnvironmentRequest {
-    id:        EnvironmentId,
-    provider:  SandboxProviderKind,
-    cwd:       Option<String>,
-    image:     ApiEnvironmentImageSettings,
-    resources: EnvironmentResourcesSettings,
-    network:   EnvironmentNetworkSettings,
-    lifecycle: EnvironmentLifecycleSettings,
-    labels:    HashMap<String, String>,
-    env:       HashMap<String, InterpString>,
+    id:                  EnvironmentId,
+    provider:            EnvironmentProvider,
+    cwd:                 Option<String>,
+    codex_oauth_profile: Option<String>,
+    image:               ApiEnvironmentImageSettings,
+    resources:           EnvironmentResourcesSettings,
+    network:             EnvironmentNetworkSettings,
+    lifecycle:           EnvironmentLifecycleSettings,
+    labels:              HashMap<String, String>,
+    env:                 HashMap<String, InterpString>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplaceEnvironmentRequest {
-    provider:  SandboxProviderKind,
-    cwd:       Option<String>,
-    image:     ApiEnvironmentImageSettings,
-    resources: EnvironmentResourcesSettings,
-    network:   EnvironmentNetworkSettings,
-    lifecycle: EnvironmentLifecycleSettings,
-    labels:    HashMap<String, String>,
-    env:       HashMap<String, InterpString>,
+    provider:            EnvironmentProvider,
+    cwd:                 Option<String>,
+    codex_oauth_profile: Option<String>,
+    image:               ApiEnvironmentImageSettings,
+    resources:           EnvironmentResourcesSettings,
+    network:             EnvironmentNetworkSettings,
+    lifecycle:           EnvironmentLifecycleSettings,
+    labels:              HashMap<String, String>,
+    env:                 HashMap<String, InterpString>,
 }
 
 #[derive(Deserialize)]
@@ -83,14 +84,15 @@ impl CreateEnvironmentRequest {
         Ok(EnvironmentDraft {
             id:       self.id,
             settings: EnvironmentSettings {
-                provider:  self.provider,
-                cwd:       self.cwd,
-                image:     self.image.into_settings()?,
-                resources: self.resources,
-                network:   self.network,
-                lifecycle: self.lifecycle,
-                labels:    self.labels,
-                env:       self.env,
+                provider:            self.provider,
+                cwd:                 self.cwd,
+                codex_oauth_profile: self.codex_oauth_profile,
+                image:               self.image.into_settings()?,
+                resources:           self.resources,
+                network:             self.network,
+                lifecycle:           self.lifecycle,
+                labels:              self.labels,
+                env:                 self.env,
             },
         })
     }
@@ -99,14 +101,15 @@ impl CreateEnvironmentRequest {
 impl ReplaceEnvironmentRequest {
     fn into_settings(self) -> Result<EnvironmentSettings, ApiError> {
         Ok(EnvironmentSettings {
-            provider:  self.provider,
-            cwd:       self.cwd,
-            image:     self.image.into_settings()?,
-            resources: self.resources,
-            network:   self.network,
-            lifecycle: self.lifecycle,
-            labels:    self.labels,
-            env:       self.env,
+            provider:            self.provider,
+            cwd:                 self.cwd,
+            codex_oauth_profile: self.codex_oauth_profile,
+            image:               self.image.into_settings()?,
+            resources:           self.resources,
+            network:             self.network,
+            lifecycle:           self.lifecycle,
+            labels:              self.labels,
+            env:                 self.env,
         })
     }
 }
@@ -268,17 +271,10 @@ impl From<EnvironmentStoreError> for ApiError {
             | EnvironmentStoreError::JsonDecode { .. }
             | EnvironmentStoreError::Db { .. }
             | EnvironmentStoreError::RowCountOverflow { .. }
-            | EnvironmentStoreError::Io { .. } => {
-                // The response hides the cause; the log keeps it.
-                tracing::error!(
-                    error = %render_with_causes(&err.to_string(), &collect_chain(&err)),
-                    "environment store operation failed"
-                );
-                Self::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "environment store operation failed",
-                )
-            }
+            | EnvironmentStoreError::Io { .. } => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "environment store operation failed",
+            ),
         }
     }
 }

@@ -2,10 +2,10 @@ use std::path::Path;
 
 use fabro_types::settings::run::{
     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
-    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentResourcesSettings,
-    EnvironmentSettings, RunEnvironmentSettings,
+    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentProvider,
+    EnvironmentResourcesSettings, EnvironmentSettings, RunEnvironmentSettings,
+    validate_codex_oauth_profile,
 };
-use fabro_types::{BundledProvider, SandboxProviderKind};
 
 use super::ResolveError;
 use crate::{
@@ -69,12 +69,13 @@ fn resolve_environment_fields(
         errors.push(ResolveError::Missing {
             path: format!("{path}.provider"),
         });
-        SandboxProviderKind::LOCAL
+        EnvironmentProvider::Local
     };
 
     let environment = EnvironmentSettings {
         provider,
         cwd: resolve_cwd(layer.cwd.as_deref(), &format!("{path}.cwd"), errors),
+        codex_oauth_profile: layer.codex_oauth_profile.clone(),
         image: resolve_image(layer.image.as_ref()),
         resources: resolve_resources(layer.resources.as_ref()),
         network: resolve_network(layer.network.as_ref(), &format!("{path}.network"), errors),
@@ -104,16 +105,15 @@ fn resolve_cwd(raw: Option<&str>, path: &str, errors: &mut Vec<ResolveError>) ->
     Some(raw.to_string())
 }
 
-fn parse_provider(raw: &str, path: &str, errors: &mut Vec<ResolveError>) -> SandboxProviderKind {
-    match raw.parse::<SandboxProviderKind>() {
-        Ok(provider) => provider,
-        Err(error) => {
-            errors.push(ResolveError::Invalid {
-                path:   path.to_string(),
-                reason: format!("invalid environment provider: {error}"),
-            });
-            SandboxProviderKind::LOCAL
-        }
+fn parse_provider(raw: &str, path: &str, errors: &mut Vec<ResolveError>) -> EnvironmentProvider {
+    if let Ok(provider) = raw.parse::<EnvironmentProvider>() {
+        provider
+    } else {
+        errors.push(ResolveError::Invalid {
+            path:   path.to_string(),
+            reason: format!("unknown environment provider: {raw}"),
+        });
+        EnvironmentProvider::Local
     }
 }
 
@@ -207,38 +207,48 @@ fn validate_provider_capabilities(
     path: &str,
     errors: &mut Vec<ResolveError>,
 ) {
-    match environment.provider.bundled() {
-        Some(BundledProvider::Local)
+    if let Err(reason) = validate_codex_oauth_profile(
+        environment.provider,
+        environment.codex_oauth_profile.as_deref(),
+        environment.env.keys().map(String::as_str),
+    ) {
+        errors.push(ResolveError::Invalid {
+            path:   format!("{path}.codex_oauth_profile"),
+            reason: reason.to_string(),
+        });
+    }
+    match environment.provider {
+        EnvironmentProvider::Local => {
             if matches!(
                 environment.network.mode,
                 EnvironmentNetworkMode::Block | EnvironmentNetworkMode::CidrAllowList
-            ) =>
-        {
-            errors.push(ResolveError::Invalid {
-                path:   format!("{path}.network.mode"),
-                reason: "local environments cannot enforce blocked or CIDR allow-list networking"
-                    .to_string(),
-            });
+            ) {
+                errors.push(ResolveError::Invalid {
+                    path:   format!("{path}.network.mode"),
+                    reason:
+                        "local environments cannot enforce blocked or CIDR allow-list networking"
+                            .to_string(),
+                });
+            }
         }
-        Some(BundledProvider::Docker)
-            if environment.network.mode == EnvironmentNetworkMode::CidrAllowList =>
-        {
-            errors.push(ResolveError::Invalid {
-                path:   format!("{path}.network.mode"),
-                reason: "docker environments cannot enforce CIDR allow-list networking".to_string(),
-            });
+        EnvironmentProvider::Docker => {
+            if environment.network.mode == EnvironmentNetworkMode::CidrAllowList {
+                errors.push(ResolveError::Invalid {
+                    path:   format!("{path}.network.mode"),
+                    reason: "docker environments cannot enforce CIDR allow-list networking"
+                        .to_string(),
+                });
+            }
         }
-        Some(BundledProvider::Daytona)
-            if environment.image.docker.is_some() && environment.image.dockerfile.is_some() =>
-        {
-            errors.push(ResolveError::Invalid {
-                path:   format!("{path}.image"),
-                reason: "daytona environments accept either image.docker or image.dockerfile, not \
-                         both"
-                    .to_string(),
-            });
+        EnvironmentProvider::Daytona => {
+            if environment.image.docker.is_some() && environment.image.dockerfile.is_some() {
+                errors.push(ResolveError::Invalid {
+                    path:   format!("{path}.image"),
+                    reason: "daytona environments accept either image.docker or image.dockerfile, \
+                             not both"
+                        .to_string(),
+                });
+            }
         }
-        // Plugin providers validate their own spec at create time.
-        Some(_) | None => {}
     }
 }

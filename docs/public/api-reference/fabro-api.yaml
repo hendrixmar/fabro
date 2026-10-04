@@ -9558,6 +9558,10 @@ components:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
           example: /srv/fabro/workspaces/team-a
+        codex_oauth_profile:
+          type: ["string", "null"]
+          pattern: "^[a-z0-9][a-z0-9_-]*$"
+          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentApiImageSettings"
         resources:
@@ -9597,6 +9601,10 @@ components:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
           example: /srv/fabro/workspaces/team-a
+        codex_oauth_profile:
+          type: ["string", "null"]
+          pattern: "^[a-z0-9][a-z0-9_-]*$"
+          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentApiImageSettings"
         resources:
@@ -9631,6 +9639,10 @@ components:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
           example: /srv/fabro/workspaces/team-a
+        codex_oauth_profile:
+          type: ["string", "null"]
+          pattern: "^[a-z0-9][a-z0-9_-]*$"
+          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentApiImageSettings"
         resources:
@@ -17431,6 +17443,10 @@ components:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
           example: /srv/fabro/workspaces/team-a
+        codex_oauth_profile:
+          type: ["string", "null"]
+          pattern: "^[a-z0-9][a-z0-9_-]*$"
+          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentImageSettings"
         resources:
@@ -17456,6 +17472,10 @@ components:
           type: ["string", "null"]
           description: Local-provider command working directory for this environment. Docker and Daytona ignore this value.
           example: /srv/fabro/workspaces/team-a
+        codex_oauth_profile:
+          type: ["string", "null"]
+          pattern: "^[a-z0-9][a-z0-9_-]*$"
+          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentImageSettings"
         resources:

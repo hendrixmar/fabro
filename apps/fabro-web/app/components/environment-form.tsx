@@ -3,6 +3,7 @@ import { ChevronRightIcon } from "@heroicons/react/20/solid";
 import {
   EnvironmentApiDockerfileSourceInlineTypeEnum,
   EnvironmentNetworkMode,
+  EnvironmentProvider,
 } from "@qltysh/fabro-api-client";
 import type {
   CreateEnvironmentRequest,
@@ -14,7 +15,6 @@ import type {
   ReplaceEnvironmentRequest,
 } from "@qltysh/fabro-api-client";
 
-import { DOCKER_PROVIDER, isCloneBasedProvider } from "../lib/environment-providers";
 import { Label, Panel, Row } from "./settings-panel";
 import { INPUT_CLASS } from "./ui";
 import {
@@ -25,15 +25,11 @@ import {
 } from "./key-value-editor";
 
 // Parse the `provider` query param used by the create flow into a creatable
-// provider, defaulting to Docker for anything that cannot back a managed
-// environment. Kind names are validated server-side on create.
-const PROVIDER_KIND_PATTERN = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
-
-export function parseCreatableProvider(value: string | null): string {
-  if (value && PROVIDER_KIND_PATTERN.test(value) && isCloneBasedProvider(value)) {
-    return value;
-  }
-  return DOCKER_PROVIDER;
+// provider, defaulting to Docker for anything unexpected.
+export function parseCreatableProvider(value: string | null): EnvironmentProvider {
+  return value === EnvironmentProvider.DAYTONA
+    ? EnvironmentProvider.DAYTONA
+    : EnvironmentProvider.DOCKER;
 }
 
 // Environment ids are server-managed file names: lowercase, digits, hyphens.
@@ -53,7 +49,9 @@ type ImageSource = "image" | "dockerfile";
 
 export interface EnvironmentFormValues {
   id: string;
-  provider: string;
+  provider: EnvironmentProvider;
+  // API-only host profile selection survives unrelated web edits.
+  codexOauthProfile?: string | null;
   imageSource: ImageSource;
   dockerRef: string;
   dockerfile: string;
@@ -73,7 +71,7 @@ export interface EnvironmentFormValues {
 
 export const EMPTY_ENVIRONMENT_FORM: EnvironmentFormValues = {
   id:             "",
-  provider:       DOCKER_PROVIDER,
+  provider:       EnvironmentProvider.DOCKER,
   imageSource:    "image",
   dockerRef:      "",
   dockerfile:     "",
@@ -92,6 +90,7 @@ export function environmentToFormValues(environment: Environment): EnvironmentFo
   return {
     id:             environment.id,
     provider:       environment.provider,
+    codexOauthProfile: environment.codex_oauth_profile,
     imageSource:    environment.image.dockerfile ? "dockerfile" : "image",
     dockerRef:      environment.image.docker ?? "",
     dockerfile:     environment.image.dockerfile?.value ?? "",
@@ -141,6 +140,7 @@ export function replaceRequestFromForm(values: EnvironmentFormValues): ReplaceEn
 function settingsFromForm(values: EnvironmentFormValues): ReplaceEnvironmentRequest {
   return {
     provider:  values.provider,
+    codex_oauth_profile: values.codexOauthProfile,
     image:     imageFromForm(values),
     resources: resourcesFromForm(values),
     network:   networkFromForm(values),
