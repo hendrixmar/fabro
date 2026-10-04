@@ -1245,44 +1245,49 @@ impl Default for EnvironmentLifecycleSettings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvironmentSettings {
-    pub provider:  EnvironmentProvider,
+    pub provider:            EnvironmentProvider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd:       Option<String>,
-    pub image:     EnvironmentImageSettings,
-    pub resources: EnvironmentResourcesSettings,
-    pub network:   EnvironmentNetworkSettings,
-    pub lifecycle: EnvironmentLifecycleSettings,
-    pub labels:    HashMap<String, String>,
-    pub env:       HashMap<String, InterpString>,
+    pub cwd:                 Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_oauth_profile: Option<String>,
+    pub image:               EnvironmentImageSettings,
+    pub resources:           EnvironmentResourcesSettings,
+    pub network:             EnvironmentNetworkSettings,
+    pub lifecycle:           EnvironmentLifecycleSettings,
+    pub labels:              HashMap<String, String>,
+    pub env:                 HashMap<String, InterpString>,
 }
 
 impl Default for EnvironmentSettings {
     fn default() -> Self {
         Self {
-            provider:  EnvironmentProvider::Local,
-            cwd:       None,
-            image:     EnvironmentImageSettings::default(),
-            resources: EnvironmentResourcesSettings::default(),
-            network:   EnvironmentNetworkSettings::default(),
-            lifecycle: EnvironmentLifecycleSettings::default(),
-            labels:    HashMap::new(),
-            env:       HashMap::new(),
+            provider:            EnvironmentProvider::Local,
+            cwd:                 None,
+            codex_oauth_profile: None,
+            image:               EnvironmentImageSettings::default(),
+            resources:           EnvironmentResourcesSettings::default(),
+            network:             EnvironmentNetworkSettings::default(),
+            lifecycle:           EnvironmentLifecycleSettings::default(),
+            labels:              HashMap::new(),
+            env:                 HashMap::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunEnvironmentSettings {
-    pub id:        String,
-    pub provider:  EnvironmentProvider,
+    pub id:                  String,
+    pub provider:            EnvironmentProvider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd:       Option<String>,
-    pub image:     EnvironmentImageSettings,
-    pub resources: EnvironmentResourcesSettings,
-    pub network:   EnvironmentNetworkSettings,
-    pub lifecycle: EnvironmentLifecycleSettings,
-    pub labels:    HashMap<String, String>,
-    pub env:       HashMap<String, InterpString>,
+    pub cwd:                 Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_oauth_profile: Option<String>,
+    pub image:               EnvironmentImageSettings,
+    pub resources:           EnvironmentResourcesSettings,
+    pub network:             EnvironmentNetworkSettings,
+    pub lifecycle:           EnvironmentLifecycleSettings,
+    pub labels:              HashMap<String, String>,
+    pub env:                 HashMap<String, InterpString>,
 }
 
 impl RunEnvironmentSettings {
@@ -1292,6 +1297,7 @@ impl RunEnvironmentSettings {
             id,
             provider: environment.provider,
             cwd: environment.cwd,
+            codex_oauth_profile: environment.codex_oauth_profile,
             image: environment.image,
             resources: environment.resources,
             network: environment.network,
@@ -1315,6 +1321,42 @@ impl RunEnvironmentSettings {
         }
         Ok(resolved)
     }
+}
+
+/// Validate the named host credential boundary without reading credentials.
+pub fn validate_codex_oauth_profile<'a>(
+    provider: EnvironmentProvider,
+    profile: Option<&str>,
+    env_names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), &'static str> {
+    if let Some(profile) = profile {
+        if provider != EnvironmentProvider::Docker {
+            return Err("codex_oauth_profile is supported only by Docker environments");
+        }
+        if profile.is_empty()
+            || !profile.as_bytes()[0].is_ascii_lowercase()
+                && !profile.as_bytes()[0].is_ascii_digit()
+            || !profile.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            })
+        {
+            return Err("codex_oauth_profile must be a single lowercase slug: [a-z0-9][a-z0-9_-]*");
+        }
+    }
+    for name in env_names {
+        if name == "FABRO_CODEX_OAUTH_PROFILE" {
+            return Err("FABRO_CODEX_OAUTH_PROFILE is reserved for managed Docker mounts");
+        }
+        if name == "CODEX_AUTH_B64" {
+            return Err(
+                "CODEX_AUTH_B64 is no longer supported; configure codex_oauth_profile instead",
+            );
+        }
+        if profile.is_some() && matches!(name, "OPENAI_API_KEY" | "CODEX_API_KEY") {
+            return Err("codex_oauth_profile cannot be combined with API key credentials");
+        }
+    }
+    Ok(())
 }
 
 impl Default for RunEnvironmentSettings {

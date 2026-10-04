@@ -5,10 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "docker")]
-use fabro_types::settings::ResolveError;
 #[cfg(feature = "daytona")]
 use fabro_types::settings::run::DockerfileSource as ResolvedDockerfileSource;
+#[cfg(feature = "docker")]
+use fabro_types::settings::run::validate_codex_oauth_profile;
 use fabro_types::settings::run::{
     EnvironmentNetworkMode, RunCloneSettings, RunEnvironmentSettings,
 };
@@ -79,7 +79,7 @@ pub fn daytona_config_from_environment(
 pub fn docker_config_from_environment(
     settings: &RunEnvironmentSettings,
     clone: &RunCloneSettings,
-) -> DockerSandboxOptions {
+) -> crate::Result<DockerSandboxOptions> {
     // No vault is available on this path (server preflight / manifest), so a
     // `{{ secrets.* }}` value keeps its source form. Nothing else is left to
     // resolve: `{{ vars.* }}` is substituted at run creation.
@@ -101,9 +101,11 @@ pub fn docker_config_from_environment_with_secrets(
     settings: &RunEnvironmentSettings,
     clone: &RunCloneSettings,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
-) -> Result<DockerSandboxOptions, ResolveError> {
-    let env = settings.resolve_env(secrets_lookup)?;
-    Ok(docker_config_from_environment_env(settings, clone, env))
+) -> crate::Result<DockerSandboxOptions> {
+    let env = settings.resolve_env(secrets_lookup).map_err(|err| {
+        crate::Error::context("failed to resolve Docker environment variables", err)
+    })?;
+    docker_config_from_environment_env(settings, clone, env)
 }
 
 #[cfg(feature = "docker")]
@@ -111,7 +113,13 @@ fn docker_config_from_environment_env(
     settings: &RunEnvironmentSettings,
     clone: &RunCloneSettings,
     env: std::collections::HashMap<String, String>,
-) -> DockerSandboxOptions {
+) -> crate::Result<DockerSandboxOptions> {
+    validate_codex_oauth_profile(
+        settings.provider,
+        settings.codex_oauth_profile.as_deref(),
+        env.keys().map(String::as_str),
+    )
+    .map_err(crate::Error::message)?;
     let mut env_vars = env
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
@@ -119,7 +127,7 @@ fn docker_config_from_environment_env(
     env_vars.sort();
     let default_options = DockerSandboxOptions::default();
 
-    DockerSandboxOptions {
+    let options = DockerSandboxOptions {
         image: settings
             .image
             .docker
@@ -140,12 +148,20 @@ fn docker_config_from_environment_env(
             .cpu
             .map(|cpu| i64::from(cpu).saturating_mul(100_000)),
         env_vars,
+        codex_oauth_profile: settings.codex_oauth_profile.as_ref().map(|name| {
+            fabro_util::home::Home::from_env()
+                .root()
+                .join("codex-oauth")
+                .join(name)
+        }),
         clone_depth: clone
             .depth_limit()
             .and_then(|depth| usize::try_from(depth).ok()),
         skip_clone: !clone.enabled,
         ..DockerSandboxOptions::default()
-    }
+    };
+    options.validate_codex_oauth_profile()?;
+    Ok(options)
 }
 
 pub fn local_working_directory_from_environment(
@@ -201,6 +217,7 @@ mod tests {
             id: "host".to_string(),
             provider,
             cwd: None,
+            codex_oauth_profile: None,
             image: EnvironmentImageSettings::default(),
             resources: EnvironmentResourcesSettings::default(),
             network: EnvironmentNetworkSettings::default(),

@@ -36,6 +36,10 @@ export interface RunEnvironmentSettings {
      * Local-provider command working directory for this environment. Docker and Daytona ignore this value.
      */
     'cwd'?: string | null;
+    /**
+     * Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
+     */
+    'codex_oauth_profile'?: string | null;
     'image': EnvironmentImageSettings;
     'resources': EnvironmentResourcesSettings;
     'network': EnvironmentNetworkSettings;

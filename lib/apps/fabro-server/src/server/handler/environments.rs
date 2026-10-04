@@ -32,28 +32,30 @@ struct EnvironmentListMeta {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateEnvironmentRequest {
-    id:        EnvironmentId,
-    provider:  EnvironmentProvider,
-    cwd:       Option<String>,
-    image:     ApiEnvironmentImageSettings,
-    resources: EnvironmentResourcesSettings,
-    network:   EnvironmentNetworkSettings,
-    lifecycle: EnvironmentLifecycleSettings,
-    labels:    HashMap<String, String>,
-    env:       HashMap<String, InterpString>,
+    id:                  EnvironmentId,
+    provider:            EnvironmentProvider,
+    cwd:                 Option<String>,
+    codex_oauth_profile: Option<String>,
+    image:               ApiEnvironmentImageSettings,
+    resources:           EnvironmentResourcesSettings,
+    network:             EnvironmentNetworkSettings,
+    lifecycle:           EnvironmentLifecycleSettings,
+    labels:              HashMap<String, String>,
+    env:                 HashMap<String, InterpString>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplaceEnvironmentRequest {
-    provider:  EnvironmentProvider,
-    cwd:       Option<String>,
-    image:     ApiEnvironmentImageSettings,
-    resources: EnvironmentResourcesSettings,
-    network:   EnvironmentNetworkSettings,
-    lifecycle: EnvironmentLifecycleSettings,
-    labels:    HashMap<String, String>,
-    env:       HashMap<String, InterpString>,
+    provider:            EnvironmentProvider,
+    cwd:                 Option<String>,
+    codex_oauth_profile: Option<String>,
+    image:               ApiEnvironmentImageSettings,
+    resources:           EnvironmentResourcesSettings,
+    network:             EnvironmentNetworkSettings,
+    lifecycle:           EnvironmentLifecycleSettings,
+    labels:              HashMap<String, String>,
+    env:                 HashMap<String, InterpString>,
 }
 
 #[derive(Deserialize)]
@@ -82,14 +84,15 @@ impl CreateEnvironmentRequest {
         Ok(EnvironmentDraft {
             id:       self.id,
             settings: EnvironmentSettings {
-                provider:  self.provider,
-                cwd:       self.cwd,
-                image:     self.image.into_settings()?,
-                resources: self.resources,
-                network:   self.network,
-                lifecycle: self.lifecycle,
-                labels:    self.labels,
-                env:       self.env,
+                provider:            self.provider,
+                cwd:                 self.cwd,
+                codex_oauth_profile: self.codex_oauth_profile,
+                image:               self.image.into_settings()?,
+                resources:           self.resources,
+                network:             self.network,
+                lifecycle:           self.lifecycle,
+                labels:              self.labels,
+                env:                 self.env,
             },
         })
     }
@@ -98,14 +101,15 @@ impl CreateEnvironmentRequest {
 impl ReplaceEnvironmentRequest {
     fn into_settings(self) -> Result<EnvironmentSettings, ApiError> {
         Ok(EnvironmentSettings {
-            provider:  self.provider,
-            cwd:       self.cwd,
-            image:     self.image.into_settings()?,
-            resources: self.resources,
-            network:   self.network,
-            lifecycle: self.lifecycle,
-            labels:    self.labels,
-            env:       self.env,
+            provider:            self.provider,
+            cwd:                 self.cwd,
+            codex_oauth_profile: self.codex_oauth_profile,
+            image:               self.image.into_settings()?,
+            resources:           self.resources,
+            network:             self.network,
+            lifecycle:           self.lifecycle,
+            labels:              self.labels,
+            env:                 self.env,
         })
     }
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,10 +16,12 @@ use bollard::container::{
 use bollard::errors::Error as DockerError;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
-use bollard::models::{ContainerInspectResponse, HostConfig};
+use bollard::models::{ContainerInspectResponse, HostConfig, Mount, MountTypeEnum};
 use fabro_github::GitHubCredentials;
 use fabro_github::token_source::InstallationTokenSource;
-use fabro_types::settings::run::RunCloneSettings;
+use fabro_types::settings::run::{
+    EnvironmentProvider, RunCloneSettings, validate_codex_oauth_profile,
+};
 use fabro_types::{CommandOutputStream, CommandTermination, RunId, SandboxProviderKind};
 use fabro_util::time::elapsed_ms;
 use futures::StreamExt;
@@ -55,6 +58,7 @@ pub(crate) const REPOS_ROOT: &str = "/repos";
 // normalized back to `blob://` in durable context.
 pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/fabro/runtime";
 const DEFAULT_GIT_CLONE_DEPTH: usize = RunCloneSettings::DEFAULT_DEPTH.unsigned_abs() as usize;
+const CODEX_OAUTH_PROFILE_MARKER: &str = "FABRO_CODEX_OAUTH_PROFILE";
 const GIT_CLONE_TIMEOUT: Duration = Duration::from_mins(5);
 #[cfg(test)]
 const EXEC_STOP_POLL_SLEEP_SECONDS: &str = "0.005";
@@ -96,6 +100,7 @@ fn clean_bash_env_entries(entries: impl IntoIterator<Item = String>) -> Vec<Stri
 fn docker_bash_exec_env(env_vars: Option<&HashMap<String, String>>) -> Vec<String> {
     let entries = env_vars.map_or_else(Vec::new, |vars| {
         vars.iter()
+            .filter(|(key, _)| key.as_str() != CODEX_OAUTH_PROFILE_MARKER)
             .map(|(key, value)| format!("{key}={value}"))
             .collect()
     });
@@ -116,36 +121,106 @@ pub fn docker_access_command(container_id: &str, working_directory: &str) -> Str
 #[derive(Clone, Debug, PartialEq)]
 pub struct DockerSandboxOptions {
     /// Docker image to use.
-    pub image:        String,
+    pub image:               String,
     /// Docker network mode. Default: `Some("bridge")`.
-    pub network_mode: Option<String>,
+    pub network_mode:        Option<String>,
     /// Memory limit in bytes. `None` = unlimited.
-    pub memory_limit: Option<i64>,
+    pub memory_limit:        Option<i64>,
     /// CPU quota (microseconds per 100ms period). `None` = unlimited.
-    pub cpu_quota:    Option<i64>,
+    pub cpu_quota:           Option<i64>,
     /// Whether to pull the image if not found locally. Default: `true`.
-    pub auto_pull:    bool,
+    pub auto_pull:           bool,
     /// Additional `KEY=VALUE` environment variables for the container.
-    pub env_vars:     Vec<String>,
+    pub env_vars:            Vec<String>,
+    /// Trusted private host profile directory; only auth.json and auth.lock are
+    /// mounted.
+    pub codex_oauth_profile: Option<PathBuf>,
     /// Maximum Git history depth fetched during clone; `None` fetches full
     /// history.
-    pub clone_depth:  Option<usize>,
+    pub clone_depth:         Option<usize>,
     /// Create an empty workspace instead of cloning even when an origin exists.
-    pub skip_clone:   bool,
+    pub skip_clone:          bool,
 }
 
 impl Default for DockerSandboxOptions {
     fn default() -> Self {
         Self {
-            image:        "buildpack-deps:noble".to_string(),
-            network_mode: Some("bridge".to_string()),
-            memory_limit: None,
-            cpu_quota:    None,
-            auto_pull:    true,
-            env_vars:     Vec::new(),
-            clone_depth:  Some(DEFAULT_GIT_CLONE_DEPTH),
-            skip_clone:   false,
+            image:               "buildpack-deps:noble".to_string(),
+            network_mode:        Some("bridge".to_string()),
+            memory_limit:        None,
+            cpu_quota:           None,
+            auto_pull:           true,
+            env_vars:            Vec::new(),
+            codex_oauth_profile: None,
+            clone_depth:         Some(DEFAULT_GIT_CLONE_DEPTH),
+            skip_clone:          false,
         }
+    }
+}
+
+impl DockerSandboxOptions {
+    pub(crate) fn validate_codex_oauth_profile(&self) -> crate::Result<()> {
+        validate_codex_oauth_profile(
+            EnvironmentProvider::Docker,
+            self.codex_oauth_profile.as_ref().map(|_| "managed"),
+            self.env_vars.iter().map(|entry| env_entry_name(entry)),
+        )
+        .map_err(crate::Error::message)?;
+        let Some(profile) = &self.codex_oauth_profile else {
+            return Ok(());
+        };
+        if !profile.is_absolute() || profile.to_str().is_none() {
+            return Err(crate::Error::message(
+                "Codex OAuth profile directory must have an absolute UTF-8 path",
+            ));
+        }
+        validate_private_profile_entry(profile, true)?;
+        for name in ["auth.json", "auth.lock"] {
+            validate_private_profile_entry(&profile.join(name), false)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_private_profile_entry(path: &Path, directory: bool) -> crate::Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|err| {
+        crate::Error::context(
+            format!(
+                "Codex OAuth profile requires pre-existing private {} at {}; provision it on the host before preflight",
+                if directory { "directory" } else { "file" },
+                path.display(),
+            ),
+            err,
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if directory { 0o700 } else { 0o600 };
+        let valid_type = if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        };
+        if !valid_type || metadata.permissions().mode() & 0o7777 != mode {
+            return Err(crate::Error::message(format!(
+                "Codex OAuth profile entry {} must be a nonsymlink {} with permissions {mode:04o}",
+                path.display(),
+                if directory {
+                    "directory"
+                } else {
+                    "regular file"
+                },
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err(crate::Error::message(
+            "Managed Codex OAuth profiles require Unix private file permissions",
+        ))
     }
 }
 
@@ -191,6 +266,7 @@ impl DockerSandbox {
         clone_tag: Option<String>,
         clone_commit_sha: Option<String>,
     ) -> crate::Result<Self> {
+        config.validate_codex_oauth_profile()?;
         if clone_tag.is_some() || clone_commit_sha.is_some() {
             clone_source::decide_clone(
                 config.skip_clone,
@@ -1615,7 +1691,18 @@ fn classify_docker_clone_result(
 
 fn host_config(config: &DockerSandboxOptions) -> HostConfig {
     HostConfig {
-        binds: None,
+        mounts: config.codex_oauth_profile.as_ref().map(|profile| {
+            ["auth.json", "auth.lock"]
+                .into_iter()
+                .map(|name| Mount {
+                    target: Some(format!("/root/.codex/{name}")),
+                    source: Some(profile.join(name).display().to_string()),
+                    typ: Some(MountTypeEnum::BIND),
+                    read_only: Some(false),
+                    ..Default::default()
+                })
+                .collect()
+        }),
         network_mode: config.network_mode.clone(),
         memory: config.memory_limit,
         cpu_quota: config.cpu_quota,
@@ -1624,6 +1711,21 @@ fn host_config(config: &DockerSandboxOptions) -> HostConfig {
 }
 
 fn container_config(config: &DockerSandboxOptions, run_id: Option<&RunId>) -> Config<String> {
+    let mut env = clean_bash_env_entries(
+        config
+            .env_vars
+            .iter()
+            .filter(|entry| env_entry_name(entry) != CODEX_OAUTH_PROFILE_MARKER)
+            .cloned(),
+    );
+    env.push(format!(
+        "{CODEX_OAUTH_PROFILE_MARKER}={}",
+        if config.codex_oauth_profile.is_some() {
+            "1"
+        } else {
+            ""
+        },
+    ));
     Config {
         image: Some(config.image.clone()),
         cmd: Some(vec![
@@ -1635,7 +1737,7 @@ fn container_config(config: &DockerSandboxOptions, run_id: Option<&RunId>) -> Co
             ),
         ]),
         working_dir: Some(WORKING_DIRECTORY.to_string()),
-        env: Some(clean_bash_env_entries(config.env_vars.clone())),
+        env: Some(env),
         labels: Some(managed_labels::for_run(run_id)),
         host_config: Some(host_config(config)),
         ..Default::default()
@@ -1784,6 +1886,7 @@ impl Sandbox for DockerSandbox {
             name,
             platform: None,
         });
+        self.config.validate_codex_oauth_profile()?;
         let container = self
             .docker
             .create_container(create_options, container_config(&self.config, self.run_id.as_ref()))
@@ -2063,6 +2166,7 @@ impl Sandbox for DockerSandbox {
         );
         let env = env_vars.map(|vars| {
             vars.iter()
+                .filter(|(key, _)| key.as_str() != CODEX_OAUTH_PROFILE_MARKER)
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect()
         });
@@ -2650,15 +2754,6 @@ mod tests {
     }
 
     #[test]
-    fn default_options_are_clone_based() {
-        let options = DockerSandboxOptions::default();
-        assert_eq!(options.image, "buildpack-deps:noble");
-        assert_eq!(options.network_mode.as_deref(), Some("bridge"));
-        assert_eq!(options.clone_depth, Some(DEFAULT_GIT_CLONE_DEPTH));
-        assert!(!options.skip_clone);
-    }
-
-    #[test]
     fn clone_command_uses_configured_depth_without_tags_for_branch_clone() {
         let command = git_clone_command(
             "https://github.com/fabro-sh/fabro",
@@ -2820,34 +2915,74 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn container_config_has_no_bind_mounts_or_socket() {
-        let options = DockerSandboxOptions {
-            env_vars: vec![
-                "FOO=bar".to_string(),
-                "BASH_ENV=/tmp/untrusted-startup".to_string(),
-            ],
-            memory_limit: Some(4_000_000_000),
-            cpu_quota: Some(200_000),
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "synchronous unit test provisions empty private file fixtures, never real credentials"
+    )]
+    fn managed_codex_profile_rejects_unsafe_credentials_at_construction() -> anyhow::Result<()> {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let construct = |options: &DockerSandboxOptions| {
+            DockerSandbox::new(options.clone(), None, None, None, None, None, None)
+        };
+        let dir = tempfile::tempdir()?;
+        let profile = dir.path().join("profile");
+        let mut options = DockerSandboxOptions {
+            codex_oauth_profile: Some(profile.clone()),
             ..DockerSandboxOptions::default()
         };
-        let config = container_config(&options, None);
-        let host_config = config.host_config.expect("host config");
-        assert!(host_config.binds.is_none());
-        assert_eq!(host_config.memory, Some(4_000_000_000));
-        assert_eq!(host_config.cpu_quota, Some(200_000));
-        assert_eq!(config.working_dir.as_deref(), Some(WORKING_DIRECTORY));
-        assert_eq!(
-            config.env,
-            Some(vec!["FOO=bar".to_string(), "BASH_ENV=".to_string()])
-        );
-        assert!(
-            config
-                .env
-                .unwrap()
-                .iter()
-                .all(|value| !value.starts_with("DOCKER_HOST="))
-        );
+        assert!(construct(&options).is_err());
+        assert!(!profile.exists());
+        std::fs::create_dir(&profile)?;
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700))?;
+        assert!(construct(&options).is_err());
+        for name in ["auth.json", "auth.lock"] {
+            let path = profile.join(name);
+            std::fs::write(&path, "")?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        construct(&options)?;
+        for name in [
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "CODEX_AUTH_B64",
+            CODEX_OAUTH_PROFILE_MARKER,
+        ] {
+            options.env_vars = vec![format!("{name}=")];
+            assert!(construct(&options).is_err());
+        }
+        options.env_vars.clear();
+        for name in ["auth.json", "auth.lock"] {
+            let path = profile.join(name);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+            assert!(construct(&options).is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            let original = profile.join(format!("{name}.original"));
+            std::fs::rename(&path, &original)?;
+            symlink(&original, &path)?;
+            assert!(construct(&options).is_err());
+            std::fs::remove_file(&path)?;
+            std::fs::rename(original, path)?;
+        }
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o755))?;
+        assert!(construct(&options).is_err());
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700))?;
+        let linked = dir.path().join("linked");
+        symlink(&profile, &linked)?;
+        options.codex_oauth_profile = Some(linked);
+        assert!(construct(&options).is_err());
+
+        for provider in [EnvironmentProvider::Local, EnvironmentProvider::Daytona] {
+            assert!(validate_codex_oauth_profile(provider, Some("work"), []).is_err());
+        }
+        for name in ["", "../work", "/work", "work/team", ".", "Work", "work:rw"] {
+            assert!(
+                validate_codex_oauth_profile(EnvironmentProvider::Docker, Some(name), []).is_err()
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -264,6 +264,7 @@ async fn load_environments(
             revision,
             provider,
             cwd,
+            codex_oauth_profile,
             image_docker,
             image_dockerfile_inline,
             resources_cpu,
@@ -309,15 +310,16 @@ fn environment_from_row(row: &SqliteRow) -> Result<Environment, EnvironmentStore
     let labels_json = row.get::<String, _>("labels_json");
     let env_json = row.get::<String, _>("env_json");
     let layer = EnvironmentLayer {
-        provider:  Some(row.get("provider")),
-        cwd:       row.get("cwd"),
-        image:     image_layer_from_row(row),
-        resources: resources_layer_from_row(row)?,
-        network:   Some(EnvironmentNetworkLayer {
+        provider:            Some(row.get("provider")),
+        cwd:                 row.get("cwd"),
+        codex_oauth_profile: row.get("codex_oauth_profile"),
+        image:               image_layer_from_row(row),
+        resources:           resources_layer_from_row(row)?,
+        network:             Some(EnvironmentNetworkLayer {
             mode:  Some(row.get("network_mode")),
             allow: decode_json("network_allow_json", &network_allow_json)?,
         }),
-        lifecycle: Some(EnvironmentLifecycleLayer {
+        lifecycle:           Some(EnvironmentLifecycleLayer {
             preserve:         Some(row.get("lifecycle_preserve")),
             stop_on_terminal: Some(row.get("lifecycle_stop_on_terminal")),
             auto_stop:        parse_duration(
@@ -325,11 +327,11 @@ fn environment_from_row(row: &SqliteRow) -> Result<Environment, EnvironmentStore
                 row.get("lifecycle_auto_stop"),
             )?,
         }),
-        labels:    StickyMap::from(decode_json::<HashMap<String, String>>(
+        labels:              StickyMap::from(decode_json::<HashMap<String, String>>(
             "labels_json",
             &labels_json,
         )?),
-        env:       StickyMap::from(decode_env_json(&env_json)?),
+        env:                 StickyMap::from(decode_env_json(&env_json)?),
     };
 
     Environment::from_row(id, revision, &layer)
@@ -452,6 +454,7 @@ async fn execute_environment_insert_sql(
         .bind(row.revision)
         .bind(row.provider)
         .bind(row.cwd)
+        .bind(row.codex_oauth_profile)
         .bind(row.image_docker)
         .bind(row.image_dockerfile_inline)
         .bind(row.resources_cpu)
@@ -479,6 +482,7 @@ async fn update_environment(
         .bind(row.revision)
         .bind(row.provider)
         .bind(row.cwd)
+        .bind(row.codex_oauth_profile)
         .bind(row.image_docker)
         .bind(row.image_dockerfile_inline)
         .bind(row.resources_cpu)
@@ -507,6 +511,7 @@ INSERT INTO environments (
     revision,
     provider,
     cwd,
+    codex_oauth_profile,
     image_docker,
     image_dockerfile_inline,
     resources_cpu,
@@ -520,7 +525,7 @@ INSERT INTO environments (
     labels_json,
     env_json
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
 ";
 
@@ -529,6 +534,7 @@ UPDATE environments SET
     revision = ?,
     provider = ?,
     cwd = ?,
+    codex_oauth_profile = ?,
     image_docker = ?,
     image_dockerfile_inline = ?,
     resources_cpu = ?,
@@ -549,6 +555,7 @@ struct EnvironmentSqlRow {
     revision: String,
     provider: String,
     cwd: Option<String>,
+    codex_oauth_profile: Option<String>,
     image_docker: Option<String>,
     image_dockerfile_inline: Option<String>,
     resources_cpu: Option<i32>,
@@ -578,6 +585,7 @@ impl EnvironmentSqlRow {
             revision: environment.revision.to_string(),
             provider: settings.provider.to_string(),
             cwd: settings.cwd.clone(),
+            codex_oauth_profile: settings.codex_oauth_profile.clone(),
             image_docker: settings.image.docker.clone(),
             image_dockerfile_inline,
             resources_cpu: settings.resources.cpu,

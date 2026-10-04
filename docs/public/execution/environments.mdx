@@ -150,6 +150,51 @@ preserve = true
 
 `env` and `labels` merge by key.
 
+## Persistent Codex subscription OAuth
+
+Docker environments can opt into a dedicated host credential profile with
+`"codex_oauth_profile": "automation"` in their REST settings. Profile names are
+single lowercase slugs, not filesystem paths. Workflow overrides cannot select
+or replace the server-owned profile.
+
+Provision the profile under `$FABRO_HOME/codex-oauth/<name>` (default
+`~/.fabro/codex-oauth/<name>`) with directory permissions `0700`, and existing
+regular, nonsymlink `auth.json` and `auth.lock` files with permissions `0600`.
+Sign in with ChatGPT using the native Codex device-login flow for this dedicated
+profile; do not copy a desktop session's rotating credentials. Never include
+credentials in images, workflow files, tickets, diagnostics, or run dumps.
+
+Only `auth.json` and `auth.lock` are mounted into `/root/.codex` in each Docker
+sandbox. Homes, conversation histories, configuration, caches, credential
+databases, and host sockets are not shared. This requires a root-user image with
+the native Codex CLI, the managed `codex-acp-wrapper`, Python, and `flock`.
+The wrapper forces native file storage and ChatGPT authentication, and holds an
+exclusive lock before the agent reads credentials. Rotated state persists
+directly through the file mount, including after a failed or cancelled turn;
+there is no post-turn credential copy-back.
+
+One Codex session runs per profile at a time. Use independently signed-in
+profiles for concurrent sessions. `OPENAI_API_KEY` and `CODEX_API_KEY` conflict
+with managed OAuth; `CODEX_AUTH_B64` snapshot reseeding is no longer supported.
+Missing files, unsafe permissions, symlinks, and unsupported providers fail
+before sandbox creation. Changing a profile or logging out requires quiescing
+its sessions first; do not replace a mounted file while it is in use.
+
+The standard image pins Codex `0.153.4`, whose native credential writer updates
+the existing inode. Verify file-bound credential persistence when upgrading
+Codex; a writer that replaces the file instead needs a different mount design.
+Default environments remain unmounted unless this profile is configured.
+
+<Warning>
+Before installing this clean cutover on an existing server, quiesce affected
+automation and remove `CODEX_AUTH_B64` from persisted environments through the
+current server API. Environment reload rejects retired snapshot settings.
+Back up SQLite before the new environment-column migration and account for
+migration compatibility before rolling back an older binary. Provisioning,
+image adoption, server restart, and live authentication checks are separate
+operational steps; a local file-storage smoke is not a live OAuth proof.
+</Warning>
+
 ## Environment value interpolation
 
 Environment `env` values can mix literal text with `{{ vars.NAME }}` and `{{ secrets.NAME }}` tokens:

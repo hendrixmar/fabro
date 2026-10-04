@@ -4,6 +4,7 @@ use fabro_types::settings::run::{
     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
     EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentProvider,
     EnvironmentResourcesSettings, EnvironmentSettings, RunEnvironmentSettings,
+    validate_codex_oauth_profile,
 };
 
 use super::ResolveError;
@@ -74,6 +75,7 @@ fn resolve_environment_fields(
     let environment = EnvironmentSettings {
         provider,
         cwd: resolve_cwd(layer.cwd.as_deref(), &format!("{path}.cwd"), errors),
+        codex_oauth_profile: layer.codex_oauth_profile.clone(),
         image: resolve_image(layer.image.as_ref()),
         resources: resolve_resources(layer.resources.as_ref()),
         network: resolve_network(layer.network.as_ref(), &format!("{path}.network"), errors),
@@ -205,6 +207,16 @@ fn validate_provider_capabilities(
     path: &str,
     errors: &mut Vec<ResolveError>,
 ) {
+    if let Err(reason) = validate_codex_oauth_profile(
+        environment.provider,
+        environment.codex_oauth_profile.as_deref(),
+        environment.env.keys().map(String::as_str),
+    ) {
+        errors.push(ResolveError::Invalid {
+            path:   format!("{path}.codex_oauth_profile"),
+            reason: reason.to_string(),
+        });
+    }
     match environment.provider {
         EnvironmentProvider::Local => {
             if matches!(

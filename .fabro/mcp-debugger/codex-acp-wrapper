@@ -1,12 +1,38 @@
 #!/bin/sh
-# Launches codex-acp with credentials injected from Fabro sandbox env vars.
-# Preference: OPENAI_API_KEY (used by codex directly), else CODEX_AUTH_JSON
-# (OAuth auth.json content produced by `codex login` on a trusted machine).
+# Keep Codex state private to the container; managed profiles share only auth files.
 set -e
 export NO_BROWSER=1
-if [ -n "$CODEX_AUTH_B64" ]; then
-  mkdir -p ~/.codex
-  printf '%s' "$CODEX_AUTH_B64" | base64 -d > ~/.codex/auth.json
-  chmod 600 ~/.codex/auth.json
+if [ "${CODEX_AUTH_B64+x}" = x ]; then
+  echo "codex-acp-wrapper: CODEX_AUTH_B64 is unsupported; use a managed OAuth profile" >&2
+  exit 1
+fi
+if [ "${FABRO_CODEX_OAUTH_PROFILE:-}" = 1 ]; then
+  if [ "${OPENAI_API_KEY+x}" = x ] || [ "${CODEX_API_KEY+x}" = x ]; then
+    echo "codex-acp-wrapper: API key credentials conflict with managed OAuth" >&2
+    exit 1
+  fi
+  export CODEX_HOME="$HOME/.codex"
+  if [ ! -f "$CODEX_HOME/auth.json" ] || [ ! -f "$CODEX_HOME/auth.lock" ]; then
+    echo "codex-acp-wrapper: managed OAuth auth.json and auth.lock must already exist" >&2
+    exit 1
+  fi
+  CODEX_CONFIG="$(python3 -c '
+import json
+import os
+import sys
+
+try:
+    config = json.loads(os.environ.get("CODEX_CONFIG", "{}"))
+    if not isinstance(config, dict):
+        raise ValueError
+    config["cli_auth_credentials_store"] = "file"
+    config["forced_login_method"] = "chatgpt"
+    print(json.dumps(config, allow_nan=False))
+except (ValueError, TypeError):
+    sys.exit("codex-acp-wrapper: CODEX_CONFIG must be a valid JSON object")
+')"
+  export CODEX_CONFIG
+  # ponytail: one active session per profile; use separate profiles for parallelism.
+  exec flock --exclusive --no-fork "$HOME/.codex/auth.lock" codex-acp "$@"
 fi
 exec codex-acp "$@"

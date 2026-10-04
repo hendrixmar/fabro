@@ -315,6 +315,7 @@ pub(crate) fn pin_workflow_environment_authority(layer: &mut SettingsLayer, envi
         let EnvironmentLayer {
             provider,
             cwd,
+            codex_oauth_profile,
             image,
             resources: _,
             network: _,
@@ -325,10 +326,12 @@ pub(crate) fn pin_workflow_environment_authority(layer: &mut SettingsLayer, envi
         *provider = None;
         *cwd = None;
         *image = None;
+        *codex_oauth_profile = None;
     }
     if let Some(environment) = layer.run.as_mut().and_then(|run| run.environment.as_mut()) {
         let RunEnvironmentLayer {
             id: _,
+            codex_oauth_profile,
             image,
             resources: _,
             network: _,
@@ -337,6 +340,7 @@ pub(crate) fn pin_workflow_environment_authority(layer: &mut SettingsLayer, envi
             env: _,
         } = environment;
         *image = None;
+        *codex_oauth_profile = None;
     }
 }
 

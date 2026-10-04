@@ -50,6 +50,8 @@ type ImageSource = "image" | "dockerfile";
 export interface EnvironmentFormValues {
   id: string;
   provider: EnvironmentProvider;
+  // API-only host profile selection survives unrelated web edits.
+  codexOauthProfile?: string | null;
   imageSource: ImageSource;
   dockerRef: string;
   dockerfile: string;
@@ -88,6 +90,7 @@ export function environmentToFormValues(environment: Environment): EnvironmentFo
   return {
     id:             environment.id,
     provider:       environment.provider,
+    codexOauthProfile: environment.codex_oauth_profile,
     imageSource:    environment.image.dockerfile ? "dockerfile" : "image",
     dockerRef:      environment.image.docker ?? "",
     dockerfile:     environment.image.dockerfile?.value ?? "",
@@ -137,6 +140,7 @@ export function replaceRequestFromForm(values: EnvironmentFormValues): ReplaceEn
 function settingsFromForm(values: EnvironmentFormValues): ReplaceEnvironmentRequest {
   return {
     provider:  values.provider,
+    codex_oauth_profile: values.codexOauthProfile,
     image:     imageFromForm(values),
     resources: resourcesFromForm(values),
     network:   networkFromForm(values),

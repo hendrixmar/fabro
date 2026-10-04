@@ -715,7 +715,7 @@ fn resolve_daytona_config(settings: &RunNamespace) -> DaytonaConfig {
     daytona_config_from_environment(&settings.environment, &settings.clone)
 }
 
-fn resolve_docker_config(settings: &RunNamespace) -> DockerSandboxOptions {
+fn resolve_docker_config(settings: &RunNamespace) -> fabro_sandbox::Result<DockerSandboxOptions> {
     docker_config_from_environment(&settings.environment, &settings.clone)
 }
 
@@ -954,6 +954,19 @@ fn preflight_sandbox_spec(
     github_app: Option<fabro_github::GitHubCredentials>,
     daytona_api_key: Option<String>,
 ) -> std::result::Result<SandboxSpec, fabro_sandbox::Error> {
+    fabro_types::settings::run::validate_codex_oauth_profile(
+        resolved_run.environment.provider,
+        resolved_run.environment.codex_oauth_profile.as_deref(),
+        resolved_run.environment.env.keys().map(String::as_str),
+    )
+    .map_err(fabro_sandbox::Error::message)?;
+    if resolved_run.environment.codex_oauth_profile.is_some()
+        && sandbox_provider != SandboxProviderKind::Docker
+    {
+        return Err(fabro_sandbox::Error::message(
+            "codex_oauth_profile requires the effective Docker sandbox provider",
+        ));
+    }
     let clone_origin_url = prepared
         .git
         .as_ref()
@@ -969,7 +982,7 @@ fn preflight_sandbox_spec(
             SandboxSpec::Local { working_directory }
         }
         SandboxProviderKind::Docker => {
-            let mut config = resolve_docker_config(resolved_run);
+            let mut config = resolve_docker_config(resolved_run)?;
             config.skip_clone = true;
             SandboxSpec::Docker {
                 config,
