@@ -169,7 +169,8 @@ pub struct RunSummaryListQuery {
     pub automation_id: Option<String>,
     pub project:       Option<RunProjectFilter>,
     pub workflow:      Option<String>,
-    /// Only runs that did something: not succeeded, changed files, or have children.
+    /// Only runs that did something: not succeeded, changed files, or have
+    /// children.
     pub activity:      bool,
     pub roots_only:    bool,
     pub visibility:    RunSummaryVisibility,
@@ -1767,12 +1768,42 @@ mod tests {
             projected.status = sample_status(kind);
             projected
         };
-        let quiet = run(1, "quiet", "artesanos-digitales/tierrapay", "scan", RunStatusKind::Succeeded);
-        let failed = run(2, "failed", "artesanos-digitales/tierrapay", "scan", RunStatusKind::Failed);
-        let parent = run(3, "parent", "artesanos-digitales/tierrapay", "ticket", RunStatusKind::Succeeded);
-        let mut child = run(4, "child", "hendrixmar/fabro-demo", "repair", RunStatusKind::Succeeded);
+        let quiet = run(
+            1,
+            "quiet",
+            "artesanos-digitales/tierrapay",
+            "scan",
+            RunStatusKind::Succeeded,
+        );
+        let failed = run(
+            2,
+            "failed",
+            "artesanos-digitales/tierrapay",
+            "scan",
+            RunStatusKind::Failed,
+        );
+        let parent = run(
+            3,
+            "parent",
+            "artesanos-digitales/tierrapay",
+            "ticket",
+            RunStatusKind::Succeeded,
+        );
+        let mut child = run(
+            4,
+            "child",
+            "hendrixmar/fabro-demo",
+            "repair",
+            RunStatusKind::Succeeded,
+        );
         child.parent_id = Some(parent.spec.run_id);
-        let stray = run(5, "stray", "hendrixmar/fabro-demo", "scan", RunStatusKind::Running);
+        let stray = run(
+            5,
+            "stray",
+            "hendrixmar/fabro-demo",
+            "scan",
+            RunStatusKind::Running,
+        );
         for projected in [quiet, failed, parent, child, stray] {
             store.upsert_projection(&entry(projected, 1)).await.unwrap();
         }
@@ -1794,7 +1825,11 @@ mod tests {
         };
         let tierrapay = Some(RunProjectFilter::Project("tierrapay".to_string()));
         assert_eq!(
-            titles(RunSummaryListQuery { project: tierrapay.clone(), ..Default::default() }).await,
+            titles(RunSummaryListQuery {
+                project: tierrapay.clone(),
+                ..Default::default()
+            })
+            .await,
             ["child", "failed", "parent", "quiet"],
         );
         assert_eq!(

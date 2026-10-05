@@ -42,6 +42,10 @@ pub enum ParseError {
         path:   String,
         source: SettingsSource,
     },
+    ServerManagedCodexOauthProfile {
+        path:   String,
+        source: SettingsSource,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -63,6 +67,10 @@ impl fmt::Display for ParseError {
             Self::ServerManagedEnvironmentCwd { path, source } => write!(
                 f,
                 "`{path}` is server-managed and cannot be set in {source} settings; configure cwd on a server-managed environment instead."
+            ),
+            Self::ServerManagedCodexOauthProfile { path, source } => write!(
+                f,
+                "`{path}` is server-managed and cannot be set in {source} settings; configure codex_oauth_profile on a server-managed environment instead."
             ),
         }
     }
@@ -151,7 +159,7 @@ impl SettingsSource {
     }
 
     #[must_use]
-    fn allows_environment_cwd(self) -> bool {
+    fn allows_server_environment_authority(self) -> bool {
         matches!(self, Self::ActiveSettings)
     }
 }
@@ -173,11 +181,17 @@ pub fn validate_settings_source(
     layer: &SettingsLayer,
     source: SettingsSource,
 ) -> Result<(), ParseError> {
-    if !source.allows_environment_cwd() {
+    if !source.allows_server_environment_authority() {
         for (id, environment) in layer.environments.iter() {
             if environment.cwd.is_some() {
                 return Err(ParseError::ServerManagedEnvironmentCwd {
                     path: format!("environments.{id}.cwd"),
+                    source,
+                });
+            }
+            if environment.codex_oauth_profile.is_some() {
+                return Err(ParseError::ServerManagedCodexOauthProfile {
+                    path: format!("environments.{id}.codex_oauth_profile"),
                     source,
                 });
             }
@@ -243,6 +257,51 @@ fn rename_hint(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_client_owned_codex_oauth_profiles() {
+        assert!(
+            r#"[run.environment]
+codex_oauth_profile = "server-owned"
+"#
+            .parse::<SettingsLayer>()
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<crate::RunLayer>(serde_json::json!({
+                "environment": { "codex_oauth_profile": "server-owned" }
+            }))
+            .is_err()
+        );
+        let layer = r#"[environments.default]
+provider = "docker"
+codex_oauth_profile = "server-owned"
+[environments.default.image]
+docker = "alpine:3.20"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap();
+        for source in [
+            SettingsSource::Project,
+            SettingsSource::Workflow,
+            SettingsSource::DirectRun,
+            SettingsSource::User,
+        ] {
+            assert!(
+                validate_settings_source(&layer, source).is_err(),
+                "{source} settings must not select a server-owned credential profile"
+            );
+        }
+        validate_settings_source(&layer, SettingsSource::ActiveSettings).unwrap();
+        let settings = crate::WorkflowSettingsBuilder::new()
+            .server_manifest_defaults(crate::RunLayer::default(), layer.environments)
+            .build()
+            .unwrap();
+        assert_eq!(
+            settings.run.environment.codex_oauth_profile.as_deref(),
+            Some("server-owned")
+        );
+    }
 
     #[test]
     fn parses_empty_file() {

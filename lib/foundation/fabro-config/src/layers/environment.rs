@@ -33,21 +33,19 @@ pub struct EnvironmentLayer {
 #[serde(deny_unknown_fields)]
 pub struct RunEnvironmentLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id:                  Option<String>,
+    pub id:        Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_oauth_profile: Option<String>,
+    pub image:     Option<EnvironmentImageLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image:               Option<EnvironmentImageLayer>,
+    pub resources: Option<EnvironmentResourcesLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resources:           Option<EnvironmentResourcesLayer>,
+    pub network:   Option<EnvironmentNetworkLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network:             Option<EnvironmentNetworkLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle:           Option<EnvironmentLifecycleLayer>,
+    pub lifecycle: Option<EnvironmentLifecycleLayer>,
     #[serde(default, skip_serializing_if = "StickyMap::is_empty")]
-    pub labels:              StickyMap<String>,
+    pub labels:    StickyMap<String>,
     #[serde(default, skip_serializing_if = "StickyMap::is_empty")]
-    pub env:                 StickyMap<InterpString>,
+    pub env:       StickyMap<InterpString>,
 }
 
 impl RunEnvironmentLayer {
@@ -56,7 +54,7 @@ impl RunEnvironmentLayer {
         EnvironmentLayer {
             provider:            None,
             cwd:                 None,
-            codex_oauth_profile: self.codex_oauth_profile,
+            codex_oauth_profile: None,
             image:               self.image,
             resources:           self.resources,
             network:             self.network,

@@ -156,6 +156,10 @@ Docker environments can opt into a dedicated host credential profile with
 `"codex_oauth_profile": "automation"` in their REST settings. Profile names are
 single lowercase slugs, not filesystem paths. Workflow overrides cannot select
 or replace the server-owned profile.
+`codex_oauth_profile` is not a run override: TOML workflow settings and JSON
+run overrides reject it under `run.environment`. Client-provided environment
+catalogs cannot configure it either; only active server settings and
+server-managed environment REST settings own credential selection.
 
 Provision the profile under `$FABRO_HOME/codex-oauth/<name>` (default
 `~/.fabro/codex-oauth/<name>`) with directory permissions `0700`, and existing
