@@ -481,6 +481,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_creation_waits_for_a_concurrent_writer() {
+        let (_directory, summaries) = store_test_support::sqlite_run_summary_store().await;
+        let summaries = Arc::new(summaries);
+        let store = store_test_support::test_database_with_stores(
+            Arc::new(InMemory::new()),
+            "run-admission-lock-test",
+            Duration::from_millis(1),
+            None,
+            store_test_support::test_blob_store(),
+            summaries.clone(),
+        );
+        let mut blocker = summaries.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let run_id: RunId = "01JT56VE4Z5NZ814GZN2JZD65A".parse().unwrap();
+        let mut admission = task::spawn(async move {
+            store
+                .create_run_with_first_event(&run_id, &run_created_payload(&run_id))
+                .await
+        });
+        let waiting = tokio::time::timeout(Duration::from_millis(250), &mut admission).await;
+        sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
+        assert!(
+            waiting.is_err(),
+            "run creation must wait for the writer instead of failing on snapshot promotion"
+        );
+        let run = tokio::time::timeout(Duration::from_secs(5), admission)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let events = run.list_events().await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|envelope| (envelope.seq, envelope.event.event_name()))
+                .collect::<Vec<_>>(),
+            vec![(1, "run.created")]
+        );
+        assert_eq!(
+            summaries
+                .get(&run_id, chrono::Utc::now())
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            run_id
+        );
+    }
+
+    #[tokio::test]
     async fn first_and_later_events_commit_to_sql_before_publication() {
         let store = store();
         let run_id: RunId = "01JT56VE4Z5NZ814GZN2JZD65A".parse().unwrap();
