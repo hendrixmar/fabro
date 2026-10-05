@@ -304,7 +304,9 @@ ON CONFLICT(singleton) DO NOTHING
     }
 
     pub(crate) async fn begin(&self) -> Result<Transaction<'static, Sqlite>> {
-        Ok(self.pool.begin().await?)
+        // Admission resolves project ownership before inserting the run. Reserve the
+        // write lock before that read so snapshot promotion cannot bypass busy_timeout.
+        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
     }
 
     pub(crate) async fn contains(&self, run_id: &RunId) -> Result<bool> {
