@@ -365,12 +365,12 @@ gateway does. Neither reserved variable can be overridden by catalog env values.
 | `startup_timeout` | Max duration to wait for the server to start listening and complete the MCP handshake. | `"10s"` |
 | `tool_timeout` | Max duration for a single tool call. | `"60s"` |
 
-The sandbox transport requires a remote sandbox provider (Daytona) that supports preview URLs. During session initialization, Fabro:
+During session initialization, Fabro:
 
 1. Launches the server inside the sandbox with `setsid "$BASH" -c` to fully detach the process while reusing the provider-selected Bash
-2. Polls until the server is listening on the configured port (up to 30 seconds)
-3. Obtains an authenticated preview URL from the sandbox provider
-4. Connects to the server over HTTP using the preview URL
+2. Polls until an owned listener is ready within `startup_timeout`
+3. Connects over loopback when the agent is in the sandbox, or obtains a provider preview URL for a host-side client
+4. Completes the MCP handshake within the same startup deadline
 
 ## Lifecycle
 
@@ -378,12 +378,12 @@ The sandbox transport requires a remote sandbox provider (Daytona) that supports
 
 Each MCP server is started sequentially during session initialization. The startup sequence for each server is:
 
-1. **Spawn / connect** — For stdio, spawn the child process. For HTTP, create the HTTP client. For sandbox, start the server inside the sandbox and connect via preview URL.
+1. **Spawn / connect** — For stdio, spawn the child process. For HTTP, create the HTTP client. For sandbox, start the server inside the sandbox and connect through loopback or a provider preview URL.
 2. **Handshake** — Perform the MCP protocol handshake within the `startup_timeout` window.
 3. **Tool discovery** — Call `tools/list` to enumerate available tools.
 4. **Registration** — Add each tool to the agent's registry with its qualified name.
 
-If a server fails to start (process crash, timeout, handshake error), it is logged and skipped. Other servers continue starting normally. The agent session proceeds with whatever tools were successfully registered.
+Sandbox transport startup failures stop the agent stage and clean up every managed process already started for that session. Native agent clients report their own configured MCP connection failures through agent events.
 
 ### Tool execution
 
