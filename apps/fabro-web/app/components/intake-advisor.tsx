@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { PaperAirplaneIcon } from "@heroicons/react/20/solid";
 
 import { Markdown } from "./stage-renderers/primitives";
@@ -9,6 +9,7 @@ import {
   SECONDARY_BUTTON_CLASS,
 } from "./ui";
 import { ApiError } from "../lib/api-client";
+import { useMountEffect } from "../hooks/effects";
 import { streamIntakeAdvisor } from "../lib/intake-chat";
 import { intakeErrorMessage } from "../lib/intake";
 
@@ -43,7 +44,7 @@ export function IntakeAdvisor({
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  useEffect(() => () => abortRef.current?.abort(), []);
+  useMountEffect(() => () => abortRef.current?.abort());
 
   async function send() {
     const text = input.trim();
