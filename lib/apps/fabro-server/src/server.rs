@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
 use base64::Engine as _;
@@ -49,7 +49,7 @@ pub use fabro_api::types::{
     UpdateVariableRequest, VariableListResponse, VncPreviewResponse, WriteBlobResponse,
 };
 use fabro_auth::SqlVaultCredentialSource;
-use fabro_automation::{self, AutomationStore};
+use fabro_automation::{self, AutomationStore, PlaneDispatchStore, ProjectId, ProjectStore};
 use fabro_config::daemon::ServerDaemon;
 use fabro_config::{LlmLayer, RunLayer, Storage, WorkflowSettingsBuilder};
 use fabro_db::DbPool;
@@ -144,6 +144,7 @@ use crate::git_checkout::GitRepoCache;
 use crate::github_webhooks::{
     WEBHOOK_ROUTE, WEBHOOK_SECRET_ENV, parse_event_metadata, verify_signature,
 };
+use crate::intake_bridge::IntakeBridge;
 use crate::jwt_auth::{self, AuthMode};
 use crate::principal_middleware::{
     AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunManagementTarget,
@@ -160,15 +161,19 @@ use crate::worker_runtime::{
 };
 use crate::worker_token::{WorkerScopeSet, WorkerTokenKeys, issue_worker_token_with_scopes};
 use crate::{
-    canonical_host, demo, diagnostics, run_manifest, security_headers, static_files, web_auth,
+    bugsink_webhooks, canonical_host, demo, diagnostics, run_manifest, security_headers,
+    static_files, web_auth,
 };
 
+mod automation_plane;
 mod automation_scheduler;
 mod handler;
+pub(crate) mod incident_intake;
 mod pull_request_supervisor;
 pub(crate) mod resource_sampler;
 mod session_runtime;
 
+pub(crate) use automation_plane::spawn_plane_dispatcher;
 pub(crate) use automation_scheduler::spawn_automation_scheduler;
 pub(crate) use handler::events::EventListParams;
 #[cfg(test)]
@@ -1134,6 +1139,7 @@ pub struct AppState {
     pub(crate) github_api_base_url: String,
     active_config_path: PathBuf,
     http_client: Option<fabro_http::HttpClient>,
+    intake: Option<IntakeBridge>,
     sandbox_inventory: SandboxInventory,
     shutdown: CancellationToken,
     shutting_down: AtomicBool,
@@ -1144,17 +1150,20 @@ pub struct AppState {
 }
 
 pub(crate) struct AppStores {
-    pub(crate) runs:            Arc<Database>,
-    pub(crate) run_summaries:   Arc<RunSummaryStore>,
+    pub(crate) projects:         Arc<ProjectStore>,
+    pub(crate) plane_dispatches: Arc<PlaneDispatchStore>,
+    pub(crate) incidents:        Arc<incident_intake::IncidentStore>,
+    pub(crate) runs:             Arc<Database>,
+    pub(crate) run_summaries:    Arc<RunSummaryStore>,
     /// Ask Fabro conversations, keyed by session id.
-    pub(crate) session_records: Arc<RunSessionRecordStore>,
-    pub(crate) auth_codes:      Arc<AuthCodeStore>,
-    pub(crate) auth_sessions:   Arc<AuthSessionStore>,
-    pub(crate) automations:     Arc<AutomationStore>,
-    pub(crate) environments:    Arc<EnvironmentStore>,
-    pub(crate) mcp_servers:     Arc<McpServerStore>,
-    pub(crate) vault:           Arc<SecretStore>,
-    pub(crate) variables:       Arc<VariableStore>,
+    pub(crate) session_records:  Arc<RunSessionRecordStore>,
+    pub(crate) auth_codes:       Arc<AuthCodeStore>,
+    pub(crate) auth_sessions:    Arc<AuthSessionStore>,
+    pub(crate) automations:      Arc<AutomationStore>,
+    pub(crate) environments:     Arc<EnvironmentStore>,
+    pub(crate) mcp_servers:      Arc<McpServerStore>,
+    pub(crate) vault:            Arc<SecretStore>,
+    pub(crate) variables:        Arc<VariableStore>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1178,6 +1187,34 @@ impl AppState {
         &self.stores.automations
     }
 
+    pub(crate) fn project_store(&self) -> &ProjectStore {
+        &self.stores.projects
+    }
+
+    /// The configured feature-intake bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actionable 503 when the integration is disabled or its
+    /// socket could not be prepared; intake surfaces degrade alone.
+    pub(crate) fn intake_bridge(&self) -> Result<IntakeBridge, ApiError> {
+        self.intake.clone().ok_or_else(|| {
+            ApiError::with_code(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "feature intake is not configured on this server",
+                "intake_not_configured",
+            )
+        })
+    }
+
+    pub(crate) fn plane_dispatch_store(&self) -> &PlaneDispatchStore {
+        &self.stores.plane_dispatches
+    }
+
+    pub(crate) fn incident_store(&self) -> &incident_intake::IncidentStore {
+        &self.stores.incidents
+    }
+
     pub(crate) fn environment_store(&self) -> &EnvironmentStore {
         &self.stores.environments
     }
@@ -1186,7 +1223,61 @@ impl AppState {
         &self.stores.mcp_servers
     }
 
+    /// Validate a project-scoped automation's owner before any checkout: a
+    /// project that disappeared, or one whose repository no longer matches the
+    /// automation's application target, blocks materialization instead of
+    /// producing a mislabeled run.
+    pub(crate) async fn validate_automation_project(
+        &self,
+        project_id: &ProjectId,
+        target: &fabro_types::GitRunTarget,
+    ) -> Result<fabro_automation::Project, RunMaterializeError> {
+        let Some(project) = self.project_store().get(project_id).await? else {
+            return Err(RunMaterializeError::ProjectNotFound {
+                id: project_id.clone(),
+            });
+        };
+        let matches = fabro_types::GitHubRepositorySlug::try_new(&target.repo)
+            .zip(fabro_types::GitHubRepositorySlug::try_new(
+                &project.repository,
+            ))
+            .is_some_and(|(target_repo, project_repo)| target_repo == project_repo);
+        if !matches {
+            return Err(RunMaterializeError::ProjectTargetMismatch {
+                project_id:         project.id,
+                project_repository: project.repository,
+                target_repository:  target.repo.clone(),
+            });
+        }
+        Ok(project)
+    }
+
     pub(crate) async fn materialize_automation_run(
+        &self,
+        input: AutomationRunMaterializeInput,
+    ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
+        // A project automation runs its workflow for exactly one registered
+        // project. Without a registry binding there is no `inputs.project`,
+        // and running without it would act on every project: fail closed.
+        let project_input = match &input.project_id {
+            Some(project_id) => {
+                let project = self
+                    .validate_automation_project(project_id, &input.target)
+                    .await?;
+                Some(
+                    project
+                        .intake_binding_id
+                        .ok_or(RunMaterializeError::ProjectNotRegistered { id: project.id })?,
+                )
+            }
+            None => None,
+        };
+        let mut materialized = self.materialize_validated_automation_run(input).await?;
+        materialized.project_input = project_input;
+        Ok(materialized)
+    }
+
+    async fn materialize_validated_automation_run(
         &self,
         input: AutomationRunMaterializeInput,
     ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
@@ -1648,6 +1739,11 @@ impl AppState {
             manifest_run_defaults,
             llm_overlay,
         } = resolved_settings;
+        anyhow::ensure!(
+            server_settings.server.integrations.bugsink
+                == self.server_settings().server.integrations.bugsink,
+            "Bugsink integration changes require a server restart and enablement validation"
+        );
         let server_settings = Arc::new(server_settings);
         let manifest_run_defaults = Arc::new(manifest_run_defaults);
         let effective_web_url =
@@ -1815,6 +1911,8 @@ pub fn build_router_with_options(
     let github_endpoints =
         github_endpoints.unwrap_or_else(|| Arc::new(GithubEndpoints::production_defaults()));
     let webhook_secret = state.github_webhook_secret.clone();
+    let bugsink_webhooks =
+        bugsink_webhooks::routes(Arc::clone(&state)).with_state(Arc::clone(&state));
     let principal_layer = middleware::from_fn_with_state(Arc::clone(&state), principal_middleware);
     let api_common = if web_enabled {
         Router::new()
@@ -1907,6 +2005,7 @@ pub fn build_router_with_options(
         let secret: Arc<[u8]> = Arc::from(secret.into_bytes().into_boxed_slice());
         router = github_webhook_routes(secret).merge(router);
     }
+    router = bugsink_webhooks.merge(router);
 
     router
         // Innermost of the outer layers so every response body — static SPA
@@ -2437,6 +2536,9 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
     })
     .context("backfill automation environment selectors")?;
     let automation_store = Arc::new(AutomationStore::new(db_pool.clone()));
+    let project_store = Arc::new(ProjectStore::new(db_pool.clone()));
+    let plane_dispatch_store = Arc::new(PlaneDispatchStore::new(db_pool.clone()));
+    let incident_store = Arc::new(incident_intake::IncidentStore::new(db_pool.clone()));
     let local_provider_enabled = resolved_settings
         .server_settings
         .server
@@ -2556,12 +2658,15 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
             Arc::new(LocalWorkerRuntime::new())
         }
     };
-    Ok(Arc::new(AppState {
+    let state = Arc::new(AppState {
         runs: Mutex::new(HashMap::new()),
         aggregate_billing: Mutex::new(BillingAccumulator::default()),
         stores: AppStores {
             runs: store,
             run_summaries,
+            projects: project_store,
+            plane_dispatches: plane_dispatch_store,
+            incidents: incident_store,
             session_records,
             auth_codes,
             auth_sessions,
@@ -2596,6 +2701,15 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         llm_source,
         manifest_run_defaults: RwLock::new(current_manifest_run_defaults),
         manifest_run_settings: RwLock::new(current_manifest_run_settings),
+        intake: match IntakeBridge::from_settings(
+            &current_server_settings.server.integrations.intake,
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                tracing::warn!(%error, "Feature-intake bridge is unavailable; intake routes will report 503");
+                None
+            }
+        },
         server_settings: RwLock::new(current_server_settings),
         effective_web_url: RwLock::new(current_effective_web_url),
         catalog: RwLock::new(current_catalog),
@@ -2612,7 +2726,21 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         // Startup snapshot for the sync router build; rotating the webhook
         // secret requires a server restart.
         github_webhook_secret: vault.get(WEBHOOK_SECRET_ENV).map(str::to_string),
-    }))
+    });
+    if state.server_settings().server.integrations.bugsink.enabled
+        || state
+            .server_settings()
+            .server
+            .integrations
+            .bugsink
+            .dispatch_enabled
+    {
+        let validation_state = Arc::clone(&state);
+        load_store_blocking("Bugsink integration validation", move || async move {
+            incident_intake::validate_enablement(&validation_state).await
+        })?;
+    }
+    Ok(state)
 }
 
 const MAX_PAGE_OFFSET: u32 = 1_000_000;
@@ -3698,6 +3826,7 @@ fn worker_launch_spec(
     run_dir: &std::path::Path,
     agent_fabro_tools_enabled: bool,
     github_app_private_key: Option<String>,
+    external_agent_harness: Option<String>,
 ) -> anyhow::Result<WorkerLaunchSpec> {
     let current_exe = std::env::current_exe().context("reading current executable path")?;
     let executable =
@@ -3736,6 +3865,11 @@ fn worker_launch_spec(
         fabro_log,
         active_config_path: state.active_config_path().to_path_buf(),
         github_app_private_key,
+        external_agent_harness,
+        external_agents_json: serde_json::to_string(
+            &state.server_settings().server.external_agents,
+        )
+        .ok(),
     })
 }
 
@@ -4365,6 +4499,13 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             return;
         }
     };
+    let external_agent_harness = run_state
+        .spec
+        .settings
+        .run
+        .metadata
+        .get("agent.harness")
+        .cloned();
     let state_for_build = Arc::clone(&state);
     let run_dir_for_build = run_dir.clone();
     let start_result = spawn_blocking(move || {
@@ -4375,6 +4516,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             &run_dir_for_build,
             agent_fabro_tools_enabled,
             github_app_private_key,
+            external_agent_harness,
         )
     })
     .await

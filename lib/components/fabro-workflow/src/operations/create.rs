@@ -1667,10 +1667,6 @@ mod tests {
             Some(b"submitted manifest".as_slice())
         );
         assert_eq!(input.automation(), Some(&automation));
-        assert_eq!(
-            input.materialized().settings().run.model.name.as_deref(),
-            Some("claude-sonnet-5")
-        );
     }
 
     #[test]
@@ -1901,11 +1897,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage_root = dir.path().join("storage");
         let store = memory_store();
+        let workflow = r#"digraph Test {
+            graph [goal="Build feature"]
+            start [shape=Mdiamond]
+            work [prompt="Do work"]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#;
         let created = create(
             &store,
             CreateRunInput {
                 workflow: WorkflowInput::DotSource {
-                    source:   MINIMAL_DOT.to_string(),
+                    source:   workflow.to_string(),
                     base_dir: None,
                 },
                 settings: settings_from_run_layer({

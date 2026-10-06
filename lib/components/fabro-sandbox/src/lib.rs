@@ -33,7 +33,6 @@ pub mod daytona;
 pub mod test_support;
 
 pub use details::sandbox_details;
-pub use docker::check_docker_daemon;
 pub use driver::{DaytonaCredentials, ProviderAccess};
 pub use driver_sandbox::RunSandbox;
 pub use environment::{CloneRequest, sandbox_spec_for_environment};

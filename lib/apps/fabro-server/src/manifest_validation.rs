@@ -10,22 +10,16 @@ use fabro_workflow::pipeline::TEMPLATE_UNDEFINED_VARIABLE_RULE;
 
 use crate::{run_intent, run_manifest};
 
-/// Validate a manifest without a model catalog.
+/// Validate manifest structure without server-owned catalogs.
 ///
-/// Every caller is a client — the CLI, an MCP server, a run worker — and a
-/// client's catalog is its own, not the server's. Judging model and provider
-/// availability here would reject workflows the server can run, so that is
-/// left to the server on create.
+/// Every caller is a client — the CLI, an MCP server, or a run worker.
+/// Environment, MCP, model and provider availability are validated by the
+/// receiving server on create, not by the client's unrelated local catalogs.
 pub fn validate_manifest(
     manifest_run_defaults: &RunLayer,
     manifest: &types::RunManifest,
 ) -> Result<types::ValidateResponse> {
-    let prepared = run_manifest::prepare_manifest_with_environment_defaults(
-        manifest_run_defaults,
-        &fabro_environment::seeded_catalog_layer(),
-        &HashMap::new(),
-        manifest,
-    )?;
+    let prepared = run_manifest::prepare_manifest_for_client(manifest_run_defaults, manifest)?;
     let validated = run_manifest::validate_prepared_manifest_structural(&prepared)
         .map_err(anyhow::Error::new)?;
     Ok(run_manifest::validate_response(&prepared, &validated))
@@ -61,7 +55,9 @@ pub fn validate_collected_workflow(
     if let Some(layer) = lowered.workflow_layer {
         builder = builder.workflow_layer(layer);
     }
-    let mut settings = builder.build().map_err(anyhow::Error::new)?;
+    let mut settings = builder
+        .build_manifest_metadata()
+        .map_err(anyhow::Error::new)?;
     settings.run.inputs.extend(input_overrides.clone());
     let validated = validate(ValidateInput {
         workflow: WorkflowInput::Bundled(workflow),
@@ -205,6 +201,39 @@ dockerfile = { path = "Dockerfile" }
         assert_eq!(
             serde_json::to_value(collected).unwrap(),
             serde_json::to_value(legacy).unwrap(),
+        );
+    }
+
+    #[test]
+    fn collected_validation_defers_environment_and_mcp_catalogs_to_server() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            temp.path(),
+            "workflow.toml",
+            r#"_version = 1
+[workflow]
+graph = "workflow.fabro"
+[run.environment]
+id = "server-only-environment"
+[run.agent.mcps.tracker]
+id = "server-only-mcp"
+"#,
+        );
+        write(
+            temp.path(),
+            "workflow.fabro",
+            "digraph Demo { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+        );
+        let package = fabro_manifest::resolve_local_workflow_package(
+            &temp.path().join("workflow.toml"),
+            temp.path(),
+            Some(temp.path()),
+        )
+        .unwrap();
+        assert!(
+            validate_collected_workflow(package.closure(), None, &HashMap::new())
+                .expect("client validation must leave catalog resolution to the server")
+                .ok
         );
     }
 

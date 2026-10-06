@@ -48,5 +48,17 @@ export interface Automation {
      */
     'workflow': string;
     'workflow_source'?: AutomationGitWorkflowSource;
+    /**
+     * Owning project. Absent or null means a global definition; otherwise this automation is a concrete per-project instance. Scope changes are only accepted while every trigger is disabled.
+     */
+    'project_id'?: string | null;
+    /**
+     * Global definitions only: this definition is selectable when adding an automation to a project. It never activates a trigger.
+     */
+    'available_to_projects'?: boolean;
+    /**
+     * Project links only: the global automation this project automation runs. Its workflow and workflow source always come from that global definition. Set when the link is created; immutable.
+     */
+    'source_automation_id'?: string | null;
     'triggers': Array<AutomationTrigger>;
 }

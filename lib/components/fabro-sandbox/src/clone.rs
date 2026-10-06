@@ -134,7 +134,9 @@ pub(crate) async fn clone_github_repo(
     .await?;
 
     if let Some(token) = &token {
-        RepoCredentials::install(&git, &layout.primary_repo_path, token).await?;
+        credentials
+            .install(&git, &layout.primary_repo_path, token)
+            .await?;
     }
     Ok(CloneOutcome { layout })
 }

@@ -2254,7 +2254,7 @@ dependencies = [
  "fabro-types",
  "fabro-util",
  "futures",
- "pebble-coding-agent",
+ "http 1.4.0",
  "serde_json",
  "shlex",
  "tempfile",
@@ -2262,6 +2262,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -2487,6 +2489,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "fabro-automation",
  "fabro-macros",
  "fabro-options-metadata",
  "fabro-proc",
@@ -2506,6 +2509,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "url",
 ]
 
 [[package]]
@@ -2608,6 +2612,7 @@ dependencies = [
  "fabro-types",
  "futures",
  "jsonwebtoken",
+ "parking_lot",
  "serde",
  "serde_json",
  "strum 0.28.0",
@@ -2775,12 +2780,26 @@ name = "fabro-mcp"
 version = "0.354.0-nightly.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "fabro-config",
+ "fabro-http",
+ "fabro-llm",
+ "fabro-mcp",
+ "fabro-sandbox",
  "fabro-types",
+ "fabro-util",
+ "futures",
  "pebble-coding-agent",
  "rmcp",
+ "sandbox-driver",
+ "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2969,6 +2988,7 @@ dependencies = [
  "fabro-template",
  "fabro-test",
  "fabro-tool",
+ "fabro-tracker",
  "fabro-types",
  "fabro-util",
  "fabro-validate",
@@ -2995,6 +3015,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "sandbox-driver",
  "semver",
  "serde",
@@ -3187,6 +3208,7 @@ dependencies = [
  "fabro-github",
  "fabro-http",
  "httpmock",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -3250,6 +3272,8 @@ dependencies = [
  "fabro-graphviz",
  "fabro-llm",
  "fabro-types",
+ "fabro-util",
+ "lithos-llm",
  "serde",
  "thiserror 2.0.18",
  "toml 0.8.23",

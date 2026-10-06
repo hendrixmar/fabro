@@ -37,7 +37,7 @@ export function useRunsWorkspacePreferences() {
     [searchParams],
   );
   const query = preferences.search;
-  const repoFilter = preferences.repo;
+  const projectFilter = preferences.project;
   const workflowFilter = preferences.workflow;
   const createdFilter = preferences.created;
   const statusFilter = preferences.status;
@@ -68,8 +68,10 @@ export function useRunsWorkspacePreferences() {
 
   const setQuery = (value: string) =>
     updatePreferences((prev) => ({ ...prev, search: value }));
-  const setRepoFilter = (value: string) =>
-    updatePreferences((prev) => ({ ...prev, repo: value }));
+  // The project filter is applied server-side, so the current page may not
+  // exist in the new result set.
+  const setProjectFilter = (value: string) =>
+    updatePreferences((prev) => ({ ...prev, project: value, page: 1 }));
   const setWorkflowFilter = (value: string) =>
     updatePreferences((prev) => ({ ...prev, workflow: value }));
   const setCreatedFilter = (value: CreatedFilter) =>
@@ -106,7 +108,7 @@ export function useRunsWorkspacePreferences() {
   return {
     hydratedSearch,
     query,
-    repoFilter,
+    projectFilter,
     workflowFilter,
     createdFilter,
     statusFilter,
@@ -118,7 +120,7 @@ export function useRunsWorkspacePreferences() {
     pageSize,
     hiddenColumns,
     setQuery,
-    setRepoFilter,
+    setProjectFilter,
     setWorkflowFilter,
     setCreatedFilter,
     setStatusFilter,

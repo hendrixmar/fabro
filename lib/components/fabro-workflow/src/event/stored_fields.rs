@@ -135,7 +135,8 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
         Event::AgentAcpStarted { node_id, visit, .. }
         | Event::AgentMcpReady { node_id, visit, .. }
         | Event::AgentMcpFailed { node_id, visit, .. }
-        | Event::AgentMcpDisconnected { node_id, visit, .. } => {
+        | Event::AgentMcpDisconnected { node_id, visit, .. }
+        | Event::AgentSkillsMaterialized { node_id, visit, .. } => {
             let node_id_str = node_id.clone();
             let node_label = default_node_label(Some(&node_id_str), None);
             StoredEventFields {
@@ -329,9 +330,8 @@ fn agent_actor_for_event(
     }
 }
 
-/// The principal pebble's steering author stands for, where the mapping is
-/// lossless. A human author cannot be rebuilt from pebble's `Actor`; the
-/// durable `run.steer` event that delivered the steer carries the principal.
+/// Pebble carries attribution, not Fabro's identity system. The durable
+/// `run.steer` event retains the full principal when the mapping loses detail.
 pub fn principal_from_actor(actor: &Actor) -> Option<Principal> {
     match actor {
         Actor::Agent { id } => Some(Principal::Agent {
@@ -346,7 +346,6 @@ pub fn principal_from_actor(actor: &Actor) -> Option<Principal> {
     }
 }
 
-/// The pebble author for a fabro principal steering a session.
 #[must_use]
 pub fn actor_from_principal(principal: &Principal) -> Actor {
     match principal {

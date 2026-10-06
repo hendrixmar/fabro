@@ -48,6 +48,9 @@ import type { RunModel } from './run-model';
 import type { RunOrigin } from './run-origin';
 // May contain unused imports in some cases
 // @ts-ignore
+import type { RunProjectRef } from './run-project-ref';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { RunQuestion } from './run-question';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -83,6 +86,7 @@ export interface Run {
     'workflow': WorkflowRef;
     'automation': AutomationRef | null;
     'repository': RepositoryRef | null;
+    'project'?: RunProjectRef | null;
     'created_by': Principal;
     'origin': RunOrigin;
     'labels': { [key: string]: string; };

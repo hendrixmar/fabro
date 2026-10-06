@@ -1537,6 +1537,7 @@ pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> Run {
             repo_origin_url,
             source_directory.as_deref(),
         )),
+        project: None,
         created_by,
         origin: RunOrigin::default(),
         labels: state.spec.labels.clone(),
@@ -1859,7 +1860,7 @@ mod tests {
     use pebble_coding_agent::tools::ToolOutputMetadata;
     use serde_json::json;
 
-    use super::{RunProjection, RunProjectionReducer, build_summary};
+    use super::{RunProjection, RunProjectionReducer, build_summary, projected_billing};
     use crate::{Error, EventEnvelope, StageId};
 
     /// Live accumulation of inference and tool time while a stage is in
@@ -5646,7 +5647,18 @@ mod tests {
     fn stage_completed_replaces_live_usage_with_terminal_billing() {
         let mut state = initialized_projection();
         let stage_id = StageId::new("build", 1);
-        let usage = billed_usage();
+        let usage: BilledModelUsage = serde_json::from_value(json!({
+            "model": { "provider": "omp", "model_id": "deepseek" },
+            "tokens": {
+                "input": 100,
+                "output": 30,
+                "reasoning": 10,
+                "cache_read": 40,
+                "cache_write": 10
+            },
+            "total_usd_micros": 12_300
+        }))
+        .unwrap();
 
         state
             .apply_event(&test_stage_event(
@@ -5672,9 +5684,19 @@ mod tests {
             ))
             .unwrap();
 
+        let expected = BilledTokenCounts {
+            input_tokens:       100,
+            output_tokens:      30,
+            reasoning_tokens:   10,
+            cache_read_tokens:  40,
+            cache_write_tokens: 10,
+            total_tokens:       190,
+            total_usd_micros:   Some(12_300),
+        };
         let stage = state.stage(&stage_id).unwrap();
-        assert_eq!(stage.usage, usage_counts(&usage));
-        assert_eq!(stage.model.as_ref(), Some(usage.model()));
+        assert_eq!(stage.usage, expected);
+        assert_eq!(stage.model.as_ref(), Some(&usage.model));
+        assert_eq!(projected_billing(&state), expected);
     }
 
     #[test]

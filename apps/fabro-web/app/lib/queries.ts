@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 import useSWR, { type SWRConfiguration } from "swr";
+import useSWRInfinite from "swr/infinite";
 import type {
   ApiQuestion,
   AuthConfigResponse,
@@ -12,6 +13,12 @@ import type {
   Environment,
   EnvironmentListResponse,
   EventEnvelope,
+  GithubRepositoryListResponse,
+  IntakeInitiativeDetail,
+  IntakeInitiativeSummary,
+  IntakeRunRecord,
+  IntakeSetupStatus,
+  IntakeTemplate,
   ListRunsDirectionEnum,
   ListRunsSortEnum,
   McpServer,
@@ -22,6 +29,11 @@ import type {
   PaginatedRunList,
   PaginatedRunStageList,
   PaginatedWorkflowListResponse,
+  PlaneDispatchListResponse,
+  PlaneProjectMetadataResponse,
+  PlaneProjectsResponse,
+  Project,
+  ProjectListResponse,
   ProviderList,
   PullRequestResponse,
   RunArtifactListResponse,
@@ -51,6 +63,8 @@ import {
   authApi,
   automationsApi,
   environmentsApi,
+  featureIntakeApi,
+  integrationsApi,
   fetchAllPages,
   fetchAllStageEvents,
   generatedAxios,
@@ -58,6 +72,7 @@ import {
   insightsApi,
   mcpServersApi,
   modelsApi,
+  projectsApi,
   runInternalsApi,
   runOutputsApi,
   runsApi,
@@ -71,6 +86,8 @@ import {
 import {
   queryKeys,
   runFileScopeSelection,
+  type AutomationListFilters,
+  type GithubRepositoriesQueryKey,
   type RunFileSelection,
   type RunGraphDirection,
 } from "./query-keys";
@@ -87,6 +104,13 @@ export interface RunsListFilters {
   sort?: ListRunsSortEnum;
   direction?: ListRunsDirectionEnum;
   includeArchived?: boolean;
+  /** Project id, or "none" for runs no project owns. */
+  projectId?:    string;
+  automationId?: string;
+  workflow?:     string;
+  /** Only runs that did something: not succeeded, changed files, or have children. */
+  activity?:     boolean;
+  rootsOnly?:    boolean;
 }
 
 export interface RunsPageOptions extends RunsListFilters {
@@ -142,22 +166,29 @@ export function useSystemResources() {
   );
 }
 
+function listRuns(filters: RunsListFilters, limit?: number, offset?: number, parentId?: string) {
+  return runsApi.listRuns(
+    limit,
+    offset,
+    filters.includeArchived ?? false,
+    parentId,
+    filters.status,
+    filters.sort,
+    filters.direction,
+    filters.projectId,
+    filters.automationId,
+    filters.workflow,
+    filters.activity,
+    filters.rootsOnly,
+  );
+}
+
 export function useAllRuns(filters: RunsListFilters = {}, enabled = true) {
   return useSWR<PaginatedEnvelope<Run>>(
     enabled ? queryKeys.runs.all(filters) : null,
     () =>
       fetchAllPages("runs", (limit, offset) =>
-        apiData(() =>
-          runsApi.listRuns(
-            limit,
-            offset,
-            filters.includeArchived ?? false,
-            undefined,
-            filters.status,
-            filters.sort,
-            filters.direction,
-          ),
-        ),
+        apiData(() => listRuns(filters, limit, offset)),
       ),
   );
 }
@@ -165,18 +196,7 @@ export function useAllRuns(filters: RunsListFilters = {}, enabled = true) {
 export function useRunsPage(opts: RunsPageOptions = {}, enabled = true) {
   return useSWR<PaginatedRunList>(
     enabled ? queryKeys.runs.page(opts) : null,
-    () =>
-      apiData(() =>
-        runsApi.listRuns(
-          opts.limit,
-          opts.offset,
-          opts.includeArchived ?? false,
-          opts.parentId,
-          opts.status,
-          opts.sort,
-          opts.direction,
-        ),
-      ),
+    () => apiData(() => listRuns(opts, opts.limit, opts.offset, opts.parentId)),
     { keepPreviousData: true },
   );
 }
@@ -419,10 +439,52 @@ export function useRunStageLog(
   );
 }
 
-export function useAutomations() {
+export function useAutomations(
+  filters: AutomationListFilters = {},
+  enabled = true,
+) {
+  const projectId = filters.scope === "project" ? filters.projectId?.trim() : undefined;
   return useSWR<AutomationListResponse>(
-    queryKeys.automations.list(),
-    () => apiData(() => automationsApi.listAutomations()),
+    !enabled || (filters.scope === "project" && !projectId)
+      ? null
+      : queryKeys.automations.list(filters),
+    () =>
+      apiData(() =>
+        automationsApi.listAutomations(
+          filters.scope,
+          projectId,
+          filters.availableToProjects,
+        ),
+      ),
+  );
+}
+
+export function useProjects() {
+  return useSWR<ProjectListResponse>(
+    queryKeys.projects.list(),
+    () => apiData(() => projectsApi.listProjects()),
+  );
+}
+
+export function useProject(id: string | undefined) {
+  return useSWR<Project | null>(
+    id ? queryKeys.projects.detail(id) : null,
+    () => apiNullableData(() => projectsApi.retrieveProject(id!)),
+  );
+}
+
+/** Cursor-paged repositories visible to the server's GitHub credentials. */
+export function useGithubRepositories() {
+  return useSWRInfinite<GithubRepositoryListResponse>(
+    (index, previous: GithubRepositoryListResponse | null) => {
+      if (index > 0 && !previous?.next_cursor) return null;
+      return queryKeys.projects.repositories(
+        index === 0 ? null : previous?.next_cursor ?? null,
+      );
+    },
+    ([, , cursor]: GithubRepositoriesQueryKey) =>
+      apiData(() => projectsApi.listGithubRepositories(cursor ?? undefined)),
+    { ...immutableOptions, revalidateFirstPage: false },
   );
 }
 
@@ -443,6 +505,29 @@ export function useAutomationRuns(id: string | undefined, opts: AutomationRunsPa
     id ? queryKeys.automations.runs(id, opts) : null,
     () => apiNullableData(() => automationsApi.listAutomationRuns(id!, opts.limit, opts.offset)),
     { keepPreviousData: true },
+  );
+}
+
+export function useAutomationPlaneDispatches(id: string | undefined) {
+  return useSWR<PlaneDispatchListResponse | null>(
+    id ? queryKeys.automations.planeDispatches(id) : null,
+    () => apiNullableData(() => automationsApi.listAutomationPlaneDispatches(id!)),
+  );
+}
+
+export function usePlaneProjects(enabled: boolean) {
+  return useSWR<PlaneProjectsResponse | null>(
+    enabled ? queryKeys.plane.projects() : null,
+    () => apiNullableData(() => integrationsApi.listPlaneProjects()),
+    { shouldRetryOnError: false },
+  );
+}
+
+export function usePlaneProjectMetadata(projectId: string | undefined) {
+  return useSWR<PlaneProjectMetadataResponse | null>(
+    projectId ? queryKeys.plane.metadata(projectId) : null,
+    () => apiNullableData(() => integrationsApi.getPlaneProjectMetadata(projectId!)),
+    { shouldRetryOnError: false },
   );
 }
 
@@ -565,5 +650,59 @@ export function useVariable(name: string | undefined) {
   return useSWR<Variable | null>(
     name ? queryKeys.variables.detail(name) : null,
     () => apiNullableData(() => variablesApi.getVariable(name!)),
+  );
+}
+
+// Feature intake. Every read is project-scoped and needs an authenticated user;
+// an unbound project reports `setup_required` instead of an empty configured
+// state, and an unreachable bridge answers 503 so the caller can say so.
+const intakeReadOptions: SWRConfiguration = { shouldRetryOnError: false };
+
+export function useProjectIntake(id: string | undefined) {
+  return useSWR<IntakeSetupStatus>(
+    id ? queryKeys.intake.status(id) : null,
+    () => apiData(() => featureIntakeApi.retrieveProjectIntake(id!)),
+    intakeReadOptions,
+  );
+}
+
+export function useProjectIntakeTemplate(id: string | undefined, enabled: boolean) {
+  return useSWR<IntakeTemplate>(
+    id && enabled ? queryKeys.intake.template(id) : null,
+    () => apiData(() => featureIntakeApi.retrieveProjectIntakeTemplate(id!)),
+    { ...intakeReadOptions, revalidateOnFocus: false },
+  );
+}
+
+export function useProjectIntakeInitiatives(
+  id: string | undefined,
+  enabled: boolean,
+) {
+  return useSWR<IntakeInitiativeSummary[]>(
+    id && enabled ? queryKeys.intake.initiatives(id) : null,
+    () => apiData(() => featureIntakeApi.listProjectIntakeInitiatives(id!)),
+    intakeReadOptions,
+  );
+}
+
+export function useProjectIntakeInitiative(
+  id: string | undefined,
+  issue: string | undefined,
+) {
+  return useSWR<IntakeInitiativeDetail>(
+    id && issue ? queryKeys.intake.initiative(id, issue) : null,
+    () => apiData(() => featureIntakeApi.retrieveProjectIntakeInitiative(id!, issue!)),
+    intakeReadOptions,
+  );
+}
+
+export function useProjectIntakeHistory(
+  id: string | undefined,
+  issue: string | undefined,
+) {
+  return useSWR<IntakeRunRecord[]>(
+    id && issue ? queryKeys.intake.history(id, issue) : null,
+    () => apiData(() => featureIntakeApi.listProjectIntakeInitiativeHistory(id!, issue!)),
+    intakeReadOptions,
   );
 }

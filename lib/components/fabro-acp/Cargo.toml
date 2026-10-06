@@ -12,7 +12,8 @@ runtime = [
   "dep:fabro-sandbox",
   "dep:fabro-types",
   "dep:futures",
-  "dep:pebble-coding-agent",
+  "dep:http",
+  "dep:url",
   "dep:tokio",
   "dep:tokio-util",
   "dep:tracing",
@@ -31,7 +32,6 @@ agent-client-protocol-tokio.workspace = true
 fabro-sandbox = { path = "../fabro-sandbox", optional = true }
 fabro-types = { path = "../../foundation/fabro-types", optional = true }
 fabro-util = { path = "../../foundation/fabro-util" }
-pebble-coding-agent = { workspace = true, optional = true }
 serde_json.workspace = true
 shlex = "1"
 thiserror.workspace = true
@@ -39,7 +39,10 @@ tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["compat", "io"], optional = true }
 futures = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+http = { version = "1", optional = true }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
 fabro-sandbox = { path = "../fabro-sandbox", features = ["test-support"] }
 tempfile = "3"
+tracing-subscriber.workspace = true

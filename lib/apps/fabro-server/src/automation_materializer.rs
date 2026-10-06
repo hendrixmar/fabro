@@ -2,8 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fabro_automation::{AutomationGitWorkflowSource, AutomationId};
+use fabro_automation::{AutomationGitWorkflowSource, AutomationId, ProjectId, ProjectStoreError};
 use fabro_manifest::WorkflowVersionCollectError;
+/// Server-owned run label carrying the owning project of a project-scoped
+/// automation run. Written only from server state, never from a caller.
+pub(crate) use fabro_types::PROJECT_LABEL;
 use fabro_types::{
     GitCoordinateValidationError, GitHubRepositorySlug, GitRunTarget,
     ResolvedAutomationGitWorkflowSource, RunId, RunIntent, RunIntentArgs, RunTarget,
@@ -24,6 +27,9 @@ pub(crate) struct AutomationRunMaterializeInput {
     pub workflow:        String,
     pub run_id:          RunId,
     pub temp_root:       PathBuf,
+    /// Owning project for a project-scoped automation; `None` is a global
+    /// definition and keeps the historical global dispatch behavior.
+    pub project_id:      Option<ProjectId>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,20 +37,37 @@ pub(crate) struct AutomationRunMaterialized {
     pub workflow_version_id: WorkflowVersionId,
     pub target:              GitRunTarget,
     pub workflow_source:     Option<Box<ResolvedAutomationGitWorkflowSource>>,
+    /// Project identity, already validated against the application target.
+    pub project_id:          Option<ProjectId>,
+    /// Registry id handed to the workflow as `inputs.project`; set only for
+    /// a project automation whose project has a feature-intake binding.
+    pub project_input:       Option<String>,
 }
 
 impl AutomationRunMaterialized {
     /// The admission request for an automation run: the packaged workflow
     /// version at the exact checked-out target, with no caller overrides.
+    /// Project ownership is the one server-derived label added here.
     pub(crate) fn into_run_intent(self, environment_id: String) -> RunIntent {
+        let mut args = RunIntentArgs::default();
+        if let Some(project_id) = &self.project_id {
+            args.labels
+                .insert(PROJECT_LABEL.to_string(), project_id.as_str().to_string());
+        }
+        if let Some(project) = &self.project_input {
+            args.inputs.insert(
+                "project".to_string(),
+                serde_json::Value::String(project.clone()),
+            );
+        }
         RunIntent {
             workflow_version_id: self.workflow_version_id,
-            target:              RunTarget::Git(self.target),
-            args:                RunIntentArgs::default(),
-            environment_id:      Some(environment_id),
-            parent_id:           None,
-            title:               None,
-            goal:                None,
+            target: RunTarget::Git(self.target),
+            args,
+            environment_id: Some(environment_id),
+            parent_id: None,
+            title: None,
+            goal: None,
         }
     }
 }
@@ -103,6 +126,23 @@ pub(crate) enum RunMaterializeError {
     LoadCredentials {
         #[source]
         source: anyhow::Error,
+    },
+    #[error("automation project {id} no longer exists")]
+    ProjectNotFound { id: ProjectId },
+    #[error("project {id} has no registry binding; cannot pass inputs.project")]
+    ProjectNotRegistered { id: ProjectId },
+    #[error(
+        "automation project {project_id} owns repository {project_repository}, but the automation targets {target_repository}"
+    )]
+    ProjectTargetMismatch {
+        project_id:         ProjectId,
+        project_repository: String,
+        target_repository:  String,
+    },
+    #[error("failed to load automation project")]
+    ProjectStore {
+        #[from]
+        source: ProjectStoreError,
     },
 }
 
@@ -230,6 +270,7 @@ impl AutomationRunMaterializer for ProductionAutomationRunMaterializer {
         &self,
         input: AutomationRunMaterializeInput,
     ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
+        let project_id = input.project_id.clone();
         let validated_target = input
             .target
             .validate()
@@ -333,8 +374,10 @@ impl AutomationRunMaterializer for ProductionAutomationRunMaterializer {
         }
         Ok(AutomationRunMaterialized {
             workflow_version_id: closure.root_id(),
-            target:              exact_target,
-            workflow_source:     resolved_workflow_source,
+            target: exact_target,
+            workflow_source: resolved_workflow_source,
+            project_id,
+            project_input: None,
         })
     }
 }
@@ -392,6 +435,27 @@ impl TestAutomationRunMaterializer {
     pub fn succeed(target: GitRunTarget) -> Self {
         Self::new(Ok(Box::new(TestMaterializedWorkflow {
             version: test_workflow_version(),
+            target,
+            store: true,
+        })))
+    }
+
+    /// Materialize a workflow version whose graph is the caller's DOT source.
+    /// Fixtures that exercise graph-shape contracts (goal gates, output
+    /// schemas) need their own graph rather than the trivial shared one.
+    pub fn succeed_with_dot(target: GitRunTarget, dot: &str) -> Self {
+        Self::new(Ok(Box::new(TestMaterializedWorkflow {
+            version: test_workflow_version_with_dot(dot),
+            target,
+            store: true,
+        })))
+    }
+
+    /// Materialize a workflow whose root carries a `workflow.toml` (this
+    /// source) over the trivial graph, for tests that read declared inputs.
+    pub fn succeed_with_workflow_toml(target: GitRunTarget, workflow_toml: &str) -> Self {
+        Self::new(Ok(Box::new(TestMaterializedWorkflow {
+            version: test_workflow_version_with_toml(workflow_toml),
             target,
             store: true,
         })))
@@ -458,17 +522,51 @@ impl TestAutomationRunMaterializer {
 
 #[cfg(any(test, feature = "test-support"))]
 fn test_workflow_version() -> fabro_workflow_version::ValidatedWorkflowVersion {
+    test_workflow_version_with_dot(
+        "digraph Test { graph [goal=\"Test\"] start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+    )
+}
+
+fn test_workflow_version_with_dot(dot: &str) -> fabro_workflow_version::ValidatedWorkflowVersion {
     use std::collections::BTreeMap;
 
     let entrypoint = fabro_types::WorkflowPath::new("workflow.fabro")
         .expect("test workflow entrypoint should be valid");
     let version = fabro_types::WorkflowVersion::new(
         entrypoint.clone(),
-        BTreeMap::from([(
-            entrypoint,
-            "digraph Test { graph [goal=\"Test\"] start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"
-                .to_string(),
-        )]),
+        BTreeMap::from([(entrypoint, dot.to_string())]),
+        BTreeMap::new(),
+    )
+    .expect("test workflow version should have a valid shape");
+    fabro_workflow_version::ValidatedWorkflowVersion::new(version)
+        .expect("test workflow version should validate")
+}
+
+/// Materialize a workflow version whose root carries a `workflow.toml`
+/// (config) beside the trivial graph (entrypoint), mirroring how
+/// `fabro_manifest::collect_workflow_versions` shapes a workflow directory:
+/// the entrypoint is the graph, and `workflow.toml` lives at
+/// `entrypoint.resolve_reference("workflow.toml")` next to it.
+fn test_workflow_version_with_toml(
+    workflow_toml: &str,
+) -> fabro_workflow_version::ValidatedWorkflowVersion {
+    use std::collections::BTreeMap;
+
+    let entrypoint = fabro_types::WorkflowPath::new("workflow.fabro")
+        .expect("test workflow entrypoint should be valid");
+    let config = entrypoint
+        .resolve_reference("workflow.toml")
+        .expect("test workflow config path should resolve beside the entrypoint");
+    let version = fabro_types::WorkflowVersion::new(
+        entrypoint.clone(),
+        BTreeMap::from([
+            (
+                entrypoint,
+                "digraph Test { graph [goal=\"Test\"] start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"
+                    .to_string(),
+            ),
+            (config, workflow_toml.to_string()),
+        ]),
         BTreeMap::new(),
     )
     .expect("test workflow version should have a valid shape");
@@ -489,6 +587,7 @@ impl AutomationRunMaterializer for TestAutomationRunMaterializer {
                 "ffffffffffffffffffffffffffffffffffffffff".to_string(),
             ))
         });
+        let project_id = input.project_id.clone();
         let response = {
             let mut guard = self
                 .inner
@@ -518,6 +617,8 @@ impl AutomationRunMaterializer for TestAutomationRunMaterializer {
             workflow_version_id,
             target: materialized.target,
             workflow_source,
+            project_id,
+            project_input: None,
         })
     }
 }
@@ -755,6 +856,7 @@ mod tests {
             automation_id: AutomationId::new("nightly").unwrap(),
             target: target(target_repo),
             workflow_source,
+            project_id: None,
             workflow: "demo".to_string(),
             run_id: RunId::new(),
             temp_root: temp_root.to_path_buf(),
@@ -1290,5 +1392,33 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, RunMaterializeError::Package { .. }));
+    }
+
+    #[test]
+    fn project_automation_intent_carries_the_project_input_and_label() {
+        let materialized = AutomationRunMaterialized {
+            workflow_version_id: test_workflow_version()
+                .version()
+                .id()
+                .expect("test workflow version should have an id"),
+            target:              GitRunTarget {
+                repo:   "artesanos-digitales/tierrapay".to_string(),
+                branch: "main".to_string(),
+                tag:    None,
+                sha:    Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            },
+            workflow_source:     None,
+            project_id:          Some(ProjectId::new("tierrapay").unwrap()),
+            project_input:       Some("tierrapay".to_string()),
+        };
+        let intent = materialized.into_run_intent("default".to_string());
+        assert_eq!(
+            intent.args.inputs.get("project"),
+            Some(&serde_json::Value::String("tierrapay".to_string()))
+        );
+        assert_eq!(
+            intent.args.labels.get(PROJECT_LABEL).map(String::as_str),
+            Some("tierrapay")
+        );
     }
 }

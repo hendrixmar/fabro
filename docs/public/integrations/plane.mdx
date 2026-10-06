@@ -1,0 +1,62 @@
+---
+title: "Plane"
+description: "Connect Plane as a first-class automation source for ready tickets"
+---
+
+Plane is a first-class automation source. Fabro polls one operator-selected project, claims ready tickets, runs the automation's repository/workflow through Codex or OMP over ACP, and reconciles the result back to Plane.
+
+## Server configuration
+
+```toml
+[server.integrations.plane]
+enabled = false # Keep disabled until the provider concurrency-safety gate is satisfied.
+api_base = "https://plane.artesanosdigitales.cloud/api/v1"
+workspace = "artesanos-digitales-workspace"
+
+[server.external_agents.codex]
+command = "codex-acp"
+
+[server.external_agents.omp]
+command = "omp"
+args = ["acp"]
+```
+
+Store `PLANE_API_KEY` in the server vault (`fabro secret set PLANE_API_KEY`). The key is never serialized into automations, run manifests, events, logs, or browser responses.
+
+Required Plane endpoints:
+
+- `GET /workspaces/{workspace}/projects/`
+- `GET /workspaces/{workspace}/projects/{id}/states/`
+- `GET /workspaces/{workspace}/projects/{id}/labels/`
+- `GET /workspaces/{workspace}/projects/{id}/issues/`
+- `PATCH /workspaces/{workspace}/projects/{id}/issues/{issue_id}/`
+- `POST /workspaces/{workspace}/projects/{id}/issues/{issue_id}/comments/`
+- `GET /workspaces/{workspace}/projects/{id}/issues/{issue_id}/comments/` (paginated effect reconciliation)
+
+HTML SPA fallbacks on those `/api/*` paths are rejected.
+
+## Lifecycle
+
+Only a human authorizes coding by moving Backlog to the configured **Ready for agent** state UUID. Generic Todo is not an alias. Fabro claims that exact state into the configured In Progress state; it re-reads authorization before claims, starts, retries, and completion, and cancels coding when it observes a human state change. State mutations send the strong ETag from that exact authoritative issue snapshot in `If-Match`. An absent or invalid validator prevents mutation; there is no unguarded fallback.
+
+Candidate polling follows `poll_interval_seconds` (60 seconds for the incident workflow), independently of the 15-second reconciliation tick. Failed polls also advance the next deadline. Restart may poll immediately, but durable ticket claims and reserved Run IDs prevent a new coding Run for an ambiguous start.
+
+Completion requires a successful Run conclusion, successful required `goal_gate` stages, the final commit SHA, and a live GitHub PR that is open, unmerged, draft, in the Run's repository, and whose head SHA matches that final commit. Pending or failed creation, unavailable GitHub verification, missing SHA, a stale head, and a non-draft PR cannot complete a ticket. Set `done_state_id` to the project's **In review** UUID; the name is retained for configuration compatibility, not permission to move tickets to Done. Done, merging, deployment, and incident closure remain human-controlled.
+
+When the same Run is Blocked at `clarification`, the dispatcher reads the validated `ticket-loop-out/clarification.json` object mirrored by `parse_clarity` into durable checkpoint `context_values.ticket_clarity`. It posts up to five bounded, HTML-escaped questions; invalid or absent artifacts are not replaced with invented questions. Human answers resume that same Run.
+
+Failure policy: two total attempts. After the second failure, leave the ticket In Progress, post a failure comment, mark the dispatch failed, and optionally apply the failure label.
+
+## Sandbox recipe
+
+Use an operator-controlled sandbox image that installs `codex-acp` and `omp`, then mount or copy only the credentials and skill directories each harness needs. Do not bake personal credentials into a committed image.
+
+## Single-server limitation
+
+Claiming is local to one Fabro server and its SQLite store. Multi-replica distributed claiming is out of scope. Use concurrency one for the incident workflow.
+
+**Activation remains gated on the approved conditional-update provider extension.** Unmodified Plane v1.4.1 fetches the issue and later saves a PATCH without a version/ETag precondition; it cannot safely support this dispatcher. The approved extension returns an opaque strong issue-row ETag from primary-database detail GET, then locks and compares the row version inside the existing PATCH transaction. A stale `If-Match` returns 412 without applying the rejected mutation. Successful conditional PATCH must return a new strong ETag.
+
+Fabro sends exactly one returned strong validator, requests identity encoding, rejects missing/weak/wildcard/malformed/multiple tags, and does not replace a rejected validator with a newly fetched one to retry the desired state. A rejected state write is durably recorded as revoked authorization; reconciliation re-reads the issue and cancels the dispatch, even when a concurrent metadata edit left the state name unchanged. Label read-modify-write is conditional as well. A provider deployment and real stale-write/concurrent-writer evidence against isolated PostgreSQL are still required before activation; source changes and HTTP mocks do not constitute that evidence.
+
+Before repeating a comment whose acknowledgment may have been lost, Fabro reads all comment pages and looks for the exact deterministic body. This is reconciliation, not a provider-side atomic idempotency key. State and label effect flags advance only after a successful provider response. Transport errors remain retryable on reconciliation, while an explicit state-version conflict revokes authorization rather than triggering a blind retry.

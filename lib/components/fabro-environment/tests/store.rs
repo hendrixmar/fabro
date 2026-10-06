@@ -33,6 +33,7 @@ fn settings(provider: SandboxProviderKind) -> EnvironmentSettings {
     EnvironmentSettings {
         provider,
         cwd: None,
+        codex_oauth_profile: None,
         image: EnvironmentImageSettings::default(),
         resources: EnvironmentResourcesSettings::default(),
         network: EnvironmentNetworkSettings::default(),
@@ -82,10 +83,13 @@ async fn seed_default_is_idempotent_and_reopen_loads_sql_rows() -> anyhow::Resul
 #[tokio::test]
 async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    let created = test
-        .store
-        .create(draft("custom", SandboxProviderKind::DOCKER))
-        .await?;
+    let mut managed = draft("custom", SandboxProviderKind::DOCKER);
+    managed.settings.codex_oauth_profile = Some("subscription".to_string());
+    let created = test.store.create(managed).await?;
+    assert_eq!(
+        created.settings.codex_oauth_profile.as_deref(),
+        Some("subscription")
+    );
 
     assert_eq!(created.id.as_str(), "custom");
     assert_eq!(
@@ -97,6 +101,15 @@ async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::R
     );
 
     let reopened = EnvironmentStore::load(test.pool.clone(), true).await?;
+    assert_eq!(
+        reopened
+            .get(&created.id)
+            .expect("persisted environment")
+            .settings
+            .codex_oauth_profile
+            .as_deref(),
+        Some("subscription"),
+    );
     assert_eq!(
         reopened
             .get(&EnvironmentId::new("custom").expect("valid id"))
@@ -116,6 +129,7 @@ async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::R
         .await?;
     assert_ne!(replaced.revision, created.revision);
     assert_eq!(replaced.settings.cwd.as_deref(), Some("/workspace/custom"));
+    assert!(replaced.settings.codex_oauth_profile.is_none());
 
     let stale = test
         .store
@@ -363,7 +377,7 @@ async fn legacy_import_invalid_input_leaves_source_directory_in_place() -> anyho
     assert_invalid_legacy_import_leaves_source_directory(
         "invalid settings",
         "invalid-settings.toml",
-        r#"provider = "Bogus Provider""#,
+        r#"provider = "../bogus""#,
         "validation",
     )
     .await?;

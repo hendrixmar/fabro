@@ -97,8 +97,8 @@ pub struct RunServices {
     pub hook_runner:              Option<Arc<HookRunner>>,
     pub locations:                RunLocations,
     pub(crate) cancel_token:      CancellationToken,
-    pub provider_id:              ProviderId,
-    pub model:                    String,
+    pub provider_id:              Option<ProviderId>,
+    pub model:                    Option<String>,
     pub llm_source:               Arc<dyn CredentialProvider>,
     pub catalog:                  Arc<Catalog>,
     pub(crate) sandbox_git:       Arc<SandboxGitRuntime>,
@@ -117,8 +117,8 @@ impl RunServices {
         hook_runner: Option<Arc<HookRunner>>,
         locations: RunLocations,
         cancel_token: CancellationToken,
-        provider_id: ProviderId,
-        model: String,
+        provider_id: Option<ProviderId>,
+        model: Option<String>,
         llm_source: Arc<dyn CredentialProvider>,
         catalog: Arc<Catalog>,
         sandbox_git: Arc<SandboxGitRuntime>,
@@ -213,8 +213,8 @@ impl RunServices {
         model: String,
     ) -> Arc<Self> {
         Arc::new(Self {
-            provider_id,
-            model,
+            provider_id: Some(provider_id),
+            model: Some(model),
             catalog,
             ..self.as_ref().clone()
         })
@@ -327,8 +327,8 @@ impl EngineServices {
                 None,
                 locations,
                 CancellationToken::new(),
-                lithos_llm::catalog::builtin::anthropic(),
-                "claude-sonnet-4.6".to_string(),
+                Some(lithos_llm::catalog::builtin::anthropic()),
+                Some("claude-sonnet-4.6".to_string()),
                 Arc::new(StubCredentialSource),
                 Arc::new(fabro_llm::default_catalog()),
                 Arc::new(SandboxGitRuntime::new()),

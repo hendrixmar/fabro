@@ -193,6 +193,7 @@ fn run_with_status(
             edge_count: 0,
         },
         automation: None,
+        project: None,
         repository: None,
         created_by: test_support::test_principal(),
         origin: RunOrigin::default(),

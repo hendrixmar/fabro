@@ -4,32 +4,46 @@ edition.workspace = true
 version.workspace = true
 publish = false
 license.workspace = true
-description = "MCP server settings for fabro's agents, and how they reach pebble"
+description = "MCP (Model Context Protocol) client for connecting to external tool servers"
 
 [lib]
 doctest = false
 
-[features]
-# A stdio MCP client for tests of fabro's own MCP server. Production agents
-# reach MCP servers through pebble; nothing here links into a normal build.
-test-support = ["dep:anyhow", "dep:rmcp", "dep:serde_json", "dep:tokio", "dep:tracing"]
-
 [lints]
 workspace = true
 
-[dependencies]
-fabro-types = { path = "../../foundation/fabro-types" }
-pebble-coding-agent.workspace = true
-anyhow = { workspace = true, optional = true }
-rmcp = { workspace = true, features = ["client", "transport-child-process"], optional = true }
-serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
+[features]
+test-support = []
 
-[dev-dependencies]
-# The test-support client's dependencies, so `cfg(test)` builds see them too.
+[dependencies]
 anyhow.workspace = true
-rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+fabro-config = { path = "../../foundation/fabro-config" }
+fabro-http.workspace = true
+fabro-types = { path = "../../foundation/fabro-types" }
+fabro-sandbox = { path = "../fabro-sandbox", default-features = false }
+sandbox-driver.workspace = true
+pebble-coding-agent.workspace = true
+fabro-util = { path = "../../foundation/fabro-util" }
+tokio-util.workspace = true
+uuid.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+futures.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
+rmcp = { workspace = true, features = [
+    "client",
+    "macros",
+    "schemars",
+    "server",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+
+[dev-dependencies]
+fabro-llm = { path = "../fabro-llm", features = ["test-support"] }
+fabro-mcp = { path = ".", features = ["test-support"] }
+axum.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio-stream.workspace = true

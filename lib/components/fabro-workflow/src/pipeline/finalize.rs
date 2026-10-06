@@ -421,7 +421,7 @@ mod tests {
             wall_time_ms,
             final_context: Context::new(),
             engine: Arc::new(engine),
-            model: "test-model".to_string(),
+            model: Some("test-model".to_string()),
         }
     }
 
@@ -434,7 +434,7 @@ mod tests {
             pr_config:  None,
             github_app: None,
             origin_url: None,
-            model:      "test-model".to_string(),
+            model:      Some("test-model".to_string()),
         })
         .await;
         finalize(published, options).await
@@ -769,8 +769,8 @@ mod tests {
             None,
             locations,
             tokio_util::sync::CancellationToken::new(),
-            lithos_llm::catalog::builtin::anthropic(),
-            "claude-sonnet-4-6".to_string(),
+            Some(lithos_llm::catalog::builtin::anthropic()),
+            Some("claude-sonnet-4-6".to_string()),
             auth_test_support::vault_only_credential_source(),
             Arc::new(fabro_llm::test_support::test_catalog()),
             Arc::new(SandboxGitRuntime::new()),
@@ -802,8 +802,8 @@ mod tests {
             None,
             locations,
             tokio_util::sync::CancellationToken::new(),
-            lithos_llm::catalog::builtin::anthropic(),
-            "claude-sonnet-4-6".to_string(),
+            Some(lithos_llm::catalog::builtin::anthropic()),
+            Some("claude-sonnet-4-6".to_string()),
             auth_test_support::vault_only_credential_source(),
             Arc::new(fabro_llm::test_support::test_catalog()),
             Arc::new(SandboxGitRuntime::new()),
@@ -867,7 +867,7 @@ mod tests {
             pr_config:  None,
             github_app: None,
             origin_url: None,
-            model:      "test-model".to_string(),
+            model:      Some("test-model".to_string()),
         })
         .await;
 
@@ -923,7 +923,7 @@ mod tests {
             pr_config:  None,
             github_app: None,
             origin_url: Some("https://github.com/owner/repo.git".to_string()),
-            model:      "test-model".to_string(),
+            model:      Some("test-model".to_string()),
         })
         .await;
 
@@ -1022,7 +1022,7 @@ mod tests {
             }),
             github_app: None,
             origin_url: Some("https://github.com/owner/repo.git".to_string()),
-            model:      "test-model".to_string(),
+            model:      Some("test-model".to_string()),
         })
         .await;
 
@@ -1086,7 +1086,7 @@ mod tests {
             pr_config:  None,
             github_app: None,
             origin_url: Some("https://github.com/owner/repo.git".to_string()),
-            model:      "test-model".to_string(),
+            model:      Some("test-model".to_string()),
         })
         .await;
         let finalized = finalize(published, &options).await.unwrap();
@@ -1144,7 +1144,7 @@ mod tests {
             }),
             github_app: None,
             origin_url: Some("https://github.com/owner/repo.git".to_string()),
-            model:      "test-model".to_string(),
+            model:      Some("test-model".to_string()),
         })
         .await;
         let finalized = finalize(published, &options).await.unwrap();

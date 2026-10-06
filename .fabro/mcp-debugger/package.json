@@ -1,0 +1,10 @@
+{
+  "name": "fabro-managed-debugger",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@debugmcp/mcp-debugger": "0.24.2",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "express": "5.2.1"
+  }
+}

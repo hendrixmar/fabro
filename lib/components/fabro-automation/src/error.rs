@@ -35,6 +35,10 @@ pub enum AutomationValidationError {
     DuplicateTriggerId { id: String },
     #[error("automation can have at most one API trigger")]
     MultipleApiTriggers,
+    #[error(
+        "available_to_projects is only valid on a global automation; a project instance is already project-scoped"
+    )]
+    AvailableToProjectsRequiresGlobalScope,
     #[error("schedule trigger {trigger_id:?} cron expression {expression:?} must have five fields")]
     InvalidCronFieldCount {
         trigger_id: String,
@@ -46,6 +50,29 @@ pub enum AutomationValidationError {
         expression: String,
         #[source]
         source:     CronError,
+    },
+    #[error("plane trigger {trigger_id:?} project_id must not be empty")]
+    EmptyPlaneProjectId { trigger_id: String },
+    #[error(
+        "plane trigger {trigger_id:?} lifecycle state IDs must all be distinct, found duplicate {state_id:?}"
+    )]
+    DuplicatePlaneStateId {
+        trigger_id: String,
+        state_id:   String,
+    },
+    #[error("plane trigger {trigger_id:?} has conflicting harness override label {label_id:?}")]
+    ConflictingPlaneHarnessLabels {
+        trigger_id: String,
+        label_id:   String,
+    },
+    #[error(
+        "plane trigger {trigger_id:?} poll interval {seconds}s must be between 15 and 3600 seconds"
+    )]
+    InvalidPlanePollInterval { trigger_id: String, seconds: u64 },
+    #[error("plane trigger {trigger_id:?} max concurrency {concurrency} must be between 1 and 10")]
+    InvalidPlaneConcurrency {
+        trigger_id:  String,
+        concurrency: usize,
     },
 }
 
@@ -63,6 +90,10 @@ pub enum AutomationStoreError {
         expected: AutomationRevision,
         actual:   AutomationRevision,
     },
+    #[error("automation {id} is used by project links; remove the links first")]
+    InUse { id: AutomationId },
+    #[error("automation {id} links a global definition, so it must stay owned by a project")]
+    LinkRequiresProject { id: AutomationId },
     #[error("automation validation failed")]
     Validation {
         #[from]
@@ -84,6 +115,8 @@ pub enum AutomationStoreError {
     StoredTriggerShape { id: AutomationId },
     #[error("stored automation {id} has a partial workflow source coordinate")]
     StoredWorkflowSourceShape { id: AutomationId },
+    #[error("stored automation {id} references invalid project {value:?}")]
+    StoredProjectId { id: AutomationId, value: String },
     #[error("stored automation {id} has an invalid revision")]
     InvalidRevision {
         id:     AutomationId,
@@ -166,11 +199,14 @@ impl AutomationStoreError {
             Self::AlreadyExists { .. } => "already_exists",
             Self::MissingRevision { .. } => "missing_revision",
             Self::StaleRevision { .. } => "stale_revision",
+            Self::InUse { .. } => "in_use",
+            Self::LinkRequiresProject { .. } => "link_requires_project",
             Self::Validation { .. } => "validation",
             Self::StoredValidation { .. } => "stored_validation",
             Self::StoredId { .. } => "stored_id",
             Self::StoredTriggerShape { .. } => "stored_trigger_shape",
             Self::StoredWorkflowSourceShape { .. } => "stored_workflow_source_shape",
+            Self::StoredProjectId { .. } => "stored_project_id",
             Self::InvalidRevision { .. } => "invalid_revision",
             Self::Db { .. } => "db",
             Self::InvalidFilename { .. } => "invalid_filename",

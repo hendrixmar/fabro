@@ -38,6 +38,17 @@ pub enum AskFabroUnavailableReason {
     LlmUnconfigured,
 }
 
+/// Server-owned run label naming the run's project. Only the server writes
+/// it: at admission, from a verified project automation.
+pub const PROJECT_LABEL: &str = "fabro_project_id";
+
+/// A run's owning project, overlaid from `runs.project_id` on every read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunProjectRef {
+    pub id:   String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Run {
     pub id:               RunId,
@@ -52,6 +63,10 @@ pub struct Run {
     pub automation:       Option<AutomationRef>,
     #[serde(default)]
     pub repository:       Option<RepositoryRef>,
+    /// Owning project; absent when unassigned. Read-model overlay, never
+    /// part of the stored summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project:          Option<RunProjectRef>,
     pub created_by:       Principal,
     pub origin:           RunOrigin,
     pub labels:           HashMap<String, String>,

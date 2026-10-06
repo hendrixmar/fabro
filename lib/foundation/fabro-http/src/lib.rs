@@ -11,7 +11,7 @@ use std::time::Duration;
 use fabro_static::EnvVars;
 pub use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 pub use reqwest::{
-    Body, Method, RequestBuilder, Response, StatusCode, Url, header, multipart, tls,
+    Body, Method, RequestBuilder, Response, StatusCode, Url, header, multipart, redirect, tls,
 };
 
 pub type HttpClient = reqwest::Client;

@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use fabro_github::GitHubCredentials;
-use fabro_github::token_source::{InstallationTokenSource, ResolvedToken};
+use fabro_github::token_source::{InstallationTokenSource, ResolvedToken, TokenSnapshot};
 use sandbox_driver::{Git as _, GitCredentials, GitFacet};
+use tokio::sync::Mutex;
 
 /// The username GitHub expects with an installation token or PAT.
 pub(crate) const GITHUB_TOKEN_USERNAME: &str = "x-access-token";
@@ -52,15 +53,21 @@ pub(crate) fn build_token_source(
 }
 
 /// The GitHub credentials a run's checkout works with: a token source when
-/// fabro manages them, nothing when the repository was cloned without a
+/// Fabro manages them, nothing when the repository was cloned without a
 /// GitHub App or the sandbox was reattached by a later process.
 pub(crate) struct RepoCredentials {
-    source: Option<Arc<InstallationTokenSource>>,
+    source:               Option<Arc<InstallationTokenSource>>,
+    /// Serializes ambient writes and prevents an older generation replacing a
+    /// newer one.
+    installed_generation: Mutex<Option<u64>>,
 }
 
 impl RepoCredentials {
     pub(crate) fn new(source: Option<Arc<InstallationTokenSource>>) -> Self {
-        Self { source }
+        Self {
+            source,
+            installed_generation: Mutex::new(None),
+        }
     }
 
     /// No managed credentials: pushes and the agent's git commands use
@@ -104,15 +111,47 @@ impl RepoCredentials {
     /// repository's helper configuration at it; calling again replaces
     /// them in place.
     pub(crate) async fn install(
+        &self,
         git: &GitFacet<'_>,
         repo_path: &str,
         token: &ResolvedToken,
     ) -> crate::Result<()> {
+        let mut installed_generation = self.installed_generation.lock().await;
+        Self::install_locked(git, repo_path, token, &mut installed_generation).await
+    }
+
+    /// Resolve and install while holding the same generation lock, so
+    /// concurrent refreshes cannot install an older token after a newer one.
+    pub(crate) async fn refresh_ambient(
+        &self,
+        git: &GitFacet<'_>,
+        repo_path: &str,
+    ) -> crate::Result<Option<TokenSnapshot>> {
+        let mut installed_generation = self.installed_generation.lock().await;
+        let Some(token) = self.resolve().await? else {
+            return Ok(None);
+        };
+        Self::install_locked(git, repo_path, &token, &mut installed_generation).await?;
+        Ok(Some(token.snapshot))
+    }
+
+    async fn install_locked(
+        git: &GitFacet<'_>,
+        repo_path: &str,
+        token: &ResolvedToken,
+        installed_generation: &mut Option<u64>,
+    ) -> crate::Result<()> {
+        if (*installed_generation).is_some_and(|generation| generation > token.snapshot.generation)
+        {
+            return Ok(());
+        }
         git.set_ambient_credentials(repo_path, Some(&git_credentials(token)))
             .await
             .map_err(|error| {
                 crate::Error::context("Failed to install the checkout's GitHub credentials", error)
-            })
+            })?;
+        *installed_generation = Some(token.snapshot.generation);
+        Ok(())
     }
 }
 

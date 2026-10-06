@@ -15,6 +15,12 @@ leak-timeout = "500ms"
     filter = "package(fabro-workflow)"
     slow-timeout = { period = "2s", terminate-after = 3 }
 
+    # These isolation checks release two owned process groups sequentially;
+    # each cleanup deliberately grants one second before escalation.
+    [[profile.default.overrides]]
+    filter = "package(fabro-mcp) & (test(simultaneous_ephemeral_servers_in_one_sandbox_are_isolated) | test(cancellation_and_drop_only_stop_owned_servers))"
+    slow-timeout = { period = "2s", terminate-after = 4 }
+
     # Real descendant regressions include bounded reaping and process probes.
     # Leave room for their own watchdogs to run fail-safe fixture cleanup.
     [[profile.default.overrides]]
@@ -48,5 +54,9 @@ leak-timeout = "2s"
 
     [[profile.ci.overrides]]
     filter = "package(fabro-workflow)"
+    slow-timeout = { period = "30s", terminate-after = 4 }
+
+    [[profile.ci.overrides]]
+    filter = "package(fabro-mcp) & (test(simultaneous_ephemeral_servers_in_one_sandbox_are_isolated) | test(cancellation_and_drop_only_stop_owned_servers))"
     slow-timeout = { period = "30s", terminate-after = 4 }
 

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use fabro_graphviz::graph::Graph;
+use fabro_graphviz::graph::{self, Graph};
 use fabro_llm::lithos_catalog::Catalog;
 use fabro_llm::{ModelSelectionError, selection};
 use fabro_types::WorkflowSettings;
@@ -38,32 +38,24 @@ fn materialize_run_with_eligible_providers(
     eligible_providers: &[ProviderId],
     catalog_fallback: bool,
 ) -> Result<WorkflowSettings, Error> {
-    let configured_model = settings.run.model.name.take();
-    let configured_provider = settings.run.model.provider.take();
-    let graph_provider = graph
-        .attrs
-        .get("default_provider")
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-    let graph_model = graph
-        .attrs
-        .get("default_model")
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
+    if graph::graph_needs_api_backend(graph) {
+        let graph_provider = graph
+            .attrs
+            .get("default_provider")
+            .and_then(|value| value.as_str());
+        let graph_model = graph
+            .attrs
+            .get("default_model")
+            .and_then(|value| value.as_str());
+        let provider = settings.run.model.provider.as_deref().or(graph_provider);
+        let model = settings.run.model.name.as_deref().or(graph_model);
+        let eligible = eligible_providers.iter().cloned().collect::<HashSet<_>>();
+        let (resolved_model, resolved_provider) =
+            resolve_run_model(catalog, &eligible, model, provider, catalog_fallback)?;
 
-    let provider = configured_provider.or(graph_provider);
-    let model = configured_model.or(graph_model);
-    let eligible = eligible_providers.iter().cloned().collect::<HashSet<_>>();
-    let (resolved_model, resolved_provider) = resolve_run_model(
-        catalog,
-        &eligible,
-        model.as_deref(),
-        provider.as_deref(),
-        catalog_fallback,
-    )?;
-
-    settings.run.model.name = Some(resolved_model);
-    settings.run.model.provider = Some(resolved_provider.into_string());
+        settings.run.model.name = Some(resolved_model);
+        settings.run.model.provider = Some(resolved_provider.into_string());
+    }
 
     let goal = graph.goal().to_string();
     settings.run.goal = if goal.is_empty() {

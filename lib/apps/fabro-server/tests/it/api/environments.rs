@@ -185,12 +185,14 @@ async fn create_environment_persists_to_sqlite_and_is_visible() {
     let (app, temp_dir, environment_dir) = environment_app();
     let mut body = environment_body("custom-env", "docker");
     body["cwd"] = json!("/workspace/custom");
+    body["codex_oauth_profile"] = json!("subscription");
 
     let created = create_environment_with_body(&app, &body).await;
 
     assert_eq!(created["id"], "custom-env");
     assert_eq!(created["provider"], "docker");
     assert_eq!(created["cwd"], "/workspace/custom");
+    assert_eq!(created["codex_oauth_profile"], "subscription");
     assert!(!environment_dir.join("custom-env.toml").exists());
 
     let retrieved = app
@@ -206,6 +208,7 @@ async fn create_environment_persists_to_sqlite_and_is_visible() {
     .await;
     assert_eq!(retrieved["id"], "custom-env");
     assert_eq!(retrieved["cwd"], "/workspace/custom");
+    assert_eq!(retrieved["codex_oauth_profile"], "subscription");
 
     let list = app
         .oneshot(empty_request(Method::GET, "/environments"))
@@ -226,6 +229,10 @@ async fn create_environment_persists_to_sqlite_and_is_visible() {
         .expect("custom environment should persist to SQLite");
     assert_eq!(persisted.settings.provider.to_string(), "docker");
     assert_eq!(persisted.settings.cwd.as_deref(), Some("/workspace/custom"));
+    assert_eq!(
+        persisted.settings.codex_oauth_profile.as_deref(),
+        Some("subscription")
+    );
 }
 
 #[tokio::test]
@@ -523,6 +530,7 @@ async fn invalid_environment_settings_return_unprocessable_entity() {
     body["network"]["mode"] = json!("block");
 
     let response = app
+        .clone()
         .oneshot(json_request(Method::POST, "/environments", &body))
         .await
         .expect("invalid environment create should respond");
@@ -533,6 +541,31 @@ async fn invalid_environment_settings_return_unprocessable_entity() {
         "POST /api/v1/environments invalid settings",
     )
     .await;
+
+    for (provider, profile, env) in [
+        ("local", "work", json!({})),
+        ("daytona", "work", json!({})),
+        ("docker", "../work", json!({})),
+        ("docker", "/tmp/work", json!({})),
+        ("docker", "work", json!({"OPENAI_API_KEY": ""})),
+        ("docker", "work", json!({"CODEX_AUTH_B64": ""})),
+        ("docker", "work", json!({"FABRO_CODEX_OAUTH_PROFILE": "1"})),
+    ] {
+        let mut body = environment_body("invalid-profile", provider);
+        body["codex_oauth_profile"] = json!(profile);
+        body["env"] = env;
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, "/environments", &body))
+            .await
+            .expect("invalid profile should respond");
+        response_status(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "POST /api/v1/environments invalid Codex profile",
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

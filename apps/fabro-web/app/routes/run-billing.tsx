@@ -26,7 +26,7 @@ const EMPTY_VALUE = "—";
 
 function formatTokens(n: number | null | undefined) {
   if (n == null) return EMPTY_VALUE;
-  return formatTokenCount(n, { compactDecimal: true });
+  return formatTokenCount(n, { compactDecimal: n >= 1_000 });
 }
 
 function formatUsdMicrosOrDash(usdMicros?: number | null): string {

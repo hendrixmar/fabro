@@ -19,4 +19,8 @@
  */
 export interface PullRequestRef {
     'ref': string;
+    /**
+     * Exact Git revision when supplied by the provider; absent revisions are not verified.
+     */
+    'sha'?: string;
 }

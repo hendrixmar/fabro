@@ -1,4 +1,5 @@
 pub mod acp;
+mod acp_tools;
 pub mod activation_lease;
 pub mod changed_files;
 pub mod controls;
@@ -8,6 +9,7 @@ pub mod pebble;
 pub mod preamble;
 pub mod router;
 pub mod routing;
+pub mod skills_injection;
 
 pub use acp::AgentAcpBackend;
 pub use controls::EffectiveRequestControls;

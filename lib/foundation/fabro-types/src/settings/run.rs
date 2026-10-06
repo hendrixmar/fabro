@@ -1187,28 +1187,31 @@ impl Default for EnvironmentLifecycleSettings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvironmentSettings {
-    pub provider:  SandboxProviderKind,
+    pub provider:            SandboxProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd:       Option<String>,
-    pub image:     EnvironmentImageSettings,
-    pub resources: EnvironmentResourcesSettings,
-    pub network:   EnvironmentNetworkSettings,
-    pub lifecycle: EnvironmentLifecycleSettings,
-    pub labels:    HashMap<String, String>,
-    pub env:       HashMap<String, InterpString>,
+    pub cwd:                 Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_oauth_profile: Option<String>,
+    pub image:               EnvironmentImageSettings,
+    pub resources:           EnvironmentResourcesSettings,
+    pub network:             EnvironmentNetworkSettings,
+    pub lifecycle:           EnvironmentLifecycleSettings,
+    pub labels:              HashMap<String, String>,
+    pub env:                 HashMap<String, InterpString>,
 }
 
 impl Default for EnvironmentSettings {
     fn default() -> Self {
         Self {
-            provider:  SandboxProviderKind::LOCAL,
-            cwd:       None,
-            image:     EnvironmentImageSettings::default(),
-            resources: EnvironmentResourcesSettings::default(),
-            network:   EnvironmentNetworkSettings::default(),
-            lifecycle: EnvironmentLifecycleSettings::default(),
-            labels:    HashMap::new(),
-            env:       HashMap::new(),
+            provider:            SandboxProviderKind::LOCAL,
+            cwd:                 None,
+            codex_oauth_profile: None,
+            image:               EnvironmentImageSettings::default(),
+            resources:           EnvironmentResourcesSettings::default(),
+            network:             EnvironmentNetworkSettings::default(),
+            lifecycle:           EnvironmentLifecycleSettings::default(),
+            labels:              HashMap::new(),
+            env:                 HashMap::new(),
         }
     }
 }
@@ -1228,16 +1231,18 @@ pub enum LocalWorkingDirectoryError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunEnvironmentSettings {
-    pub id:        String,
-    pub provider:  SandboxProviderKind,
+    pub id:                  String,
+    pub provider:            SandboxProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd:       Option<String>,
-    pub image:     EnvironmentImageSettings,
-    pub resources: EnvironmentResourcesSettings,
-    pub network:   EnvironmentNetworkSettings,
-    pub lifecycle: EnvironmentLifecycleSettings,
-    pub labels:    HashMap<String, String>,
-    pub env:       HashMap<String, InterpString>,
+    pub cwd:                 Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_oauth_profile: Option<String>,
+    pub image:               EnvironmentImageSettings,
+    pub resources:           EnvironmentResourcesSettings,
+    pub network:             EnvironmentNetworkSettings,
+    pub lifecycle:           EnvironmentLifecycleSettings,
+    pub labels:              HashMap<String, String>,
+    pub env:                 HashMap<String, InterpString>,
 }
 
 impl RunEnvironmentSettings {
@@ -1247,6 +1252,7 @@ impl RunEnvironmentSettings {
             id,
             provider: environment.provider,
             cwd: environment.cwd,
+            codex_oauth_profile: environment.codex_oauth_profile,
             image: environment.image,
             resources: environment.resources,
             network: environment.network,
@@ -2345,7 +2351,7 @@ pub struct HookDefinition {
 
 impl HookDefinition {
     pub fn resolved_hook_type(&self) -> Option<std::borrow::Cow<'_, HookType>> {
-        if let Some(ref hook_type) = self.hook_type {
+        if let Some(hook_type) = &self.hook_type {
             return Some(std::borrow::Cow::Borrowed(hook_type));
         }
         self.command.as_ref().map(|command| {
@@ -2385,7 +2391,7 @@ impl HookDefinition {
                   template source; the source text is the intended display value here"
     )]
     pub fn effective_name(&self) -> String {
-        if let Some(ref name) = self.name {
+        if let Some(name) = &self.name {
             return name.clone();
         }
         let event = self.event.to_string();
@@ -2546,4 +2552,79 @@ pub enum MergeStrategy {
     Merge,
     Squash,
     Rebase,
+}
+
+/// Validate the named host credential boundary without reading credentials.
+pub fn validate_codex_oauth_profile<'a>(
+    provider: &crate::SandboxProviderKind,
+    profile: Option<&str>,
+    env_names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), &'static str> {
+    if let Some(profile) = profile {
+        if provider != &crate::SandboxProviderKind::DOCKER {
+            return Err("codex_oauth_profile is supported only by Docker environments");
+        }
+        if profile.is_empty()
+            || !profile.as_bytes()[0].is_ascii_lowercase()
+                && !profile.as_bytes()[0].is_ascii_digit()
+            || !profile.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            })
+        {
+            return Err("codex_oauth_profile must be a single lowercase slug: [a-z0-9][a-z0-9_-]*");
+        }
+    }
+    for name in env_names {
+        if name == "FABRO_CODEX_OAUTH_PROFILE" {
+            return Err("FABRO_CODEX_OAUTH_PROFILE is reserved for managed Docker mounts");
+        }
+        if name == "CODEX_AUTH_B64" {
+            return Err(
+                "CODEX_AUTH_B64 is no longer supported; configure codex_oauth_profile instead",
+            );
+        }
+        if profile.is_some() && matches!(name, "OPENAI_API_KEY" | "CODEX_API_KEY") {
+            return Err("codex_oauth_profile cannot be combined with API key credentials");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod codex_oauth_profile_tests {
+    use super::validate_codex_oauth_profile;
+    use crate::SandboxProviderKind;
+
+    #[test]
+    fn validates_named_oauth_profile_boundary() {
+        let docker = SandboxProviderKind::DOCKER;
+        assert_eq!(
+            validate_codex_oauth_profile(&docker, Some("team_work-2"), []),
+            Ok(())
+        );
+        assert!(
+            validate_codex_oauth_profile(&SandboxProviderKind::LOCAL, Some("team"), []).is_err()
+        );
+        assert!(
+            validate_codex_oauth_profile(
+                &SandboxProviderKind::try_new("custom").unwrap(),
+                Some("team"),
+                [],
+            )
+            .is_err()
+        );
+        for name in ["", "../work", "/work", "work/team", ".", "Work", "work:rw"] {
+            assert!(validate_codex_oauth_profile(&docker, Some(name), []).is_err());
+        }
+        assert!(
+            validate_codex_oauth_profile(&docker, None, ["FABRO_CODEX_OAUTH_PROFILE"]).is_err()
+        );
+        assert!(validate_codex_oauth_profile(&docker, None, ["CODEX_AUTH_B64"]).is_err());
+        assert!(validate_codex_oauth_profile(&docker, Some("team"), ["OPENAI_API_KEY"]).is_err());
+        assert!(validate_codex_oauth_profile(&docker, Some("team"), ["CODEX_API_KEY"]).is_err());
+        assert_eq!(
+            validate_codex_oauth_profile(&docker, None, ["OPENAI_API_KEY"]),
+            Ok(())
+        );
+    }
 }

@@ -13,6 +13,7 @@ pub mod conclusion;
 pub mod dense;
 pub mod diff;
 pub mod event_envelope;
+pub mod external_agent;
 pub mod failure_signature;
 pub mod git_identity;
 pub mod graph;
@@ -26,6 +27,7 @@ pub mod model_test;
 pub mod outcome;
 pub mod pair;
 pub mod parallel;
+pub mod plane_dispatch;
 pub mod principal;
 pub mod pull_request;
 pub mod repository;
@@ -73,6 +75,7 @@ pub use conclusion::{Conclusion, StageSummary};
 pub use dense::{ServerSettings, UserSettings, WorkflowSettings};
 pub use diff::{DiffStats, DiffSummary, RunDiff};
 pub use event_envelope::EventEnvelope;
+pub use external_agent::{ExternalAgentHarness, ExternalAgentProfile, ExternalAgentsSettings};
 pub use failure_signature::FailureSignature;
 pub use git_identity::{GitIdentity, GitIdentitySource};
 pub use graph::{
@@ -115,6 +118,10 @@ pub use pebble_coding_agent::events::{
     SkillSummary, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection,
     TodoProjection, TodoStatus, TodoUpdatedProps, ToolCategory, ToolSource, ToolSummary,
 };
+pub use plane_dispatch::{
+    PlaneDispatch, PlaneDispatchListResponse, PlaneDispatchStatus, PlaneLabelResponse,
+    PlaneProjectMetadataResponse, PlaneProjectResponse, PlaneProjectsResponse, PlaneStateResponse,
+};
 pub use principal::{AuthMethod, Principal, SystemActorKind, UserPrincipal};
 pub use pull_request::{
     CheckRun, CheckRunStatus, PullRequest, PullRequestCreation, PullRequestCreationId,
@@ -153,9 +160,10 @@ pub use run_sandbox::{
     RunSandboxRuntime,
 };
 pub use run_summary::{
-    AskFabro, AskFabroUnavailableReason, AutomationRef, ResolvedAutomationGitWorkflowSource, Run,
-    RunApproval, RunApprovalState, RunBillingSummary, RunError, RunLifecycle, RunLinks, RunModel,
-    RunOrigin, RunOriginKind, RunSize, RunTimestamps, WorkflowRef,
+    AskFabro, AskFabroUnavailableReason, AutomationRef, PROJECT_LABEL,
+    ResolvedAutomationGitWorkflowSource, Run, RunApproval, RunApprovalState, RunBillingSummary,
+    RunError, RunLifecycle, RunLinks, RunModel, RunOrigin, RunOriginKind, RunProjectRef, RunSize,
+    RunTimestamps, WorkflowRef,
 };
 pub use run_title::{
     MAX_RUN_TITLE_CHARS, RunTitleError, infer_run_title, normalize_explicit_run_title,

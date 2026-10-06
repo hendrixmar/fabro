@@ -128,6 +128,22 @@ fn resolved_server_integrations_disable_slack_when_config_is_absent() {
                 "enabled": false,
                 "default_channel": null,
             },
+            "plane": {
+                "enabled": false,
+                "api_base": null,
+                "workspace": null,
+            },
+            "bugsink": {
+                "enabled": false,
+                "dispatch_enabled": false,
+                "origin": null,
+                "api_token_secret": null,
+                "projects": [],
+            },
+            "intake": {
+                "enabled": false,
+                "socket": null,
+            },
         })
     );
 }
@@ -286,24 +302,44 @@ E2B_API_URL = "https://api.e2b.example"
 
 #[test]
 fn server_sandbox_rejects_plugin_settings_on_bundled_providers() {
-    let err = ServerSettingsBuilder::from_toml(
-        r#"
+    for kind in SandboxProviderKind::bundled_kinds() {
+        for (field, value) in [
+            ("path", r#""/usr/local/bin/plugin""#),
+            (
+                "sha256",
+                r#""0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef""#,
+            ),
+            ("dev", "false"),
+            ("args", "[]"),
+            ("env", "{}"),
+            ("inherit_env", "[]"),
+        ] {
+            let source = format!(
+                r#"
 _version = 1
 
 [server.auth]
 methods = ["dev-token"]
 
-[server.sandbox.providers.docker]
-path = "/usr/local/bin/fabro-sandbox-docker"
-"#,
-    )
-    .expect_err("bundled providers take no plugin settings");
-
-    assert!(
-        err.to_string()
-            .contains("server.sandbox.providers.docker.path"),
-        "unexpected error: {err}"
-    );
+[server.sandbox.providers.{kind}]
+enabled = false
+{field} = {value}
+"#
+            );
+            let errors = resolve_errors(
+                ServerSettingsBuilder::from_toml(&source)
+                    .expect_err("even disabled bundled providers take no plugin settings"),
+            );
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    crate::ResolveError::Invalid { path, .. }
+                        if path == &format!("server.sandbox.providers.{kind}.{field}")
+                )),
+                "expected rejection of {kind}.{field}, got {errors:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -323,6 +359,23 @@ enabled = true
 
     assert!(
         err.to_string().contains("invalid sandbox provider kind"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn parsing_rejects_unknown_server_sandbox_plugin_fields() {
+    let err = r#"
+_version = 1
+
+[server.sandbox.providers.e2b]
+executable = "/opt/fabro/plugins/e2b"
+"#
+    .parse::<SettingsLayer>()
+    .expect_err("plugin settings must reject unknown fields and legacy aliases");
+
+    assert!(
+        err.to_string().contains("unknown field `executable`"),
         "unexpected error: {err}"
     );
 }

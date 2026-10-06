@@ -33,10 +33,18 @@ export type RunsListViewProps = {
   onPageChange:     (page: number) => void;
   onPageSizeChange: (size: number) => void;
   query:            string;
-  repoFilter:       string;
   workflowFilter:   string;
   statusFilter?:    ReadonlySet<BoardColumn>;
   createdCutoffMs:  number | null;
+  /**
+   * Optional extra client-side row predicate for callers with their own
+   * filter (e.g. automation-detail's page-local repo filter). Applied on top
+   * of the built-in filters when computing `rows`; emptiness (`apiRunCount`,
+   * `isEmptyServerSide`) is still derived from the unfiltered `data` so a
+   * non-empty page whose rows this hides still shows "No matching runs"
+   * instead of the server-empty `emptyState`.
+   */
+  rowFilter?:       (run: RunWithStatus) => boolean;
 };
 
 export function RunsListView({
@@ -52,10 +60,10 @@ export function RunsListView({
   onPageChange,
   onPageSizeChange,
   query,
-  repoFilter,
   workflowFilter,
   statusFilter = EMPTY_STATUS_FILTER,
   createdCutoffMs,
+  rowFilter,
 }: RunsListViewProps) {
   const show = (col: ToggleableColumn) => !hiddenColumns.has(col);
   const rows: RunWithStatus[] = useMemo(() => {
@@ -66,8 +74,8 @@ export function RunsListView({
       const item = toRunWithStatus(run);
       if (
         (!filterStatuses || statusFilter.has(item.status)) &&
-        (repoFilter === "all" || item.repo === repoFilter) &&
         (workflowFilter === "all" || item.workflow === workflowFilter) &&
+        (rowFilter == null || rowFilter(item)) &&
         (createdCutoffMs == null ||
           (item.createdAt != null && Date.parse(item.createdAt) >= createdCutoffMs)) &&
         (!query ||
@@ -80,7 +88,7 @@ export function RunsListView({
       }
     }
     return next;
-  }, [data, repoFilter, workflowFilter, statusFilter, createdCutoffMs, query]);
+  }, [data, workflowFilter, statusFilter, createdCutoffMs, query, rowFilter]);
 
   const hasMore = data?.meta.has_more ?? false;
   const total = data?.meta.total ?? null;
@@ -90,7 +98,7 @@ export function RunsListView({
   const isEmptyServerSide = data !== undefined && apiRunCount === 0 && page === 1;
 
   const statusScopeKey = [...statusFilter].sort().join(",");
-  const selectionScopeKey = `${page}:${sort}:${direction}:${query}:${repoFilter}:${workflowFilter}:${statusScopeKey}:${createdCutoffMs ?? ""}`;
+  const selectionScopeKey = `${page}:${sort}:${direction}:${query}:${workflowFilter}:${statusScopeKey}:${createdCutoffMs ?? ""}`;
   const [selection, setSelection] = useState<{
     scopeKey: string;
     ids: Set<string>;
@@ -157,6 +165,9 @@ export function RunsListView({
                     By
                   </th>
                 )}
+                {show("project") && (
+                  <th className="px-3 py-2 text-left text-xs font-medium text-fg-muted">Project</th>
+                )}
                 {show("repo") && (
                   <SortHeader label="Repo" sortKey="repo" activeSort={sort} direction={direction} onClick={onSortClick} />
                 )}
@@ -208,7 +219,7 @@ export function RunsListView({
             description={
               apiRunCount === 0
                 ? "Try a different page, sort, or filter combination."
-                : "Try clearing the search, repo, or workflow filter."
+                : "Try clearing the filters."
             }
           />
         </div>

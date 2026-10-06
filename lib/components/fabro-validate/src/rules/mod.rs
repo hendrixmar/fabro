@@ -11,6 +11,7 @@ mod fidelity_valid;
 mod for_each_contract;
 mod freeform_edge_count;
 mod goal_gate_has_retry;
+mod harness_valid;
 mod import_error;
 mod inert_attribute;
 mod join_policy_removed;
@@ -23,10 +24,12 @@ mod parallel_branch_inert_attribute;
 mod prompt_on_llm_nodes;
 mod random_selection_no_conditions;
 mod reachability;
+mod reasoning_effort_enum;
 mod reserved_keyword_node_id;
 mod retry_target_exists;
 mod script_absolute_cd;
 mod selection_valid;
+mod skills_known;
 mod start_no_incoming;
 mod start_node;
 mod stdin_source_valid;
@@ -70,6 +73,9 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         auto_status_deprecated::rule(),
         script_absolute_cd::rule(),
         command_requires_script::rule(),
+        harness_valid::rule(),
+        reasoning_effort_enum::rule(),
+        skills_known::rule(),
         import_error::rule(),
         join_policy_removed::rule(),
         unresolved_file_ref::rule(),

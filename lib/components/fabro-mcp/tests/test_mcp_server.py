@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Minimal MCP server for integration testing over stdio.
+"""Minimal MCP server for integration testing over stdio or HTTP.
 
-Speaks JSON-RPC 2.0 over stdin/stdout per the MCP specification.
+Speaks JSON-RPC 2.0 over stdin/stdout or authenticated streamable HTTP.
 Exposes a single tool: echo(message) -> message.
 """
 import json
@@ -92,6 +92,36 @@ def handle_request(req):
 
 
 def main():
+    if "--http" in sys.argv:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                expected = "Bearer " + os.environ["FABRO_MCP_BEARER_TOKEN"]
+                if self.path != "/mcp" or self.headers.get("Authorization") != expected:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                resp = handle_request(req)
+                if resp is None:
+                    self.send_response(202)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = json.dumps(resp).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", int(os.environ["FABRO_MCP_PORT"])), Handler)
+        if port_file := os.environ.get("FABRO_MCP_TEST_PORT_FILE"):
+            with open(port_file, "w") as output:
+                output.write(str(server.server_port))
+        server.serve_forever()
+        return
     for line in sys.stdin:
         line = line.strip()
         if not line:

@@ -67,6 +67,16 @@ mock.module("../lib/queries", () => ({
       isLoading: false,
     };
   },
+  usePlaneProjects: () => ({
+    data: { data: [] },
+    error: null,
+    isLoading: false,
+  }),
+  usePlaneProjectMetadata: () => ({
+    data: { states: [], labels: [] },
+    error: null,
+    isLoading: false,
+  }),
   useRunState: (id: string | undefined) => {
     queryCalls.push({ hook: "useRunState", id });
     return {

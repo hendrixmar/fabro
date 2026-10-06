@@ -1,4 +1,5 @@
 use sqlx::Row as _;
+use sqlx::migrate::Migrator;
 
 #[tokio::test]
 async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow::Result<()> {
@@ -766,7 +767,7 @@ async fn runs_schema_creates_indexes_and_rejects_invalid_rows() -> anyhow::Resul
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(index_count, 5);
+    assert_eq!(index_count, 6);
 
     insert_minimal_run(database.pool(), "submitted", 0, r#"{"id":"run"}"#).await?;
     for (status, input_tokens, summary_json) in [
@@ -795,7 +796,7 @@ async fn session_owner_schema_has_final_shape_constraints_and_indexes() -> anyho
         .await?;
     assert_eq!(
         run_columns.len(),
-        24,
+        25,
         "the existing runs row must stay unchanged"
     );
 
@@ -1536,6 +1537,64 @@ async fn migrate_snapshots_database_before_applying_new_migrations() -> anyhow::
         "no-pending migrate must leave the snapshot untouched"
     );
     snapshot.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_oauth_profiles_survive_provider_upgrade_failure_and_retry() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let database = fabro_db::Database::connect(dir.path().join("fabro.sqlite3")).await?;
+    let current = sqlx::migrate!("./migrations");
+    let legacy = Migrator::with_migrations(
+        current
+            .iter()
+            .filter(|migration| !matches!(migration.version, 2_026_090_901 | 2_026_091_101))
+            .cloned()
+            .collect(),
+    );
+    legacy.run(database.pool()).await?;
+    insert_minimal_environment(database.pool(), "subscription", "docker", "allow_all").await?;
+    sqlx::query(
+        "UPDATE environments SET codex_oauth_profile = 'team_work-2' WHERE id = 'subscription'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    // Fail a subsequent real migration after the provider table rebuild.
+    sqlx::query("CREATE TABLE run_session_records (obstruction TEXT)")
+        .execute(database.pool())
+        .await?;
+    let error = database.migrate().await.unwrap_err();
+    assert!(format!("{error:#}").contains("run_session_records"));
+    let row = sqlx::query(
+        "SELECT provider, revision, network_mode, codex_oauth_profile FROM environments WHERE id = 'subscription'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(row.get::<String, _>("provider"), "docker");
+    assert_eq!(row.get::<String, _>("revision"), "a".repeat(64));
+    assert_eq!(row.get::<String, _>("network_mode"), "allow_all");
+    assert_eq!(row.get::<String, _>("codex_oauth_profile"), "team_work-2");
+    assert!(!table_exists(database.pool(), "_fabro_environment_profile_upgrade").await?);
+
+    sqlx::query("DROP TABLE run_session_records")
+        .execute(database.pool())
+        .await?;
+    database.migrate().await?;
+    database.migrate().await?;
+    let profile: String = sqlx::query_scalar(
+        "SELECT codex_oauth_profile FROM environments WHERE id = 'subscription'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(profile, "team_work-2");
+    insert_minimal_environment(database.pool(), "plugin", "synthetic-plugin", "allow_all").await?;
+    let violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(database.pool())
+        .await?;
+    assert!(violations.is_empty());
+    assert!(table_exists(database.pool(), "run_session_records").await?);
+    assert!(!table_exists(database.pool(), "_fabro_environment_profile_upgrade").await?);
     Ok(())
 }
 

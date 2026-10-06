@@ -77,6 +77,36 @@ def first_prompt_text(message):
         return first
     return first.get("text", "")
 
+def prompt_control(name):
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    value = json.loads(raw)
+    if isinstance(value, list):
+        index = prompt_count - 1
+        return value[index] if index < len(value) else None
+    return value
+
+def respond_to_prompt(message, stop_reason):
+    usage_update = prompt_control("ACP_USAGE_UPDATE")
+    if usage_update is not None:
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    **usage_update,
+                },
+            },
+        })
+    response = {"stopReason": stop_reason}
+    usage = prompt_control("ACP_PROMPT_USAGE")
+    if usage is not None:
+        response["usage"] = usage
+    respond(message, response)
+
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
@@ -85,7 +115,12 @@ for line in sys.stdin:
     if method == "initialize":
         if os.environ.get("ACP_MODE") == "slow_initialize":
             time.sleep(60)
-        respond(message, {"protocolVersion": 1, "agentCapabilities": {}})
+        respond(message, {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "mcpCapabilities": json.loads(os.environ.get("ACP_MCP_CAPABILITIES", "{}"))
+            },
+        })
     elif method == "session/new":
         if os.environ.get("ACP_SESSION_NEW_PARAMS"):
             with open(os.environ["ACP_SESSION_NEW_PARAMS"], "w", encoding="utf-8") as record:
@@ -106,6 +141,21 @@ for line in sys.stdin:
         if mode == "early_exit":
             print("early boom", file=sys.stderr, flush=True)
             sys.exit(2)
+        if mode == "in_band_error":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "{\"type\":\"error\",\"message\":\"model access denied\",\"code\":\"usage_limit\"}"}
+                    }
+                }
+            })
+            record_methods()
+            respond_to_prompt(message, "end_turn")
+            break
         if mode == "write_file":
             path = os.environ.get("ACP_WRITE_PATH", "hello.txt")
             parent = os.path.dirname(path)
@@ -133,7 +183,7 @@ for line in sys.stdin:
                 if cancel_message.get("method") == "session/cancel":
                     with open(os.environ["ACP_CANCEL_RECORD"], "w", encoding="utf-8") as record:
                         record.write("session/cancel\n")
-                    respond(message, {"stopReason": "cancelled"})
+                    respond_to_prompt(message, "cancelled")
                     sys.exit(0)
         if mode == "ignore_cancel":
             send({
@@ -156,6 +206,40 @@ for line in sys.stdin:
                             record.write("session/cancel\n")
                     record_methods()
                     time.sleep(60)
+        if mode == "stream_after_cancel":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "waiting for streaming cancellation"}
+                    }
+                }
+            })
+            for control_line in sys.stdin:
+                control_message = json.loads(control_line)
+                methods.append(control_message.get("method"))
+                if control_message.get("method") == "session/cancel":
+                    if os.environ.get("ACP_CANCEL_RECORD"):
+                        with open(os.environ["ACP_CANCEL_RECORD"], "w", encoding="utf-8") as record:
+                            record.write("session/cancel\n")
+                    record_methods()
+                    break
+            while True:
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "still streaming"}
+                        }
+                    }
+                })
+                time.sleep(0.001)
         if mode == "permission":
             send({
                 "jsonrpc": "2.0",
@@ -194,7 +278,7 @@ for line in sys.stdin:
                         if os.environ.get("ACP_CANCEL_RECORD"):
                             with open(os.environ["ACP_CANCEL_RECORD"], "w", encoding="utf-8") as record:
                                 record.write("session/cancel\n")
-                        respond(message, {"stopReason": "cancelled"})
+                        respond_to_prompt(message, "cancelled")
                         break
                 continue
             if os.environ.get("ACP_STEER_PROMPT_RECORD"):
@@ -212,7 +296,7 @@ for line in sys.stdin:
                 }
             })
             record_methods()
-            respond(message, {"stopReason": "end_turn"})
+            respond_to_prompt(message, "end_turn")
             break
         if mode == "steer":
             if prompt_count == 1:
@@ -227,7 +311,7 @@ for line in sys.stdin:
                         }
                     }
                 })
-                respond(message, {"stopReason": "end_turn"})
+                respond_to_prompt(message, "end_turn")
                 continue
             if os.environ.get("ACP_STEER_PROMPT_RECORD"):
                 with open(os.environ["ACP_STEER_PROMPT_RECORD"], "w", encoding="utf-8") as record:
@@ -244,8 +328,86 @@ for line in sys.stdin:
                 }
             })
             record_methods()
-            respond(message, {"stopReason": "end_turn"})
+            respond_to_prompt(message, "end_turn")
             break
+        if mode == "buffered_updates_before_response":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 1,
+                        "size": 1000,
+                        "cost": {"amount": 0.01, "currency": "USD"},
+                    },
+                },
+            })
+            for _ in range(70):
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "x"}
+                        }
+                    }
+                })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "TAIL"}
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "late-tool",
+                        "title": "Late tool",
+                        "kind": "read",
+                        "rawInput": {"path": "late.txt"}
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "late-tool",
+                        "status": "completed",
+                        "rawOutput": {"ok": True}
+                    }
+                }
+            })
+            record_methods()
+            respond_to_prompt(message, "end_turn")
+            while True:
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": ""}
+                        }
+                    }
+                })
         for text in ["hello ", "from acp"]:
             send({
                 "jsonrpc": "2.0",
@@ -259,7 +421,7 @@ for line in sys.stdin:
                 }
             })
         record_methods()
-        respond(message, {"stopReason": os.environ.get("ACP_STOP_REASON", "end_turn")})
+        respond_to_prompt(message, os.environ.get("ACP_STOP_REASON", "end_turn"))
         if mode == "linger_after_response":
             while True:
                 time.sleep(1)

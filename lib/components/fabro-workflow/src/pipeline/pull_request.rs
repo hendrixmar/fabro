@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -134,6 +135,13 @@ fn fallback_pr_title(goal: &str) -> String {
         DEFAULT_PR_TITLE.to_string()
     } else {
         title
+    }
+}
+
+fn fallback_pr_content(goal: &str) -> PrContent {
+    PrContent {
+        title: fallback_pr_title(goal),
+        body:  EMPTY_BODY_NOTICE.to_string(),
     }
 }
 
@@ -330,24 +338,31 @@ fn assemble_pr_body(
 
 /// Build complete PR content by combining LLM-generated narrative with
 /// deterministic fallbacks and programmatic sections.
+/// If `model` is absent, publication selects a default from providers the
+/// native client can use.
 pub async fn build_pr_content(
     diff: &str,
     goal: &str,
-    model: &str,
+    model: Option<&str>,
     run_store: &RunStoreHandle,
     llm_source: Arc<dyn CredentialProvider>,
     catalog: Arc<Catalog>,
     conclusion: Option<&Conclusion>,
     run_state: Option<&RunProjection>,
 ) -> Result<PrContent, String> {
-    let client = fabro_llm::build_client(
+    let client = match fabro_llm::build_client(
         Catalog::clone(&catalog),
         llm_source,
         ClientOptions::standard(),
     )
     .await
-    .map_err(|e| format!("Failed to create LLM client: {e}"))?
-    .client;
+    {
+        Ok(client) => Some(Arc::new(client.client)),
+        Err(error) => {
+            warn!(error = %error, "Failed to create LLM client; using fallback PR content");
+            None
+        }
+    };
 
     build_pr_content_with_client(
         diff,
@@ -357,7 +372,7 @@ pub async fn build_pr_content(
         catalog.as_ref(),
         conclusion,
         run_state,
-        Arc::new(client),
+        client,
     )
     .await
 }
@@ -365,12 +380,12 @@ pub async fn build_pr_content(
 async fn build_pr_content_with_client(
     diff: &str,
     goal: &str,
-    model: &str,
+    model: Option<&str>,
     run_store: &RunStoreHandle,
     catalog: &Catalog,
     conclusion: Option<&Conclusion>,
     run_state: Option<&RunProjection>,
-    client: Arc<Client>,
+    client: Option<Arc<Client>>,
 ) -> Result<PrContent, String> {
     info!("Building PR content");
 
@@ -391,32 +406,61 @@ async fn build_pr_content_with_client(
     let run_spec = run_state.map(|state| state.spec.clone());
     let dot_source = run_state.and_then(|state| state.spec.graph_source.clone());
 
-    let eligible = client.available_providers().iter().cloned().collect();
-    let caps = truncation_caps(model, &eligible, catalog);
-    let truncated_diff = truncate_chars(diff, caps.diff);
+    let generated = if let Some(client) = client {
+        let eligible: HashSet<ProviderId> = client.available_providers().iter().cloned().collect();
+        let model = model.map(Cow::Borrowed).or_else(|| {
+            match selection::select_default(catalog, &eligible) {
+                Ok(offering) => Some(Cow::Owned(format!(
+                    "{}/{}",
+                    offering.provider.id(),
+                    offering.model.id()
+                ))),
+                Err(error) => {
+                    warn!(%error, "No eligible model for PR content; using fallback PR content");
+                    None
+                }
+            }
+        });
 
-    let prompt = if let Some(ref plan) = plan_text {
-        let truncated_plan = truncate_chars(plan, caps.plan);
-        format!(
-            "Goal: {goal}\n\nPlan:\n```\n{truncated_plan}\n```\n\nDiff:\n```\n{truncated_diff}\n```"
-        )
+        if let Some(model) = model.as_deref() {
+            let caps = truncation_caps(model, &eligible, catalog);
+            let truncated_diff = truncate_chars(diff, caps.diff);
+
+            let prompt = if let Some(plan) = &plan_text {
+                let truncated_plan = truncate_chars(plan, caps.plan);
+                format!(
+                    "Goal: {goal}\n\nPlan:\n```\n{truncated_plan}\n```\n\nDiff:\n```\n{truncated_diff}\n```"
+                )
+            } else {
+                format!("Goal: {goal}\n\nDiff:\n```\n{truncated_diff}\n```")
+            };
+
+            let generation = match Request::builder()
+                .model(model)
+                .system(PR_BODY_SYSTEM_PROMPT)
+                .message(Message::text(Role::User, prompt))
+                .build()
+            {
+                Ok(request) => client
+                    .complete_object(request, "pr_content", PR_CONTENT_SCHEMA.clone())
+                    .await
+                    .map_err(|error| format!("LLM generation failed: {error}"))
+                    .and_then(|completion| {
+                        serde_json::from_value(completion.object)
+                            .map_err(|error| format!("Failed to deserialize PR content: {error}"))
+                    }),
+                Err(error) => Err(format!("invalid PR content request: {error}")),
+            };
+            generation.unwrap_or_else(|error| {
+                warn!(model = %model, %error, "Using fallback PR content");
+                fallback_pr_content(goal)
+            })
+        } else {
+            fallback_pr_content(goal)
+        }
     } else {
-        format!("Goal: {goal}\n\nDiff:\n```\n{truncated_diff}\n```")
+        fallback_pr_content(goal)
     };
-
-    let request = Request::builder()
-        .model(model)
-        .system(PR_BODY_SYSTEM_PROMPT)
-        .message(Message::text(Role::User, prompt))
-        .build()
-        .map_err(|e| format!("invalid PR content request: {e}"))?;
-    let completion = client
-        .complete_object(request, "pr_content", PR_CONTENT_SCHEMA.clone())
-        .await
-        .map_err(|e| format!("LLM generation failed: {e}"))?;
-
-    let generated: PrContent = serde_json::from_value(completion.object)
-        .map_err(|e| format!("Failed to deserialize PR content: {e}"))?;
 
     let title = if generated.title.trim().is_empty() {
         fallback_pr_title(goal)
@@ -426,7 +470,7 @@ async fn build_pr_content_with_client(
     let title = enforce_title_cap(&title);
 
     let llm_body = if generated.body.trim().is_empty() {
-        warn!(model = %model, "LLM generated empty PR body; using skeleton PR body");
+        warn!(model = ?model, "LLM generated empty PR body; using skeleton PR body");
         EMPTY_BODY_NOTICE.to_string()
     } else {
         generated.body
@@ -460,7 +504,9 @@ pub struct OpenPullRequestRequest<'a> {
     pub expected_head_sha: &'a str,
     pub goal:              &'a str,
     pub diff:              &'a str,
-    pub model:             &'a str,
+    /// Optional run API model; absent selects a default from providers the
+    /// native client can use.
+    pub model:             Option<&'a str>,
     pub draft:             bool,
     pub auto_merge:        Option<AutoMergeOptions>,
     pub run_store:         &'a RunStoreHandle,
@@ -782,6 +828,7 @@ mod tests {
 display_name = "Mock"
 adapter = "openai-compatible"
 codec = "openai-chat"
+default_model = "mock-model"
 base_url = "http://mock.invalid/v1"
 auth = { type = "bearer" }
 allow_passthrough = true
@@ -1070,15 +1117,15 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         let PrContent { title, body } = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
             &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client(
+            Some(explicit_client(
                 "mock",
                 &pr_content_json("Mock title", "Narrative from mock."),
-            ),
+            )),
         )
         .await
         .unwrap();
@@ -1088,6 +1135,27 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         assert!(body.contains("### Fabro Details"));
         assert!(body.contains("Ran 3 stages in 2m 30s for $0.42"));
         assert!(body.contains("| **Total** | **2m 30s** | **$0.42** | **0** |"));
+    }
+
+    #[tokio::test]
+    async fn build_pr_content_falls_back_when_model_returns_invalid_json() {
+        let store = test_store();
+        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        let content = build_pr_content_with_client(
+            "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
+            "Implement feature",
+            Some("mock-model"),
+            &run_store.into(),
+            &mock_catalog(),
+            None,
+            None,
+            Some(explicit_client("mock", "not json")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content.title, "Implement feature");
+        assert!(!content.body.contains("not json"));
     }
 
     #[tokio::test]
@@ -1144,15 +1212,15 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         let body = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
             &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client(
+            Some(explicit_client(
                 "mock",
                 &pr_content_json("Mock title", "Narrative from mock."),
-            ),
+            )),
         )
         .await
         .unwrap()
@@ -1242,15 +1310,15 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         let body = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
             &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client(
+            Some(explicit_client(
                 "mock",
                 &pr_content_json("Mock title", "Narrative from mock."),
-            ),
+            )),
         )
         .await
         .unwrap()
@@ -1267,15 +1335,15 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         let body = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "gpt-5.4",
+            Some("gpt-5.4"),
             &run_store.clone().into(),
             &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client(
+            Some(explicit_client(
                 "openai",
                 &pr_content_json("Explicit title", "Narrative from explicit client."),
-            ),
+            )),
         )
         .await
         .unwrap()
@@ -1283,6 +1351,60 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
 
         assert!(body.contains("Narrative from explicit client."));
         assert!(!body.contains("Narrative from mock."));
+    }
+
+    #[tokio::test]
+    async fn build_pr_content_selects_catalog_default_when_model_is_absent() {
+        let store = test_store();
+        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        let content = build_pr_content_with_client(
+            "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
+            "Implement feature",
+            None,
+            &run_store.clone().into(),
+            &mock_catalog(),
+            Some(&make_test_conclusion()),
+            None,
+            Some(explicit_client(
+                "mock",
+                &pr_content_json("Default title", "Default model narrative."),
+            )),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content.title, "Default title");
+        assert!(content.body.contains("Default model narrative."));
+    }
+
+    #[tokio::test]
+    async fn build_pr_content_without_model_or_credentials_uses_honest_fallback() {
+        let store = test_store();
+        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        let llm_source: Arc<dyn CredentialProvider> = Arc::new(VaultCredentialSource::vault_only(
+            Arc::new(AsyncRwLock::new(Vault::from_entries(HashMap::new()))),
+        ));
+        let content = build_pr_content(
+            "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
+            "Implement feature",
+            None,
+            &run_store.clone().into(),
+            llm_source,
+            Arc::new(mock_catalog()),
+            Some(&make_test_conclusion()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content.title, "Implement feature");
+        assert!(content.body.starts_with(EMPTY_BODY_NOTICE));
+        assert!(content.body.contains("### Fabro Details"));
+        assert!(
+            content
+                .body
+                .contains("Generated with [Fabro](https://fabro.sh)")
+        );
     }
 
     #[tokio::test]
@@ -1325,7 +1447,7 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         let PrContent { title, body } = build_pr_content(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "gpt-5.4",
+            Some("gpt-5.4"),
             &run_store_handle,
             llm_source,
             catalog,
@@ -1511,7 +1633,7 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
             expected_head_sha: "final-sha",
             goal:              "Fix bug",
             diff:              "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
-            model:             "claude-sonnet-4-20250514",
+            model:             Some("claude-sonnet-4-20250514"),
             draft:             false,
             auto_merge:        None,
             run_store:         &harness.run_store,
@@ -1552,12 +1674,12 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         let title = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
             &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client("mock", &payload),
+            Some(explicit_client("mock", &payload)),
         )
         .await
         .unwrap()
@@ -1575,12 +1697,12 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         let title = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
             "## Plan:",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
             &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client("mock", &payload),
+            Some(explicit_client("mock", &payload)),
         )
         .await
         .unwrap()
@@ -1665,12 +1787,12 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
         let body = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
             &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client("mock", &payload),
+            Some(explicit_client("mock", &payload)),
         )
         .await
         .unwrap()
@@ -1939,7 +2061,7 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
             expected_head_sha: "final-sha",
             goal: "Fix telemetry leak",
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
-            model: "gpt-5.4",
+            model: Some("gpt-5.4"),
             draft: false,
             auto_merge: None,
             run_store: &harness.run_store,
@@ -1987,7 +2109,7 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
             expected_head_sha: "final-sha",
             goal: "Fix telemetry leak\n\ndetails...",
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
-            model: "gpt-5.4",
+            model: Some("gpt-5.4"),
             draft: false,
             auto_merge: None,
             run_store: &harness.run_store,
@@ -2024,7 +2146,7 @@ capabilities = { text = true, tools = true, response_format = { json_object = tr
             expected_head_sha: "final-sha",
             goal: &goal,
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
-            model: "gpt-5.4",
+            model: Some("gpt-5.4"),
             draft: false,
             auto_merge: None,
             run_store: &harness.run_store,

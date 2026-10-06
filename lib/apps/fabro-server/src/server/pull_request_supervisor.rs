@@ -192,7 +192,7 @@ async fn attempt_pull_request_creation(
         expected_head_sha: inputs.final_git_sha,
         goal: inputs.goal,
         diff: inputs.diff,
-        model: &creation.model,
+        model: Some(&creation.model),
         draft: true,
         auto_merge: None,
         run_store: &run_store_handle,

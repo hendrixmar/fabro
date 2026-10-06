@@ -296,7 +296,7 @@ describe("runs route workspace preferences", () => {
         version:   1,
         view:      "list",
         search:    "retry failures",
-        repo:      "qlty/fabro",
+        project:   "qlty/fabro",
         workflow:  "release",
         created:   "7d",
         status:    "running,blocked",
@@ -310,7 +310,7 @@ describe("runs route workspace preferences", () => {
     );
 
     expect(loadStoredRunsWorkspaceSearchParams(storage).toString()).toBe(
-      "view=list&search=retry+failures&repo=qlty%2Ffabro&workflow=release&created=7d&status=running%2Cblocked&archived=1&sort=updated_at&direction=asc&size=50&hide=repo%2Cchanges",
+      "view=list&search=retry+failures&project=qlty%2Ffabro&workflow=release&created=7d&status=running%2Cblocked&archived=1&sort=updated_at&direction=asc&size=50&hide=repo%2Cchanges",
     );
   });
 
@@ -337,7 +337,7 @@ describe("runs route workspace preferences", () => {
         version:   1,
         view:      "columns",
         search:    "abc",
-        repo:      "all",
+        project:   "all",
         workflow:  "all",
         created:   "1d",
         status:    new Set<BoardColumn>(["running", "blocked"]),
@@ -355,7 +355,7 @@ describe("runs route workspace preferences", () => {
       version:   1,
       view:      "columns",
       search:    "abc",
-      repo:      "all",
+      project:   "all",
       workflow:  "all",
       created:   "1d",
       status:    "running,blocked",

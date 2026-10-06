@@ -8273,7 +8273,7 @@ async fn workflow_run_with_vault_only_openai_codex_builds_pr_body() {
     let content = fabro_workflow::pull_request::build_pr_content(
         "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
         "Implement feature",
-        "gpt-5.4",
+        Some("gpt-5.4"),
         &run_store_handle,
         Arc::clone(&llm_source),
         Arc::clone(&catalog),

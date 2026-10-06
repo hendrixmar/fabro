@@ -45,7 +45,8 @@ pub use run::{
     RunScmSettings, ScmGitHubSettings, TlsMode,
 };
 pub use server::{
-    GithubIntegrationSettings, IntegrationWebhooksSettings, LogDestination, ObjectStoreSettings,
+    BugsinkIntegrationSettings, BugsinkProjectSettings, GithubIntegrationSettings,
+    IntegrationWebhooksSettings, LogDestination, ObjectStoreSettings, PlaneIntegrationSettings,
     ServerApiSettings, ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod,
     ServerAuthSettings, ServerIntegrationsSettings, ServerListenSettings, ServerLoggingSettings,
     ServerNamespace, ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings,

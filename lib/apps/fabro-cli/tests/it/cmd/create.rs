@@ -245,6 +245,73 @@ fn create_defers_provider_validation_to_the_server() {
 }
 
 #[test]
+fn create_defers_environment_and_mcp_catalogs_to_the_server() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let run_id = unique_run_id();
+    let environment_mock = mock_environment(&server, "server-environment", "docker");
+    let registered_versions = Arc::new(Mutex::new(Vec::new()));
+    let version_mock =
+        mock_workflow_version_registrations_recording(&server, Arc::clone(&registered_versions));
+    let create_mock = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/v1/runs")
+            .body_includes("server-environment");
+        then.status(201)
+            .header("Content-Type", "application/json")
+            .body(run_status_response(run_id.as_str(), "submitted").to_string());
+    });
+    context.write_temp(
+        "managed.fabro",
+        "digraph Managed { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }",
+    );
+    context.write_temp(
+        "workflow.toml",
+        r#"_version = 1
+[workflow]
+graph = "managed.fabro"
+[run.agent.mcps.debugger]
+id = "server-debugger"
+"#,
+    );
+    let output = context
+        .create_cmd()
+        .args([
+            "--server",
+            &format!("{}/api/v1", server.base_url()),
+            "--dry-run",
+            "--environment",
+            "server-environment",
+        ])
+        .arg(context.temp_dir.join("workflow.toml"))
+        .output()
+        .expect("command should execute");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    environment_mock.assert();
+    version_mock.assert();
+    create_mock.assert();
+    let registrations = match registered_versions.lock() {
+        Ok(registrations) => registrations,
+        Err(error) => panic!("workflow registration capture lock was poisoned: {error}"),
+    };
+    assert_eq!(registrations.len(), 1);
+    let workflow_toml = registrations[0]["files"]["workflow.toml"]
+        .as_str()
+        .expect("registered workflow should contain workflow.toml");
+    let registered_settings: toml::Value =
+        toml::from_str(workflow_toml).expect("registered workflow settings should be valid TOML");
+    assert_eq!(
+        registered_settings["run"]["agent"]["mcps"]["debugger"]["id"].as_str(),
+        Some("server-debugger")
+    );
+    assert_eq!(output_stdout(&output).trim(), run_id.as_str());
+}
+
+#[test]
 fn create_uses_configured_server_target_without_server_flag() {
     let context = test_context!();
     let server = MockServer::start();

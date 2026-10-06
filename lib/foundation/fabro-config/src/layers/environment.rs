@@ -10,21 +10,23 @@ use super::maps::StickyMap;
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider:  Option<String>,
+    pub provider:            Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd:       Option<String>,
+    pub cwd:                 Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image:     Option<EnvironmentImageLayer>,
+    pub codex_oauth_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resources: Option<EnvironmentResourcesLayer>,
+    pub image:               Option<EnvironmentImageLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network:   Option<EnvironmentNetworkLayer>,
+    pub resources:           Option<EnvironmentResourcesLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle: Option<EnvironmentLifecycleLayer>,
+    pub network:             Option<EnvironmentNetworkLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle:           Option<EnvironmentLifecycleLayer>,
     #[serde(default, skip_serializing_if = "StickyMap::is_empty")]
-    pub labels:    StickyMap<String>,
+    pub labels:              StickyMap<String>,
     #[serde(default, skip_serializing_if = "StickyMap::is_empty")]
-    pub env:       StickyMap<InterpString>,
+    pub env:                 StickyMap<InterpString>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
@@ -50,14 +52,15 @@ impl RunEnvironmentLayer {
     #[must_use]
     pub fn into_environment_override(self) -> EnvironmentLayer {
         EnvironmentLayer {
-            provider:  None,
-            cwd:       None,
-            image:     self.image,
-            resources: self.resources,
-            network:   self.network,
-            lifecycle: self.lifecycle,
-            labels:    self.labels,
-            env:       self.env,
+            provider:            None,
+            cwd:                 None,
+            codex_oauth_profile: None,
+            image:               self.image,
+            resources:           self.resources,
+            network:             self.network,
+            lifecycle:           self.lifecycle,
+            labels:              self.labels,
+            env:                 self.env,
         }
     }
 }

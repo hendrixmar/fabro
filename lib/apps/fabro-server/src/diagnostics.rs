@@ -10,6 +10,7 @@ use fabro_llm::lithos_catalog::{Catalog, CatalogProvider};
 use fabro_llm::probe::{self, ModelTestStatus};
 use fabro_redact::redact_string;
 use fabro_sandbox::daytona;
+use fabro_sandbox::driver::{ProviderConnectOptions, connect_provider};
 use fabro_static::EnvVars;
 use fabro_types::SandboxProviderKind;
 use fabro_types::settings::ServerAuthMethod;
@@ -20,6 +21,7 @@ use fabro_util::session_secret;
 use fabro_util::version::FABRO_VERSION;
 use futures_util::future::join_all;
 use lithos_llm::catalog::ProviderId;
+use sandbox_driver::HealthStatus;
 use serde::Serialize;
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
@@ -578,17 +580,36 @@ async fn check_github_app(state: &AppState) -> CheckResult {
 }
 
 async fn check_docker_sandbox(state: &AppState) -> CheckResult {
+    let kind = SandboxProviderKind::DOCKER;
+    let server_settings = state.server_settings();
     check_docker_sandbox_with_probe(
-        state
-            .server_settings()
-            .server
-            .sandbox
-            .providers
-            .is_enabled(&SandboxProviderKind::DOCKER),
+        server_settings.server.sandbox.providers.is_enabled(&kind),
         || async {
-            fabro_sandbox::check_docker_daemon()
+            let provider_settings = server_settings
+                .server
+                .sandbox
+                .providers
+                .get(&kind)
+                .cloned()
+                .unwrap_or_default();
+            let connected = connect_provider(
+                &kind,
+                &provider_settings,
+                &ProviderConnectOptions::default(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let health = connected
+                .provider
+                .health()
                 .await
-                .map_err(|err| err.display_with_causes())
+                .map_err(|error| error.to_string())?;
+            match health.status {
+                HealthStatus::Ok | HealthStatus::Unknown => Ok(()),
+                _ => Err(health
+                    .message
+                    .unwrap_or_else(|| "Docker daemon is unavailable".to_string())),
+            }
         },
         DOCKER_PROBE_TIMEOUT,
     )

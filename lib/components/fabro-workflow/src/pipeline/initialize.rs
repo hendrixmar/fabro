@@ -24,7 +24,8 @@ use tokio::sync::RwLock as AsyncRwLock;
 use super::types::{InitOptions, Initialized, LlmSpec, Persisted, SandboxEnvSpec};
 use crate::error::Error;
 use crate::event::{DriverEventRecorder, Event, RunNoticeCode, RunNoticeLevel, SandboxLifecycle};
-use crate::handler::llm::{AgentAcpBackend, BackendRouter, PebbleBackend, routing};
+use crate::handler::agent::CodergenBackend;
+use crate::handler::llm::{AgentAcpBackend, BackendRouter, PebbleBackend};
 use crate::handler::{HandlerRegistry, default_registry};
 #[cfg(test)]
 use crate::model_fallback::ModelFallbackPolicy;
@@ -253,18 +254,41 @@ async fn build_registry(
         return Ok((build_no_backend(), true));
     }
 
-    let graph_needs_llm = graph
-        .nodes
-        .values()
-        .any(|n| graph::is_llm_handler_type(n.handler_type()));
+    let graph_needs_api = graph::graph_needs_api_backend(graph);
+    let graph_needs_llm = graph_needs_api
+        || graph
+            .nodes
+            .values()
+            .any(|n| graph::is_llm_handler_type(n.handler_type()));
 
     if !graph_needs_llm {
         return Ok((build_no_backend(), false));
     }
 
+    if !graph_needs_api {
+        let mcp_servers = spec.mcp_servers.clone();
+        let tool_env_provider = Arc::clone(&tool_env_provider);
+        let steering_hub = Arc::clone(&steering_hub);
+        let acp_factory = move || {
+            Some(Box::new(
+                AgentAcpBackend::from_worker_env()
+                    .with_mcp_servers(mcp_servers.clone())
+                    .with_tool_env_provider(tool_env_provider.clone(), github_token_refresh_managed)
+                    .with_steering_hub(Arc::clone(&steering_hub)),
+            ) as Box<dyn CodergenBackend>)
+        };
+        return Ok((Arc::new(default_registry(interviewer, acp_factory)), false));
+    }
+
+    let model = spec.model.clone().ok_or_else(|| {
+        Error::Precondition("API-backed graph requires a resolved model".to_string())
+    })?;
+    let provider_id = spec.provider_id.clone().ok_or_else(|| {
+        Error::Precondition("API-backed graph requires a resolved provider".to_string())
+    })?;
     let build_llm_registry = || {
-        let model = spec.model.clone();
-        let provider_id = spec.provider_id.clone();
+        let model = model.clone();
+        let provider_id = provider_id.clone();
         let fallbacks = spec.fallbacks.clone();
         let mcp_servers = spec.mcp_servers.clone();
         let model_controls = spec.model_controls.clone();
@@ -291,16 +315,13 @@ async fn build_registry(
             if let Some(services) = fabro_run_tools_for_api.clone() {
                 api = api.with_fabro_run_tools(services);
             }
-            let acp = AgentAcpBackend::new()
+            let acp = AgentAcpBackend::from_worker_env()
+                .with_mcp_servers(mcp_servers.clone())
                 .with_tool_env_provider(tool_env_provider.clone(), github_token_refresh_managed)
                 .with_steering_hub(Arc::clone(&steering_hub));
             Some(Box::new(BackendRouter::new(Box::new(api), acp)))
         }))
     };
-
-    if !graph_needs_api_backend(graph) {
-        return Ok((build_llm_registry(), false));
-    }
 
     let result = readiness(catalog.enabled_providers(), llm_source.as_ref()).await;
     if result.ready.is_empty() {
@@ -332,10 +353,6 @@ async fn search_secrets_from_configured_sources(vault: &Arc<AsyncRwLock<Vault>>)
         brave_search_api_key: vault.get(EnvVars::BRAVE_SEARCH_API_KEY).map(str::to_string),
         venice_api_key:       vault.get(EnvVars::VENICE_API_KEY).map(str::to_string),
     }
-}
-
-fn graph_needs_api_backend(graph: &graph::Graph) -> bool {
-    graph.nodes.values().any(routing::node_needs_api_backend)
 }
 
 /// Trace header attached to every LLM request in a run so gateways that
@@ -938,8 +955,8 @@ mod tests {
             emitter: Arc::clone(&emitter),
             sandbox: SandboxSpec::local(working_directory, ProviderAccess::default()),
             llm: LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::anthropic(),
+                model:          Some("test-model".to_string()),
+                provider_id:    Some(lithos_llm::catalog::builtin::anthropic()),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -1284,10 +1301,10 @@ mod tests {
             Some("value")
         );
         assert!(initialized.engine.dry_run);
-        assert_eq!(initialized.model, "test-model");
+        assert_eq!(initialized.model, Some("test-model".to_string()));
         assert_eq!(
             initialized.engine.run.provider_id,
-            lithos_llm::catalog::builtin::anthropic()
+            Some(lithos_llm::catalog::builtin::anthropic())
         );
         assert!(
             readiness(
@@ -1418,8 +1435,8 @@ mod tests {
         });
         let (_registry, effective_dry_run) = build_registry(
             &LlmSpec {
-                model:          "claude-opus-4-6".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::anthropic(),
+                model:          Some("claude-opus-4-6".to_string()),
+                provider_id:    Some(lithos_llm::catalog::builtin::anthropic()),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -1471,7 +1488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_executes_acp_backend_node_from_registry() {
+    async fn initialize_executes_acp_backend_without_api_credentials() {
         let temp = tempfile::tempdir().unwrap();
         let run_dir = temp.path().join("run");
         create_dir_all(&run_dir).await.unwrap();
@@ -1523,10 +1540,7 @@ mod tests {
         graph.edges.push(Edge::new("start", "writer"));
         graph.edges.push(Edge::new("writer", "exit"));
 
-        let mut vault = Vault::load(temp.path().join("secrets.json")).unwrap();
-        vault
-            .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
-            .unwrap();
+        let vault = Vault::from_entries(HashMap::new());
         let vault = Arc::new(AsyncRwLock::new(vault));
 
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
@@ -1543,8 +1557,8 @@ mod tests {
             emitter: emitter.clone(),
             sandbox: SandboxSpec::local(temp.path(), ProviderAccess::default()),
             llm: LlmSpec {
-                model:          "fake-acp".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::openai(),
+                model:          None,
+                provider_id:    None,
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -1649,8 +1663,8 @@ mod tests {
                 ProviderAccess::default(),
             ),
             llm:               LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::anthropic(),
+                model:          Some("test-model".to_string()),
+                provider_id:    Some(lithos_llm::catalog::builtin::anthropic()),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -1794,8 +1808,8 @@ mod tests {
                 ProviderAccess::default(),
             ),
             llm: LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::anthropic(),
+                model:          Some("test-model".to_string()),
+                provider_id:    Some(lithos_llm::catalog::builtin::anthropic()),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),

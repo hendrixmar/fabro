@@ -24,9 +24,7 @@ import {
   type KeyValueEntry,
 } from "./key-value-editor";
 
-// Parse the `provider` query param used by the create flow into a creatable
-// provider, defaulting to Docker for anything that cannot back a managed
-// environment. Kind names are validated server-side on create.
+// Kind names are validated server-side on create.
 const PROVIDER_KIND_PATTERN = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
 
 export function parseCreatableProvider(value: string | null): string {
@@ -54,6 +52,8 @@ type ImageSource = "image" | "dockerfile";
 export interface EnvironmentFormValues {
   id: string;
   provider: string;
+  // API-only host profile selection survives unrelated web edits.
+  codexOauthProfile?: string | null;
   imageSource: ImageSource;
   dockerRef: string;
   dockerfile: string;
@@ -92,6 +92,7 @@ export function environmentToFormValues(environment: Environment): EnvironmentFo
   return {
     id:             environment.id,
     provider:       environment.provider,
+    codexOauthProfile: environment.codex_oauth_profile,
     imageSource:    environment.image.dockerfile ? "dockerfile" : "image",
     dockerRef:      environment.image.docker ?? "",
     dockerfile:     environment.image.dockerfile?.value ?? "",
@@ -141,6 +142,7 @@ export function replaceRequestFromForm(values: EnvironmentFormValues): ReplaceEn
 function settingsFromForm(values: EnvironmentFormValues): ReplaceEnvironmentRequest {
   return {
     provider:  values.provider,
+    codex_oauth_profile: values.codexOauthProfile,
     image:     imageFromForm(values),
     resources: resourcesFromForm(values),
     network:   networkFromForm(values),

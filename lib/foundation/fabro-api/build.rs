@@ -201,6 +201,7 @@ fn main() {
             &[],
         ),
         ("Run", "fabro_types::Run", &[]),
+        ("RunProjectRef", "fabro_types::RunProjectRef", &[]),
         ("RunApproval", "fabro_types::RunApproval", &[]),
         ("RunApprovalState", "fabro_types::RunApprovalState", &[]),
         ("RunRunnableSource", "fabro_types::RunRunnableSource", &[]),
@@ -325,6 +326,26 @@ fn main() {
         (
             "ServerIntegrationsSettings",
             "fabro_types::settings::server::ServerIntegrationsSettings",
+            &[],
+        ),
+        (
+            "PlaneIntegrationSettings",
+            "fabro_types::settings::server::PlaneIntegrationSettings",
+            &[],
+        ),
+        (
+            "IntakeIntegrationSettings",
+            "fabro_types::settings::server::IntakeIntegrationSettings",
+            &[],
+        ),
+        (
+            "BugsinkIntegrationSettings",
+            "fabro_types::settings::server::BugsinkIntegrationSettings",
+            &[],
+        ),
+        (
+            "BugsinkProjectSettings",
+            "fabro_types::settings::server::BugsinkProjectSettings",
             &[],
         ),
         (
@@ -682,6 +703,7 @@ fn main() {
         ("SandboxTimestamps", "fabro_types::SandboxTimestamps", &[]),
         ("AskFabro", "fabro_types::AskFabro", &[]),
         ("Automation", "fabro_automation::Automation", &[]),
+        ("Project", "fabro_automation::Project", &[]),
         (
             "AutomationGitWorkflowSource",
             "fabro_types::GitRunTarget",
@@ -701,6 +723,46 @@ fn main() {
         (
             "ReplaceAutomationRequest",
             "fabro_automation::AutomationReplace",
+            &[],
+        ),
+        (
+            "ExternalAgentHarness",
+            "fabro_types::ExternalAgentHarness",
+            &[],
+        ),
+        (
+            "AutomationPlaneTrigger",
+            "fabro_automation::PlaneTrigger",
+            &[],
+        ),
+        ("AutomationApiTrigger", "fabro_automation::ApiTrigger", &[]),
+        (
+            "AutomationScheduleTrigger",
+            "fabro_automation::ScheduleTrigger",
+            &[],
+        ),
+        (
+            "PlaneDispatchStatus",
+            "fabro_types::PlaneDispatchStatus",
+            &[],
+        ),
+        ("PlaneDispatch", "fabro_types::PlaneDispatch", &[]),
+        (
+            "PlaneDispatchListResponse",
+            "fabro_types::PlaneDispatchListResponse",
+            &[],
+        ),
+        ("PlaneProject", "fabro_types::PlaneProjectResponse", &[]),
+        (
+            "PlaneProjectsResponse",
+            "fabro_types::PlaneProjectsResponse",
+            &[],
+        ),
+        ("PlaneState", "fabro_types::PlaneStateResponse", &[]),
+        ("PlaneLabel", "fabro_types::PlaneLabelResponse", &[]),
+        (
+            "PlaneProjectMetadataResponse",
+            "fabro_types::PlaneProjectMetadataResponse",
             &[],
         ),
         // MCP server catalog wire types reuse the domain model rather than

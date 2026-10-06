@@ -3,7 +3,8 @@ use std::sync::Arc;
 use axum::http::HeaderMap;
 use axum_extra::extract::Query as ExtraQuery;
 use fabro_automation::{
-    Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationStoreError,
+    Automation, AutomationDraft, AutomationId, AutomationListFilter, AutomationReplace,
+    AutomationScope, AutomationStoreError, ProjectId,
 };
 use fabro_environment::EnvironmentId;
 use fabro_store::{RunSummaryListQuery, RunSummaryVisibility};
@@ -42,6 +43,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
             get(list_automation_runs).post(create_automation_run),
         )
         .route(
+            "/automations/{id}/plane-dispatches",
+            get(list_automation_plane_dispatches),
+        )
+        .route(
             "/automations/{id}",
             get(get_automation)
                 .put(replace_automation)
@@ -49,11 +54,20 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         )
 }
 
+#[derive(serde::Deserialize)]
+struct AutomationListQuery {
+    scope:                 Option<String>,
+    project_id:            Option<String>,
+    available_to_projects: Option<bool>,
+}
+
 async fn list_automations(
     _auth: RequiredUser,
     State(state): State<Arc<AppState>>,
+    ExtraQuery(query): ExtraQuery<AutomationListQuery>,
 ) -> Result<Response, ApiError> {
-    let data = state.automation_store().list().await?;
+    let filter = automation_list_filter(&query)?;
+    let data = state.automation_store().list_filtered(&filter).await?;
     let total = data.len();
     Ok((
         StatusCode::OK,
@@ -91,6 +105,35 @@ async fn list_automation_runs(
         ..RunSummaryListQuery::default()
     };
     runs::run_summary_page_response(&state, &query).await
+}
+
+async fn list_automation_plane_dispatches(
+    _auth: RequiredUser,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let id = parse_path_id(id)?;
+    match state.automation_store().exists(&id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(ApiError::not_found(format!("automation not found: {id}")));
+        }
+        Err(err) => return Err(ApiError::from(err)),
+    }
+    let records = state
+        .plane_dispatch_store()
+        .list_for_automation(&id)
+        .await
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let data = records
+        .into_iter()
+        .map(|record| record.dispatch)
+        .collect::<Vec<_>>();
+    Ok((
+        StatusCode::OK,
+        Json(fabro_types::PlaneDispatchListResponse { data }),
+    )
+        .into_response())
 }
 
 async fn create_automation_run(
@@ -141,6 +184,7 @@ async fn create_automation_run(
             automation_id: automation.id.clone(),
             target,
             workflow_source: automation.workflow_source.clone(),
+            project_id: automation.project_id.clone(),
             workflow: automation.workflow.clone(),
             run_id,
             temp_root: state.automation_temp_root(),
@@ -251,6 +295,49 @@ async fn delete_automation(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Translate the ownership query into a store filter. `scope=project`
+/// requires a project id; an unknown scope is a client error rather than a
+/// silently unfiltered list.
+fn automation_list_filter(query: &AutomationListQuery) -> Result<AutomationListFilter, ApiError> {
+    let scope = match query
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        None | Some("all") => AutomationScope::All,
+        Some("global") => AutomationScope::Global,
+        Some("project") => AutomationScope::Project,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown automation scope {other:?}; expected all, global, or project"
+            )));
+        }
+    };
+    let project_id = query
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            ProjectId::new(value)
+                .map_err(|err| ApiError::bad_request(format!("invalid project id: {err}")))
+        })
+        .transpose()?;
+    if scope == AutomationScope::Project && project_id.is_none() {
+        return Err(ApiError::bad_request("scope=project requires a project_id"));
+    }
+    Ok(AutomationListFilter {
+        scope,
+        project_id: if scope == AutomationScope::Project {
+            project_id
+        } else {
+            None
+        },
+        available_to_projects: query.available_to_projects.unwrap_or(false),
+    })
+}
+
 fn parse_path_id(id: String) -> Result<AutomationId, ApiError> {
     AutomationId::new(id)
         .map_err(|err| ApiError::bad_request(format!("invalid automation id: {err}")))
@@ -337,6 +424,14 @@ impl From<AutomationStoreError> for ApiError {
             AutomationStoreError::Validation { source } => {
                 Self::new(StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
             }
+            err @ AutomationStoreError::InUse { .. } => {
+                Self::with_code(StatusCode::CONFLICT, err.to_string(), "automation_in_use")
+            }
+            err @ AutomationStoreError::LinkRequiresProject { .. } => Self::with_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                err.to_string(),
+                "automation_link_requires_project",
+            ),
             err => {
                 tracing::error!(error = ?err, "Automation store operation failed");
                 Self::new(

@@ -2,8 +2,15 @@ use fabro_graphviz::graph::{AttrValue, Graph};
 pub use fabro_graphviz::stylesheet::{Rule, Selector, Stylesheet, parse_stylesheet};
 
 /// Recognized stylesheet properties.
-const STYLESHEET_PROPERTIES: &[&str] =
-    &["model", "provider", "reasoning_effort", "speed", "backend"];
+const STYLESHEET_PROPERTIES: &[&str] = &[
+    "model",
+    "provider",
+    "reasoning_effort",
+    "speed",
+    "backend",
+    "harness",
+    "skills",
+];
 
 /// Apply a stylesheet to a graph. Rules are applied by specificity order;
 /// higher specificity wins. Explicit node attributes are never overridden.
@@ -21,14 +28,12 @@ pub fn apply_stylesheet(stylesheet: &Stylesheet, graph: &mut Graph) {
         let mut applied: std::collections::HashMap<String, (String, u8)> =
             std::collections::HashMap::new();
 
+        let node = graph
+            .nodes
+            .get_mut(node_id.as_str())
+            .expect("node_id was collected from graph.nodes.keys() on the line above, so it must still exist");
         for rule in &sorted_rules {
-            let node = &graph.nodes[node_id.as_str()];
-            let matches = match &rule.selector {
-                Selector::Universal => true,
-                Selector::Shape(shape) => node.shape() == shape,
-                Selector::Class(cls) => node.classes.contains(cls),
-                Selector::Id(id) => node_id == id,
-            };
+            let matches = rule.selector.matches_node(node_id, node);
 
             if matches {
                 for decl in &rule.declarations {
@@ -45,10 +50,6 @@ pub fn apply_stylesheet(stylesheet: &Stylesheet, graph: &mut Graph) {
             }
         }
 
-        let node = graph
-            .nodes
-            .get_mut(node_id.as_str())
-            .expect("node_id was collected from graph.nodes.keys() on the line above, so it must still exist");
         for (prop, (val, _)) in &applied {
             if !node.attrs.contains_key(prop) {
                 node.attrs
@@ -139,6 +140,59 @@ mod tests {
             graph.nodes["a"].attrs.get("model"),
             Some(&AttrValue::String("explicit".into()))
         );
+    }
+
+    #[test]
+    fn apply_harness_and_skills_properties_via_stylesheet() {
+        let ss = parse_stylesheet(
+            ".builder { backend: acp; harness: codex; model: gpt-5.6-luna; \
+             reasoning_effort: xhigh; skills: tdd,diagnosing-bugs; }",
+        )
+        .unwrap();
+        let mut graph = Graph::new("test");
+
+        let mut node = Node::new("build");
+        node.classes.push("builder".into());
+        graph.nodes.insert("build".into(), node);
+
+        apply_stylesheet(&ss, &mut graph);
+
+        let attrs = &graph.nodes["build"].attrs;
+        assert_eq!(
+            attrs.get("harness"),
+            Some(&AttrValue::String("codex".into()))
+        );
+        assert_eq!(
+            attrs.get("skills"),
+            Some(&AttrValue::String("tdd,diagnosing-bugs".into()))
+        );
+        assert_eq!(
+            attrs.get("model"),
+            Some(&AttrValue::String("gpt-5.6-luna".into()))
+        );
+    }
+
+    #[test]
+    fn harness_and_skills_not_overridden_by_stylesheet() {
+        let ss = parse_stylesheet(".builder { harness: omp; skills: code-review; }").unwrap();
+        let mut graph = Graph::new("test");
+
+        let mut node = Node::new("build");
+        node.classes.push("builder".into());
+        node.attrs
+            .insert("harness".into(), AttrValue::String("codex".into()));
+        node.attrs
+            .insert("skills".into(), AttrValue::String("tdd".into()));
+        graph.nodes.insert("build".into(), node);
+
+        apply_stylesheet(&ss, &mut graph);
+
+        let attrs = &graph.nodes["build"].attrs;
+        assert_eq!(
+            attrs.get("harness"),
+            Some(&AttrValue::String("codex".into()))
+        );
+        assert_eq!(attrs.get("skills"), Some(&AttrValue::String("tdd".into())));
     }
 
     #[test]

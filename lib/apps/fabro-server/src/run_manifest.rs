@@ -8,11 +8,11 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use fabro_api::types;
 use fabro_config::parse::SettingsSource;
 use fabro_config::{
-    CliLayer, CliOutputLayer, EnvironmentLayer, MergeMap, RunLayer, SettingsLayer,
+    CliLayer, CliOutputLayer, EnvironmentLayer, MergeMap, ResolveErrors, RunLayer, SettingsLayer,
     WorkflowSettingsBuilder, parse_input_overrides, parse_labels, project,
 };
 use fabro_github::token_source::{InstallationTokenSource, ResolvedToken, TokenSnapshot};
-use fabro_graphviz::graph::{Graph, is_llm_handler_type};
+use fabro_graphviz::graph::{Graph, graph_needs_api_backend, node_needs_api_backend};
 use fabro_graphviz::render::apply_direction;
 use fabro_llm::FabroClient;
 use fabro_llm::lithos_catalog::Catalog;
@@ -25,7 +25,9 @@ use fabro_static::EnvVars;
 use fabro_types::settings::ModelRef;
 use fabro_types::settings::cli::OutputVerbosity;
 use fabro_types::settings::interp::InterpString;
-use fabro_types::settings::run::{McpServerSettings, RunGoal, RunNamespace};
+use fabro_types::settings::run::{
+    McpServerSettings, RunGoal, RunNamespace, validate_codex_oauth_profile,
+};
 use fabro_types::{
     BundledProvider, ManifestPath, RunId, RunNoticeLevel, SandboxProviderKind, ServerSettings,
     WorkflowSettings,
@@ -73,11 +75,44 @@ pub(crate) fn manifest_run_defaults(run: Option<&RunLayer>) -> RunLayer {
     run.cloned().unwrap_or_default()
 }
 
+/// Client-side structural validation must preserve unresolved server-owned
+/// catalogs in the manifest, without judging their availability locally.
+pub(crate) fn prepare_manifest_for_client(
+    manifest_run_defaults: &RunLayer,
+    manifest: &types::RunManifest,
+) -> Result<PreparedManifest> {
+    prepare_manifest_with_resolver(
+        manifest_run_defaults,
+        &fabro_environment::seeded_catalog_layer(),
+        &HashMap::new(),
+        manifest,
+        WorkflowSettingsBuilder::build_manifest_metadata,
+    )
+}
+
 pub(crate) fn prepare_manifest_with_environment_defaults(
     manifest_run_defaults: &RunLayer,
     manifest_environment_defaults: &MergeMap<EnvironmentLayer>,
     manifest_mcp_server_catalog: &HashMap<String, McpServerSettings>,
     manifest: &types::RunManifest,
+) -> Result<PreparedManifest> {
+    prepare_manifest_with_resolver(
+        manifest_run_defaults,
+        manifest_environment_defaults,
+        manifest_mcp_server_catalog,
+        manifest,
+        WorkflowSettingsBuilder::build,
+    )
+}
+
+fn prepare_manifest_with_resolver(
+    manifest_run_defaults: &RunLayer,
+    manifest_environment_defaults: &MergeMap<EnvironmentLayer>,
+    manifest_mcp_server_catalog: &HashMap<String, McpServerSettings>,
+    manifest: &types::RunManifest,
+    build_settings: fn(
+        WorkflowSettingsBuilder,
+    ) -> std::result::Result<WorkflowSettings, ResolveErrors>,
 ) -> Result<PreparedManifest> {
     if manifest.version != 1 {
         bail!("unsupported manifest version {}", manifest.version);
@@ -141,9 +176,8 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
             workflow_settings_builder = workflow_settings_builder.user_toml(source)?;
         }
     }
-    let mut settings = workflow_settings_builder
-        .build()
-        .context("failed to resolve manifest settings")?;
+    let mut settings =
+        build_settings(workflow_settings_builder).context("failed to resolve manifest settings")?;
     settings.run.inputs.extend(args_overrides.input_overrides);
     if let Some(goal) = manifest
         .goal
@@ -151,6 +185,12 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
         .filter(|goal| goal.type_ != types::ManifestGoalType::Graph)
     {
         settings.run.goal = Some(RunGoal::Inline(InterpString::parse(&goal.text)));
+    }
+    if let Some(harness) = manifest.external_agent_harness.as_ref() {
+        settings
+            .run
+            .metadata
+            .insert("agent.harness".to_string(), harness.as_str().to_string());
     }
     manifest
         .title
@@ -430,11 +470,17 @@ async fn build_preflight_report(
         &ready_providers,
     )?;
     let resolved_run = materialized.run;
-    let (Some(run_model), Some(run_provider)) = (
-        resolved_run.model.name.as_deref(),
-        resolved_run.model.provider.as_deref(),
-    ) else {
-        bail!("materialized run is missing a resolved model or provider");
+    let needs_api_backend = graph_needs_api_backend(graph);
+    let (run_model, run_provider) = if needs_api_backend {
+        let (Some(model), Some(provider)) = (
+            resolved_run.model.name.as_deref(),
+            resolved_run.model.provider.as_deref(),
+        ) else {
+            bail!("materialized run is missing a resolved model or provider");
+        };
+        (Some(model), Some(provider))
+    } else {
+        (None, None)
     };
     let server_settings = state.server_settings();
     let github_integration = &server_settings.server.integrations.github;
@@ -459,12 +505,16 @@ async fn build_preflight_report(
         ));
     }
     run_environment_capability_check(&mut checks, &resolved_run);
-    let model_fallbacks_ok = run_model_fallback_check(
-        &mut checks,
-        catalog.as_ref(),
-        &ready_providers,
-        &resolved_run.model.fallbacks,
-    );
+    let model_fallbacks_ok = if needs_api_backend {
+        run_model_fallback_check(
+            &mut checks,
+            catalog.as_ref(),
+            &ready_providers,
+            &resolved_run.model.fallbacks,
+        )
+    } else {
+        true
+    };
     let needs_github_credentials = sandbox_provider.clones_workspace()
         || resolved_run.integrations.github.is_token_requested();
     let github_app = if needs_github_credentials {
@@ -501,15 +551,19 @@ async fn build_preflight_report(
         github_app.clone(),
     )
     .await;
-    let llm_ok = run_llm_check(
-        &mut checks,
-        graph,
-        run_model,
-        run_provider,
-        catalog.as_ref(),
-        llm_result,
-    )
-    .await;
+    let llm_ok = if let (Some(run_model), Some(run_provider)) = (run_model, run_provider) {
+        run_llm_check(
+            &mut checks,
+            graph,
+            run_model,
+            run_provider,
+            catalog.as_ref(),
+            llm_result,
+        )
+        .await
+    } else {
+        true
+    };
     let github_token_ok =
         run_github_token_check(&mut checks, prepared, &resolved_run, github_app).await;
 
@@ -921,6 +975,19 @@ fn preflight_sandbox_spec(
     github_app: Option<fabro_github::GitHubCredentials>,
     access: &ProviderAccess,
 ) -> std::result::Result<SandboxSpec, fabro_sandbox::Error> {
+    validate_codex_oauth_profile(
+        &resolved_run.environment.provider,
+        resolved_run.environment.codex_oauth_profile.as_deref(),
+        resolved_run.environment.env.keys().map(String::as_str),
+    )
+    .map_err(fabro_sandbox::Error::message)?;
+    if resolved_run.environment.codex_oauth_profile.is_some()
+        && *sandbox_provider != SandboxProviderKind::DOCKER
+    {
+        return Err(fabro_sandbox::Error::message(
+            "codex_oauth_profile requires the effective Docker sandbox provider",
+        ));
+    }
     let clone_origin_url = prepared
         .git
         .as_ref()
@@ -1077,7 +1144,7 @@ async fn run_llm_check(
     let mut has_llm_nodes = false;
 
     for node in graph.nodes.values() {
-        if !is_llm_handler_type(node.handler_type()) {
+        if !node_needs_api_backend(node) {
             continue;
         }
         has_llm_nodes = true;
@@ -1698,24 +1765,28 @@ mod tests {
 
     fn minimal_manifest() -> types::RunManifest {
         types::RunManifest {
-            args:      None,
-            configs:   Vec::new(),
-            cwd:       "/tmp/project".to_string(),
-            git:       None,
-            goal:      None,
-            parent_id: None,
-            title:     None,
-            target:    types::ManifestTarget {
+            args:                   None,
+            configs:                Vec::new(),
+            cwd:                    "/tmp/project".to_string(),
+            git:                    None,
+            goal:                   None,
+            parent_id:              None,
+            title:                  None,
+            external_agent_harness: None,
+            target:                 types::ManifestTarget {
                 path: "workflow.fabro".to_string(),
             },
-            version:   1,
-            workflows: HashMap::from([("workflow.fabro".to_string(), types::ManifestWorkflow {
-                config: None,
-                files:  HashMap::new(),
-                source:
-                    "digraph Demo { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"
-                        .to_string(),
-            })]),
+            version:                1,
+            workflows:              HashMap::from([(
+                "workflow.fabro".to_string(),
+                types::ManifestWorkflow {
+                    config: None,
+                    files:  HashMap::new(),
+                    source:
+                        "digraph Demo { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"
+                            .to_string(),
+                },
+            )]),
         }
     }
 
@@ -1780,6 +1851,115 @@ mod tests {
             &HashMap::new(),
             manifest,
         )
+    }
+
+    #[test]
+    fn client_manifest_preserves_server_catalog_references_and_server_rejects_missing_entries() {
+        for config in [
+            "_version = 1\n[run.environment]\nid = \"server-only\"\n",
+            "_version = 1\n[run.agent.mcps.tracker]\nid = \"server-only\"\n",
+        ] {
+            let mut manifest = minimal_manifest();
+            manifest.workflows.get_mut("workflow.fabro").unwrap().config =
+                Some(types::ManifestWorkflowConfig {
+                    path:   "workflow.toml".to_string(),
+                    source: config.to_string(),
+                });
+            let prepared = prepare_manifest_for_client(&RunLayer::default(), &manifest)
+                .expect("client metadata must not resolve server-owned catalogs");
+            assert_eq!(
+                prepared.workflow_input.config.as_ref().unwrap().source,
+                config
+            );
+            assert!(
+                crate::manifest_validation::validate_manifest(&RunLayer::default(), &manifest)
+                    .expect("client structural validation should succeed")
+                    .ok
+            );
+            let error = prepare_manifest(&RunLayer::default(), &manifest)
+                .err()
+                .expect("server resolution must reject an unavailable catalog entry");
+            assert!(format!("{error:#}").contains("server-only"));
+        }
+    }
+
+    #[test]
+    fn external_harness_is_preserved_in_manifest_metadata() {
+        for harness in [
+            fabro_types::ExternalAgentHarness::Codex,
+            fabro_types::ExternalAgentHarness::Omp,
+        ] {
+            let mut manifest = minimal_manifest();
+            manifest.external_agent_harness = Some(harness);
+            let client = prepare_manifest_for_client(&RunLayer::default(), &manifest).unwrap();
+            let server = prepare_manifest(&RunLayer::default(), &manifest).unwrap();
+            for prepared in [client, server] {
+                assert_eq!(
+                    prepared
+                        .settings
+                        .run
+                        .metadata
+                        .get("agent.harness")
+                        .map(String::as_str),
+                    Some(harness.as_str())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_nodes_bypass_api_readiness_without_exempting_api_nodes() {
+        use fabro_graphviz::graph::{AttrValue, Node};
+
+        let mut graph = Graph::new("preflight");
+        let mut external = Node::new("external");
+        external
+            .attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        external.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("harness-only-model".to_string()),
+        );
+        graph.nodes.insert(external.id.clone(), external);
+        let mut checks = Vec::new();
+        assert!(
+            run_llm_check(
+                &mut checks,
+                &graph,
+                "api-model",
+                "openai",
+                test_catalog().as_ref(),
+                Err(anyhow!("API credential resolution is unavailable")),
+            )
+            .await
+        );
+        assert!(
+            checks.is_empty(),
+            "ACP-only graphs must not credential-probe"
+        );
+
+        let api = Node::new("api");
+        graph.nodes.insert(api.id.clone(), api);
+        let state = crate::test_support::test_app_state_with_env_lookup(
+            crate::test_support::default_test_server_settings(),
+            RunLayer::default(),
+            5,
+            |_| None,
+        );
+        assert!(
+            !run_llm_check(
+                &mut checks,
+                &graph,
+                "api-model",
+                "openai",
+                test_catalog().as_ref(),
+                state.resolve_llm_client().await,
+            )
+            .await
+        );
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].summary, "api-model");
+        assert_eq!(checks[0].status, CheckStatus::Warning);
     }
 
     fn test_catalog() -> Arc<Catalog> {
@@ -2261,6 +2441,64 @@ provider = "local"
             spec.clone.origin_url.as_deref(),
             Some("https://github.com/acme/widgets")
         );
+        assert_eq!(spec.clone.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn preflight_rejects_oauth_profiles_without_effective_docker_and_conflicting_credentials() {
+        let (prepared, mut resolved) =
+            prepared_and_resolved_for_sandbox(&SandboxProviderKind::DOCKER, true, None);
+        resolved.environment.codex_oauth_profile = Some("team".to_string());
+        let access = ProviderAccess::default();
+        preflight_sandbox_spec(
+            &SandboxProviderKind::LOCAL,
+            &prepared,
+            &resolved,
+            None,
+            &access,
+        )
+        .expect_err("dry-run local override must not bypass the OAuth Docker boundary");
+
+        for name in [
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "CODEX_AUTH_B64",
+            "FABRO_CODEX_OAUTH_PROFILE",
+        ] {
+            resolved.environment.env =
+                HashMap::from([(name.to_string(), InterpString::parse("untrusted"))]);
+            assert!(
+                preflight_sandbox_spec(
+                    &SandboxProviderKind::DOCKER,
+                    &prepared,
+                    &resolved,
+                    None,
+                    &access,
+                )
+                .is_err(),
+                "{name} must not override the server-owned OAuth source"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_preserves_plugin_provider_and_clone_probe_contract() {
+        let provider = SandboxProviderKind::try_new("custom").unwrap();
+        let (prepared, resolved) = prepared_and_resolved_for_sandbox(
+            &provider,
+            true,
+            Some(git_context("https://github.com/acme/widgets", "main")),
+        );
+        let spec = preflight_sandbox_spec(
+            &provider,
+            &prepared,
+            &resolved,
+            None,
+            &ProviderAccess::default(),
+        )
+        .expect("plugin preflight spec should build without bundled-provider fallback");
+        assert_eq!(spec.kind, provider);
+        assert!(spec.clone.skip);
         assert_eq!(spec.clone.branch.as_deref(), Some("main"));
     }
 

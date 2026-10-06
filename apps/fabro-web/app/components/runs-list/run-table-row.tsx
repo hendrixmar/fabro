@@ -62,6 +62,9 @@ export function RunTableRow({
           </Tooltip>
         </td>
       )}
+      {show("project") && (
+        <td className="whitespace-nowrap px-3 py-2.5 text-xs text-fg-3">{run.projectName ?? "—"}</td>
+      )}
       {show("repo") && (
         <td className="whitespace-nowrap px-3 py-2.5 font-mono text-xs font-medium text-teal-500">
           {run.repo}

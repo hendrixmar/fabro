@@ -1,12 +1,9 @@
+import { useId } from "react";
 import useSWR, { type SWRConfiguration } from "swr";
 
 import { getInstallSession, type InstallSessionResponse } from "./install-api";
 
-type InstallSessionKey = readonly ["install", "session", string];
-
-function installSessionKey(token: string | null): InstallSessionKey | null {
-  return token ? ["install", "session", token] : null;
-}
+type InstallSessionKey = readonly ["install", "session", string, string];
 
 /**
  * Reads the install session through SWR so server state is owned by the query
@@ -17,8 +14,14 @@ export function useInstallSessionQuery(
   token: string | null,
   options: SWRConfiguration<InstallSessionResponse, Error> = {},
 ) {
+  // A GitHub redirect can change the session outside this browser instance.
+  // Each installer mount must fetch fresh state instead of reusing an old mount.
+  const mountId = useId();
+  const key: InstallSessionKey | null = token
+    ? ["install", "session", token, mountId]
+    : null;
   return useSWR<InstallSessionResponse, Error, InstallSessionKey | null>(
-    installSessionKey(token),
+    key,
     ([, , currentToken]) => getInstallSession(currentToken),
     {
       dedupingInterval:       0,

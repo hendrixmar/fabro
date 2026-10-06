@@ -21,9 +21,9 @@ INSERT INTO runs (
     status, archived_at_ms, parent_id, title, workflow_slug, workflow_name,
     repository_name, automation_id, diff_files_changed, diff_additions, diff_deletions,
     input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens,
-    total_usd_micros, summary_json
+    total_usd_micros, summary_json, project_id
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 ";
 
@@ -34,9 +34,9 @@ INSERT INTO runs (
     status, archived_at_ms, parent_id, title, workflow_slug, workflow_name,
     repository_name, automation_id, diff_files_changed, diff_additions, diff_deletions,
     input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens,
-    total_usd_micros, summary_json
+    total_usd_micros, summary_json, project_id
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 ON CONFLICT(id) DO UPDATE SET
     source_last_seq = excluded.source_last_seq,
@@ -61,7 +61,8 @@ ON CONFLICT(id) DO UPDATE SET
     cache_read_tokens = excluded.cache_read_tokens,
     cache_write_tokens = excluded.cache_write_tokens,
     total_usd_micros = excluded.total_usd_micros,
-    summary_json = excluded.summary_json
+    summary_json = excluded.summary_json,
+    project_id = COALESCE(runs.project_id, excluded.project_id)
 WHERE excluded.source_last_seq > runs.source_last_seq
 ";
 
@@ -103,8 +104,20 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 
 const SELECT_RUN_SUMMARIES_SQL: &str = r"
 SELECT runs.id, runs.summary_json,
-       (SELECT COUNT(*) FROM runs AS child WHERE child.parent_id = runs.id) AS children_count
+       (SELECT COUNT(*) FROM runs AS child WHERE child.parent_id = runs.id) AS children_count,
+       runs.project_id,
+       (SELECT projects.name FROM projects WHERE projects.id = runs.project_id) AS project_name
 FROM runs";
+
+/// The owning project, decided once when a run's row is first written: the
+/// server-verified `fabro_project_id` label, then the parent's project, then
+/// the project whose repository the run targets.
+const RESOLVE_RUN_PROJECT_SQL: &str = r"
+SELECT COALESCE(
+    (SELECT id FROM projects WHERE id = ?1),
+    (SELECT project_id FROM runs WHERE id = ?2),
+    (SELECT id FROM projects WHERE repository_key = lower(?3))
+)";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +167,12 @@ impl Default for RunSummaryVisibility {
 pub struct RunSummaryListQuery {
     pub parent_id:     Option<RunId>,
     pub automation_id: Option<String>,
+    pub project:       Option<RunProjectFilter>,
+    pub workflow:      Option<String>,
+    /// Only runs that did something: not succeeded, changed files, or have
+    /// children.
+    pub activity:      bool,
+    pub roots_only:    bool,
     pub visibility:    RunSummaryVisibility,
     pub sort:          RunSummarySort,
     pub direction:     RunSummarySortDirection,
@@ -166,6 +185,10 @@ impl Default for RunSummaryListQuery {
         Self {
             parent_id:     None,
             automation_id: None,
+            project:       None,
+            workflow:      None,
+            activity:      false,
+            roots_only:    false,
             visibility:    RunSummaryVisibility::default(),
             sort:          RunSummarySort::default(),
             direction:     RunSummarySortDirection::default(),
@@ -173,6 +196,14 @@ impl Default for RunSummaryListQuery {
             offset:        0,
         }
     }
+}
+
+/// Project scope of a run listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunProjectFilter {
+    /// Runs no project owns.
+    Unassigned,
+    Project(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -274,7 +305,9 @@ ON CONFLICT(singleton) DO NOTHING
     }
 
     pub(crate) async fn begin(&self) -> Result<Transaction<'static, Sqlite>> {
-        Ok(self.pool.begin().await?)
+        // Admission resolves project ownership before inserting the run. Reserve the
+        // write lock before that read so snapshot promotion cannot bypass busy_timeout.
+        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
     }
 
     pub(crate) async fn contains(&self, run_id: &RunId) -> Result<bool> {
@@ -1297,7 +1330,15 @@ async fn write_insert_shaped_run(
     record: &PreparedRunSummary,
     sql: &'static str,
 ) -> Result<()> {
-    bind_run_columns(sqlx::query(sql).bind(record.run.id.to_string()), record)?
+    let run = &record.run;
+    let project_id: Option<String> = sqlx::query_scalar(RESOLVE_RUN_PROJECT_SQL)
+        .bind(run.labels.get(fabro_types::PROJECT_LABEL))
+        .bind(run.parent_id.map(|id| id.to_string()))
+        .bind(record.repository_name.as_deref())
+        .fetch_one(&mut *connection)
+        .await?;
+    bind_run_columns(sqlx::query(sql).bind(run.id.to_string()), record)?
+        .bind(project_id)
         .execute(connection)
         .await?;
     Ok(())
@@ -1388,6 +1429,32 @@ fn push_filters(builder: &mut QueryBuilder<Sqlite>, query: &RunSummaryListQuery)
         builder
             .push(" AND automation_id = ")
             .push_bind(automation_id.clone());
+    }
+    match &query.project {
+        None => {}
+        Some(RunProjectFilter::Unassigned) => {
+            builder.push(" AND project_id IS NULL");
+        }
+        Some(RunProjectFilter::Project(project_id)) => {
+            builder
+                .push(" AND project_id = ")
+                .push_bind(project_id.clone());
+        }
+    }
+    if let Some(workflow) = &query.workflow {
+        builder
+            .push(" AND workflow_slug = ")
+            .push_bind(workflow.clone());
+    }
+    if query.activity {
+        builder.push(format!(
+            " AND (status <> '{}' OR diff_files_changed > 0 OR EXISTS \
+             (SELECT 1 FROM runs AS activity_child WHERE activity_child.parent_id = runs.id))",
+            RunStatusKind::Succeeded
+        ));
+    }
+    if query.roots_only {
+        builder.push(" AND parent_id IS NULL");
     }
 
     match &query.visibility {
@@ -1507,6 +1574,12 @@ fn decode_run_row(row: &SqliteRow, now: DateTime<Utc>) -> Result<Run> {
         run_id: run.id.to_string(),
         field:  "children_count",
     })?;
+    let project_id: Option<String> = row.try_get("project_id")?;
+    let project_name: Option<String> = row.try_get("project_name")?;
+    run.project = project_id.map(|id| fabro_types::RunProjectRef {
+        name: project_name.unwrap_or_else(|| id.clone()),
+        id,
+    });
     overlay_live_wall_time(&mut run, now);
     Ok(run)
 }
@@ -1538,18 +1611,19 @@ mod tests {
 
     use chrono::{DateTime, Utc};
     use fabro_types::{
-        AutomationRef, BilledTokenCounts, BlockedReason, Conclusion, DiffSummary, EventEnvelope,
-        FailureReason, Graph, PendingReason, PullRequestCreationId, RunDiff, RunId, RunProjection,
-        RunSize, RunSpec, RunStatus, RunStatusKind, RunTiming, SessionId, StageId, StageOutcome,
-        SuccessReason, WorkflowSettings, test_support,
+        AutomationRef, BilledTokenCounts, BlockedReason, Conclusion, DiffSummary, DirtyStatus,
+        EventEnvelope, FailureReason, GitContext, Graph, PROJECT_LABEL, PendingReason,
+        PullRequestCreationId, Run, RunDiff, RunId, RunProjection, RunSize, RunSpec, RunStatus,
+        RunStatusKind, RunTiming, SessionId, StageId, StageOutcome, SuccessReason,
+        WorkflowSettings, test_support,
     };
     use strum::VariantArray as _;
     use tokio::time;
     use ulid::Ulid;
 
     use super::{
-        INSERT_EVENT_SQL, RunSummaryListQuery, RunSummarySort, RunSummarySortDirection,
-        RunSummaryStore, RunSummaryVisibility, decode_event_row,
+        INSERT_EVENT_SQL, RunProjectFilter, RunSummaryListQuery, RunSummarySort,
+        RunSummarySortDirection, RunSummaryStore, RunSummaryVisibility, decode_event_row,
     };
     use crate::run_state::ProjectedRun;
     use crate::{Error, EventPayload, RunProjectionReducer, test_support as store_test_support};
@@ -1593,6 +1667,200 @@ mod tests {
 
     async fn store() -> (tempfile::TempDir, RunSummaryStore) {
         store_test_support::sqlite_run_summary_store().await
+    }
+
+    async fn seed_project(store: &RunSummaryStore, id: &str, github_id: &str, repository: &str) {
+        let mut connection = store.acquire().await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, revision, name, github_repository_id, repository, \
+             repository_key, default_branch) VALUES (?, ?, ?, ?, ?, lower(?), 'main')",
+        )
+        .bind(id)
+        .bind("0".repeat(64))
+        .bind(format!("{id} name"))
+        .bind(github_id)
+        .bind(repository)
+        .bind(repository)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    }
+
+    fn origin(repository: &str) -> GitContext {
+        GitContext {
+            origin_url: format!("https://github.com/{repository}"),
+            branch:     "main".to_string(),
+            sha:        None,
+            dirty:      DirtyStatus::Clean,
+        }
+    }
+
+    fn project_of(runs: &[Run], title: &str) -> Option<String> {
+        runs.iter()
+            .find(|run| run.title == title)
+            .and_then(|run| run.project.as_ref())
+            .map(|project| project.id.clone())
+    }
+
+    #[tokio::test]
+    async fn first_write_tags_the_project_by_label_then_parent_then_repository() {
+        let (_directory, store) = store().await;
+        seed_project(&store, "tierrapay", "1", "artesanos-digitales/tierrapay").await;
+        seed_project(&store, "mafeva", "2", "artesanos-digitales/mafeva").await;
+        let at = dt("2026-09-26T12:00:00Z");
+        let ms = at.timestamp_millis().cast_unsigned();
+
+        let mut labeled = projection(run_id(ms, 1), "labeled", at);
+        labeled
+            .spec
+            .labels
+            .insert(PROJECT_LABEL.to_string(), "mafeva".to_string());
+        labeled.spec.git = Some(origin("artesanos-digitales/tierrapay"));
+        let mut parent = projection(run_id(ms, 2), "parent", at);
+        parent.spec.git = Some(origin("artesanos-digitales/mafeva"));
+        let mut child = projection(run_id(ms, 3), "child", at);
+        child.parent_id = Some(parent.spec.run_id);
+        child.spec.git = Some(origin("artesanos-digitales/tierrapay"));
+        let mut stray = projection(run_id(ms, 4), "stray", at);
+        stray.spec.git = Some(origin("hendrixmar/fabro-demo"));
+        for projected in [labeled, parent, child, stray] {
+            store.upsert_projection(&entry(projected, 1)).await.unwrap();
+        }
+
+        let runs = store.list_all(at).await.unwrap();
+        assert_eq!(project_of(&runs, "labeled").as_deref(), Some("mafeva"));
+        assert_eq!(project_of(&runs, "parent").as_deref(), Some("mafeva"));
+        assert_eq!(project_of(&runs, "child").as_deref(), Some("mafeva"));
+        assert_eq!(project_of(&runs, "stray"), None);
+        let parent = runs.iter().find(|run| run.title == "parent").unwrap();
+        assert_eq!(parent.project.as_ref().unwrap().name, "mafeva name");
+    }
+
+    #[tokio::test]
+    async fn later_writes_never_move_a_run_to_another_project() {
+        let (_directory, store) = store().await;
+        seed_project(&store, "tierrapay", "1", "artesanos-digitales/tierrapay").await;
+        seed_project(&store, "mafeva", "2", "artesanos-digitales/mafeva").await;
+        let at = dt("2026-09-26T12:00:00Z");
+        let id = run_id(at.timestamp_millis().cast_unsigned(), 9);
+
+        let mut first = projection(id, "moving", at);
+        first.spec.git = Some(origin("artesanos-digitales/tierrapay"));
+        store.upsert_projection(&entry(first, 1)).await.unwrap();
+        let mut later = projection(id, "moving", at);
+        later.spec.git = Some(origin("artesanos-digitales/mafeva"));
+        store.upsert_projection(&entry(later, 2)).await.unwrap();
+
+        let runs = store.list_all(at).await.unwrap();
+        assert_eq!(project_of(&runs, "moving").as_deref(), Some("tierrapay"));
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_project_workflow_activity_and_roots() {
+        let (_directory, store) = store().await;
+        seed_project(&store, "tierrapay", "1", "artesanos-digitales/tierrapay").await;
+        let at = dt("2026-09-26T12:00:00Z");
+        let ms = at.timestamp_millis().cast_unsigned();
+        let run = |n: u128, title: &str, repository: &str, workflow: &str, kind: RunStatusKind| {
+            let mut projected = projection(run_id(ms + u64::try_from(n).unwrap(), n), title, at);
+            projected.spec.git = Some(origin(repository));
+            projected.spec.workflow_slug = Some(workflow.to_string());
+            projected.status = sample_status(kind);
+            projected
+        };
+        let quiet = run(
+            1,
+            "quiet",
+            "artesanos-digitales/tierrapay",
+            "scan",
+            RunStatusKind::Succeeded,
+        );
+        let failed = run(
+            2,
+            "failed",
+            "artesanos-digitales/tierrapay",
+            "scan",
+            RunStatusKind::Failed,
+        );
+        let parent = run(
+            3,
+            "parent",
+            "artesanos-digitales/tierrapay",
+            "ticket",
+            RunStatusKind::Succeeded,
+        );
+        let mut child = run(
+            4,
+            "child",
+            "hendrixmar/fabro-demo",
+            "repair",
+            RunStatusKind::Succeeded,
+        );
+        child.parent_id = Some(parent.spec.run_id);
+        let stray = run(
+            5,
+            "stray",
+            "hendrixmar/fabro-demo",
+            "scan",
+            RunStatusKind::Running,
+        );
+        store.upsert_projection(&entry(quiet, 1)).await.unwrap();
+        store.upsert_projection(&entry(failed, 1)).await.unwrap();
+        store.upsert_projection(&entry(parent, 1)).await.unwrap();
+        store.upsert_projection(&entry(child, 1)).await.unwrap();
+        store.upsert_projection(&entry(stray, 1)).await.unwrap();
+
+        let titles = |query: RunSummaryListQuery| {
+            let store = &store;
+            async move {
+                let mut titles: Vec<String> = store
+                    .list(&query, at)
+                    .await
+                    .unwrap()
+                    .data
+                    .into_iter()
+                    .map(|run| run.title)
+                    .collect();
+                titles.sort();
+                titles
+            }
+        };
+        let tierrapay = Some(RunProjectFilter::Project("tierrapay".to_string()));
+        assert_eq!(
+            titles(RunSummaryListQuery {
+                project: tierrapay.clone(),
+                ..Default::default()
+            })
+            .await,
+            ["child", "failed", "parent", "quiet"],
+        );
+        assert_eq!(
+            titles(RunSummaryListQuery {
+                project: Some(RunProjectFilter::Unassigned),
+                ..Default::default()
+            })
+            .await,
+            ["stray"],
+        );
+        assert_eq!(
+            titles(RunSummaryListQuery {
+                project: tierrapay.clone(),
+                workflow: Some("scan".to_string()),
+                ..Default::default()
+            })
+            .await,
+            ["failed", "quiet"],
+        );
+        assert_eq!(
+            titles(RunSummaryListQuery {
+                project: tierrapay,
+                activity: true,
+                roots_only: true,
+                ..Default::default()
+            })
+            .await,
+            ["failed", "parent"],
+        );
     }
 
     fn sql_event_payload(

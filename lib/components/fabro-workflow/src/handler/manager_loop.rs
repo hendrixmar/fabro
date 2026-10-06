@@ -267,7 +267,7 @@ impl Handler for SubWorkflowHandler {
                     workflow_path: child_workflow_path,
                     workflow_bundle,
                 }),
-                model:         String::new(),
+                model:         None,
             };
             let executed = pipeline::execute(initialized).await;
             Ok::<_, Error>((executed.outcome?, executed.final_context))

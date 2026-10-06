@@ -4,6 +4,11 @@ export type RunFileSelection =
   | { kind: "scope"; scope: RunFileScope }
   | { kind: "commit"; fromSha: string; toSha: string };
 export type QueryKey = readonly unknown[];
+export type GithubRepositoriesQueryKey = readonly [
+  "projects",
+  "github-repositories",
+  string | null,
+];
 
 const RUN_FILE_SCOPES = ["committed", "uncommitted", "all"] as const;
 
@@ -11,6 +16,15 @@ export function runFileScopeSelection(
   scope: RunFileScope = "committed",
 ): RunFileSelection {
   return { kind: "scope", scope };
+}
+
+/** Ownership filter for the automation catalog. */
+export type AutomationScope = "all" | "global" | "project";
+
+export interface AutomationListFilters {
+  scope?: AutomationScope;
+  projectId?: string;
+  availableToProjects?: boolean;
 }
 
 function pathSegment(value: string): string {
@@ -91,10 +105,33 @@ export const queryKeys = {
     runs: (name: string) => ["workflows", "runs", name] as const,
   },
   automations: {
-    list: () => ["automations", "list"] as const,
+    list: (filters: AutomationListFilters = {}) =>
+      ["automations", "list", filters] as const,
     detail: (id: string) => ["automations", "detail", id] as const,
     runs: (id: string, opts: { limit?: number; offset?: number } = {}) =>
       ["automations", "runs", id, opts.limit ?? null, opts.offset ?? null] as const,
+    planeDispatches: (id: string) => ["automations", "plane-dispatches", id] as const,
+  },
+  projects: {
+    list: () => ["projects", "list"] as const,
+    detail: (id: string) => ["projects", "detail", id] as const,
+    repositories: (cursor: string | null = null): GithubRepositoriesQueryKey =>
+      ["projects", "github-repositories", cursor] as const,
+  },
+  intake: {
+    status: (projectId: string) => ["intake", "status", projectId] as const,
+    template: (projectId: string) => ["intake", "template", projectId] as const,
+    initiatives: (projectId: string) => ["intake", "initiatives", projectId] as const,
+    initiative: (projectId: string, issue: string) =>
+      ["intake", "initiative", projectId, issue] as const,
+    history: (projectId: string, issue: string) =>
+      ["intake", "history", projectId, issue] as const,
+    /** Advisor session state, namespaced per project like the session itself. */
+    chat: (projectId: string) => ["intake", "chat", projectId] as const,
+  },
+  plane: {
+    projects: () => ["plane", "projects"] as const,
+    metadata: (projectId: string) => ["plane", "metadata", projectId] as const,
   },
   insights: {
     queries: () => ["insights", "queries"] as const,

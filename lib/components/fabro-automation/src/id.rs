@@ -186,7 +186,8 @@ fn is_valid_automation_trigger_id(value: &str) -> bool {
     is_valid_id(value, true)
 }
 
-fn is_valid_id(value: &str, allow_underscore: bool) -> bool {
+/// Canonical slug grammar shared by automation and project ids.
+pub(crate) fn is_valid_id(value: &str, allow_underscore: bool) -> bool {
     let mut bytes = value.bytes();
     let Some(first) = bytes.next() else {
         return false;

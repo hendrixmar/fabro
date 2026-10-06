@@ -500,3 +500,58 @@ async fn parent_link_validation_rejects_missing_self_and_cycles() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn callers_cannot_set_the_project_label() {
+    let app = fabro_server::test_support::build_test_router(crate::helpers::test_app_state());
+    let mut manifest = minimal_manifest_json(MINIMAL_DOT);
+    manifest["args"] = serde_json::json!({ "label": ["fabro_project_id=tierrapay"] });
+    manifest["configs"] = serde_json::json!([]);
+    let request = Request::builder()
+        .method("POST")
+        .uri(api("/runs"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&manifest).unwrap()))
+        .unwrap();
+    let body = response_json(
+        app.clone().oneshot(request).await.unwrap(),
+        StatusCode::CONFLICT,
+        "POST /api/v1/runs with a project label",
+    )
+    .await;
+    assert_eq!(
+        body["errors"][0]["code"], "run_project_binding_invalid",
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn list_runs_accepts_project_workflow_and_activity_filters() {
+    let app = fabro_server::test_support::build_test_router(crate::helpers::test_app_state());
+    let created = create_run(&app, minimal_manifest_json(MINIMAL_DOT)).await;
+    assert!(
+        created["project"].is_null(),
+        "a /tmp run belongs to no project"
+    );
+    for (query, expected) in [
+        ("project_id=none", 1),
+        ("project_id=tierrapay", 0),
+        ("activity=true", 1),
+        ("roots_only=true", 1),
+        ("workflow=missing", 0),
+        ("automation_id=missing", 0),
+    ] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(api(&format!("/runs?{query}")))
+            .body(Body::empty())
+            .unwrap();
+        let list = response_json(
+            app.clone().oneshot(request).await.unwrap(),
+            StatusCode::OK,
+            format!("GET /api/v1/runs?{query}"),
+        )
+        .await;
+        assert_eq!(list["data"].as_array().unwrap().len(), expected, "{query}");
+    }
+}

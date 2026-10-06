@@ -152,6 +152,25 @@ pub fn is_llm_handler_type(handler_type: Option<&str>) -> bool {
     matches!(handler_type, Some("agent" | "prompt"))
 }
 
+/// Returns whether a node executes through Fabro's API-backed LLM backend.
+#[must_use]
+pub fn node_needs_api_backend(node: &Node) -> bool {
+    match node.handler_type() {
+        Some("prompt") => true,
+        Some("parallel.fan_in") => node
+            .prompt()
+            .is_some_and(|prompt| !prompt.trim().is_empty()),
+        Some("agent") => matches!(node.agent_backend(), None | Some(Ok(AgentBackend::Api))),
+        _ => false,
+    }
+}
+
+/// Returns whether a graph contains a node that requires the API-backed LLM.
+#[must_use]
+pub fn graph_needs_api_backend(graph: &Graph) -> bool {
+    graph.nodes.values().any(node_needs_api_backend)
+}
+
 pub const KNOWN_HANDLER_TYPES: &[&str] = &[
     "start",
     "exit",
@@ -452,6 +471,29 @@ impl Node {
     #[must_use]
     pub fn acp_config_attr(&self) -> Option<&str> {
         self.str_attr("acp.config")
+    }
+
+    #[must_use]
+    pub fn harness_attr(&self) -> Option<&str> {
+        self.str_attr("harness")
+    }
+
+    #[must_use]
+    pub fn reasoning_effort_attr(&self) -> Option<&str> {
+        self.str_attr("reasoning_effort")
+    }
+
+    /// Comma-separated `skills` attribute split into trimmed, non-empty names.
+    #[must_use]
+    pub fn skills_attr(&self) -> Option<Vec<String>> {
+        let raw = self.str_attr("skills")?;
+        let names: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        (!names.is_empty()).then_some(names)
     }
 
     #[must_use]
@@ -964,6 +1006,49 @@ mod tests {
         assert!(!is_llm_handler_type(Some("command")));
         assert!(!is_llm_handler_type(Some("human")));
         assert!(!is_llm_handler_type(None));
+    }
+
+    #[test]
+    fn graph_api_backend_classification_matches_node_backend_semantics() {
+        let api = Node::new("api");
+        assert!(node_needs_api_backend(&api));
+
+        let mut acp = Node::new("acp");
+        acp.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        assert!(!node_needs_api_backend(&acp));
+
+        let mut prompt = Node::new("prompt");
+        prompt
+            .attrs
+            .insert("type".to_string(), AttrValue::String("prompt".to_string()));
+        prompt
+            .attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        assert!(node_needs_api_backend(&prompt));
+
+        let mut graph = Graph::new("acp");
+        graph.nodes.insert(acp.id.clone(), acp);
+        assert!(!graph_needs_api_backend(&graph));
+
+        let mut join = Node::new("join");
+        join.attrs.insert(
+            "type".to_string(),
+            AttrValue::String("parallel.fan_in".to_string()),
+        );
+        join.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        join.attrs
+            .insert("prompt".to_string(), AttrValue::String("   ".to_string()));
+        graph.nodes.insert(join.id.clone(), join);
+        assert!(!graph_needs_api_backend(&graph));
+        graph.nodes.get_mut("join").unwrap().attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Summarize branch results".to_string()),
+        );
+        assert!(graph_needs_api_backend(&graph));
+        graph.nodes.insert(api.id.clone(), api);
+        assert!(graph_needs_api_backend(&graph));
     }
 
     #[test]

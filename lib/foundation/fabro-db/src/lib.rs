@@ -17,6 +17,14 @@ pub type DbPool = sqlx::SqlitePool;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 const SESSION_OWNER_INDEX_MIGRATION_VERSION: i64 = 2_026_083_101;
+const ENVIRONMENT_PROVIDER_KIND_MIGRATION_VERSION: i64 = 2_026_090_901;
+const CODEX_OAUTH_PROFILE_MIGRATION_VERSION: i64 = 2_026_100_401;
+
+/// Tags runs persisted before `runs.project_id` existed. sqlx applies it once
+/// as a migration; the SQL itself is idempotent (it only fills unassigned
+/// rows that resolve to a project).
+const RUN_PROJECT_BACKFILL_SQL: &str =
+    include_str!("../migrations/2026092603_backfill_run_projects.sql");
 
 /// The blob-table migration, exposed so fixtures in other crates can install
 /// the production blob schema without a filesystem path into this crate.
@@ -45,6 +53,27 @@ pub const RUN_SESSION_RECORDS_MIGRATION_SQL: &str =
 /// other crates can install the production compatibility schema.
 pub const RUN_HISTORY_ACTIVATION_MIGRATION_SQL: &str =
     include_str!("../migrations/2026082802_run_history_activation.sql");
+
+/// The automations migration, exposed so fixtures in other crates can
+/// install the `automations` table the projects migration alters.
+pub const AUTOMATIONS_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026071103_automations.sql");
+
+/// The native-projects migration, exposed so fixtures in other crates can
+/// resolve a run's owning project without a filesystem path into this crate.
+pub const PROJECTS_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026092101_projects_and_automation_scope.sql");
+
+/// The `runs.project_id` migration, exposed so fixtures in other crates can
+/// install the production schema without a filesystem path into this crate.
+pub const RUN_PROJECT_ID_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026092601_run_project_id.sql");
+
+/// The automation-source-link migration, exposed so fixtures in other crates
+/// can install the production schema without a filesystem path into this
+/// crate.
+pub const AUTOMATION_SOURCE_LINKS_MIGRATION_SQL: &str =
+    include_str!("../migrations/2026092602_automation_source_links.sql");
 
 #[derive(Clone)]
 pub struct Database {
@@ -86,10 +115,79 @@ impl Database {
         self.snapshot_before_new_migrations(&applied)
             .await
             .context("snapshotting SQLite database before migrations")?;
-        MIGRATOR
+        self.prepare_oauth_profile_upgrade(&applied).await?;
+        let migration_result = MIGRATOR
             .run(&self.pool)
             .await
-            .context("running SQLite migrations")
+            .context("running SQLite migrations");
+        // Restore on failure too. The durable staging table survives a process
+        // interruption between the legacy table rebuild and this restoration.
+        self.restore_oauth_profiles().await?;
+        migration_result
+    }
+
+    async fn prepare_oauth_profile_upgrade(&self, applied: &HashSet<i64>) -> anyhow::Result<()> {
+        if !applied.contains(&CODEX_OAUTH_PROFILE_MIGRATION_VERSION)
+            || applied.contains(&ENVIRONMENT_PROVIDER_KIND_MIGRATION_VERSION)
+        {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let has_profile: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'codex_oauth_profile')",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_profile {
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS _fabro_environment_profile_upgrade (id TEXT PRIMARY KEY, profile TEXT NOT NULL)",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT OR REPLACE INTO _fabro_environment_profile_upgrade SELECT id, codex_oauth_profile FROM environments WHERE codex_oauth_profile IS NOT NULL",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            // The unchanged upstream migration rebuilds its original 16
+            // columns using SELECT *. Existing migration checksums stay valid.
+            sqlx::query("ALTER TABLE environments DROP COLUMN codex_oauth_profile")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn restore_oauth_profiles(&self) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let staged: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_fabro_environment_profile_upgrade')",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if staged {
+            let has_profile: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'codex_oauth_profile')",
+            )
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !has_profile {
+                sqlx::query("ALTER TABLE environments ADD COLUMN codex_oauth_profile TEXT")
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            sqlx::query(
+                "UPDATE environments SET codex_oauth_profile = (SELECT profile FROM _fabro_environment_profile_upgrade WHERE id = environments.id) WHERE id IN (SELECT id FROM _fabro_environment_profile_upgrade)",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query("DROP TABLE _fabro_environment_profile_upgrade")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Refuse the unique owner index when old event history contains
@@ -227,6 +325,15 @@ FROM (
     pub fn clone_pool(&self) -> DbPool {
         self.pool.clone()
     }
+}
+
+/// Tag pre-existing runs with their project; returns how many were tagged.
+pub async fn backfill_run_projects(pool: &DbPool) -> anyhow::Result<u64> {
+    let result = sqlx::query(RUN_PROJECT_BACKFILL_SQL)
+        .execute(pool)
+        .await
+        .context("backfilling run projects")?;
+    Ok(result.rows_affected())
 }
 
 /// Parse an RFC 3339 timestamp column value into UTC.
@@ -572,6 +679,107 @@ mod tests {
             .await?;
         assert_eq!(value, "kept");
         snapshot.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_project_backfill_follows_rule_order_and_is_idempotent() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = Database::connect(root.path().join("fabro.sqlite3")).await?;
+        database.migrate().await?;
+        let pool = database.pool();
+        for (id, github_id, repository, binding) in [
+            (
+                "tierrapay",
+                "1",
+                "artesanos-digitales/tierrapay",
+                "tierrapay",
+            ),
+            ("mafeva", "2", "artesanos-digitales/mafeva", "mafeva-intake"),
+        ] {
+            sqlx::query(
+                "INSERT INTO projects (id, revision, name, github_repository_id, repository, \
+                 repository_key, default_branch, intake_binding_id) \
+                 VALUES (?, ?, ?, ?, ?, lower(?), 'main', ?)",
+            )
+            .bind(id)
+            .bind("0".repeat(64))
+            .bind(id)
+            .bind(github_id)
+            .bind(repository)
+            .bind(repository)
+            .bind(binding)
+            .execute(pool)
+            .await?;
+        }
+        // (id, parent, repository_name, labels)
+        let rows: [(&str, Option<&str>, Option<&str>, &str); 6] = [
+            (
+                "label",
+                None,
+                Some("hendrixmar/fabro-demo"),
+                r#"{"fabro_project_id":"mafeva"}"#,
+            ),
+            (
+                "legacy",
+                None,
+                Some("workspace"),
+                r#"{"project":"mafeva-intake"}"#,
+            ),
+            ("repo", None, Some("artesanos-digitales/tierrapay"), "{}"),
+            (
+                "child",
+                Some("legacy"),
+                Some("artesanos-digitales/tierrapay"),
+                "{}",
+            ),
+            ("grandchild", Some("child"), None, "{}"),
+            (
+                "stray",
+                None,
+                Some("hendrixmar/fabro-demo"),
+                r#"{"project":"unknown"}"#,
+            ),
+        ];
+        for (id, parent, repository, labels) in rows {
+            sqlx::query(
+                "INSERT INTO runs (id, source_last_seq, created_at_ms, last_event_at_ms, status, \
+                 parent_id, title, repository_name, summary_json) \
+                 VALUES (?, 1, 0, 0, 'succeeded', ?, ?, ?, json_object('labels', json(?)))",
+            )
+            .bind(id)
+            .bind(parent)
+            .bind(id)
+            .bind(repository)
+            .bind(labels)
+            .execute(pool)
+            .await?;
+        }
+
+        assert_eq!(backfill_run_projects(pool).await?, 5);
+        assert_eq!(
+            backfill_run_projects(pool).await?,
+            0,
+            "a second run changes nothing"
+        );
+
+        let tagged: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, project_id FROM runs ORDER BY id")
+                .fetch_all(pool)
+                .await?;
+        let tagged: Vec<(&str, Option<&str>)> = tagged
+            .iter()
+            .map(|(id, project)| (id.as_str(), project.as_deref()))
+            .collect();
+        assert_eq!(tagged, vec![
+            // The parent's project wins over the child's own repository.
+            ("child", Some("mafeva")),
+            ("grandchild", Some("mafeva")),
+            ("label", Some("mafeva")),
+            ("legacy", Some("mafeva")),
+            ("repo", Some("tierrapay")),
+            ("stray", None),
+        ]);
         Ok(())
     }
 }

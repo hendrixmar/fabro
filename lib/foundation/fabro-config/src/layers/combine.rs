@@ -18,8 +18,8 @@ use super::run::{
     RunPrepareLayer, ScmGitHubLayer, StringOrSplice,
 };
 use super::server::{
-    ObjectStoreLocalLayer, ObjectStoreS3Layer, ServerApiLayer, ServerAuthGithubLayer,
-    ServerListenLayer,
+    BugsinkProjectLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer, ServerApiLayer,
+    ServerAuthGithubLayer, ServerListenLayer,
 };
 
 /// Internal merge trait used by sparse config layers inside `fabro-config`.
@@ -89,13 +89,19 @@ impl Combine for Option<Vec<String>> {
     }
 }
 
+impl Combine for Option<BTreeMap<String, String>> {
+    fn combine(self, other: Self) -> Self {
+        self.or(other)
+    }
+}
+
 impl Combine for Option<Vec<ServerAuthMethod>> {
     fn combine(self, other: Self) -> Self {
         self.or(other)
     }
 }
 
-impl Combine for Option<BTreeMap<String, String>> {
+impl Combine for Option<Vec<BugsinkProjectLayer>> {
     fn combine(self, other: Self) -> Self {
         self.or(other)
     }
