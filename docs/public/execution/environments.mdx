@@ -189,6 +189,14 @@ the existing inode. Verify file-bound credential persistence when upgrading
 Codex; a writer that replaces the file instead needs a different mount design.
 Default environments remain unmounted unless this profile is configured.
 
+Profile file safety is checked when resolving the environment and again before
+creating each container. The native Docker provider retains its normal workspace,
+image-pull, and lifecycle policy while adding these two file binds.
+
+Upgrades preserve stored profile names through the provider-kind database
+migration, including a failed migration followed by a retry. Credential bytes
+remain in the private host files, never in migration metadata.
+
 <Warning>
 Before installing this clean cutover on an existing server, quiesce affected
 automation and remove `CODEX_AUTH_B64` from persisted environments through the

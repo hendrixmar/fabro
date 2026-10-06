@@ -25,6 +25,12 @@ When the same skill name appears in multiple directories, **later directories ov
 You can override the default directories by setting `skill_dirs` in the session configuration. When set, only the specified directories are searched.
 </Note>
 
+An explicit node `skills` selection replaces all discovery directories for that
+stage. Only the selected skills are materialized into an isolated directory;
+missing selections do not fall back to unrelated project or global skills.
+When a full-thread run changes its selection, the resumed native agent refreshes
+skill discovery while preserving the conversation and recorded model.
+
 ## Invocation
 
 Skills can be invoked in two ways.

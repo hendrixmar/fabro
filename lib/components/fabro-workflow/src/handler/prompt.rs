@@ -67,10 +67,16 @@ impl Handler for PromptHandler {
 
         // 1b. Discover project docs for system prompt when project_memory is enabled
         let system_prompt = if node.project_memory() {
+            let provider_id = services.run.provider_id.as_ref().ok_or_else(|| {
+                Error::Precondition("prompt handler requires an API provider".to_string())
+            })?;
+            let model = services.run.model.as_deref().ok_or_else(|| {
+                Error::Precondition("prompt handler requires an API model".to_string())
+            })?;
             let profile_kind = routing::resolve_node_provider_context(
                 services.run.catalog.as_ref(),
-                &services.run.provider_id,
-                &services.run.model,
+                provider_id,
+                model,
                 node,
             )?
             .profile_kind;
@@ -141,7 +147,7 @@ impl Handler for PromptHandler {
         let response_provider = node
             .provider()
             .map(String::from)
-            .or_else(|| Some(services.run.provider_id.to_string()))
+            .or_else(|| services.run.provider_id.as_ref().map(ToString::to_string))
             .unwrap_or_default();
 
         services.run.emitter.emit_scoped(

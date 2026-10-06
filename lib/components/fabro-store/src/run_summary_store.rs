@@ -1686,13 +1686,13 @@ mod tests {
         .unwrap();
     }
 
-    fn origin(repository: &str) -> Option<GitContext> {
-        Some(GitContext {
+    fn origin(repository: &str) -> GitContext {
+        GitContext {
             origin_url: format!("https://github.com/{repository}"),
             branch:     "main".to_string(),
             sha:        None,
             dirty:      DirtyStatus::Clean,
-        })
+        }
     }
 
     fn project_of(runs: &[Run], title: &str) -> Option<String> {
@@ -1715,14 +1715,14 @@ mod tests {
             .spec
             .labels
             .insert(PROJECT_LABEL.to_string(), "mafeva".to_string());
-        labeled.spec.git = origin("artesanos-digitales/tierrapay");
+        labeled.spec.git = Some(origin("artesanos-digitales/tierrapay"));
         let mut parent = projection(run_id(ms, 2), "parent", at);
-        parent.spec.git = origin("artesanos-digitales/mafeva");
+        parent.spec.git = Some(origin("artesanos-digitales/mafeva"));
         let mut child = projection(run_id(ms, 3), "child", at);
         child.parent_id = Some(parent.spec.run_id);
-        child.spec.git = origin("artesanos-digitales/tierrapay");
+        child.spec.git = Some(origin("artesanos-digitales/tierrapay"));
         let mut stray = projection(run_id(ms, 4), "stray", at);
-        stray.spec.git = origin("hendrixmar/fabro-demo");
+        stray.spec.git = Some(origin("hendrixmar/fabro-demo"));
         for projected in [labeled, parent, child, stray] {
             store.upsert_projection(&entry(projected, 1)).await.unwrap();
         }
@@ -1745,10 +1745,10 @@ mod tests {
         let id = run_id(at.timestamp_millis().cast_unsigned(), 9);
 
         let mut first = projection(id, "moving", at);
-        first.spec.git = origin("artesanos-digitales/tierrapay");
+        first.spec.git = Some(origin("artesanos-digitales/tierrapay"));
         store.upsert_projection(&entry(first, 1)).await.unwrap();
         let mut later = projection(id, "moving", at);
-        later.spec.git = origin("artesanos-digitales/mafeva");
+        later.spec.git = Some(origin("artesanos-digitales/mafeva"));
         store.upsert_projection(&entry(later, 2)).await.unwrap();
 
         let runs = store.list_all(at).await.unwrap();
@@ -1763,7 +1763,7 @@ mod tests {
         let ms = at.timestamp_millis().cast_unsigned();
         let run = |n: u128, title: &str, repository: &str, workflow: &str, kind: RunStatusKind| {
             let mut projected = projection(run_id(ms + u64::try_from(n).unwrap(), n), title, at);
-            projected.spec.git = origin(repository);
+            projected.spec.git = Some(origin(repository));
             projected.spec.workflow_slug = Some(workflow.to_string());
             projected.status = sample_status(kind);
             projected
@@ -1804,9 +1804,11 @@ mod tests {
             "scan",
             RunStatusKind::Running,
         );
-        for projected in [quiet, failed, parent, child, stray] {
-            store.upsert_projection(&entry(projected, 1)).await.unwrap();
-        }
+        store.upsert_projection(&entry(quiet, 1)).await.unwrap();
+        store.upsert_projection(&entry(failed, 1)).await.unwrap();
+        store.upsert_projection(&entry(parent, 1)).await.unwrap();
+        store.upsert_projection(&entry(child, 1)).await.unwrap();
+        store.upsert_projection(&entry(stray, 1)).await.unwrap();
 
         let titles = |query: RunSummaryListQuery| {
             let store = &store;

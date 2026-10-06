@@ -1,4 +1,4 @@
-use fabro_graphviz::graph::{self, Node};
+use fabro_graphviz::graph::Node;
 use fabro_llm::lithos_catalog::Catalog;
 use fabro_llm::{ModelSelectionError, catalog, selection};
 use fabro_types::{AgentBackend, AgentProfileKind};
@@ -25,17 +25,6 @@ pub(crate) fn select_one_shot_backend(node: &Node) -> Result<AgentBackend, Error
         Some(Err(_)) => Err(unsupported_backend_error(
             node.backend().unwrap_or_default(),
         )),
-    }
-}
-
-pub(crate) fn node_needs_api_backend(node: &Node) -> bool {
-    if !graph::is_llm_handler_type(node.handler_type()) {
-        return false;
-    }
-
-    match node.handler_type() {
-        Some("prompt") => true,
-        _ => matches!(select_run_backend(node), Ok(AgentBackend::Api)),
     }
 }
 

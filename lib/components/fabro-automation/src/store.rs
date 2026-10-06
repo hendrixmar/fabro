@@ -543,11 +543,12 @@ fn automations_from_rows(
         };
         replace.triggers.push(AutomationTrigger::Plane(trigger));
         let mut rebuilt =
-            Automation::from_stored(automation_id.clone(), automation.revision, replace)
-                .map_err(|source| AutomationStoreError::StoredValidation {
+            Automation::from_stored(automation_id.clone(), automation.revision, replace).map_err(
+                |source| AutomationStoreError::StoredValidation {
                     id: automation_id.clone(),
                     source,
-                })?;
+                },
+            )?;
         rebuilt.source_automation_id = automation.source_automation_id;
         by_id.insert(automation_id, rebuilt);
     }
@@ -649,7 +650,12 @@ pub(crate) async fn insert_automation_ignoring_conflict(
     .bind(workflow_source.and_then(|source| source.sha.as_deref()))
     .bind(automation.project_id.as_ref().map(ProjectId::as_str))
     .bind(automation.available_to_projects)
-    .bind(automation.source_automation_id.as_ref().map(AutomationId::as_str))
+    .bind(
+        automation
+            .source_automation_id
+            .as_ref()
+            .map(AutomationId::as_str),
+    )
     .execute(&mut **transaction)
     .await?;
     if result.rows_affected() == 0 {

@@ -318,10 +318,15 @@ impl PlaneClient {
 
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            let preview = if body_text.len() > 300 {
-                format!("{}...", &body_text[..300])
+            let mut preview_end = body_text.len().min(300);
+            while !body_text.is_char_boundary(preview_end) {
+                preview_end -= 1;
+            }
+            let preview = &body_text[..preview_end];
+            let preview = if preview_end < body_text.len() {
+                format!("{preview}...")
             } else {
-                body_text
+                preview.to_owned()
             };
             bail!(
                 "Plane API request failed (HTTP {}): {preview}",
@@ -1029,6 +1034,28 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Plane returned HTML response instead of JSON"));
     }
+    #[tokio::test]
+    async fn failed_response_preview_truncates_at_utf8_boundaries() {
+        let server = MockServer::start_async().await;
+        let client = test_client(&server.url(""));
+        let body = format!("{}éafter", "a".repeat(299));
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/test-workspace/projects/");
+            then.status(500)
+                .header("Content-Type", "application/json")
+                .body(body);
+        });
+
+        let error = client
+            .request(Method::GET, "projects/", None)
+            .await
+            .expect_err("a provider failure should remain a recoverable error");
+        let detail = format!("{error:#}");
+        assert!(detail.contains(&format!("HTTP 500): {}...", "a".repeat(299))));
+        assert!(!detail.contains("after"));
+    }
+
     #[tokio::test]
     async fn paged_request_follows_cursor() {
         let server = MockServer::start_async().await;

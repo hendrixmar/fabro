@@ -529,7 +529,10 @@ async fn callers_cannot_set_the_project_label() {
 async fn list_runs_accepts_project_workflow_and_activity_filters() {
     let app = fabro_server::test_support::build_test_router(crate::helpers::test_app_state());
     let created = create_run(&app, minimal_manifest_json(MINIMAL_DOT)).await;
-    assert!(created["project"].is_null(), "a /tmp run belongs to no project");
+    assert!(
+        created["project"].is_null(),
+        "a /tmp run belongs to no project"
+    );
     for (query, expected) in [
         ("project_id=none", 1),
         ("project_id=tierrapay", 0),

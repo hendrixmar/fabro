@@ -28,14 +28,12 @@ pub fn apply_stylesheet(stylesheet: &Stylesheet, graph: &mut Graph) {
         let mut applied: std::collections::HashMap<String, (String, u8)> =
             std::collections::HashMap::new();
 
+        let node = graph
+            .nodes
+            .get_mut(node_id.as_str())
+            .expect("node_id was collected from graph.nodes.keys() on the line above, so it must still exist");
         for rule in &sorted_rules {
-            let node = &graph.nodes[node_id.as_str()];
-            let matches = match &rule.selector {
-                Selector::Universal => true,
-                Selector::Shape(shape) => node.shape() == shape,
-                Selector::Class(cls) => node.classes.contains(cls),
-                Selector::Id(id) => node_id == id,
-            };
+            let matches = rule.selector.matches_node(node_id, node);
 
             if matches {
                 for decl in &rule.declarations {
@@ -52,10 +50,6 @@ pub fn apply_stylesheet(stylesheet: &Stylesheet, graph: &mut Graph) {
             }
         }
 
-        let node = graph
-            .nodes
-            .get_mut(node_id.as_str())
-            .expect("node_id was collected from graph.nodes.keys() on the line above, so it must still exist");
         for (prop, (val, _)) in &applied {
             if !node.attrs.contains_key(prop) {
                 node.attrs

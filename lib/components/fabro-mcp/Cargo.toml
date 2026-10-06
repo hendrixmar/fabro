@@ -12,12 +12,17 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 fabro-config = { path = "../../foundation/fabro-config" }
 fabro-http.workspace = true
 fabro-types = { path = "../../foundation/fabro-types" }
 fabro-sandbox = { path = "../fabro-sandbox", default-features = false }
+sandbox-driver.workspace = true
+pebble-coding-agent.workspace = true
 fabro-util = { path = "../../foundation/fabro-util" }
 tokio-util.workspace = true
 uuid.workspace = true
@@ -27,7 +32,6 @@ tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-sse-stream.workspace = true
 rmcp = { workspace = true, features = [
     "client",
     "macros",
@@ -38,6 +42,8 @@ rmcp = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+fabro-llm = { path = "../fabro-llm", features = ["test-support"] }
+fabro-mcp = { path = ".", features = ["test-support"] }
 axum.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tokio-stream.workspace = true

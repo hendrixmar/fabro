@@ -9,11 +9,18 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
-use fabro_mcp::client::McpClient;
+use fabro_llm::test_support::{ScriptedAdapter, client_with_adapter, text_response};
+use fabro_llm::types::{ContentPart, FinishReason, ToolCall};
 use fabro_mcp::config::{McpHttpProtocol, McpServerSettings, McpTransport};
-use fabro_mcp::connection_manager::{McpConnectionManager, call_result_to_string};
 use fabro_mcp::http_transport::sandbox_mcp_http_url;
+use fabro_mcp::pebble::pebble_server;
+use fabro_mcp::test_support::McpStdioTestClient;
 use futures::{StreamExt as _, stream};
+use pebble_coding_agent::environment::LocalEnvironment;
+use pebble_coding_agent::mcp::qualified_tool_name;
+use pebble_coding_agent::state::Message;
+use pebble_coding_agent::{CodingAgent, ShutdownReason};
+use rmcp::model::CallToolResult;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
@@ -34,10 +41,73 @@ fn test_server_config() -> McpServerSettings {
     }
 }
 
+fn result_text(result: &CallToolResult) -> &str {
+    &result
+        .content
+        .first()
+        .expect("MCP fixture returns content")
+        .as_text()
+        .expect("MCP fixture returns text")
+        .text
+}
+
+async fn native_agent(config: &McpServerSettings, message: Option<&str>) -> CodingAgent {
+    let done = text_response("anthropic", "claude-opus-4-6", "done");
+    let mut first = done.clone();
+    if let Some(message) = message {
+        first.content = vec![ContentPart::ToolCall(ToolCall::function(
+            "echo-call",
+            qualified_tool_name(&config.name, "echo"),
+            serde_json::json!({"message": message}),
+        ))];
+        first.finish_reason = FinishReason::ToolCall;
+    }
+    let client = client_with_adapter(
+        "anthropic",
+        Arc::new(ScriptedAdapter::new(vec![first, done])),
+    );
+    CodingAgent::builder(
+        client,
+        Arc::new(LocalEnvironment::new(std::env::temp_dir())),
+    )
+    .model("anthropic/claude-opus-4-6")
+    .permission_level(fabro_types::PermissionLevel::Full)
+    .mcp_servers([pebble_server(config)])
+    .build()
+    .await
+    .expect("build native MCP fixture agent")
+}
+
+fn tool_result_text(agent: &CodingAgent) -> String {
+    agent
+        .history()
+        .turns()
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResults { results, .. } => Some(
+                results
+                    .iter()
+                    .map(|result| {
+                        result
+                            .content
+                            .iter()
+                            .filter_map(|part| match part {
+                                ContentPart::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>()
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn stdio_client_initialize_and_list_tools() {
     let config = test_server_config();
-    let client = McpClient::new(&config).unwrap();
+    let client = McpStdioTestClient::new(&config).unwrap();
     client.initialize(config.startup_timeout()).await.unwrap();
 
     let tools = client.list_tools().await.unwrap();
@@ -80,7 +150,7 @@ async fn stdio_client_uses_configured_cwd_and_exact_env() {
         startup_timeout_secs: 10,
         tool_timeout_secs:    30,
     };
-    let client = McpClient::new(&config).unwrap();
+    let client = McpStdioTestClient::new(&config).unwrap();
     client.initialize(config.startup_timeout()).await.unwrap();
 
     let cwd = client
@@ -91,10 +161,7 @@ async fn stdio_client_uses_configured_cwd_and_exact_env() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        call_result_to_string(&cwd).unwrap(),
-        canonical_temp_dir.display().to_string()
-    );
+    assert_eq!(result_text(&cwd), canonical_temp_dir.display().to_string());
     let sentinel = client
         .call_tool(
             "echo",
@@ -103,7 +170,7 @@ async fn stdio_client_uses_configured_cwd_and_exact_env() {
         )
         .await
         .unwrap();
-    assert_eq!(call_result_to_string(&sentinel).unwrap(), "fixture");
+    assert_eq!(result_text(&sentinel), "fixture");
     let home = client
         .call_tool(
             "echo",
@@ -112,7 +179,7 @@ async fn stdio_client_uses_configured_cwd_and_exact_env() {
         )
         .await
         .unwrap();
-    assert_eq!(call_result_to_string(&home).unwrap(), "");
+    assert_eq!(result_text(&home), "");
 
     client.shutdown().await.unwrap();
     std::fs::remove_dir(&temp_dir).unwrap();
@@ -121,7 +188,7 @@ async fn stdio_client_uses_configured_cwd_and_exact_env() {
 #[tokio::test]
 async fn stdio_client_call_tool_echo() {
     let config = test_server_config();
-    let client = McpClient::new(&config).unwrap();
+    let client = McpStdioTestClient::new(&config).unwrap();
     client.initialize(config.startup_timeout()).await.unwrap();
 
     let result = client
@@ -133,62 +200,37 @@ async fn stdio_client_call_tool_echo() {
         .await
         .unwrap();
 
-    let text = call_result_to_string(&result).unwrap();
+    let text = result_text(&result);
     assert_eq!(text, "hello from rust");
 }
 
 #[tokio::test]
-async fn connection_manager_stdio_roundtrip() {
-    let config = test_server_config();
-    let mut mgr = McpConnectionManager::new();
-    let results = mgr.start_servers(&[config]).await;
-
-    assert_eq!(results.len(), 1);
-    let (name, tool_count) = &results[0];
-    assert_eq!(name, "test-echo");
-    assert_eq!(*tool_count.as_ref().unwrap(), 1);
-
-    let tools = mgr.all_tools();
-    assert!(tools.contains_key("mcp__test_echo__echo"));
-
-    let result = mgr
-        .call_tool(
-            "mcp__test_echo__echo",
-            serde_json::json!({"message": "roundtrip"}),
-        )
-        .await
-        .unwrap();
-
-    let text = call_result_to_string(&result).unwrap();
-    assert_eq!(text, "roundtrip");
+async fn native_pebble_stdio_roundtrip() {
+    let mut agent = native_agent(&test_server_config(), Some("roundtrip")).await;
+    assert!(
+        agent
+            .snapshot()
+            .tools()
+            .iter()
+            .any(|tool| tool.name == "mcp__test_echo__echo")
+    );
+    assert!(agent.prompt("echo").await.result.is_ok());
+    assert_eq!(tool_result_text(&agent), "roundtrip");
+    agent.shutdown(ShutdownReason::Completed).await.unwrap();
 }
 
 #[tokio::test]
-async fn connection_manager_call_tool_uses_configured_tool_timeout() {
+async fn native_pebble_mcp_tool_timeout() {
     let mut config = test_server_config();
     config.tool_timeout_secs = 1;
-
-    let mut mgr = McpConnectionManager::new();
-    let results = mgr.start_servers(&[config]).await;
-    assert_eq!(results.len(), 1);
-    assert!(
-        results[0].1.is_ok(),
-        "server should start: {:?}",
-        results[0]
-    );
-
-    let err = mgr
-        .call_tool(
-            "mcp__test_echo__echo",
-            serde_json::json!({"message": "__sleep_ms:1500__"}),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("timed out calling tool 'echo' on MCP server 'test-echo'"),
-        "unexpected error: {err}"
-    );
+    let mut agent = native_agent(&config, Some("__sleep_ms:1500__")).await;
+    let report = agent.prompt("echo").await;
+    assert!(report.result.is_ok());
+    assert!(agent.history().turns().iter().any(|message| {
+        matches!(message, Message::ToolResults { results, .. }
+            if results.iter().any(|result| result.tool_call_id == "echo-call" && result.is_error))
+    }));
+    agent.shutdown(ShutdownReason::Completed).await.unwrap();
 }
 
 #[tokio::test]
@@ -293,21 +335,11 @@ async fn sse_client_initialize_and_call_tool() {
         startup_timeout_secs: 10,
         tool_timeout_secs:    30,
     };
-    let client = McpClient::new(&config).unwrap();
-    client.initialize(config.startup_timeout()).await.unwrap();
-
-    let tools = client.list_tools().await.unwrap();
-    assert_eq!(tools[0].0, "echo");
-
-    let result = client
-        .call_tool(
-            "echo",
-            serde_json::json!({"message": "hello"}),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-    assert_eq!(call_result_to_string(&result).unwrap(), "hello from sse");
+    let mut agent = native_agent(&config, Some("hello")).await;
+    assert!(agent.snapshot().mcp_servers()[0].error.is_none());
+    assert!(agent.prompt("echo").await.result.is_ok());
+    assert_eq!(tool_result_text(&agent), "hello from sse");
+    agent.shutdown(ShutdownReason::Completed).await.unwrap();
 }
 
 #[tokio::test]
@@ -390,12 +422,12 @@ async fn sse_client_rejects_oversized_messages() {
         startup_timeout_secs: 2,
         tool_timeout_secs:    30,
     };
-    let client = McpClient::new(&config).unwrap();
-    let error = client
-        .initialize(config.startup_timeout())
-        .await
-        .expect_err("oversized SSE message should fail initialization");
-    let error = error.to_string();
+    let mut agent = native_agent(&config, None).await;
+    let error = agent.snapshot().mcp_servers()[0]
+        .error
+        .clone()
+        .expect("oversized SSE message must fail startup");
+    agent.shutdown(ShutdownReason::Completed).await.unwrap();
 
     assert!(
         error.contains("connection closed"),
@@ -477,11 +509,12 @@ async fn sse_client_rejects_cross_origin_endpoint() {
         startup_timeout_secs: 2,
         tool_timeout_secs:    30,
     };
-    let client = McpClient::new(&config).unwrap();
-    client
-        .initialize(config.startup_timeout())
-        .await
-        .expect_err("cross-origin SSE endpoint should fail initialization");
+    let mut agent = native_agent(&config, None).await;
+    assert!(
+        agent.snapshot().mcp_servers()[0].error.is_some(),
+        "cross-origin SSE endpoint must fail startup"
+    );
+    agent.shutdown(ShutdownReason::Completed).await.unwrap();
 
     assert_eq!(
         evil_state.hits.load(Ordering::SeqCst),

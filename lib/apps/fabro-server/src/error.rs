@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -75,6 +77,7 @@ pub struct ApiError {
     status: StatusCode,
     detail: String,
     code:   Option<String>,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 impl ApiError {
@@ -83,6 +86,7 @@ impl ApiError {
             status,
             detail: detail.into(),
             code: None,
+            source: None,
         }
     }
 
@@ -95,6 +99,20 @@ impl ApiError {
             status,
             detail: detail.into(),
             code: Some(code.into()),
+            source: None,
+        }
+    }
+
+    pub fn with_source(
+        status: StatusCode,
+        detail: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            status,
+            detail: detail.into(),
+            code: None,
+            source: Some(Arc::new(source)),
         }
     }
 
@@ -152,6 +170,19 @@ impl ApiError {
         }
     }
 }
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ApiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 impl From<Error> for ApiError {
     fn from(err: Error) -> Self {
@@ -163,12 +194,20 @@ impl From<Error> for ApiError {
             Error::Conflict(msg) => Self::new(StatusCode::CONFLICT, msg),
             Error::ServiceUnavailable(msg) => Self::new(StatusCode::SERVICE_UNAVAILABLE, msg),
             Error::BadGateway(msg) => Self::new(StatusCode::BAD_GATEWAY, msg),
-            Error::Workflow(err) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            Error::Agent(err) => Self::new(StatusCode::BAD_GATEWAY, err.to_string()),
+            Error::Workflow(err) => {
+                Self::with_source(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), err)
+            }
+            Error::Agent(err) => Self::with_source(StatusCode::BAD_GATEWAY, err.to_string(), err),
             Error::Llm(err) => Self::from(err),
-            Error::Store(err) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            Error::Config(err) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            Error::Vault(err) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            Error::Store(err) => {
+                Self::with_source(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), err)
+            }
+            Error::Config(err) => {
+                Self::with_source(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), err)
+            }
+            Error::Vault(err) => {
+                Self::with_source(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), err)
+            }
             Error::Internal(msg) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, msg),
         }
     }
@@ -181,9 +220,9 @@ impl From<fabro_llm::Error> for ApiError {
     fn from(err: fabro_llm::Error) -> Self {
         match err.kind() {
             fabro_llm::ErrorKind::InvalidRequest | fabro_llm::ErrorKind::ModelSelection => {
-                Self::bad_request(err.message().to_string())
+                Self::with_source(StatusCode::BAD_REQUEST, err.message().to_string(), err)
             }
-            _ => Self::new(StatusCode::BAD_GATEWAY, format!("LLM error: {err}")),
+            _ => Self::with_source(StatusCode::BAD_GATEWAY, format!("LLM error: {err}"), err),
         }
     }
 }
@@ -241,6 +280,22 @@ mod tests {
                     "code": "access_token_expired"
                 }]
             })
+        );
+    }
+    #[test]
+    fn api_error_keeps_a_typed_source_without_exposing_it_as_detail() {
+        let error = ApiError::with_source(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "environment store operation failed",
+            std::io::Error::other("private filesystem detail"),
+        );
+
+        assert_eq!(error.detail(), "environment store operation failed");
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("source should be retained")
+                .to_string(),
+            "private filesystem detail"
         );
     }
 

@@ -4,6 +4,11 @@ export type RunFileSelection =
   | { kind: "scope"; scope: RunFileScope }
   | { kind: "commit"; fromSha: string; toSha: string };
 export type QueryKey = readonly unknown[];
+export type GithubRepositoriesQueryKey = readonly [
+  "projects",
+  "github-repositories",
+  string | null,
+];
 
 const RUN_FILE_SCOPES = ["committed", "uncommitted", "all"] as const;
 
@@ -110,7 +115,7 @@ export const queryKeys = {
   projects: {
     list: () => ["projects", "list"] as const,
     detail: (id: string) => ["projects", "detail", id] as const,
-    repositories: (cursor: string | null = null) =>
+    repositories: (cursor: string | null = null): GithubRepositoriesQueryKey =>
       ["projects", "github-repositories", cursor] as const,
   },
   intake: {

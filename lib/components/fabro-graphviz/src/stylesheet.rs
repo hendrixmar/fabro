@@ -1,4 +1,5 @@
-use crate::error::Error;
+use crate::Error;
+use crate::graph::Node;
 
 /// A parsed stylesheet selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,17 @@ impl Selector {
             Self::Shape(_) => 1,
             Self::Class(_) => 2,
             Self::Id(_) => 3,
+        }
+    }
+
+    /// Returns whether this selector matches the given graph node.
+    #[must_use]
+    pub fn matches_node(&self, node_id: &str, node: &Node) -> bool {
+        match self {
+            Self::Universal => true,
+            Self::Shape(shape) => node.shape() == shape,
+            Self::Class(class) => node.classes.contains(class),
+            Self::Id(id) => node_id == id,
         }
     }
 }

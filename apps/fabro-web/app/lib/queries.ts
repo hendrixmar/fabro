@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 import useSWR, { type SWRConfiguration } from "swr";
+import useSWRInfinite from "swr/infinite";
 import type {
   ApiQuestion,
   AuthConfigResponse,
@@ -86,6 +87,7 @@ import {
   queryKeys,
   runFileScopeSelection,
   type AutomationListFilters,
+  type GithubRepositoriesQueryKey,
   type RunFileSelection,
   type RunGraphDirection,
 } from "./query-keys";
@@ -471,15 +473,18 @@ export function useProject(id: string | undefined) {
   );
 }
 
-/** One page of repositories visible to the server's GitHub credentials. */
-export function useGithubRepositories(
-  cursor: string | null = null,
-  enabled = true,
-) {
-  return useSWR<GithubRepositoryListResponse>(
-    enabled ? queryKeys.projects.repositories(cursor) : null,
-    () => apiData(() => projectsApi.listGithubRepositories(cursor ?? undefined)),
-    immutableOptions,
+/** Cursor-paged repositories visible to the server's GitHub credentials. */
+export function useGithubRepositories() {
+  return useSWRInfinite<GithubRepositoryListResponse>(
+    (index, previous: GithubRepositoryListResponse | null) => {
+      if (index > 0 && !previous?.next_cursor) return null;
+      return queryKeys.projects.repositories(
+        index === 0 ? null : previous?.next_cursor ?? null,
+      );
+    },
+    ([, , cursor]: GithubRepositoriesQueryKey) =>
+      apiData(() => projectsApi.listGithubRepositories(cursor ?? undefined)),
+    { ...immutableOptions, revalidateFirstPage: false },
   );
 }
 

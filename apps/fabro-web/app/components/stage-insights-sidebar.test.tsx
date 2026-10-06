@@ -210,7 +210,7 @@ describe("StageInsightsSidebar", () => {
       name,
       description: `${name} tool`,
       source:      { kind: "native" as const },
-      category:    name === "bash" ? AgentToolCategory.SHELL : AgentToolCategory.OTHER,
+      category:    name === "bash" ? ToolCategory.SHELL : ToolCategory.OTHER,
       invoked:     index < 4,
     }));
 

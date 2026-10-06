@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail, ensure};
-use fabro_sandbox::Sandbox;
+use fabro_sandbox::RunSandbox;
 use fabro_util::shell;
+use sandbox_driver::Termination;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{McpServerSettings, McpTransport};
@@ -27,7 +28,7 @@ impl ManagedMcpServers {
     /// credentials across the sandbox boundary. Startup failure is fatal.
     pub async fn start(
         servers: &[McpServerSettings],
-        sandbox: Arc<dyn Sandbox>,
+        sandbox: Arc<RunSandbox>,
         cancel_token: &CancellationToken,
         client_in_sandbox: bool,
     ) -> Result<Self> {
@@ -53,12 +54,14 @@ impl ManagedMcpServers {
             // dropped. Never abandon a remote detached launch on cancellation.
             managed.workers.push(tokio::spawn(async move {
                 let directory = format!("/tmp/fabro-mcp-{}", uuid::Uuid::new_v4());
+                let mut forwarded_port = None;
                 let result = start_one(
                     &config,
                     sandbox.as_ref(),
                     &directory,
                     &stop,
                     client_in_sandbox,
+                    &mut forwarded_port,
                 )
                 .await;
                 let started = result.is_ok();
@@ -66,6 +69,12 @@ impl ManagedMcpServers {
                     stop.cancelled().await;
                 }
                 cleanup(sandbox.as_ref(), &directory).await;
+                if let Some(port) = forwarded_port {
+                    if let Some(routes) = sandbox.port_routes() {
+                        let _ =
+                            timeout(Duration::from_secs(5), routes.release_preview_url(port)).await;
+                    }
+                }
             }));
             match receive.await {
                 Ok(Ok(resolved)) => managed.servers.push(resolved),
@@ -108,10 +117,11 @@ impl Drop for ManagedMcpServers {
 
 async fn start_one(
     config: &McpServerSettings,
-    sandbox: &dyn Sandbox,
+    sandbox: &RunSandbox,
     directory: &str,
     stop: &CancellationToken,
     client_in_sandbox: bool,
+    forwarded_port: &mut Option<u16>,
 ) -> Result<McpServerSettings> {
     let McpTransport::Sandbox {
         protocol,
@@ -142,17 +152,10 @@ async fn start_one(
         .transpose()?;
     // Explicit MCP credentials belong to the trusted process-launch seam.
     // Tool exec intentionally filters secret-shaped environment keys.
-    let launch_cancel = stop.child_token();
-    let cancel_launch_on_drop = launch_cancel.clone().drop_guard();
     let command = format!("\"$BASH\" -c {}", shell::shell_quote(&launch));
     let launched = timeout_at(
         deadline,
-        sandbox.spawn_stdio_process(
-            &command,
-            working_dir,
-            Some(&env),
-            Some(launch_cancel.clone()),
-        ),
+        sandbox.spawn_stdio_process(&command, working_dir, Some(&env)),
     )
     .await
     .map_err(|_| anyhow!("MCP server '{}' startup timed out", config.name))?
@@ -161,17 +164,15 @@ async fn start_one(
         () = stop.cancelled() => Err(anyhow!("MCP startup cancelled")),
         result = timeout_at(deadline, launched.handle.wait()) => {
             result.map_err(|_| anyhow!("MCP server '{}' startup timed out", config.name))
-                .and_then(|result| result.map_err(|_| anyhow!("MCP server '{}' launch failed", config.name)))
         }
     };
     if completion.is_err() {
-        let _ = tokio::time::timeout(Duration::from_secs(5), launched.handle.terminate()).await;
+        let _ = timeout(Duration::from_secs(5), launched.handle.terminate()).await;
     }
-    drop(cancel_launch_on_drop);
     let completion = completion?;
     ensure!(!stop.is_cancelled(), "MCP startup cancelled");
     ensure!(
-        completion.exit_code == Some(0),
+        completion == (Termination::Exited, Some(0)),
         "MCP server '{}' launch failed",
         config.name
     );
@@ -191,13 +192,16 @@ async fn start_one(
             }
         };
         ensure!(
-            !ready.is_timed_out(),
+            ready.termination != Termination::TimedOut,
             "MCP server '{}' startup timed out",
             config.name
         );
         match ready.exit_code {
             Some(0) => {
-                let actual_port = ready.stdout.trim().parse::<u16>().map_err(|_| {
+                let output = std::str::from_utf8(&ready.stdout).map_err(|_| {
+                    anyhow!("MCP server '{}' reported an invalid port", config.name)
+                })?;
+                let actual_port = output.trim().parse::<u16>().map_err(|_| {
                     anyhow!("MCP server '{}' reported an invalid port", config.name)
                 })?;
                 ensure!(
@@ -215,12 +219,13 @@ async fn start_one(
         }
         tokio::select! {
             () = stop.cancelled() => bail!("MCP startup cancelled"),
-            _ = tokio::time::sleep_until((Instant::now() + Duration::from_millis(100)).min(deadline)) => {}
+            () = sleep_until((Instant::now() + Duration::from_millis(100)).min(deadline)) => {}
         }
     };
     let (base_url, mut headers) = if client_in_sandbox {
         (format!("http://127.0.0.1:{port}"), HashMap::new())
     } else {
+        *forwarded_port = Some(port);
         tokio::select! {
             () = stop.cancelled() => bail!("MCP startup cancelled"),
             result = timeout_at(deadline, sandbox.get_preview_url(port)) => {
@@ -332,7 +337,7 @@ exit 1
     )
 }
 
-async fn cleanup(sandbox: &dyn Sandbox, directory: &str) {
+async fn cleanup(sandbox: &RunSandbox, directory: &str) {
     let script = format!(
         r#"
 dir={}
@@ -360,14 +365,17 @@ rm -rf -- "$dir"
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use fabro_sandbox::LocalSandbox;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::sleep;
 
     use super::*;
+    use crate::config::McpHttpProtocol;
     #[tokio::test]
     async fn late_launch_cannot_start_after_cleanup() {
-        let sandbox = fabro_sandbox::LocalSandbox::new(std::env::temp_dir());
+        let sandbox = fabro_sandbox::local_sandbox(std::env::temp_dir())
+            .await
+            .unwrap();
         let directory = format!("/tmp/fabro-mcp-{}", uuid::Uuid::new_v4());
         let launch = launch_script(&["sleep".into(), "30".into()], &directory);
         // The remote launch request is delayed until after its owner times out
@@ -398,16 +406,20 @@ mod tests {
         );
     }
 
-    fn sandbox() -> Arc<dyn Sandbox> {
-        Arc::new(LocalSandbox::new(std::env::temp_dir()))
+    async fn sandbox() -> Arc<RunSandbox> {
+        Arc::new(
+            fabro_sandbox::local_sandbox(std::env::temp_dir())
+                .await
+                .expect("create local MCP fixture sandbox"),
+        )
     }
 
     async fn available_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
             .await
-            .unwrap()
+            .expect("bind ephemeral MCP fixture port")
             .local_addr()
-            .unwrap()
+            .expect("read ephemeral MCP fixture address")
             .port()
     }
 
@@ -415,7 +427,7 @@ mod tests {
         McpServerSettings {
             name:                 "debugger".into(),
             transport:            McpTransport::Sandbox {
-                protocol: crate::config::McpHttpProtocol::StreamableHttp,
+                protocol: McpHttpProtocol::StreamableHttp,
                 command: vec![
                     "python3".into(),
                     "-m".into(),
@@ -435,18 +447,18 @@ mod tests {
     }
 
     async fn wait_closed(port: u16) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        timeout(Duration::from_secs(10), async {
             while TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("owned MCP server closes within cleanup deadline");
     }
 
     #[tokio::test]
     async fn simultaneous_ephemeral_servers_in_one_sandbox_are_isolated() {
-        let sandbox = sandbox();
+        let sandbox = sandbox().await;
         let mut config = server(0);
         if let McpTransport::Sandbox { command, env, .. } = &mut config.transport {
             env.insert("FABRO_MCP_PORT".into(), "1".into());
@@ -490,9 +502,13 @@ mod tests {
     async fn occupied_port_is_not_readiness_and_is_not_killed() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let result =
-            ManagedMcpServers::start(&[server(port)], sandbox(), &CancellationToken::new(), true)
-                .await;
+        let result = ManagedMcpServers::start(
+            &[server(port)],
+            sandbox().await,
+            &CancellationToken::new(),
+            true,
+        )
+        .await;
         assert!(result.is_err());
         assert!(TcpStream::connect(("127.0.0.1", port)).await.is_ok());
     }
@@ -501,13 +517,14 @@ mod tests {
     async fn cancellation_and_drop_only_stop_owned_servers() {
         let first_port = available_port().await;
         let token = CancellationToken::new();
-        let mut first = ManagedMcpServers::start(&[server(first_port)], sandbox(), &token, true)
-            .await
-            .unwrap();
+        let mut first =
+            ManagedMcpServers::start(&[server(first_port)], sandbox().await, &token, true)
+                .await
+                .unwrap();
         let second_port = available_port().await;
         let second = ManagedMcpServers::start(
             &[server(second_port)],
-            sandbox(),
+            sandbox().await,
             &CancellationToken::new(),
             true,
         )
@@ -534,7 +551,7 @@ mod tests {
                 "python3".into(),
                 "-c".into(),
                 format!(
-                    r#"
+                    r"
 import http.server, os
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -542,12 +559,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(204 if valid else 403)
         self.end_headers()
 http.server.HTTPServer(('127.0.0.1', {port}), Handler).serve_forever()
-"#
+"
                 ),
             ];
         }
         let mut managed =
-            ManagedMcpServers::start(&[config], sandbox(), &CancellationToken::new(), true)
+            ManagedMcpServers::start(&[config], sandbox().await, &CancellationToken::new(), true)
                 .await
                 .unwrap();
         let McpTransport::Http { headers, .. } = &managed.servers()[0].transport else {
@@ -569,7 +586,7 @@ http.server.HTTPServer(('127.0.0.1', {port}), Handler).serve_forever()
 
     #[tokio::test]
     async fn stale_process_identity_does_not_kill_reused_pid() {
-        let sandbox = sandbox();
+        let sandbox = sandbox().await;
         let directory = format!("/tmp/fabro-mcp-{}", uuid::Uuid::new_v4());
         let launch = launch_script(&["sleep".into(), "30".into()], &directory);
         sandbox
@@ -577,14 +594,14 @@ http.server.HTTPServer(('127.0.0.1', {port}), Handler).serve_forever()
             .await
             .unwrap();
         let identity_path = format!("{directory}/identity");
-        let identity = tokio::time::timeout(Duration::from_secs(5), async {
+        let identity = timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(identity) = sandbox.read_file_text(&identity_path).await {
                     if identity.split_whitespace().count() == 2 {
                         break identity;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                sleep(Duration::from_millis(25)).await;
             }
         })
         .await
@@ -618,7 +635,8 @@ http.server.HTTPServer(('127.0.0.1', {port}), Handler).serve_forever()
             ];
         }
         let result =
-            ManagedMcpServers::start(&[config], sandbox(), &CancellationToken::new(), true).await;
+            ManagedMcpServers::start(&[config], sandbox().await, &CancellationToken::new(), true)
+                .await;
         let error = result.err().expect("startup must fail").to_string();
         assert!(error.contains("timed out"), "{error}");
         assert!(!error.contains("secret-value"));
@@ -634,11 +652,11 @@ http.server.HTTPServer(('127.0.0.1', {port}), Handler).serve_forever()
         let token = CancellationToken::new();
         let cancellation = token.clone();
         let task = tokio::spawn(async move {
-            ManagedMcpServers::start(&[server(port), pending], sandbox(), &token, true).await
+            ManagedMcpServers::start(&[server(port), pending], sandbox().await, &token, true).await
         });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        timeout(Duration::from_secs(5), async {
             while TcpStream::connect(("127.0.0.1", port)).await.is_err() {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                sleep(Duration::from_millis(25)).await;
             }
         })
         .await

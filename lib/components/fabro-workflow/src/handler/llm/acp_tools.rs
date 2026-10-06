@@ -1,122 +1,115 @@
 use std::collections::HashMap;
 
 use fabro_acp::AcpToolKind;
-use fabro_types::{AgentToolCategory, AgentToolSource, AgentToolSummary};
+use fabro_types::{ToolCategory, ToolSource, ToolSummary};
 
-const OMP_BUILTINS: &[(&str, &str, AgentToolCategory)] = &[
+const OMP_BUILTINS: &[(&str, &str, ToolCategory)] = &[
     (
         "ast_edit",
         "Structural codemod via ast-grep patterns; preview-staged before write.",
-        AgentToolCategory::Write,
+        ToolCategory::Write,
     ),
     (
         "ast_grep",
         "Structural code search via ast-grep patterns.",
-        AgentToolCategory::Read,
+        ToolCategory::Read,
     ),
     (
         "bash",
         "Run shell commands in a persistent session.",
-        AgentToolCategory::Shell,
+        ToolCategory::Shell,
     ),
     (
         "browser",
         "Drive a real Chromium tab via Puppeteer.",
-        AgentToolCategory::Other,
+        ToolCategory::Other,
     ),
     (
         "debug",
         "DAP-driven breakpoints, stepping, and locals inspection.",
-        AgentToolCategory::Other,
+        ToolCategory::Other,
     ),
     (
         "edit",
         "Line-anchored patches verified against file snapshots.",
-        AgentToolCategory::Write,
+        ToolCategory::Write,
     ),
     (
         "eval",
         "Run Python or JavaScript cells in a persistent kernel.",
-        AgentToolCategory::Shell,
+        ToolCategory::Shell,
     ),
-    (
-        "find",
-        "Fast file-name lookup by glob.",
-        AgentToolCategory::Read,
-    ),
+    ("find", "Fast file-name lookup by glob.", ToolCategory::Read),
     (
         "generate_image",
         "Structured image generation.",
-        AgentToolCategory::Other,
+        ToolCategory::Other,
     ),
     (
         "github",
         "GitHub repository, pull request, search, and Actions operations.",
-        AgentToolCategory::Other,
+        ToolCategory::Other,
     ),
     (
         "inspect_image",
         "Inspect a local image with a vision model.",
-        AgentToolCategory::Read,
+        ToolCategory::Read,
     ),
     (
         "irc",
         "Short messages between peer agents.",
-        AgentToolCategory::Subagent,
+        ToolCategory::Subagent,
     ),
     (
         "job",
         "List, wait on, or cancel background jobs.",
-        AgentToolCategory::Subagent,
+        ToolCategory::Subagent,
     ),
     (
         "lsp",
         "Language-server navigation, refactoring, actions, and diagnostics.",
-        AgentToolCategory::Read,
+        ToolCategory::Read,
     ),
     (
         "read",
         "Read files, directories, archives, data, documents, images, and URLs.",
-        AgentToolCategory::Read,
+        ToolCategory::Read,
     ),
     (
         "recipe",
         "Run a target from the project task runner.",
-        AgentToolCategory::Shell,
+        ToolCategory::Shell,
     ),
     (
         "report_tool_issue",
         "Report unexpected tool behavior for QA tracking.",
-        AgentToolCategory::Other,
+        ToolCategory::Other,
     ),
     (
         "resolve",
         "Apply or discard a pending preview action.",
-        AgentToolCategory::Write,
+        ToolCategory::Write,
     ),
     (
         "search",
         "Regex content search across project data.",
-        AgentToolCategory::Read,
+        ToolCategory::Read,
     ),
-    (
-        "task",
-        "Spawn parallel subagents.",
-        AgentToolCategory::Subagent,
-    ),
-    ("todo", "Track phased tasks.", AgentToolCategory::Other),
+    ("task", "Spawn parallel subagents.", ToolCategory::Subagent),
+    ("todo", "Track phased tasks.", ToolCategory::Other),
     (
         "web_search",
         "Run a web search through the configured provider.",
-        AgentToolCategory::Read,
+        ToolCategory::Read,
     ),
     (
         "write",
         "Create or overwrite files and supported data targets.",
-        AgentToolCategory::Write,
+        ToolCategory::Write,
     ),
 ];
 
+#[derive(Clone, Copy)]
 pub(super) struct AcpObservedTool<'a> {
     pub(super) title:     &'a str,
     pub(super) kind:      AcpToolKind,
@@ -125,7 +118,7 @@ pub(super) struct AcpObservedTool<'a> {
 
 pub(super) struct AcpToolInventory {
     harness:    Option<String>,
-    tools:      Vec<AgentToolSummary>,
+    tools:      Vec<ToolSummary>,
     name_index: HashMap<String, usize>,
 }
 
@@ -144,10 +137,10 @@ impl AcpToolInventory {
 
         if harness == Some("omp") {
             for &(name, description, category) in OMP_BUILTINS {
-                inventory.append(AgentToolSummary {
+                inventory.append(ToolSummary {
                     name: name.to_owned(),
                     description: description.to_owned(),
-                    source: AgentToolSource::Native,
+                    source: ToolSource::Native,
                     category,
                     invoked: false,
                 });
@@ -157,7 +150,7 @@ impl AcpToolInventory {
         inventory
     }
 
-    pub(super) fn snapshot(&self) -> Vec<AgentToolSummary> {
+    pub(super) fn snapshot(&self) -> Vec<ToolSummary> {
         self.tools.clone()
     }
 
@@ -173,17 +166,17 @@ impl AcpToolInventory {
         }
 
         let category = category_for_kind(observed.kind);
-        self.append(AgentToolSummary {
+        self.append(ToolSummary {
             name,
             description: "Observed ACP tool".to_owned(),
-            source: AgentToolSource::Native,
+            source: ToolSource::Native,
             category,
             invoked: true,
         });
         true
     }
 
-    fn append(&mut self, tool: AgentToolSummary) {
+    fn append(&mut self, tool: ToolSummary) {
         let index = self.tools.len();
         self.name_index.insert(tool.name.clone(), index);
         self.tools.push(tool);
@@ -259,21 +252,19 @@ fn normalize_extension_name(name: &str) -> String {
     }
 }
 
-fn category_for_kind(kind: AcpToolKind) -> AgentToolCategory {
+fn category_for_kind(kind: AcpToolKind) -> ToolCategory {
     match kind {
-        AcpToolKind::Read | AcpToolKind::Search | AcpToolKind::Fetch => AgentToolCategory::Read,
-        AcpToolKind::Edit | AcpToolKind::Delete | AcpToolKind::Move => AgentToolCategory::Write,
-        AcpToolKind::Execute => AgentToolCategory::Shell,
-        AcpToolKind::Think | AcpToolKind::SwitchMode | AcpToolKind::Other => {
-            AgentToolCategory::Other
-        }
+        AcpToolKind::Read | AcpToolKind::Search | AcpToolKind::Fetch => ToolCategory::Read,
+        AcpToolKind::Edit | AcpToolKind::Delete | AcpToolKind::Move => ToolCategory::Write,
+        AcpToolKind::Execute => ToolCategory::Shell,
+        AcpToolKind::Think | AcpToolKind::SwitchMode | AcpToolKind::Other => ToolCategory::Other,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use fabro_acp::AcpToolKind;
-    use fabro_types::{AgentToolCategory, AgentToolSource};
+    use fabro_types::{ToolCategory, ToolSource};
 
     use super::{AcpObservedTool, AcpToolInventory};
 
@@ -290,119 +281,111 @@ mod tests {
             (
                 "ast_edit",
                 "Structural codemod via ast-grep patterns; preview-staged before write.",
-                AgentToolCategory::Write,
+                ToolCategory::Write,
             ),
             (
                 "ast_grep",
                 "Structural code search via ast-grep patterns.",
-                AgentToolCategory::Read,
+                ToolCategory::Read,
             ),
             (
                 "bash",
                 "Run shell commands in a persistent session.",
-                AgentToolCategory::Shell,
+                ToolCategory::Shell,
             ),
             (
                 "browser",
                 "Drive a real Chromium tab via Puppeteer.",
-                AgentToolCategory::Other,
+                ToolCategory::Other,
             ),
             (
                 "debug",
                 "DAP-driven breakpoints, stepping, and locals inspection.",
-                AgentToolCategory::Other,
+                ToolCategory::Other,
             ),
             (
                 "edit",
                 "Line-anchored patches verified against file snapshots.",
-                AgentToolCategory::Write,
+                ToolCategory::Write,
             ),
             (
                 "eval",
                 "Run Python or JavaScript cells in a persistent kernel.",
-                AgentToolCategory::Shell,
+                ToolCategory::Shell,
             ),
-            (
-                "find",
-                "Fast file-name lookup by glob.",
-                AgentToolCategory::Read,
-            ),
+            ("find", "Fast file-name lookup by glob.", ToolCategory::Read,),
             (
                 "generate_image",
                 "Structured image generation.",
-                AgentToolCategory::Other,
+                ToolCategory::Other,
             ),
             (
                 "github",
                 "GitHub repository, pull request, search, and Actions operations.",
-                AgentToolCategory::Other,
+                ToolCategory::Other,
             ),
             (
                 "inspect_image",
                 "Inspect a local image with a vision model.",
-                AgentToolCategory::Read,
+                ToolCategory::Read,
             ),
             (
                 "irc",
                 "Short messages between peer agents.",
-                AgentToolCategory::Subagent,
+                ToolCategory::Subagent,
             ),
             (
                 "job",
                 "List, wait on, or cancel background jobs.",
-                AgentToolCategory::Subagent,
+                ToolCategory::Subagent,
             ),
             (
                 "lsp",
                 "Language-server navigation, refactoring, actions, and diagnostics.",
-                AgentToolCategory::Read,
+                ToolCategory::Read,
             ),
             (
                 "read",
                 "Read files, directories, archives, data, documents, images, and URLs.",
-                AgentToolCategory::Read,
+                ToolCategory::Read,
             ),
             (
                 "recipe",
                 "Run a target from the project task runner.",
-                AgentToolCategory::Shell,
+                ToolCategory::Shell,
             ),
             (
                 "report_tool_issue",
                 "Report unexpected tool behavior for QA tracking.",
-                AgentToolCategory::Other,
+                ToolCategory::Other,
             ),
             (
                 "resolve",
                 "Apply or discard a pending preview action.",
-                AgentToolCategory::Write,
+                ToolCategory::Write,
             ),
             (
                 "search",
                 "Regex content search across project data.",
-                AgentToolCategory::Read,
+                ToolCategory::Read,
             ),
-            (
-                "task",
-                "Spawn parallel subagents.",
-                AgentToolCategory::Subagent,
-            ),
-            ("todo", "Track phased tasks.", AgentToolCategory::Other,),
+            ("task", "Spawn parallel subagents.", ToolCategory::Subagent,),
+            ("todo", "Track phased tasks.", ToolCategory::Other,),
             (
                 "web_search",
                 "Run a web search through the configured provider.",
-                AgentToolCategory::Read,
+                ToolCategory::Read,
             ),
             (
                 "write",
                 "Create or overwrite files and supported data targets.",
-                AgentToolCategory::Write,
+                ToolCategory::Write,
             ),
         ]);
         assert!(
             snapshot
                 .iter()
-                .all(|tool| { tool.source == AgentToolSource::Native && !tool.invoked })
+                .all(|tool| { tool.source == ToolSource::Native && !tool.invoked })
         );
     }
 
@@ -541,7 +524,7 @@ mod tests {
         );
         assert!(snapshot.iter().all(|tool| {
             tool.description == "Observed ACP tool"
-                && tool.source == AgentToolSource::Native
+                && tool.source == ToolSource::Native
                 && tool.invoked
         }));
     }
@@ -549,16 +532,16 @@ mod tests {
     #[test]
     fn unknown_tool_category_is_derived_from_structured_kind() {
         let cases = [
-            (AcpToolKind::Read, AgentToolCategory::Read),
-            (AcpToolKind::Search, AgentToolCategory::Read),
-            (AcpToolKind::Fetch, AgentToolCategory::Read),
-            (AcpToolKind::Edit, AgentToolCategory::Write),
-            (AcpToolKind::Delete, AgentToolCategory::Write),
-            (AcpToolKind::Move, AgentToolCategory::Write),
-            (AcpToolKind::Execute, AgentToolCategory::Shell),
-            (AcpToolKind::Think, AgentToolCategory::Other),
-            (AcpToolKind::SwitchMode, AgentToolCategory::Other),
-            (AcpToolKind::Other, AgentToolCategory::Other),
+            (AcpToolKind::Read, ToolCategory::Read),
+            (AcpToolKind::Search, ToolCategory::Read),
+            (AcpToolKind::Fetch, ToolCategory::Read),
+            (AcpToolKind::Edit, ToolCategory::Write),
+            (AcpToolKind::Delete, ToolCategory::Write),
+            (AcpToolKind::Move, ToolCategory::Write),
+            (AcpToolKind::Execute, ToolCategory::Shell),
+            (AcpToolKind::Think, ToolCategory::Other),
+            (AcpToolKind::SwitchMode, ToolCategory::Other),
+            (AcpToolKind::Other, ToolCategory::Other),
         ];
 
         for (kind, expected) in cases {

@@ -1,7 +1,6 @@
-pub mod client;
-mod client_handler;
 pub mod config;
-pub mod connection_manager;
 pub mod http_transport;
+pub mod pebble;
 pub mod sandbox;
-mod sse_client;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

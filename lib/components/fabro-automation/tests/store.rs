@@ -770,7 +770,12 @@ async fn insert_project(pool: &fabro_db::DbPool, id: &str, repository: &str) {
 #[tokio::test]
 async fn a_link_reads_the_global_workflow_and_source_on_every_load() {
     let (_dir, database) = test_database().await;
-    insert_project(database.pool(), "tierrapay", "artesanos-digitales/tierrapay").await;
+    insert_project(
+        database.pool(),
+        "tierrapay",
+        "artesanos-digitales/tierrapay",
+    )
+    .await;
     let store = AutomationStore::new(database.clone_pool());
 
     let mut global = draft("woodpecker-loop", true);
@@ -800,9 +805,16 @@ async fn a_link_reads_the_global_workflow_and_source_on_every_load() {
     let mut edited = replacement("Woodpecker", "0 1 * * *");
     edited.target = global.target.clone();
     edited.workflow = "woodpecker-loop-v2".to_string();
-    edited.workflow_source = Some(workflow_source("main", None, Some("1e930e021b91bfebfd0b9362300b39717ffa6d6b")));
+    edited.workflow_source = Some(workflow_source(
+        "main",
+        None,
+        Some("1e930e021b91bfebfd0b9362300b39717ffa6d6b"),
+    ));
     edited.available_to_projects = true;
-    store.replace(&global.id, &global.revision, edited).await.unwrap();
+    store
+        .replace(&global.id, &global.revision, edited)
+        .await
+        .unwrap();
 
     let loaded = store
         .get(&AutomationId::new("tierrapay-woodpecker-loop").unwrap())
@@ -813,10 +825,19 @@ async fn a_link_reads_the_global_workflow_and_source_on_every_load() {
     assert_eq!(loaded.workflow, "woodpecker-loop-v2");
     assert_eq!(
         loaded.workflow_source,
-        Some(workflow_source("main", None, Some("1e930e021b91bfebfd0b9362300b39717ffa6d6b")))
+        Some(workflow_source(
+            "main",
+            None,
+            Some("1e930e021b91bfebfd0b9362300b39717ffa6d6b")
+        ))
     );
-    let Some(RunTarget::Git(target)) = Some(&loaded.target) else { unreachable!() };
-    assert_eq!(target.repo, "artesanos-digitales/tierrapay", "the link keeps its own target");
+    let Some(RunTarget::Git(target)) = Some(&loaded.target) else {
+        unreachable!()
+    };
+    assert_eq!(
+        target.repo, "artesanos-digitales/tierrapay",
+        "the link keeps its own target"
+    );
 
     // A linked global cannot be deleted.
     let current = store.get(&global.id).await.unwrap().unwrap();
@@ -826,7 +847,12 @@ async fn a_link_reads_the_global_workflow_and_source_on_every_load() {
 #[tokio::test]
 async fn a_link_to_a_global_without_workflow_source_loads_from_the_global_target() {
     let (_dir, database) = test_database().await;
-    insert_project(database.pool(), "tierrapay", "artesanos-digitales/tierrapay").await;
+    insert_project(
+        database.pool(),
+        "tierrapay",
+        "artesanos-digitales/tierrapay",
+    )
+    .await;
     let store = AutomationStore::new(database.clone_pool());
     let global = store.create(draft("scanner", true)).await.unwrap();
     let mut link = draft("tierrapay-scanner", true);
@@ -839,7 +865,9 @@ async fn a_link_to_a_global_without_workflow_source_loads_from_the_global_target
         .await
         .unwrap()
         .unwrap();
-    let Some(RunTarget::Git(global_target)) = Some(&global.target) else { unreachable!() };
+    let Some(RunTarget::Git(global_target)) = Some(&global.target) else {
+        unreachable!()
+    };
     assert_eq!(loaded.workflow_source.as_ref(), Some(global_target));
 }
 

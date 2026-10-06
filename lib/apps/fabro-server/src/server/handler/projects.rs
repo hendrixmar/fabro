@@ -595,7 +595,10 @@ mod tests {
         )
         .expect("the link drafts");
         assert_eq!(
-            draft.source_automation_id.as_ref().map(AutomationId::as_str),
+            draft
+                .source_automation_id
+                .as_ref()
+                .map(AutomationId::as_str),
             Some("ticket-loop")
         );
     }

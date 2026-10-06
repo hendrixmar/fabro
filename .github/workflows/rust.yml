@@ -48,7 +48,7 @@ env:
 jobs:
   fmt:
     name: Format
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -63,7 +63,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -93,7 +93,7 @@ jobs:
 
   generated-docs:
     name: Generated Docs
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -110,7 +110,7 @@ jobs:
 
   test:
     name: Test (Linux)
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -133,7 +133,7 @@ jobs:
 
   sandbox-plugins:
     name: Sandbox plugins (stdio)
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     env:

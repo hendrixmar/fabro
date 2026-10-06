@@ -341,23 +341,28 @@ function useInstallController() {
     initialInstallState,
   );
   const { finishState } = installState;
-  const installSessionQuery = useInstallSessionQuery(installToken, {
-    onSuccess: (session) => {
-      if (!installToken) return;
-      dispatchInstall({ type: "sessionReady", token: installToken, session });
-    },
-    onError: (error) => {
-      dispatchInstall({
-        type:    "sessionFailed",
-        token:   installToken,
-        message: installSessionErrorMessage(error),
-      });
-    },
-  });
+  const installSessionQuery = useInstallSessionQuery(installToken);
 
   useInstallTokenFromUrl({ setInstallToken });
   useInstallGithubCallbackError({ dispatchInstall, pathname });
   useInstallRestartHealthPolling({ dispatchInstall, finishState });
+  // Seed forms from the settled query result, including cached subscribers that
+  // do not receive onSuccess. A new mount must await fresh callback state.
+  if (
+    installToken &&
+    installSessionQuery.data &&
+    !installSessionQuery.isValidating &&
+    !installSessionQuery.error &&
+    (installState.sessionState.status !== "ready" ||
+      installState.sessionState.token !== installToken ||
+      installState.sessionState.data !== installSessionQuery.data)
+  ) {
+    dispatchInstall({
+      type: "sessionReady",
+      token: installToken,
+      session: installSessionQuery.data,
+    });
+  }
   const sessionState = sessionStateForInstallToken(
     installToken,
     installState.sessionState,
@@ -372,11 +377,6 @@ function useInstallController() {
       throw new Error("Install token is required to refresh the session.");
     }
     const nextSession = await getInstallSession(installToken);
-    dispatchInstall({
-      type:    "sessionReady",
-      token:   installToken,
-      session: nextSession,
-    });
     await installSessionQuery.mutate(nextSession, { revalidate: false });
     return nextSession;
   };

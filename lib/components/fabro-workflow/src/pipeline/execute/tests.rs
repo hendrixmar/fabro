@@ -269,8 +269,8 @@ async fn execute_test_run_with_options(
                 ProviderAccess::default(),
             ),
             llm: LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::anthropic(),
+                model:          Some("test-model".to_string()),
+                provider_id:    Some(lithos_llm::catalog::builtin::anthropic()),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -332,8 +332,8 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
                 ProviderAccess::default(),
             ),
             llm: LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::anthropic(),
+                model:          Some("test-model".to_string()),
+                provider_id:    Some(lithos_llm::catalog::builtin::anthropic()),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -477,8 +477,8 @@ async fn resumed_in_flight_node_starts_a_new_stage_execution() {
                 ProviderAccess::default(),
             ),
             llm: LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::anthropic(),
+                model:          Some("test-model".to_string()),
+                provider_id:    Some(lithos_llm::catalog::builtin::anthropic()),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
@@ -591,8 +591,8 @@ async fn run_with_lifecycle(
             emitter: emitter.clone(),
             sandbox: SandboxSpec::local(sandbox.working_directory(), ProviderAccess::default()),
             llm: LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    lithos_llm::catalog::builtin::anthropic(),
+                model:          Some("test-model".to_string()),
+                provider_id:    Some(lithos_llm::catalog::builtin::anthropic()),
                 fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),

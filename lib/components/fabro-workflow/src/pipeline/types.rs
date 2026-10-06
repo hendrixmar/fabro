@@ -239,8 +239,8 @@ impl Persisted {
 
 #[derive(Clone)]
 pub struct LlmSpec {
-    pub model:          String,
-    pub provider_id:    ProviderId,
+    pub model:          Option<String>,
+    pub provider_id:    Option<ProviderId>,
     pub fallbacks:      ModelFallbackPolicy,
     pub mcp_servers:    Vec<McpServerSettings>,
     pub model_controls: RunModelControls,
@@ -332,7 +332,7 @@ pub struct Initialized {
     pub artifact_sink:       Option<ArtifactSink>,
     pub run_control:         Option<Arc<RunControlState>>,
     pub engine:              Arc<EngineServices>,
-    pub model:               String,
+    pub model:               Option<String>,
 }
 
 /// Output of the EXECUTE phase.
@@ -345,7 +345,7 @@ pub struct Executed {
     pub wall_time_ms:  u64,
     pub final_context: Context,
     pub engine:        Arc<EngineServices>,
-    pub model:         String,
+    pub model:         Option<String>,
 }
 
 /// Output of the CONCLUDE phase.
@@ -420,5 +420,5 @@ pub struct PublishOptions {
     pub pr_config:  Option<PullRequestSettings>,
     pub github_app: Option<fabro_github::GitHubCredentials>,
     pub origin_url: Option<String>,
-    pub model:      String,
+    pub model:      Option<String>,
 }

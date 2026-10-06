@@ -103,3 +103,77 @@ fn validate_resolving_models(
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use fabro_llm::test_support::test_catalog;
+
+    use super::*;
+
+    #[test]
+    fn ready_provider_validation_preserves_acp_only_model_metadata_without_providers() {
+        let source = r#"digraph Test {
+            graph [default_model="harness-default", default_provider="external-harness"]
+            start [shape=Mdiamond]
+            work [
+                backend="acp",
+                prompt="Do work",
+                model="harness-only-model",
+                provider="external-harness",
+                acp.command="native-agent"
+            ]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#;
+        let validated = validate_with_ready_providers(
+            ValidateInput {
+                workflow:          WorkflowInput::DotSource {
+                    source:   source.to_string(),
+                    base_dir: None,
+                },
+                settings:          WorkflowSettings::default(),
+                vars:              HashMap::new(),
+                cwd:               PathBuf::from("."),
+                custom_transforms: Vec::new(),
+            },
+            Arc::new(test_catalog()),
+            &[],
+        )
+        .unwrap();
+
+        validated.raise_on_errors().unwrap();
+        assert_eq!(
+            validated
+                .graph()
+                .attrs
+                .get("default_model")
+                .and_then(|value| value.as_str()),
+            Some("harness-default")
+        );
+        assert_eq!(
+            validated
+                .graph()
+                .attrs
+                .get("default_provider")
+                .and_then(|value| value.as_str()),
+            Some("external-harness")
+        );
+        assert_eq!(
+            validated.graph().nodes["work"].model(),
+            Some("harness-only-model")
+        );
+        assert_eq!(
+            validated.graph().nodes["work"].provider(),
+            Some("external-harness")
+        );
+        assert_eq!(
+            validated.graph().nodes["work"]
+                .attrs
+                .get("acp.command")
+                .and_then(|value| value.as_str()),
+            Some("native-agent")
+        );
+    }
+}

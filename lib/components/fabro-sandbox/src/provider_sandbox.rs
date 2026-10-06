@@ -47,7 +47,7 @@ pub async fn provider_sandbox(
     }
     Ok(match kind.bundled() {
         Some(BundledProvider::Docker) => {
-            RunSandbox::pending(kind, provider, docker::overlay(spec), workspace)
+            RunSandbox::pending(kind, provider, docker::overlay(spec)?, workspace)
         }
         Some(BundledProvider::Daytona) => RunSandbox::pending(
             kind,

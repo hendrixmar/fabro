@@ -362,7 +362,7 @@ async fn main_inner(worker_token: Option<String>) -> (String, Result<()>) {
                 Box::pin(commands::pr::dispatch(ns, &base_ctx)).await?;
             }
             Commands::Parent(ns) => {
-                commands::parent::dispatch(ns, &base_ctx).await?;
+                Box::pin(commands::parent::dispatch(ns, &base_ctx)).await?;
             }
             Commands::Secret(ns) => {
                 commands::secret::dispatch(ns, &base_ctx).await?;

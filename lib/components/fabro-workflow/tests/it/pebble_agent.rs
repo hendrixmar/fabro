@@ -356,6 +356,102 @@ fn work_stage(state: &fabro_types::RunProjection) -> &fabro_types::StageProjecti
         .expect("the work stage should be projected")
 }
 
+#[tokio::test]
+async fn node_skill_selection_restricts_native_discovery_across_full_thread_stages() {
+    let stage = Stage::new().await;
+    stage
+        .server
+        .mock_async(|when, then| {
+            when.method(POST).path(CHAT_PATH);
+            sse_headers(then, sse_text("done"));
+        })
+        .await;
+    let chosen = format!("chosen-{}", uuid::Uuid::new_v4());
+    let excluded = format!("excluded-{}", uuid::Uuid::new_v4());
+    for name in [&chosen, &excluded] {
+        let directory = stage.dir.path().join("skills").join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        tokio::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\nTest instructions.\n"),
+        )
+        .await
+        .unwrap();
+    }
+    let sandbox = local_sandbox(stage.dir.path()).await;
+    let backend = stage
+        .backend("openai")
+        .with_skill_dirs(vec![stage.file("skills")]);
+    let context = Context::new();
+    context.set(
+        fabro_workflow::context::keys::INTERNAL_FIDELITY,
+        serde_json::json!("full"),
+    );
+    let mut node = Node::new("work");
+    for (visit, selected) in [(1, chosen.as_str()), (2, "missing-fabro-regression-skill")] {
+        context.set(
+            fabro_workflow::context::keys::INTERNAL_NODE_VISIT_COUNT,
+            serde_json::json!(visit),
+        );
+        node.attrs.insert(
+            "skills".to_string(),
+            AttrValue::String(selected.to_string()),
+        );
+        backend
+            .run(CodergenRunRequest {
+                node:            &node,
+                prompt:          "Say done",
+                context:         &context,
+                thread_id:       Some("selected-thread"),
+                emitter:         &stage.emitter,
+                sandbox:         &sandbox,
+                tool_middleware: None,
+                cancel_token:    CancellationToken::new(),
+                human_input:     None,
+            })
+            .await
+            .unwrap();
+    }
+    let discoveries: Vec<_> = coding_events(&stage.events)
+        .into_iter()
+        .filter_map(|(_, event)| match event {
+            CodingEvent::SkillsDiscovered { skills, .. } => Some(
+                skills
+                    .into_iter()
+                    .map(|skill| skill.name)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(discoveries, vec![
+        vec![chosen.clone()],
+        Vec::<String>::new()
+    ]);
+    let materializations: Vec<_> = match stage.events.lock() {
+        Ok(events) => events
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AgentSkillsMaterialized(props) => {
+                    Some((props.names.clone(), props.target_dir.clone()))
+                }
+                _ => None,
+            })
+            .collect(),
+        Err(error) => panic!("materialization event collection was poisoned: {error}"),
+    };
+    assert_eq!(materializations.len(), 1);
+    assert_eq!(materializations[0].0, vec![chosen]);
+    assert!(
+        !sandbox.file_exists(&materializations[0].1).await.unwrap(),
+        "stage-owned skill directory is cleaned up"
+    );
+    assert!(
+        stage.dir.path().join("skills").join(excluded).is_dir(),
+        "unselected source is untouched"
+    );
+}
+
 // --- Profiles ---------------------------------------------------------------
 
 /// One agent stage under `profile`: the model writes a file with the profile's
@@ -987,6 +1083,128 @@ async fn an_mcp_tool_is_available_to_the_stage() {
         "got {}",
         completed.1
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_debugger_mcp_reaches_native_pebble_toolbox_and_cleans_up() {
+    let stage = Stage::new().await;
+    stage
+        .server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path(CHAT_PATH)
+                .body_excludes(TOOL_RESULT_MARKER);
+            sse_headers(
+                then,
+                sse_tool_call(
+                    "debug",
+                    "mcp__debugger__echo",
+                    &serde_json::json!({"message": "native debugger"}),
+                ),
+            );
+        })
+        .await;
+    let answered = stage
+        .server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path(CHAT_PATH)
+                .body_includes(TOOL_RESULT_MARKER)
+                .body_includes("native debugger");
+            sse_headers(then, sse_text("Debugged"));
+        })
+        .await;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../fabro-mcp/tests/test_mcp_server.py")
+        .canonicalize()
+        .unwrap();
+    let port_file = stage.file("debugger-port");
+    let backend = stage
+        .backend("openai")
+        .with_mcp_servers(vec![McpServerSettings {
+            name: "debugger".to_string(),
+            transport: McpTransport::Sandbox {
+                protocol: fabro_types::settings::run::McpHttpProtocol::StreamableHttp,
+                command:  vec![
+                    "python3".to_string(),
+                    script.display().to_string(),
+                    "--http".to_string(),
+                ],
+                port:     0,
+                env:      std::collections::HashMap::from([(
+                    "FABRO_MCP_TEST_PORT_FILE".to_string(),
+                    port_file.clone(),
+                )]),
+            },
+            ..McpServerSettings::default()
+        }]);
+    let state = stage
+        .run_ok(backend, &agent_graph("Debugger", "Use debugger echo"))
+        .await;
+    assert_eq!(answered.calls_async().await, 1);
+    assert_eq!(work_stage(&state).response.as_deref(), Some("Debugged"));
+    assert!(coding_events(&stage.events).into_iter().any(|(_, event)| matches!(event,
+        CodingEvent::ToolCallCompleted { tool_name, output, .. }
+            if tool_name == "mcp__debugger__echo" && output.to_string().contains("native debugger")
+    )));
+    let port: u16 = tokio::fs::read_to_string(port_file)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(port, 0, "managed runtime discovers the ephemeral port");
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "stage cleanup stops its debugger"
+    );
+}
+
+#[tokio::test]
+async fn configured_mcp_handshake_failure_prevents_model_request() {
+    let stage = Stage::new().await;
+    let model = stage
+        .server
+        .mock_async(|when, then| {
+            when.method(POST).path(CHAT_PATH);
+            sse_headers(then, sse_text("must not run"));
+        })
+        .await;
+    let backend = stage
+        .backend("openai")
+        .with_mcp_servers(vec![McpServerSettings {
+            name: "broken".to_string(),
+            transport: McpTransport::Stdio {
+                command: vec![
+                    "python3".to_string(),
+                    "-c".to_string(),
+                    "raise SystemExit(7)".to_string(),
+                ],
+                env:     std::collections::HashMap::new(),
+            },
+            ..McpServerSettings::default()
+        }]);
+    let sandbox = local_sandbox(stage.dir.path()).await;
+    let node = Node::new("work");
+    let context = Context::new();
+    let result = backend
+        .run(CodergenRunRequest {
+            node:            &node,
+            prompt:          "Do not run",
+            context:         &context,
+            thread_id:       None,
+            emitter:         &stage.emitter,
+            sandbox:         &sandbox,
+            tool_middleware: None,
+            cancel_token:    CancellationToken::new(),
+            human_input:     None,
+        })
+        .await;
+    let error = result.err().expect("configured MCP failure is fatal");
+    assert!(error.to_string().contains("Required MCP server 'broken'"));
+    assert_eq!(model.calls_async().await, 0);
 }
 
 // --- Failover ---------------------------------------------------------------

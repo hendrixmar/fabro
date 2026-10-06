@@ -2,22 +2,24 @@
 //!
 //! The environment names an image or Dockerfile, resources, a network
 //! policy, labels, variables, and a lifecycle. Every provider starts from
-//! the same driver [`SandboxSpec`] built here; a bundled provider adds only
-//! what its backend needs on top (the Docker working directory and default
-//! image, the Daytona snapshot and timers) in its own overlay, and the
-//! ownership scope adds fabro's labels. The clone policy travels beside the
-//! spec as a [`CloneRequest`]: cloning is fabro's work once the sandbox
-//! exists, not the provider's.
+//! the same driver [`SandboxSpec`] built here; bundled providers add only what
+//! their backend needs (Docker's fixed working directory/default image and
+//! its server-managed `auth.json`/`auth.lock` file binds, or Daytona's snapshot
+//! and timers) in their overlay. The ownership scope stamps fabro's labels;
+//! the clone policy travels beside the spec as a [`CloneRequest`]: cloning
+//! is fabro's work once the sandbox exists, not the provider's.
 
 use std::collections::BTreeMap;
 
 use fabro_types::RunId;
 use fabro_types::settings::run::{
-    DockerfileSource, EnvironmentNetworkMode, RunCloneSettings, RunEnvironmentSettings,
+    self, DockerfileSource, EnvironmentNetworkMode, RunCloneSettings, RunEnvironmentSettings,
 };
 use sandbox_driver::{
     Capabilities, LifecycleTimers, NetworkPolicy, Resources, SandboxSource, SandboxSpec,
 };
+
+use crate::docker;
 
 /// What to clone into a provider sandbox, if anything.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -73,6 +75,12 @@ pub fn sandbox_spec_for_environment(
     settings: &RunEnvironmentSettings,
     env: BTreeMap<String, String>,
 ) -> crate::Result<SandboxSpec> {
+    run::validate_codex_oauth_profile(
+        &settings.provider,
+        settings.codex_oauth_profile.as_deref(),
+        env.keys().map(String::as_str),
+    )
+    .map_err(crate::Error::message)?;
     // fabro-config rejects environments that set both image.docker and
     // image.dockerfile. If both still arrive here, the image wins.
     let source = match (&settings.image.docker, &settings.image.dockerfile) {
@@ -108,6 +116,13 @@ pub fn sandbox_spec_for_environment(
     }
     for (key, value) in env {
         spec = spec.env_var(key, value);
+    }
+    if let Some(profile_name) = settings.codex_oauth_profile.as_deref() {
+        let profile = fabro_util::Home::from_env()
+            .root()
+            .join("codex-oauth")
+            .join(profile_name);
+        spec = docker::with_codex_oauth_profile(spec, &profile)?;
     }
     let mut resources = Resources::default();
     resources.cpu_cores = settings
@@ -185,15 +200,16 @@ mod tests {
 
     fn environment(kind: &str) -> RunEnvironmentSettings {
         RunEnvironmentSettings {
-            id:        kind.to_string(),
-            provider:  SandboxProviderKind::try_new(kind).unwrap(),
-            cwd:       None,
-            image:     EnvironmentImageSettings::default(),
-            resources: EnvironmentResourcesSettings::default(),
-            network:   EnvironmentNetworkSettings::default(),
-            lifecycle: EnvironmentLifecycleSettings::default(),
-            labels:    HashMap::from([("team".to_string(), "platform".to_string())]),
-            env:       HashMap::new(),
+            id:                  kind.to_string(),
+            provider:            SandboxProviderKind::try_new(kind).unwrap(),
+            cwd:                 None,
+            codex_oauth_profile: None,
+            image:               EnvironmentImageSettings::default(),
+            resources:           EnvironmentResourcesSettings::default(),
+            network:             EnvironmentNetworkSettings::default(),
+            lifecycle:           EnvironmentLifecycleSettings::default(),
+            labels:              HashMap::from([("team".to_string(), "platform".to_string())]),
+            env:                 HashMap::new(),
         }
     }
 
@@ -211,6 +227,7 @@ mod tests {
             "the run names the sandbox, not the environment"
         );
         assert_eq!(spec.env.get("FOO").map(String::as_str), Some("bar"));
+        assert!(!spec.env.contains_key(docker::CODEX_OAUTH_PROFILE_MARKER));
         assert_eq!(
             spec.labels.get("team").map(String::as_str),
             Some("platform")

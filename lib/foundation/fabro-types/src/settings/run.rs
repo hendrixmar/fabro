@@ -7,7 +7,7 @@
 //! behavior, and artifact collection.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use fabro_util::shell;
@@ -19,6 +19,7 @@ use super::duration::Duration;
 use super::interp::{InterpString, Namespace, ResolveCtx, ResolveError};
 use super::model_ref::ModelRef;
 use super::size::Size;
+use crate::SandboxProviderKind;
 
 /// A structurally resolved `[run]` view for consumers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,7 +36,6 @@ pub struct RunNamespace {
     pub checkpoint:    RunCheckpointSettings,
     pub clone:         RunCloneSettings,
     pub run_branch:    RunBranchSettings,
-    pub meta_branch:   RunMetaBranchSettings,
     pub environment:   RunEnvironmentSettings,
     pub notifications: HashMap<String, NotificationRouteSettings>,
     pub interviews:    RunInterviewsSettings,
@@ -65,7 +65,6 @@ impl Default for RunNamespace {
             checkpoint:    RunCheckpointSettings::default(),
             clone:         RunCloneSettings::default(),
             run_branch:    RunBranchSettings::default(),
-            meta_branch:   RunMetaBranchSettings::default(),
             environment:   RunEnvironmentSettings::default(),
             notifications: HashMap::new(),
             interviews:    RunInterviewsSettings::default(),
@@ -1038,14 +1037,16 @@ impl Default for RunExecutionSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunCheckpointSettings {
     pub exclude_globs:     Vec<String>,
-    /// When `true`, Fabro-managed run-branch checkpoint commits bypass
-    /// local Git commit hooks (e.g. `pre-commit`, `commit-msg`). This does
-    /// not affect Fabro workflow `[[run.hooks]]` or metadata-branch
-    /// snapshots, which already bypass repository hooks.
+    /// Accepted for compatibility. Fabro-managed run-branch checkpoint
+    /// commits never run local Git commit hooks (e.g. `pre-commit`,
+    /// `commit-msg`): the sandbox driver disables repository hooks on every
+    /// git command it runs, whatever this field says. Fabro workflow
+    /// `[[run.hooks]]` are unaffected.
     #[serde(default)]
     pub skip_git_hooks:    bool,
-    /// Timeout (ms) for the per-node run-branch checkpoint commit, which runs
-    /// repository commit hooks unless `skip_git_hooks` is set. Default 30_000.
+    /// Accepted for compatibility. The per-node run-branch checkpoint commit
+    /// runs under the sandbox driver's own git command budget now that no
+    /// repository hook can prolong it. Default 30_000.
     #[serde(default = "default_checkpoint_commit_timeout_ms")]
     pub commit_timeout_ms: u64,
 }
@@ -1108,65 +1109,6 @@ impl Default for RunBranchSettings {
         Self {
             enabled: true,
             push:    true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunMetaBranchSettings {
-    pub enabled: bool,
-    pub push:    bool,
-}
-
-impl Default for RunMetaBranchSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            push:    true,
-        }
-    }
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    Serialize,
-    Deserialize,
-    strum::Display,
-    strum::EnumString,
-    strum::IntoStaticStr,
-)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
-pub enum EnvironmentProvider {
-    #[default]
-    Local,
-    Docker,
-    Daytona,
-}
-
-impl EnvironmentProvider {
-    #[must_use]
-    pub fn is_local(self) -> bool {
-        matches!(self, Self::Local)
-    }
-
-    #[must_use]
-    pub fn is_clone_based(self) -> bool {
-        matches!(self, Self::Docker | Self::Daytona)
-    }
-}
-
-impl From<EnvironmentProvider> for crate::SandboxProviderKind {
-    fn from(value: EnvironmentProvider) -> Self {
-        match value {
-            EnvironmentProvider::Local => Self::Local,
-            EnvironmentProvider::Docker => Self::Docker,
-            EnvironmentProvider::Daytona => Self::Daytona,
         }
     }
 }
@@ -1245,7 +1187,7 @@ impl Default for EnvironmentLifecycleSettings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvironmentSettings {
-    pub provider:            EnvironmentProvider,
+    pub provider:            SandboxProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd:                 Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1261,7 +1203,7 @@ pub struct EnvironmentSettings {
 impl Default for EnvironmentSettings {
     fn default() -> Self {
         Self {
-            provider:            EnvironmentProvider::Local,
+            provider:            SandboxProviderKind::LOCAL,
             cwd:                 None,
             codex_oauth_profile: None,
             image:               EnvironmentImageSettings::default(),
@@ -1274,10 +1216,23 @@ impl Default for EnvironmentSettings {
     }
 }
 
+/// Why a `local` run has no directory to work in.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalWorkingDirectoryError {
+    #[error(
+        "local environment requires a server-side working directory; configure `environment.cwd = \"/absolute/path\"` on the selected local environment"
+    )]
+    MissingCwd,
+    #[error(
+        "local environment source_directory does not exist or is not a directory on this server: {0}. Configure `environment.cwd = \"/absolute/path\"` on the selected local environment for remote client/server deployments."
+    )]
+    MissingSourceDirectory(PathBuf),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunEnvironmentSettings {
     pub id:                  String,
-    pub provider:            EnvironmentProvider,
+    pub provider:            SandboxProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd:                 Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1307,6 +1262,42 @@ impl RunEnvironmentSettings {
         }
     }
 
+    /// The environment's variables in source form, for a path with no vault
+    /// (server preflight): a `{{ secrets.* }}` value keeps its token, and
+    /// nothing else is left to resolve because `{{ vars.* }}` is substituted
+    /// at run creation.
+    #[must_use]
+    pub fn unresolved_env(&self) -> BTreeMap<String, String> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "preflight has no vault, so an unresolved secret token is carried in source form"
+        )]
+        self.env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_source()))
+            .collect()
+    }
+
+    /// The directory a `local` run works in: the environment's `cwd`, or
+    /// the run's source directory when it exists on this host.
+    pub fn local_working_directory(
+        &self,
+        source_directory: Option<&Path>,
+    ) -> Result<PathBuf, LocalWorkingDirectoryError> {
+        if let Some(cwd) = self.cwd.as_deref() {
+            return Ok(PathBuf::from(cwd));
+        }
+        let Some(source_directory) = source_directory else {
+            return Err(LocalWorkingDirectoryError::MissingCwd);
+        };
+        if source_directory.is_dir() {
+            return Ok(source_directory.to_path_buf());
+        }
+        Err(LocalWorkingDirectoryError::MissingSourceDirectory(
+            source_directory.to_path_buf(),
+        ))
+    }
+
     /// Resolve every environment value's `{{ secrets.* }}` tokens via
     /// `secrets_lookup`. `{{ vars.* }}` is already substituted server-side at
     /// run creation, so anything still unresolved here fails closed.
@@ -1321,42 +1312,6 @@ impl RunEnvironmentSettings {
         }
         Ok(resolved)
     }
-}
-
-/// Validate the named host credential boundary without reading credentials.
-pub fn validate_codex_oauth_profile<'a>(
-    provider: EnvironmentProvider,
-    profile: Option<&str>,
-    env_names: impl IntoIterator<Item = &'a str>,
-) -> Result<(), &'static str> {
-    if let Some(profile) = profile {
-        if provider != EnvironmentProvider::Docker {
-            return Err("codex_oauth_profile is supported only by Docker environments");
-        }
-        if profile.is_empty()
-            || !profile.as_bytes()[0].is_ascii_lowercase()
-                && !profile.as_bytes()[0].is_ascii_digit()
-            || !profile.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
-            })
-        {
-            return Err("codex_oauth_profile must be a single lowercase slug: [a-z0-9][a-z0-9_-]*");
-        }
-    }
-    for name in env_names {
-        if name == "FABRO_CODEX_OAUTH_PROFILE" {
-            return Err("FABRO_CODEX_OAUTH_PROFILE is reserved for managed Docker mounts");
-        }
-        if name == "CODEX_AUTH_B64" {
-            return Err(
-                "CODEX_AUTH_B64 is no longer supported; configure codex_oauth_profile instead",
-            );
-        }
-        if profile.is_some() && matches!(name, "OPENAI_API_KEY" | "CODEX_API_KEY") {
-            return Err("codex_oauth_profile cannot be combined with API key credentials");
-        }
-    }
-    Ok(())
 }
 
 impl Default for RunEnvironmentSettings {
@@ -2396,7 +2351,7 @@ pub struct HookDefinition {
 
 impl HookDefinition {
     pub fn resolved_hook_type(&self) -> Option<std::borrow::Cow<'_, HookType>> {
-        if let Some(ref hook_type) = self.hook_type {
+        if let Some(hook_type) = &self.hook_type {
             return Some(std::borrow::Cow::Borrowed(hook_type));
         }
         self.command.as_ref().map(|command| {
@@ -2436,7 +2391,7 @@ impl HookDefinition {
                   template source; the source text is the intended display value here"
     )]
     pub fn effective_name(&self) -> String {
-        if let Some(ref name) = self.name {
+        if let Some(name) = &self.name {
             return name.clone();
         }
         let event = self.event.to_string();
@@ -2597,4 +2552,79 @@ pub enum MergeStrategy {
     Merge,
     Squash,
     Rebase,
+}
+
+/// Validate the named host credential boundary without reading credentials.
+pub fn validate_codex_oauth_profile<'a>(
+    provider: &crate::SandboxProviderKind,
+    profile: Option<&str>,
+    env_names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), &'static str> {
+    if let Some(profile) = profile {
+        if provider != &crate::SandboxProviderKind::DOCKER {
+            return Err("codex_oauth_profile is supported only by Docker environments");
+        }
+        if profile.is_empty()
+            || !profile.as_bytes()[0].is_ascii_lowercase()
+                && !profile.as_bytes()[0].is_ascii_digit()
+            || !profile.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            })
+        {
+            return Err("codex_oauth_profile must be a single lowercase slug: [a-z0-9][a-z0-9_-]*");
+        }
+    }
+    for name in env_names {
+        if name == "FABRO_CODEX_OAUTH_PROFILE" {
+            return Err("FABRO_CODEX_OAUTH_PROFILE is reserved for managed Docker mounts");
+        }
+        if name == "CODEX_AUTH_B64" {
+            return Err(
+                "CODEX_AUTH_B64 is no longer supported; configure codex_oauth_profile instead",
+            );
+        }
+        if profile.is_some() && matches!(name, "OPENAI_API_KEY" | "CODEX_API_KEY") {
+            return Err("codex_oauth_profile cannot be combined with API key credentials");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod codex_oauth_profile_tests {
+    use super::validate_codex_oauth_profile;
+    use crate::SandboxProviderKind;
+
+    #[test]
+    fn validates_named_oauth_profile_boundary() {
+        let docker = SandboxProviderKind::DOCKER;
+        assert_eq!(
+            validate_codex_oauth_profile(&docker, Some("team_work-2"), []),
+            Ok(())
+        );
+        assert!(
+            validate_codex_oauth_profile(&SandboxProviderKind::LOCAL, Some("team"), []).is_err()
+        );
+        assert!(
+            validate_codex_oauth_profile(
+                &SandboxProviderKind::try_new("custom").unwrap(),
+                Some("team"),
+                [],
+            )
+            .is_err()
+        );
+        for name in ["", "../work", "/work", "work/team", ".", "Work", "work:rw"] {
+            assert!(validate_codex_oauth_profile(&docker, Some(name), []).is_err());
+        }
+        assert!(
+            validate_codex_oauth_profile(&docker, None, ["FABRO_CODEX_OAUTH_PROFILE"]).is_err()
+        );
+        assert!(validate_codex_oauth_profile(&docker, None, ["CODEX_AUTH_B64"]).is_err());
+        assert!(validate_codex_oauth_profile(&docker, Some("team"), ["OPENAI_API_KEY"]).is_err());
+        assert!(validate_codex_oauth_profile(&docker, Some("team"), ["CODEX_API_KEY"]).is_err());
+        assert_eq!(
+            validate_codex_oauth_profile(&docker, None, ["OPENAI_API_KEY"]),
+            Ok(())
+        );
+    }
 }

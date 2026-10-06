@@ -434,6 +434,7 @@ mod tests {
     use object_store::memory::InMemory;
     use serde_json::json;
     use tokio::task;
+    use tokio::time::timeout;
 
     use crate::{EventPayload, test_support as store_test_support};
 
@@ -503,13 +504,13 @@ mod tests {
                 .create_run_with_first_event(&run_id, &run_created_payload(&run_id))
                 .await
         });
-        let waiting = tokio::time::timeout(Duration::from_millis(250), &mut admission).await;
+        let waiting = timeout(Duration::from_millis(250), &mut admission).await;
         sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
         assert!(
             waiting.is_err(),
             "run creation must wait for the writer instead of failing on snapshot promotion"
         );
-        let run = tokio::time::timeout(Duration::from_secs(5), admission)
+        let run = timeout(Duration::from_secs(5), admission)
             .await
             .unwrap()
             .unwrap()

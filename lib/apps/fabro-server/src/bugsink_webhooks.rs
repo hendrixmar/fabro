@@ -194,7 +194,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use fabro_automation::{AutomationDraft, AutomationId, AutomationStore};
-    use fabro_model::catalog::LlmCatalogSettings;
+    use fabro_config::LlmLayer;
     use fabro_types::settings::server::{BugsinkIntegrationSettings, BugsinkProjectSettings};
     use fabro_types::{GitRunTarget, RunTarget};
     use fabro_vault::{SecretStore, SecretType};
@@ -249,7 +249,7 @@ mod tests {
         // built-in Docker environment the way a provisioned server has one.
         fabro_environment::seed_default_environment(
             database.pool(),
-            fabro_types::settings::run::EnvironmentProvider::Docker,
+            fabro_types::SandboxProviderKind::DOCKER,
         )
         .await
         .unwrap();
@@ -281,7 +281,7 @@ mod tests {
                 workflow_source:       None,
                 project_id:            None,
                 available_to_projects: false,
-                source_automation_id: None,
+                source_automation_id:  None,
                 triggers:              vec![],
             })
             .await
@@ -310,7 +310,7 @@ mod tests {
             resolved_settings: resolved_runtime_settings_for_tests(
                 settings,
                 fabro_config::RunLayer::default(),
-                LlmCatalogSettings::default(),
+                LlmLayer::default(),
             ),
             registry_factory_override: None,
             max_concurrent_runs: 5,
@@ -326,7 +326,7 @@ mod tests {
             github_api_base_url: None,
             active_config_path: dir.path().join("settings.toml"),
             http_client: Some(fabro_http::test_http_client().unwrap()),
-            sandbox_provider_registry: None,
+            sandbox_inventory: None,
             shutdown: tokio_util::sync::CancellationToken::new(),
             worker_control_bus: None,
             worker_runtime: None,

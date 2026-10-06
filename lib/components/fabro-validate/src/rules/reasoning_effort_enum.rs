@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use fabro_graphviz::graph::Graph;
-use fabro_model::ReasoningEffort;
+use lithos_llm::types::ReasoningEffort;
 
 use crate::{Diagnostic, LintRule, Severity};
 
@@ -30,15 +30,15 @@ impl LintRule for Rule {
                 severity: Severity::Error,
                 message: format!(
                     "invalid reasoning_effort \"{effort}\"; expected one of: {}",
-                    ReasoningEffort::variants()
+                    ReasoningEffort::ALL
                         .iter()
-                        .map(|variant| variant.to_string())
+                        .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
                 node_id: Some(node.id.clone()),
                 edge: None,
-                fix: Some("Use one of: low, medium, high, xhigh, max".to_string()),
+                fix: Some("Use one of: minimal, low, medium, high, xhigh, max".to_string()),
 
                 ..Diagnostic::default()
             });
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_enum_accepts_all_variants() {
-        for effort in ["low", "medium", "high", "xhigh", "max"] {
+        for effort in ["minimal", "low", "medium", "high", "xhigh", "max"] {
             let mut graph = minimal_graph();
             graph.nodes.insert(
                 "work".to_string(),

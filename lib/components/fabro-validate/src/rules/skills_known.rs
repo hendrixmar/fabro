@@ -61,6 +61,10 @@ mod tests {
     use crate::rules::test_support::{minimal_graph, node_with_attrs};
     use crate::{LintRule, Severity};
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Synchronous lint-rule fixtures run without a Tokio runtime"
+    )]
     fn temp_skills_root(tag: &str, skill_names: &[&str]) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("fabro-skills-known-{tag}-{}", std::process::id()));

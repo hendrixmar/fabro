@@ -17,6 +17,8 @@ pub type DbPool = sqlx::SqlitePool;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 const SESSION_OWNER_INDEX_MIGRATION_VERSION: i64 = 2_026_083_101;
+const ENVIRONMENT_PROVIDER_KIND_MIGRATION_VERSION: i64 = 2_026_090_901;
+const CODEX_OAUTH_PROFILE_MIGRATION_VERSION: i64 = 2_026_100_401;
 
 /// Tags runs persisted before `runs.project_id` existed. sqlx applies it once
 /// as a migration; the SQL itself is idempotent (it only fills unassigned
@@ -113,10 +115,78 @@ impl Database {
         self.snapshot_before_new_migrations(&applied)
             .await
             .context("snapshotting SQLite database before migrations")?;
-        MIGRATOR
+        self.prepare_oauth_profile_upgrade(&applied).await?;
+        let migration_result = MIGRATOR
             .run(&self.pool)
             .await
-            .context("running SQLite migrations")?;
+            .context("running SQLite migrations");
+        // Restore on failure too. The durable staging table survives a process
+        // interruption between the legacy table rebuild and this restoration.
+        self.restore_oauth_profiles().await?;
+        migration_result
+    }
+
+    async fn prepare_oauth_profile_upgrade(&self, applied: &HashSet<i64>) -> anyhow::Result<()> {
+        if !applied.contains(&CODEX_OAUTH_PROFILE_MIGRATION_VERSION)
+            || applied.contains(&ENVIRONMENT_PROVIDER_KIND_MIGRATION_VERSION)
+        {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let has_profile: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'codex_oauth_profile')",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_profile {
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS _fabro_environment_profile_upgrade (id TEXT PRIMARY KEY, profile TEXT NOT NULL)",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT OR REPLACE INTO _fabro_environment_profile_upgrade SELECT id, codex_oauth_profile FROM environments WHERE codex_oauth_profile IS NOT NULL",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            // The unchanged upstream migration rebuilds its original 16
+            // columns using SELECT *. Existing migration checksums stay valid.
+            sqlx::query("ALTER TABLE environments DROP COLUMN codex_oauth_profile")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn restore_oauth_profiles(&self) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let staged: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_fabro_environment_profile_upgrade')",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if staged {
+            let has_profile: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'codex_oauth_profile')",
+            )
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !has_profile {
+                sqlx::query("ALTER TABLE environments ADD COLUMN codex_oauth_profile TEXT")
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            sqlx::query(
+                "UPDATE environments SET codex_oauth_profile = (SELECT profile FROM _fabro_environment_profile_upgrade WHERE id = environments.id) WHERE id IN (SELECT id FROM _fabro_environment_profile_upgrade)",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query("DROP TABLE _fabro_environment_profile_upgrade")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -619,7 +689,12 @@ mod tests {
         database.migrate().await?;
         let pool = database.pool();
         for (id, github_id, repository, binding) in [
-            ("tierrapay", "1", "artesanos-digitales/tierrapay", "tierrapay"),
+            (
+                "tierrapay",
+                "1",
+                "artesanos-digitales/tierrapay",
+                "tierrapay",
+            ),
             ("mafeva", "2", "artesanos-digitales/mafeva", "mafeva-intake"),
         ] {
             sqlx::query(
@@ -639,12 +714,32 @@ mod tests {
         }
         // (id, parent, repository_name, labels)
         let rows: [(&str, Option<&str>, Option<&str>, &str); 6] = [
-            ("label", None, Some("hendrixmar/fabro-demo"), r#"{"fabro_project_id":"mafeva"}"#),
-            ("legacy", None, Some("workspace"), r#"{"project":"mafeva-intake"}"#),
+            (
+                "label",
+                None,
+                Some("hendrixmar/fabro-demo"),
+                r#"{"fabro_project_id":"mafeva"}"#,
+            ),
+            (
+                "legacy",
+                None,
+                Some("workspace"),
+                r#"{"project":"mafeva-intake"}"#,
+            ),
             ("repo", None, Some("artesanos-digitales/tierrapay"), "{}"),
-            ("child", Some("legacy"), Some("artesanos-digitales/tierrapay"), "{}"),
+            (
+                "child",
+                Some("legacy"),
+                Some("artesanos-digitales/tierrapay"),
+                "{}",
+            ),
             ("grandchild", Some("child"), None, "{}"),
-            ("stray", None, Some("hendrixmar/fabro-demo"), r#"{"project":"unknown"}"#),
+            (
+                "stray",
+                None,
+                Some("hendrixmar/fabro-demo"),
+                r#"{"project":"unknown"}"#,
+            ),
         ];
         for (id, parent, repository, labels) in rows {
             sqlx::query(
@@ -662,7 +757,11 @@ mod tests {
         }
 
         assert_eq!(backfill_run_projects(pool).await?, 5);
-        assert_eq!(backfill_run_projects(pool).await?, 0, "a second run changes nothing");
+        assert_eq!(
+            backfill_run_projects(pool).await?,
+            0,
+            "a second run changes nothing"
+        );
 
         let tagged: Vec<(String, Option<String>)> =
             sqlx::query_as("SELECT id, project_id FROM runs ORDER BY id")

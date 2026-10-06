@@ -17,6 +17,7 @@ use fabro_api::types::{
 use fabro_http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use fabro_types::UserPrincipal;
 use fabro_types::settings::server::IntakeIntegrationSettings;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -51,6 +52,8 @@ pub(crate) enum IntakeBridgeError {
     Refused(String),
     #[error("the feature-intake bridge returned an unusable response")]
     Payload,
+    #[error("feature-intake path identifier is invalid")]
+    InvalidPathSegment,
     #[error("the feature-intake bridge failed")]
     Failed,
 }
@@ -212,6 +215,7 @@ impl IntakeBridge {
         actor: &IntakeActor,
         body: Value,
     ) -> Result<Value, IntakeBridgeError> {
+        let binding = encode_path_segment(binding)?;
         let response = self
             .request(
                 fabro_http::Method::POST,
@@ -310,6 +314,7 @@ impl IntakeBridge {
         actor: &IntakeActor,
         issue: &str,
     ) -> Result<Value, IntakeBridgeError> {
+        let issue = encode_path_segment(issue)?;
         self.get_json(
             binding,
             &format!("/initiatives/{issue}"),
@@ -325,6 +330,7 @@ impl IntakeBridge {
         actor: &IntakeActor,
         issue: &str,
     ) -> Result<Value, IntakeBridgeError> {
+        let issue = encode_path_segment(issue)?;
         self.get_json(
             binding,
             &format!("/initiatives/{issue}/history"),
@@ -344,6 +350,8 @@ impl IntakeBridge {
         action: &str,
         body: Value,
     ) -> Result<Value, IntakeBridgeError> {
+        let issue = encode_path_segment(issue)?;
+        let action = encode_path_segment(action)?;
         self.post_json(
             binding,
             &format!("/initiatives/{issue}/{action}"),
@@ -363,11 +371,9 @@ impl IntakeBridge {
         key: &str,
         text: &str,
     ) -> Result<fabro_http::Response, IntakeBridgeError> {
-        let url = format!(
-            "{}{}",
-            self.base,
-            Self::path(binding, &format!("/chat/{key}"))
-        );
+        let key = encode_path_segment(key)?;
+        let path = Self::path(binding, &format!("/chat/{key}"))?;
+        let url = format!("{}{path}", self.base);
         let response = self
             .client
             .post(&url)
@@ -391,12 +397,14 @@ impl IntakeBridge {
         actor: &IntakeActor,
         key: &str,
     ) -> Result<Value, IntakeBridgeError> {
+        let key = encode_path_segment(key)?;
         self.delete_json(binding, &format!("/chat/{key}"), actor, ORDINARY_TIMEOUT)
             .await
     }
 
-    fn path(binding: &str, suffix: &str) -> String {
-        format!("/api/p/{binding}{suffix}")
+    fn path(binding: &str, suffix: &str) -> Result<String, IntakeBridgeError> {
+        let binding = encode_path_segment(binding)?;
+        Ok(format!("/api/p/{binding}{suffix}"))
     }
 
     fn actor_headers(actor: Option<&IntakeActor>) -> HeaderMap {
@@ -465,14 +473,9 @@ impl IntakeBridge {
         actor: &IntakeActor,
         timeout: Duration,
     ) -> Result<Value, IntakeBridgeError> {
+        let path = Self::path(binding, suffix)?;
         let response = self
-            .request(
-                fabro_http::Method::GET,
-                &Self::path(binding, suffix),
-                Some(actor),
-                None,
-                timeout,
-            )
+            .request(fabro_http::Method::GET, &path, Some(actor), None, timeout)
             .await?;
         Self::expect_success(response)
     }
@@ -485,10 +488,11 @@ impl IntakeBridge {
         body: Value,
         timeout: Duration,
     ) -> Result<Value, IntakeBridgeError> {
+        let path = Self::path(binding, suffix)?;
         let response = self
             .request(
                 fabro_http::Method::POST,
-                &Self::path(binding, suffix),
+                &path,
                 Some(actor),
                 Some(&body),
                 timeout,
@@ -504,10 +508,11 @@ impl IntakeBridge {
         actor: &IntakeActor,
         timeout: Duration,
     ) -> Result<Value, IntakeBridgeError> {
+        let path = Self::path(binding, suffix)?;
         let response = self
             .request(
                 fabro_http::Method::DELETE,
-                &Self::path(binding, suffix),
+                &path,
                 Some(actor),
                 None,
                 timeout,
@@ -515,6 +520,17 @@ impl IntakeBridge {
             .await?;
         Self::expect_success(response)
     }
+}
+
+fn encode_path_segment(value: &str) -> Result<String, IntakeBridgeError> {
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return Err(IntakeBridgeError::InvalidPathSegment);
+    }
+    Ok(utf8_percent_encode(value, NON_ALPHANUMERIC).to_string())
 }
 
 fn map_transport(error: &reqwest::Error) -> IntakeBridgeError {
@@ -560,8 +576,12 @@ fn status_error(status: u16, body: &Value) -> IntakeBridgeError {
 mod tests {
     use fabro_types::settings::server::IntakeIntegrationSettings;
     use fabro_types::{AuthMethod, IdpIdentity, UserPrincipal};
+    use percent_encoding::percent_decode_str;
 
-    use super::{ACTOR_PREFIX, IntakeActor, IntakeBridge, IntakeBridgeError, status_error};
+    use super::{
+        ACTOR_PREFIX, IntakeActor, IntakeBridge, IntakeBridgeError, encode_path_segment,
+        status_error,
+    };
 
     fn principal(issuer: &str, subject: &str, login: &str) -> UserPrincipal {
         UserPrincipal {
@@ -621,6 +641,45 @@ mod tests {
         let bridge = IntakeBridge::from_settings(&settings(true, Some("/run/fabro/intake.sock")))
             .expect("socket client should build");
         assert!(bridge.is_some());
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Parse a synthetic test URL to verify path/query separation, never formatting credentials"
+    )]
+    fn dynamic_bridge_identifiers_cannot_escape_their_path_segments() {
+        use fabro_http::Url;
+
+        let key = encode_path_segment("opaque?x=%").expect("opaque id should encode");
+        let path = IntakeBridge::path("project-id", &format!("/initiatives/{key}"))
+            .expect("binding and identifier should remain path segments");
+        let url = Url::parse(&format!("http://intake.invalid{path}")).unwrap();
+        let segments: Vec<_> = url
+            .path_segments()
+            .unwrap()
+            .map(|segment| {
+                percent_decode_str(segment)
+                    .decode_utf8()
+                    .unwrap()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(segments, [
+            "api",
+            "p",
+            "project-id",
+            "initiatives",
+            "opaque?x=%"
+        ]);
+        assert_eq!(url.query(), None);
+        assert_eq!(url.fragment(), None);
+        for segment in [".", "..", "a/b", "a\\b"] {
+            assert!(matches!(
+                encode_path_segment(segment),
+                Err(IntakeBridgeError::InvalidPathSegment)
+            ));
+        }
     }
 
     #[test]

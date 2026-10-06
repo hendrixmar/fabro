@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fabro_auth::VaultCredentialSource;
+use fabro_graphviz::graph;
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::credentials::readiness;
 use fabro_llm::lithos_catalog::Catalog;
@@ -18,7 +19,7 @@ use fabro_types::GitRunTarget;
 use fabro_types::settings::run::{
     ApprovalMode, McpServerSettings as ResolvedMcpServerSettings, PullRequestSettings,
     ResolvedGithubIntegration, ResolvedMcpEntry, RunMode, RunNamespace as ResolvedRunSettings,
-    RunPrepareSettings as ResolvedRunPrepareSettings,
+    RunPrepareSettings as ResolvedRunPrepareSettings, validate_codex_oauth_profile,
 };
 use fabro_types::settings::server::ServerSandboxProvidersSettings;
 use fabro_types::{
@@ -84,7 +85,7 @@ struct RunSession {
     pr_config:         Option<PullRequestSettings>,
     pr_github_app:     Option<fabro_github::GitHubCredentials>,
     pr_origin_url:     Option<String>,
-    pr_model:          String,
+    pr_model:          Option<String>,
     workflow_path:     Option<ManifestPath>,
     workflow_bundle:   Option<Arc<WorkflowBundle>>,
     run_control:       Option<Arc<RunControlState>>,
@@ -430,14 +431,14 @@ impl RunSession {
         let resolved = &settings.run;
         let configured_sandbox_provider = resolve_sandbox_provider(resolved);
         let sandbox_provider = configured_sandbox_provider.effective_for(resolved.execution.mode);
-        fabro_types::settings::run::validate_codex_oauth_profile(
-            resolved.environment.provider,
+        validate_codex_oauth_profile(
+            &resolved.environment.provider,
             resolved.environment.codex_oauth_profile.as_deref(),
             resolved.environment.env.keys().map(String::as_str),
         )
         .map_err(Error::engine)?;
         if resolved.environment.codex_oauth_profile.is_some()
-            && sandbox_provider != SandboxProviderKind::Docker
+            && sandbox_provider != SandboxProviderKind::DOCKER
         {
             return Err(Error::engine(
                 "codex_oauth_profile requires the effective Docker sandbox provider",
@@ -465,16 +466,23 @@ impl RunSession {
             .then(|| record.repo_origin_url().map(str::to_string))
             .flatten();
         let catalog = Arc::clone(&services.catalog);
-        let configured =
-            configured_providers_for_start(&services.vault, Arc::clone(&catalog)).await;
-        #[cfg(feature = "test-support")]
-        let configured = workflow_test_support::test_configured_provider_ids(
-            catalog.as_ref(),
-            configured,
-            process_env_var("FABRO_TEST_ASSUME_LLM_READY")
-                .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no")),
-        );
-        let llm = resolve_start_llm(catalog.as_ref(), &configured, resolved)?;
+        let (model, provider_id, fallbacks) = if resolved.execution.mode != RunMode::DryRun
+            && graph::graph_needs_api_backend(persisted.graph())
+        {
+            let configured =
+                configured_providers_for_start(&services.vault, Arc::clone(&catalog)).await;
+            #[cfg(feature = "test-support")]
+            let configured = workflow_test_support::test_configured_provider_ids(
+                catalog.as_ref(),
+                configured,
+                process_env_var("FABRO_TEST_ASSUME_LLM_READY")
+                    .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no")),
+            );
+            let llm = resolve_start_llm(catalog.as_ref(), &configured, resolved)?;
+            (Some(llm.model), Some(llm.provider_id), llm.fallbacks)
+        } else {
+            (None, None, ResolvedModelFallbacks::default())
+        };
         let vault_guard = services.vault.read().await;
         // Token-only secrets lookup over the vault read guard, shared across
         // every run-boundary resolver. A missing or non-Token secret becomes
@@ -603,14 +611,14 @@ impl RunSession {
             run_control: services.run_control,
             sandbox,
             llm: LlmSpec {
-                model: llm.model.clone(),
-                provider_id: llm.provider_id.clone(),
-                fallbacks: llm.fallbacks.policy,
+                model: model.clone(),
+                provider_id,
+                fallbacks: fallbacks.policy,
                 mcp_servers,
                 model_controls: resolved.model.controls.clone(),
                 dry_run: resolved.execution.mode == RunMode::DryRun,
             },
-            fallback_notices: llm.fallbacks.notices,
+            fallback_notices: fallbacks.notices,
             interviewer,
             steering_hub: services.steering_hub,
             on_node: services.on_node,
@@ -633,7 +641,7 @@ impl RunSession {
             pr_config,
             pr_github_app: services.github_app,
             pr_origin_url: runtime_origin_url,
-            pr_model: llm.model,
+            pr_model: model,
             workflow_path,
             workflow_bundle,
             vault: services.vault,

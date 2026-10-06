@@ -117,8 +117,8 @@ fn validate_acp_node(rule: &str, node: &Node) -> Vec<Diagnostic> {
             node_id: Some(node.id.clone()),
             edge: None,
             fix: Some(
-                "Remove provider/max_tokens/speed from ACP nodes; model and \
-                 reasoning_effort are translated to harness environment overrides"
+                "Remove max_tokens/speed from ACP nodes; treat model/provider as opaque ACP hints; \
+                 reasoning_effort is translated to harness environment overrides"
                     .to_string(),
             ),
 
@@ -183,7 +183,7 @@ fn render_acp_process_error(error: &AcpCommandError) -> String {
 }
 
 fn api_only_attrs_present(node: &Node) -> Vec<&'static str> {
-    const API_ONLY_ATTRS: &[&str] = &["provider", "max_tokens", "speed"];
+    const API_ONLY_ATTRS: &[&str] = &["max_tokens", "speed"];
     API_ONLY_ATTRS
         .iter()
         .copied()
@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_valid_accepts_model_and_effort_on_acp_agent_nodes() {
+    fn backend_valid_accepts_model_effort_and_provider_hints_on_acp_agent_nodes() {
         let mut graph = minimal_graph();
         let mut node = Node::new("work");
         node.attrs
@@ -407,6 +407,10 @@ mod tests {
         node.attrs.insert(
             "reasoning_effort".to_string(),
             AttrValue::String("xhigh".to_string()),
+        );
+        node.attrs.insert(
+            "provider".to_string(),
+            AttrValue::String("external-harness".to_string()),
         );
         graph.nodes.insert("work".to_string(), node);
 
@@ -440,10 +444,6 @@ mod tests {
             "acp.command".to_string(),
             AttrValue::String("python3 agent.py".to_string()),
         );
-        node.attrs.insert(
-            "provider".to_string(),
-            AttrValue::String("openai".to_string()),
-        );
         node.attrs
             .insert("max_tokens".to_string(), AttrValue::Integer(4096));
         node.attrs
@@ -457,7 +457,7 @@ mod tests {
                 .message
                 .contains("backend=\"acp\" does not support API-only attributes")
         );
-        for attr in ["provider", "max_tokens", "speed"] {
+        for attr in ["max_tokens", "speed"] {
             assert!(
                 diagnostics[0].message.contains(attr),
                 "message should list {attr}: {}",

@@ -270,8 +270,8 @@ async fn initialized(
                     options.hook_runner,
                     locations,
                     run_options.cancel_token.clone(),
-                    builtin::anthropic(),
-                    "claude-sonnet-4-6".to_string(),
+                    Some(builtin::anthropic()),
+                    Some("claude-sonnet-4-6".to_string()),
                     options
                         .llm_source
                         .unwrap_or_else(auth_test_support::vault_only_credential_source),
@@ -289,7 +289,7 @@ async fn initialized(
                 workflow_path:   None,
                 workflow_bundle: None,
             }),
-            model:         String::new(),
+            model:         None,
         },
         store_logger,
     }

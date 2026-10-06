@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router";
 import {
   Combobox,
@@ -8,7 +8,6 @@ import {
 } from "@headlessui/react";
 import type {
   GithubRepository,
-  GithubRepositoryListResponse,
   Project,
 } from "@qltysh/fabro-api-client";
 
@@ -37,41 +36,26 @@ export function RepositoryPicker({
   projects: Project[];
 }) {
   const navigate = useNavigate();
-  const [cursors, setCursors] = useState<Array<string | null>>([null]);
-  const [pages, setPages] = useState<
-    Array<{ cursor: string | null; response: GithubRepositoryListResponse }>
-  >([]);
+  const {
+    data: pages = [],
+    error,
+    isLoading,
+    isValidating,
+    setSize,
+    mutate,
+  } = useGithubRepositories();
   const [query, setQuery] = useState("");
-
-  const handleLoaded = useCallback(
-    (cursor: string | null, response: GithubRepositoryListResponse) => {
-      setPages((current) =>
-        current.some(
-          (page) => page.cursor === cursor && page.response === response,
-        )
-          ? current
-          : [
-              ...current.filter((page) => page.cursor !== cursor),
-              { cursor, response },
-            ],
-      );
-    },
-    [],
-  );
-
   const repositories: GithubRepository[] = [];
   const seen = new Set<string>();
-  for (const cursor of cursors) {
-    const page = pages.find((candidate) => candidate.cursor === cursor);
-    for (const repository of page?.response.data ?? []) {
+  for (const page of pages) {
+    for (const repository of page.data) {
       if (seen.has(repository.id)) continue;
       seen.add(repository.id);
       repositories.push(repository);
     }
   }
-  const lastCursor = cursors[cursors.length - 1];
-  const lastPage = pages.find((page) => page.cursor === lastCursor);
-  const nextCursor = lastPage?.response.next_cursor ?? null;
+  const lastPage = pages.at(-1);
+  const nextCursor = lastPage?.next_cursor ?? null;
 
   const needle = query.trim().toLowerCase();
   const matches = needle
@@ -145,13 +129,25 @@ export function RepositoryPicker({
         </ComboboxOptions>
 
         <div className="space-y-1 border-t border-line px-2.5 py-2">
-          {cursors.map((cursor) => (
-            <RepositoryPageLoader
-              key={cursor ?? "first-page"}
-              cursor={cursor}
-              onLoaded={handleLoaded}
-            />
-          ))}
+          {error ? (
+            <p role="alert" className="text-xs/5 text-coral">
+              {error instanceof Error && error.message
+                ? error.message
+                : "Couldn't load repositories from this Fabro server."}{" "}
+              <button
+                type="button"
+                onClick={() => void mutate()}
+                className="text-mint underline hover:text-fg"
+              >
+                Retry this page
+              </button>
+            </p>
+          ) : isLoading || isValidating ? (
+            <p role="status" className="flex items-center gap-2 text-xs/5 text-fg-muted">
+              <Spinner className="size-3" />
+              Loading repositories…
+            </p>
+          ) : null}
 
           {repositories.length === 0 && lastPage !== undefined ? (
             <p role="status" className={STATUS_CLASS}>
@@ -177,9 +173,8 @@ export function RepositoryPicker({
           {nextCursor ? (
             <button
               type="button"
-              onClick={() =>
-                setCursors((current) => [...current, nextCursor])
-              }
+              disabled={isValidating || Boolean(error)}
+              onClick={() => void setSize((current) => current + 1)}
               className={COMPACT_SECONDARY_BUTTON_CLASS}
             >
               Load more repositories
@@ -195,47 +190,3 @@ export function RepositoryPicker({
   );
 }
 
-function RepositoryPageLoader({
-  cursor,
-  onLoaded,
-}: {
-  cursor: string | null;
-  onLoaded: (
-    cursor: string | null,
-    response: GithubRepositoryListResponse,
-  ) => void;
-}) {
-  const { data, error, isLoading, mutate } = useGithubRepositories(cursor);
-
-  useEffect(() => {
-    if (data) onLoaded(cursor, data);
-  }, [cursor, data, onLoaded]);
-
-  if (error) {
-    return (
-      <p role="alert" className="text-xs/5 text-coral">
-        {error instanceof Error && error.message
-          ? error.message
-          : "Couldn't load repositories from this Fabro server."}{" "}
-        <button
-          type="button"
-          onClick={() => void mutate()}
-          className="text-mint underline hover:text-fg"
-        >
-          Retry this page
-        </button>
-      </p>
-    );
-  }
-
-  if (isLoading && !data) {
-    return (
-      <p className="flex items-center gap-2 text-xs/5 text-fg-muted">
-        <Spinner className="size-3" />
-        Loading repositories…
-      </p>
-    );
-  }
-
-  return null;
-}

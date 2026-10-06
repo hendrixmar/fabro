@@ -66,7 +66,7 @@ impl LintRule for Rule {
 
 #[cfg(test)]
 mod tests {
-    use fabro_graphviz::graph::AttrValue;
+    use fabro_graphviz::graph::{AttrValue, Node};
 
     use super::{KNOWN_HARNESSES, Rule};
     use crate::rules::test_support::{minimal_graph, node_with_attrs};
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn harness_valid_ignores_non_string_attr_values() {
         let mut graph = minimal_graph();
-        let mut node = fabro_graphviz::graph::Node::new("work");
+        let mut node = Node::new("work");
         node.attrs
             .insert("harness".to_string(), AttrValue::Integer(1));
         graph.nodes.insert("work".to_string(), node);

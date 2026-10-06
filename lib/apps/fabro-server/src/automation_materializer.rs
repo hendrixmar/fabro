@@ -4,6 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fabro_automation::{AutomationGitWorkflowSource, AutomationId, ProjectId, ProjectStoreError};
 use fabro_manifest::WorkflowVersionCollectError;
+/// Server-owned run label carrying the owning project of a project-scoped
+/// automation run. Written only from server state, never from a caller.
+pub(crate) use fabro_types::PROJECT_LABEL;
 use fabro_types::{
     GitCoordinateValidationError, GitHubRepositorySlug, GitRunTarget,
     ResolvedAutomationGitWorkflowSource, RunId, RunIntent, RunIntentArgs, RunTarget,
@@ -15,10 +18,6 @@ use tokio::{fs, task};
 use crate::git_checkout::{
     self, GitAuthConfig, GitCheckoutError, GitCheckoutSelector, GitRepoCache, WorktreePrepareInput,
 };
-
-/// Server-owned run label carrying the owning project of a project-scoped
-/// automation run. Written only from server state, never from a caller.
-pub(crate) use fabro_types::PROJECT_LABEL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AutomationRunMaterializeInput {

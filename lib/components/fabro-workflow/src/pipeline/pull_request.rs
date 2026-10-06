@@ -1,17 +1,19 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use fabro_auth::CredentialSource;
 use fabro_github::{self as github_app, ssh_url_to_https};
 use fabro_graphviz::parser;
-use fabro_llm::client::Client;
-use fabro_llm::generate::{GenerateParams, generate_object};
-use fabro_model::{Catalog, ProviderId};
+use fabro_llm::credentials::CredentialProvider;
+use fabro_llm::lithos_catalog::Catalog;
+use fabro_llm::{Client, ClientOptions, Request, selection};
 use fabro_store::RunProjection;
 use fabro_types::PullRequestLink;
 use fabro_types::settings::run::MergeStrategy;
 use fabro_util::text::strip_goal_decoration;
+use lithos_llm::catalog::ProviderId;
+use lithos_llm::types::{Message, Role};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -72,10 +74,10 @@ fn truncation_caps(
     eligible: &HashSet<ProviderId>,
     catalog: &Catalog,
 ) -> TruncationCaps {
-    let ctx = catalog
-        .select(model, None, eligible)
+    let ctx = selection::select(catalog, model, None, eligible)
         .ok()
-        .and_then(|m| usize::try_from(m.context_window()).ok())
+        .and_then(|entry| entry.model.limits())
+        .and_then(|limits| usize::try_from(limits.context_tokens).ok())
         .unwrap_or(UNKNOWN_MODEL_CTX);
 
     truncation_caps_for_context_window(ctx)
@@ -133,6 +135,13 @@ fn fallback_pr_title(goal: &str) -> String {
         DEFAULT_PR_TITLE.to_string()
     } else {
         title
+    }
+}
+
+fn fallback_pr_content(goal: &str) -> PrContent {
+    PrContent {
+        title: fallback_pr_title(goal),
+        body:  EMPTY_BODY_NOTICE.to_string(),
     }
 }
 
@@ -329,19 +338,31 @@ fn assemble_pr_body(
 
 /// Build complete PR content by combining LLM-generated narrative with
 /// deterministic fallbacks and programmatic sections.
+/// If `model` is absent, publication selects a default from providers the
+/// native client can use.
 pub async fn build_pr_content(
     diff: &str,
     goal: &str,
-    model: &str,
+    model: Option<&str>,
     run_store: &RunStoreHandle,
-    llm_source: &dyn CredentialSource,
+    llm_source: Arc<dyn CredentialProvider>,
     catalog: Arc<Catalog>,
     conclusion: Option<&Conclusion>,
     run_state: Option<&RunProjection>,
 ) -> Result<PrContent, String> {
-    let client = Client::from_source(llm_source, Arc::clone(&catalog))
-        .await
-        .map_err(|e| format!("Failed to create LLM client: {e}"))?;
+    let client = match fabro_llm::build_client(
+        Catalog::clone(&catalog),
+        llm_source,
+        ClientOptions::standard(),
+    )
+    .await
+    {
+        Ok(client) => Some(Arc::new(client.client)),
+        Err(error) => {
+            warn!(error = %error, "Failed to create LLM client; using fallback PR content");
+            None
+        }
+    };
 
     build_pr_content_with_client(
         diff,
@@ -351,7 +372,7 @@ pub async fn build_pr_content(
         catalog.as_ref(),
         conclusion,
         run_state,
-        Arc::new(client),
+        client,
     )
     .await
 }
@@ -359,12 +380,12 @@ pub async fn build_pr_content(
 async fn build_pr_content_with_client(
     diff: &str,
     goal: &str,
-    model: &str,
+    model: Option<&str>,
     run_store: &RunStoreHandle,
     catalog: &Catalog,
     conclusion: Option<&Conclusion>,
     run_state: Option<&RunProjection>,
-    client: Arc<Client>,
+    client: Option<Arc<Client>>,
 ) -> Result<PrContent, String> {
     info!("Building PR content");
 
@@ -385,40 +406,61 @@ async fn build_pr_content_with_client(
     let run_spec = run_state.map(|state| state.spec.clone());
     let dot_source = run_state.and_then(|state| state.spec.graph_source.clone());
 
-    let eligible = client.provider_ids();
-    let caps = truncation_caps(model, &eligible, catalog);
-    let truncated_diff = truncate_chars(diff, caps.diff);
-
-    let prompt = if let Some(ref plan) = plan_text {
-        let truncated_plan = truncate_chars(plan, caps.plan);
-        format!(
-            "Goal: {goal}\n\nPlan:\n```\n{truncated_plan}\n```\n\nDiff:\n```\n{truncated_diff}\n```"
-        )
-    } else {
-        format!("Goal: {goal}\n\nDiff:\n```\n{truncated_diff}\n```")
-    };
-
-    let params = GenerateParams::new(model, client)
-        .system(PR_BODY_SYSTEM_PROMPT)
-        .prompt(prompt);
-
-    let generated: PrContent = generate_object(params, PR_CONTENT_SCHEMA.clone())
-        .await
-        .map_err(|e| format!("LLM generation failed: {e}"))
-        .and_then(|result| {
-            let output = result
-                .output
-                .ok_or_else(|| "LLM generation returned no structured output".to_string())?;
-            serde_json::from_value(output)
-                .map_err(|e| format!("Failed to deserialize PR content: {e}"))
-        })
-        .unwrap_or_else(|err| {
-            warn!(model = %model, %err, "Using fallback PR content");
-            PrContent {
-                title: fallback_pr_title(goal),
-                body: EMPTY_BODY_NOTICE.to_string(),
+    let generated = if let Some(client) = client {
+        let eligible: HashSet<ProviderId> = client.available_providers().iter().cloned().collect();
+        let model = model.map(Cow::Borrowed).or_else(|| {
+            match selection::select_default(catalog, &eligible) {
+                Ok(offering) => Some(Cow::Owned(format!(
+                    "{}/{}",
+                    offering.provider.id(),
+                    offering.model.id()
+                ))),
+                Err(error) => {
+                    warn!(%error, "No eligible model for PR content; using fallback PR content");
+                    None
+                }
             }
         });
+
+        if let Some(model) = model.as_deref() {
+            let caps = truncation_caps(model, &eligible, catalog);
+            let truncated_diff = truncate_chars(diff, caps.diff);
+
+            let prompt = if let Some(plan) = &plan_text {
+                let truncated_plan = truncate_chars(plan, caps.plan);
+                format!(
+                    "Goal: {goal}\n\nPlan:\n```\n{truncated_plan}\n```\n\nDiff:\n```\n{truncated_diff}\n```"
+                )
+            } else {
+                format!("Goal: {goal}\n\nDiff:\n```\n{truncated_diff}\n```")
+            };
+
+            let generation = match Request::builder()
+                .model(model)
+                .system(PR_BODY_SYSTEM_PROMPT)
+                .message(Message::text(Role::User, prompt))
+                .build()
+            {
+                Ok(request) => client
+                    .complete_object(request, "pr_content", PR_CONTENT_SCHEMA.clone())
+                    .await
+                    .map_err(|error| format!("LLM generation failed: {error}"))
+                    .and_then(|completion| {
+                        serde_json::from_value(completion.object)
+                            .map_err(|error| format!("Failed to deserialize PR content: {error}"))
+                    }),
+                Err(error) => Err(format!("invalid PR content request: {error}")),
+            };
+            generation.unwrap_or_else(|error| {
+                warn!(model = %model, %error, "Using fallback PR content");
+                fallback_pr_content(goal)
+            })
+        } else {
+            fallback_pr_content(goal)
+        }
+    } else {
+        fallback_pr_content(goal)
+    };
 
     let title = if generated.title.trim().is_empty() {
         fallback_pr_title(goal)
@@ -428,7 +470,7 @@ async fn build_pr_content_with_client(
     let title = enforce_title_cap(&title);
 
     let llm_body = if generated.body.trim().is_empty() {
-        warn!(model = %model, "LLM generated empty PR body; using skeleton PR body");
+        warn!(model = ?model, "LLM generated empty PR body; using skeleton PR body");
         EMPTY_BODY_NOTICE.to_string()
     } else {
         generated.body
@@ -462,11 +504,13 @@ pub struct OpenPullRequestRequest<'a> {
     pub expected_head_sha: &'a str,
     pub goal:              &'a str,
     pub diff:              &'a str,
-    pub model:             &'a str,
+    /// Optional run API model; absent selects a default from providers the
+    /// native client can use.
+    pub model:             Option<&'a str>,
     pub draft:             bool,
     pub auto_merge:        Option<AutoMergeOptions>,
     pub run_store:         &'a RunStoreHandle,
-    pub llm_source:        &'a dyn CredentialSource,
+    pub llm_source:        Arc<dyn CredentialProvider>,
     pub catalog:           Arc<Catalog>,
     pub conclusion:        Option<&'a Conclusion>,
     pub run_state:         Option<&'a RunProjection>,
@@ -620,7 +664,7 @@ pub async fn open_pull_request(
         req.goal,
         req.model,
         req.run_store,
-        req.llm_source,
+        Arc::clone(&req.llm_source),
         Arc::clone(&req.catalog),
         req.conclusion,
         req.run_state,
@@ -690,22 +734,21 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
-    use fabro_auth::{CredentialSource, VaultCredentialSource};
+    use fabro_auth::VaultCredentialSource;
     use fabro_graphviz::graph::Graph;
-    use fabro_llm::Error as LlmError;
-    use fabro_llm::client::Client;
-    use fabro_llm::provider::{ProviderAdapter, StreamEventStream};
-    use fabro_llm::types::{FinishReason, Message, Request, Response, StreamEvent, TokenCounts};
-    use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
+    use fabro_llm::adapter::{ProviderAdapter, ResolvedCall};
+    use fabro_llm::credentials::CredentialProvider;
+    use fabro_llm::lithos_catalog::AdapterId;
+    use fabro_llm::{Response, ResponseStream};
     use fabro_store::Database;
     use fabro_types::{
         BilledTokenCounts, RunProjection, RunSpec, SuccessReason, WorkflowSettings,
         first_event_seq, fixtures, test_support,
     };
     use fabro_vault::{SecretType, Vault};
-    use futures::stream;
     use httpmock::Method::{GET, POST};
     use httpmock::MockServer;
+    use lithos_llm::types::{ContentPart, TokenCounts};
     use object_store::memory::InMemory;
     use tokio::sync::RwLock as AsyncRwLock;
 
@@ -713,77 +756,53 @@ mod tests {
     use crate::event::{Event, append_event};
     use crate::records::StageSummary;
 
+    /// Answers every completion with one fixed text, attributed to the route
+    /// that was asked.
     struct MockProvider {
-        name:          String,
+        id:            AdapterId,
         response_text: String,
     }
 
     impl MockProvider {
-        fn new(name: &str, text: &str) -> Self {
+        fn new(text: &str) -> Self {
             Self {
-                name:          name.to_string(),
+                id:            AdapterId::new("mock"),
                 response_text: text.to_string(),
             }
+        }
+
+        fn response(&self, call: &ResolvedCall) -> Response {
+            let handle = call.route().handle();
+            let mut response =
+                Response::new(handle.provider().clone(), handle.model().clone(), vec![
+                    ContentPart::Text {
+                        text: self.response_text.clone(),
+                    },
+                ]);
+            response.id = Some("resp_1".to_string());
+            response.usage = TokenCounts {
+                input: 10,
+                output: 20,
+                ..TokenCounts::default()
+            };
+            response
         }
     }
 
     #[async_trait::async_trait]
     impl ProviderAdapter for MockProvider {
-        fn name(&self) -> &str {
-            &self.name
+        fn id(&self) -> &AdapterId {
+            &self.id
         }
 
-        async fn complete(&self, _request: &Request) -> Result<Response, LlmError> {
-            Ok(Response {
-                id:            "resp_1".into(),
-                model:         "mock-model".into(),
-                provider:      "mock".into(),
-                message:       Message::assistant(&self.response_text),
-                finish_reason: FinishReason::Stop,
-                usage:         TokenCounts {
-                    input_tokens: 10,
-                    output_tokens: 20,
-                    ..Default::default()
-                },
-                raw:           None,
-                warnings:      vec![],
-                rate_limit:    None,
-                cost_usd:      None,
-                cost_source:   None,
-            })
+        async fn complete(&self, call: &ResolvedCall) -> Result<Response, fabro_llm::Error> {
+            Ok(self.response(call))
         }
 
-        async fn stream(&self, _request: &Request) -> Result<StreamEventStream, LlmError> {
-            let text = self.response_text.clone();
-            let events = vec![
-                Ok(StreamEvent::text_delta(&text, Some("t1".into()))),
-                Ok(StreamEvent::finish(
-                    FinishReason::Stop,
-                    TokenCounts {
-                        input_tokens: 10,
-                        output_tokens: 20,
-                        ..Default::default()
-                    },
-                    Response {
-                        id:            "resp_1".into(),
-                        model:         "mock-model".into(),
-                        provider:      "mock".into(),
-                        message:       Message::assistant(&text),
-                        finish_reason: FinishReason::Stop,
-                        usage:         TokenCounts {
-                            input_tokens: 10,
-                            output_tokens: 20,
-                            ..Default::default()
-                        },
-                        raw:           None,
-                        warnings:      vec![],
-                        rate_limit:    None,
-                        cost_usd:      None,
-                        cost_source:   None,
-                    },
-                )),
-            ];
-            Ok(Box::pin(stream::iter(events)))
+        async fn stream(&self, call: &ResolvedCall) -> Result<ResponseStream, fabro_llm::Error> {
+            Ok(fabro_llm::test_support::response_to_stream(
+                self.response(call),
+            ))
         }
     }
 
@@ -797,30 +816,48 @@ mod tests {
     }
 
     fn test_catalog_with_provider_base_url(provider: &str, base_url: &str) -> Arc<Catalog> {
-        let mut settings = LlmCatalogSettings::default();
-        settings
-            .providers
-            .insert(provider.to_string(), ProviderCatalogSettings {
-                base_url: Some(base_url.to_string()),
-                ..ProviderCatalogSettings::default()
-            });
-        Arc::new(
-            Catalog::from_builtin_with_overrides(&settings)
-                .expect("catalog with custom base_url should build"),
+        Arc::new(fabro_llm::test_support::test_catalog_with_provider_base_url(provider, base_url))
+    }
+
+    /// The catalog every mock-backed test resolves against: the built-ins plus
+    /// a `mock` provider that passes any model name through.
+    fn mock_catalog() -> Catalog {
+        fabro_llm::test_support::test_catalog_with_overlay(
+            r#"
+[providers.mock]
+display_name = "Mock"
+adapter = "openai-compatible"
+codec = "openai-chat"
+default_model = "mock-model"
+base_url = "http://mock.invalid/v1"
+auth = { type = "bearer" }
+allow_passthrough = true
+
+[providers.mock.metadata.agent]
+profile = "openai"
+
+[providers.mock.models.mock-model]
+display_name = "Mock Model"
+api_model = "mock-model"
+limits = { context_tokens = 8192, max_output_tokens = 1024 }
+capabilities = { text = true, tools = true, response_format = { json_object = true, json_schema = true } }
+"#,
         )
     }
 
+    /// A client over [`mock_catalog`] whose `provider_name` answers with
+    /// `text`.
     fn explicit_client(provider_name: &str, text: &str) -> Arc<Client> {
-        let mut providers: HashMap<String, Arc<dyn ProviderAdapter>> = HashMap::new();
-        providers.insert(
-            provider_name.to_string(),
-            Arc::new(MockProvider::new(provider_name, text)),
-        );
-        Arc::new(Client::new(
-            providers,
-            Some(provider_name.to_string()),
-            vec![],
-        ))
+        let adapter: Arc<dyn ProviderAdapter> = Arc::new(MockProvider::new(text));
+        let mut options = fabro_llm::ClientOptions::default();
+        options
+            .adapters
+            .push((ProviderId::new(provider_name), adapter));
+        Arc::new(
+            fabro_llm::build_offline_client(mock_catalog(), options)
+                .expect("mock client should build")
+                .client,
+        )
     }
 
     fn test_projection() -> RunProjection {
@@ -1080,15 +1117,15 @@ mod tests {
         let PrContent { title, body } = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
-            Catalog::builtin(),
+            &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client(
+            Some(explicit_client(
                 "mock",
                 &pr_content_json("Mock title", "Narrative from mock."),
-            ),
+            )),
         )
         .await
         .unwrap();
@@ -1107,19 +1144,18 @@ mod tests {
         let content = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.into(),
-            Catalog::builtin(),
+            &mock_catalog(),
             None,
             None,
-            explicit_client("mock", "not json"),
+            Some(explicit_client("mock", "not json")),
         )
         .await
         .unwrap();
 
         assert_eq!(content.title, "Implement feature");
-        assert!(content.body.contains("The LLM did not produce a description"));
-        assert!(content.body.contains("Generated with [Fabro](https://fabro.sh)"));
+        assert!(!content.body.contains("not json"));
     }
 
     #[tokio::test]
@@ -1176,15 +1212,15 @@ mod tests {
         let body = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
-            Catalog::builtin(),
+            &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client(
+            Some(explicit_client(
                 "mock",
                 &pr_content_json("Mock title", "Narrative from mock."),
-            ),
+            )),
         )
         .await
         .unwrap()
@@ -1274,15 +1310,15 @@ mod tests {
         let body = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
-            Catalog::builtin(),
+            &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client(
+            Some(explicit_client(
                 "mock",
                 &pr_content_json("Mock title", "Narrative from mock."),
-            ),
+            )),
         )
         .await
         .unwrap()
@@ -1299,15 +1335,15 @@ mod tests {
         let body = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "gpt-5.4",
+            Some("gpt-5.4"),
             &run_store.clone().into(),
-            Catalog::builtin(),
+            &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client(
+            Some(explicit_client(
                 "openai",
                 &pr_content_json("Explicit title", "Narrative from explicit client."),
-            ),
+            )),
         )
         .await
         .unwrap()
@@ -1315,6 +1351,60 @@ mod tests {
 
         assert!(body.contains("Narrative from explicit client."));
         assert!(!body.contains("Narrative from mock."));
+    }
+
+    #[tokio::test]
+    async fn build_pr_content_selects_catalog_default_when_model_is_absent() {
+        let store = test_store();
+        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        let content = build_pr_content_with_client(
+            "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
+            "Implement feature",
+            None,
+            &run_store.clone().into(),
+            &mock_catalog(),
+            Some(&make_test_conclusion()),
+            None,
+            Some(explicit_client(
+                "mock",
+                &pr_content_json("Default title", "Default model narrative."),
+            )),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content.title, "Default title");
+        assert!(content.body.contains("Default model narrative."));
+    }
+
+    #[tokio::test]
+    async fn build_pr_content_without_model_or_credentials_uses_honest_fallback() {
+        let store = test_store();
+        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        let llm_source: Arc<dyn CredentialProvider> = Arc::new(VaultCredentialSource::vault_only(
+            Arc::new(AsyncRwLock::new(Vault::from_entries(HashMap::new()))),
+        ));
+        let content = build_pr_content(
+            "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
+            "Implement feature",
+            None,
+            &run_store.clone().into(),
+            llm_source,
+            Arc::new(mock_catalog()),
+            Some(&make_test_conclusion()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content.title, "Implement feature");
+        assert!(content.body.starts_with(EMPTY_BODY_NOTICE));
+        assert!(content.body.contains("### Fabro Details"));
+        assert!(
+            content
+                .body
+                .contains("Generated with [Fabro](https://fabro.sh)")
+        );
     }
 
     #[tokio::test]
@@ -1344,9 +1434,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let llm_source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::new(Arc::new(
-            AsyncRwLock::new(vault),
-        )));
+        let llm_source: Arc<dyn CredentialProvider> = Arc::new(VaultCredentialSource::new(
+            Arc::new(AsyncRwLock::new(vault)),
+        ));
         // Use catalog settings to override base_url instead of env var
         let catalog = test_catalog_with_provider_base_url("openai", &server.url("/v1"));
 
@@ -1357,9 +1447,9 @@ mod tests {
         let PrContent { title, body } = build_pr_content(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
             "Implement feature",
-            "gpt-5.4",
+            Some("gpt-5.4"),
             &run_store_handle,
-            llm_source.as_ref(),
+            llm_source,
             catalog,
             Some(&make_test_conclusion()),
             None,
@@ -1520,8 +1610,8 @@ mod tests {
         assert_eq!(
             truncation_caps(
                 "unknown-model",
-                &Catalog::builtin().all_provider_ids(),
-                Catalog::builtin(),
+                &mock_catalog().enabled_provider_ids().into_iter().collect(),
+                &mock_catalog(),
             ),
             TruncationCaps {
                 diff: 80_000,
@@ -1543,11 +1633,11 @@ mod tests {
             expected_head_sha: "final-sha",
             goal:              "Fix bug",
             diff:              "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
-            model:             "claude-sonnet-4-20250514",
+            model:             Some("claude-sonnet-4-20250514"),
             draft:             false,
             auto_merge:        None,
             run_store:         &harness.run_store,
-            llm_source:        harness.llm_source.as_ref(),
+            llm_source:        Arc::clone(&harness.llm_source),
             catalog:           harness.catalog.clone(),
             conclusion:        None,
             run_state:         None,
@@ -1584,12 +1674,12 @@ mod tests {
         let title = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
-            Catalog::builtin(),
+            &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client("mock", &payload),
+            Some(explicit_client("mock", &payload)),
         )
         .await
         .unwrap()
@@ -1607,12 +1697,12 @@ mod tests {
         let title = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
             "## Plan:",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
-            Catalog::builtin(),
+            &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client("mock", &payload),
+            Some(explicit_client("mock", &payload)),
         )
         .await
         .unwrap()
@@ -1697,12 +1787,12 @@ mod tests {
         let body = build_pr_content_with_client(
             "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
             "Implement feature",
-            "mock-model",
+            Some("mock-model"),
             &run_store.clone().into(),
-            Catalog::builtin(),
+            &mock_catalog(),
             Some(&make_test_conclusion()),
             None,
-            explicit_client("mock", &payload),
+            Some(explicit_client("mock", &payload)),
         )
         .await
         .unwrap()
@@ -1732,7 +1822,7 @@ mod tests {
         branch_mock_id:    usize,
         reconcile_mock_id: usize,
         github_mock_id:    usize,
-        llm_source:        Arc<dyn CredentialSource>,
+        llm_source:        Arc<dyn CredentialProvider>,
         catalog:           Arc<Catalog>,
         creds:             fabro_github::GitHubCredentials,
         run_store:         RunStoreHandle,
@@ -1840,9 +1930,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let llm_source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::new(Arc::new(
-            AsyncRwLock::new(vault),
-        )));
+        let llm_source: Arc<dyn CredentialProvider> = Arc::new(VaultCredentialSource::new(
+            Arc::new(AsyncRwLock::new(vault)),
+        ));
         // Use catalog settings to override base_url instead of env var
         let catalog = test_catalog_with_provider_base_url("openai", &openai_server.url("/v1"));
 
@@ -1971,11 +2061,11 @@ mod tests {
             expected_head_sha: "final-sha",
             goal: "Fix telemetry leak",
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
-            model: "gpt-5.4",
+            model: Some("gpt-5.4"),
             draft: false,
             auto_merge: None,
             run_store: &harness.run_store,
-            llm_source: harness.llm_source.as_ref(),
+            llm_source: Arc::clone(&harness.llm_source),
             catalog: harness.catalog.clone(),
             conclusion: None,
             run_state: None,
@@ -2019,11 +2109,11 @@ mod tests {
             expected_head_sha: "final-sha",
             goal: "Fix telemetry leak\n\ndetails...",
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
-            model: "gpt-5.4",
+            model: Some("gpt-5.4"),
             draft: false,
             auto_merge: None,
             run_store: &harness.run_store,
-            llm_source: harness.llm_source.as_ref(),
+            llm_source: Arc::clone(&harness.llm_source),
             catalog: harness.catalog.clone(),
             conclusion: None,
             run_state: None,
@@ -2056,11 +2146,11 @@ mod tests {
             expected_head_sha: "final-sha",
             goal: &goal,
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
-            model: "gpt-5.4",
+            model: Some("gpt-5.4"),
             draft: false,
             auto_merge: None,
             run_store: &harness.run_store,
-            llm_source: harness.llm_source.as_ref(),
+            llm_source: Arc::clone(&harness.llm_source),
             catalog: harness.catalog.clone(),
             conclusion: None,
             run_state: None,

@@ -39,7 +39,7 @@ export interface ReplaceEnvironmentRequest {
      */
     'cwd'?: string | null;
     /**
-     * Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
+     * Server-owned, Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock as writable files; cannot be combined with CODEX_AUTH_B64, OPENAI_API_KEY, or CODEX_API_KEY. No host paths are accepted.
      */
     'codex_oauth_profile'?: string | null;
     'image': EnvironmentApiImageSettings;

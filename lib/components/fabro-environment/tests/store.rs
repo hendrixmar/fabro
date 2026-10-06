@@ -5,11 +5,12 @@ use fabro_environment::{
     EnvironmentDraft, EnvironmentId, EnvironmentStore, EnvironmentStoreError,
     import_legacy_directory_once, seed_default_environment, seed_environments,
 };
+use fabro_types::SandboxProviderKind;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
-    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentProvider,
-    EnvironmentResourcesSettings, EnvironmentSettings,
+    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentResourcesSettings,
+    EnvironmentSettings,
 };
 use tokio::fs;
 
@@ -28,7 +29,7 @@ async fn test_store(local_enabled: bool) -> anyhow::Result<TestStore> {
     Ok(TestStore { dir, pool, store })
 }
 
-fn settings(provider: EnvironmentProvider) -> EnvironmentSettings {
+fn settings(provider: SandboxProviderKind) -> EnvironmentSettings {
     EnvironmentSettings {
         provider,
         cwd: None,
@@ -42,7 +43,7 @@ fn settings(provider: EnvironmentProvider) -> EnvironmentSettings {
     }
 }
 
-fn draft(id: &str, provider: EnvironmentProvider) -> EnvironmentDraft {
+fn draft(id: &str, provider: SandboxProviderKind) -> EnvironmentDraft {
     EnvironmentDraft {
         id:       EnvironmentId::new(id).expect("test environment id should be valid"),
         settings: settings(provider),
@@ -82,7 +83,7 @@ async fn seed_default_is_idempotent_and_reopen_loads_sql_rows() -> anyhow::Resul
 #[tokio::test]
 async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    let mut managed = draft("custom", EnvironmentProvider::Docker);
+    let mut managed = draft("custom", SandboxProviderKind::DOCKER);
     managed.settings.codex_oauth_profile = Some("subscription".to_string());
     let created = test.store.create(managed).await?;
     assert_eq!(
@@ -117,7 +118,7 @@ async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::R
         created.revision
     );
 
-    let mut replacement = settings(EnvironmentProvider::Local);
+    let mut replacement = settings(SandboxProviderKind::LOCAL);
     replacement.cwd = Some("/workspace/custom".to_string());
     replacement
         .labels
@@ -135,7 +136,7 @@ async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::R
         .replace(
             &created.id,
             &created.revision,
-            settings(EnvironmentProvider::Docker),
+            settings(SandboxProviderKind::DOCKER),
         )
         .await
         .expect_err("stale revision should be rejected");
@@ -156,7 +157,7 @@ async fn create_get_replace_delete_and_reload_round_trip_sql_rows() -> anyhow::R
 #[tokio::test]
 async fn default_is_deletable() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    seed_default_environment(&test.pool, EnvironmentProvider::Docker).await?;
+    seed_default_environment(&test.pool, SandboxProviderKind::DOCKER).await?;
     let store = EnvironmentStore::load(test.pool.clone(), true).await?;
     let default = store
         .get(&EnvironmentId::new("default").expect("valid id"))
@@ -173,7 +174,7 @@ async fn default_is_deletable() -> anyhow::Result<()> {
 #[tokio::test]
 async fn maps_network_lifecycle_and_inline_dockerfile_round_trip() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    let mut settings = settings(EnvironmentProvider::Daytona);
+    let mut settings = settings(SandboxProviderKind::DAYTONA);
     settings.image.dockerfile = Some(DockerfileSource::Inline("FROM alpine\n".to_string()));
     settings.resources.cpu = Some(4);
     settings.resources.memory = Some("8GB".parse()?);
@@ -211,7 +212,7 @@ async fn maps_network_lifecycle_and_inline_dockerfile_round_trip() -> anyhow::Re
 #[tokio::test]
 async fn direct_create_rejects_dockerfile_path_without_reading_it() -> anyhow::Result<()> {
     let test = test_store(true).await?;
-    let mut settings = settings(EnvironmentProvider::Docker);
+    let mut settings = settings(SandboxProviderKind::DOCKER);
     settings.image.dockerfile = Some(DockerfileSource::Path {
         path: test.dir.path().join("Dockerfile").display().to_string(),
     });
@@ -301,7 +302,7 @@ cpu = 99
 async fn legacy_import_keeps_existing_sql_row_and_inlines_dockerfile_path() -> anyhow::Result<()> {
     let test = test_store(true).await?;
     test.store
-        .create(draft("existing", EnvironmentProvider::Local))
+        .create(draft("existing", SandboxProviderKind::LOCAL))
         .await?;
     let environment_dir = test.dir.path().join("environments");
     fs::create_dir(&environment_dir).await?;
@@ -342,7 +343,7 @@ path = "Dockerfile"
             .expect("existing row should win")
             .settings
             .provider,
-        EnvironmentProvider::Local
+        SandboxProviderKind::LOCAL
     );
     assert_eq!(
         store
@@ -376,7 +377,7 @@ async fn legacy_import_invalid_input_leaves_source_directory_in_place() -> anyho
     assert_invalid_legacy_import_leaves_source_directory(
         "invalid settings",
         "invalid-settings.toml",
-        r#"provider = "bogus""#,
+        r#"provider = "../bogus""#,
         "validation",
     )
     .await?;

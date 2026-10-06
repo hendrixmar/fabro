@@ -121,6 +121,12 @@ impl From<IntakeBridgeError> for ApiError {
             IntakeBridgeError::Refused(detail) => {
                 Self::with_code(StatusCode::CONFLICT, detail, "intake_refused")
             }
+            IntakeBridgeError::InvalidPathSegment => Self::with_code(
+                StatusCode::BAD_REQUEST,
+                "invalid feature-intake path identifier",
+                "intake_invalid_identifier",
+            ),
+
             IntakeBridgeError::Payload => Self::with_code(
                 StatusCode::BAD_GATEWAY,
                 "the feature-intake bridge returned a response this server could not read",

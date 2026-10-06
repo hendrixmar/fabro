@@ -3,6 +3,9 @@
     reason = "tests assert the raw template source"
 )]
 
+use std::collections::BTreeMap;
+
+use fabro_types::SandboxProviderKind;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::cli::{OutputFormat, OutputVerbosity};
 use fabro_types::settings::server::LogDestination;
@@ -323,6 +326,85 @@ destination = "stdout"
         Some("warn")
     );
     assert_eq!(logging.destination, Some(LogDestination::Stdout));
+}
+
+#[test]
+fn server_sandbox_providers_merge_by_kind_and_sparse_field() {
+    let lower = parse(
+        r#"
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.local]
+enabled = false
+
+[server.sandbox.providers.daytona]
+enabled = true
+
+[server.sandbox.providers.e2b]
+path = "/opt/fabro/plugins/e2b"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+args = ["--lower"]
+inherit_env = ["PATH"]
+env = { LOWER = "lower" }
+
+[server.sandbox.providers.other-plugin]
+dev = true
+"#,
+    );
+    let higher = parse(
+        r#"
+[server.sandbox.providers.daytona]
+enabled = false
+
+[server.sandbox.providers.e2b]
+enabled = false
+dev = true
+args = []
+inherit_env = []
+env = { HIGHER = "higher" }
+"#,
+    );
+
+    let merged = higher.combine(lower);
+    let settings = crate::ServerSettingsBuilder::from_layer(&merged)
+        .expect("merged server settings should resolve");
+    let providers = settings.server.sandbox.providers;
+    assert!(!providers.is_enabled(&SandboxProviderKind::LOCAL));
+    assert!(!providers.is_enabled(&SandboxProviderKind::DAYTONA));
+    assert!(providers.is_enabled(&SandboxProviderKind::DOCKER));
+    assert!(providers.is_enabled(&SandboxProviderKind::try_new("other-plugin").unwrap()));
+
+    let kind = SandboxProviderKind::try_new("e2b").unwrap();
+    assert!(!providers.is_enabled(&kind));
+    let plugin = providers.get(&kind).unwrap().plugin.as_ref().unwrap();
+    assert_eq!(plugin.path.as_deref(), Some("/opt/fabro/plugins/e2b"));
+    assert_eq!(
+        plugin.sha256.as_deref(),
+        Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    );
+    assert!(plugin.dev);
+    assert!(plugin.args.is_empty());
+    assert!(plugin.inherit_env.is_empty());
+    assert_eq!(
+        plugin.env,
+        BTreeMap::from([("HIGHER".to_string(), "higher".to_string())])
+    );
+    assert_eq!(providers.enabled_plugins().count(), 1);
+
+    let empty = parse(
+        r"
+[server.sandbox.providers]
+",
+    );
+    assert_eq!(
+        crate::ServerSettingsBuilder::from_layer(&empty.combine(merged))
+            .expect("an empty provider map should preserve fallback policies")
+            .server
+            .sandbox
+            .providers,
+        providers
+    );
 }
 
 #[test]

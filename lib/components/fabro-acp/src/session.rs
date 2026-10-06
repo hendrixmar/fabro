@@ -12,15 +12,18 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{ActiveSession, Agent, Client, Error as ProtocolError, SessionMessage};
-use fabro_sandbox::Sandbox;
+use fabro_sandbox::RunSandbox;
 use fabro_types::settings::run::{McpHttpProtocol, McpServerSettings, McpTransport};
 use fabro_types::{Principal, SteeringMessage};
 use fabro_util::time::elapsed_ms;
+use http::header::{HeaderName, HeaderValue};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, oneshot};
+use tokio::task::yield_now;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument::WithSubscriber;
+use tracing::subscriber::NoSubscriber;
 
 use crate::command::AcpProcessSpec;
 use crate::error::AcpError;
@@ -450,7 +453,7 @@ pub struct AcpRunRequest {
     pub env:                 HashMap<String, String>,
     /// Resolved transports only; sandbox processes are owned by the caller.
     pub mcp_servers:         Vec<McpServerSettings>,
-    pub sandbox:             Arc<dyn Sandbox>,
+    pub sandbox:             Arc<RunSandbox>,
     pub cancel_token:        CancellationToken,
     pub on_activity:         Option<Arc<dyn Fn() + Send + Sync>>,
     pub on_session_activity: Option<AcpSessionActivityCallback>,
@@ -542,7 +545,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         });
     // The ACP library traces raw JSON-RPC payloads, including MCP auth headers.
     // Keep that transport trace disabled independently of the host log filter.
-    let run = run.with_subscriber(tracing::subscriber::NoSubscriber::default());
+    let run = run.with_subscriber(NoSubscriber::default());
 
     let cancel_deadline_token = cancel_token.clone();
     let run_outcome = async {
@@ -646,13 +649,14 @@ fn acp_mcp_servers(servers: Vec<McpServerSettings>) -> Result<Vec<McpServer>, Ac
                 ))
             }
             McpTransport::Http { protocol, url, headers } => {
+                #[expect(clippy::disallowed_types, reason = "ACP transports the original validated MCP URL; errors never format its credentials")]
                 let parsed = url::Url::parse(&url).map_err(|_| invalid("invalid HTTP URL"))?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
                     return Err(invalid("HTTP URL must use http or https and include a host"));
                 }
                 if headers.iter().any(|(name, value)| {
-                    http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
-                        || http::header::HeaderValue::from_str(value).is_err()
+                    HeaderName::from_bytes(name.as_bytes()).is_err()
+                        || HeaderValue::from_str(value).is_err()
                 }) {
                     return Err(invalid("invalid HTTP header"));
                 }
@@ -826,7 +830,7 @@ async fn read_live_session(
                     LiveSessionEvent::PostResponseDrainComplete
                 }
                 update = session.read_update() => LiveSessionEvent::SessionMessage(update),
-                () = tokio::task::yield_now() => LiveSessionEvent::PostResponseDrainComplete,
+                () = yield_now() => LiveSessionEvent::PostResponseDrainComplete,
             }
         } else if prioritize_session_updates {
             tokio::select! {
@@ -881,36 +885,32 @@ async fn read_live_session(
                 if let Some(on_activity) = on_activity {
                     on_activity();
                 }
-                match update? {
-                    SessionMessage::SessionMessage(dispatch) => {
-                        MatchDispatch::new(dispatch)
-                            .if_notification(async |notification: SessionNotification| {
-                                if let SessionUpdate::UsageUpdate(update) = &notification.update {
-                                    usage_accumulator.record_reported_cost(
-                                        update.cost.as_ref().map(convert_reported_cost),
-                                    );
-                                }
-                                if let Some(on_session_activity) = on_session_activity {
-                                    for activity in convert_session_update(
-                                        &notification.update,
-                                        &mut tracked_tools,
-                                    ) {
-                                        on_session_activity(activity);
-                                    }
-                                }
-                                if let SessionUpdate::AgentMessageChunk(ContentChunk {
-                                    content: ContentBlock::Text(text_chunk),
-                                    ..
-                                }) = notification.update
+                if let SessionMessage::SessionMessage(dispatch) = update? {
+                    MatchDispatch::new(dispatch)
+                        .if_notification(async |notification: SessionNotification| {
+                            if let SessionUpdate::UsageUpdate(update) = &notification.update {
+                                usage_accumulator.record_reported_cost(
+                                    update.cost.as_ref().map(convert_reported_cost),
+                                );
+                            }
+                            if let Some(on_session_activity) = on_session_activity {
+                                for activity in
+                                    convert_session_update(&notification.update, &mut tracked_tools)
                                 {
-                                    text.push_str(&text_chunk.text);
+                                    on_session_activity(activity);
                                 }
-                                Ok(())
-                            })
-                            .await
-                            .otherwise_ignore()?;
-                    }
-                    _ => {}
+                            }
+                            if let SessionUpdate::AgentMessageChunk(ContentChunk {
+                                content: ContentBlock::Text(text_chunk),
+                                ..
+                            }) = notification.update
+                            {
+                                text.push_str(&text_chunk.text);
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .otherwise_ignore()?;
                 }
             }
             LiveSessionEvent::PromptResponse(response) => {

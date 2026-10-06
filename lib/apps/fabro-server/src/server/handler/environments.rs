@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use fabro_environment::{Environment, EnvironmentDraft, EnvironmentId, EnvironmentStoreError};
+use fabro_types::SandboxProviderKind;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
-    EnvironmentNetworkSettings, EnvironmentProvider, EnvironmentResourcesSettings,
-    EnvironmentSettings,
+    EnvironmentNetworkSettings, EnvironmentResourcesSettings, EnvironmentSettings,
 };
+use fabro_util::error::{collect_chain, render_with_causes};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +34,7 @@ struct EnvironmentListMeta {
 #[serde(deny_unknown_fields)]
 struct CreateEnvironmentRequest {
     id:                  EnvironmentId,
-    provider:            EnvironmentProvider,
+    provider:            SandboxProviderKind,
     cwd:                 Option<String>,
     codex_oauth_profile: Option<String>,
     image:               ApiEnvironmentImageSettings,
@@ -47,7 +48,7 @@ struct CreateEnvironmentRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplaceEnvironmentRequest {
-    provider:            EnvironmentProvider,
+    provider:            SandboxProviderKind,
     cwd:                 Option<String>,
     codex_oauth_profile: Option<String>,
     image:               ApiEnvironmentImageSettings,
@@ -243,24 +244,25 @@ fn environment_with_etag_response(status: StatusCode, environment: Environment) 
 
 impl From<EnvironmentStoreError> for ApiError {
     fn from(err: EnvironmentStoreError) -> Self {
-        match err {
-            EnvironmentStoreError::NotFound { id } => {
-                Self::not_found(format!("environment not found: {id}"))
-            }
-            EnvironmentStoreError::AlreadyExists { id } => Self::new(
+        let (status, detail) = match &err {
+            EnvironmentStoreError::NotFound { id } => (
+                StatusCode::NOT_FOUND,
+                format!("environment not found: {id}"),
+            ),
+            EnvironmentStoreError::AlreadyExists { id } => (
                 StatusCode::CONFLICT,
                 format!("environment already exists: {id}"),
             ),
-            EnvironmentStoreError::StaleRevision { id, .. } => Self::new(
+            EnvironmentStoreError::StaleRevision { id, .. } => (
                 StatusCode::CONFLICT,
                 format!("environment revision is stale: {id}"),
             ),
-            EnvironmentStoreError::Reserved { id } => Self::new(
+            EnvironmentStoreError::Reserved { id } => (
                 StatusCode::CONFLICT,
                 format!("environment is reserved and cannot be modified: {id}"),
             ),
             EnvironmentStoreError::Validation { source } => {
-                Self::new(StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
+                (StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
             }
             EnvironmentStoreError::InvalidFilename { .. }
             | EnvironmentStoreError::InvalidRevision { .. }
@@ -271,10 +273,37 @@ impl From<EnvironmentStoreError> for ApiError {
             | EnvironmentStoreError::JsonDecode { .. }
             | EnvironmentStoreError::Db { .. }
             | EnvironmentStoreError::RowCountOverflow { .. }
-            | EnvironmentStoreError::Io { .. } => Self::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "environment store operation failed",
-            ),
-        }
+            | EnvironmentStoreError::Io { .. } => {
+                // The response hides the cause; the log keeps it.
+                tracing::error!(
+                    error = %render_with_causes(&err.to_string(), &collect_chain(&err)),
+                    "environment store operation failed"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "environment store operation failed".to_string(),
+                )
+            }
+        };
+        Self::with_source(status, detail, err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_found_error_retains_typed_source() {
+        let source = EnvironmentStoreError::NotFound {
+            id: EnvironmentId::new("missing".to_string()).unwrap(),
+        };
+        let error = ApiError::from(source);
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<EnvironmentStoreError>()
+        );
     }
 }

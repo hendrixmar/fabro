@@ -15,6 +15,7 @@ use fabro_api::types::{GithubRepository, GithubRepositoryId, GithubRepositoryLis
 use fabro_github::repositories::{
     self, REPOSITORIES_PER_PAGE, RepositoryEnumerationError, RepositorySummary,
 };
+use fabro_types::GitHubRepositorySlug;
 use fabro_types::settings::server::{GithubIntegrationSettings, GithubIntegrationStrategy};
 use serde::{Deserialize, Serialize};
 
@@ -167,8 +168,15 @@ pub(super) async fn read_repository(
     state: &AppState,
     slug: &str,
 ) -> Result<RepositorySummary, ApiError> {
+    let slug = GitHubRepositorySlug::try_new(slug).ok_or_else(|| {
+        ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "repository must be an owner/repo slug",
+            "project_repository_invalid",
+        )
+    })?;
     let reader = GithubReader::load(state).await?;
-    reader.fetch(slug).await
+    reader.fetch(&slug).await
 }
 
 fn repository_response(summary: RepositorySummary) -> Result<GithubRepository, ApiError> {
@@ -260,7 +268,7 @@ impl GithubReader {
         }
     }
 
-    async fn fetch(&self, slug: &str) -> Result<RepositorySummary, ApiError> {
+    async fn fetch(&self, slug: &GitHubRepositorySlug) -> Result<RepositorySummary, ApiError> {
         let token = match &self.credentials {
             ReaderCredentials::Pat(token) | ReaderCredentials::Installation(token) => token,
             // App credentials can only read a repository through an
@@ -278,20 +286,13 @@ impl GithubReader {
         &self,
         client: &fabro_http::HttpClient,
         jwt: &str,
-        slug: &str,
+        slug: &GitHubRepositorySlug,
     ) -> Result<RepositorySummary, ApiError> {
-        let (owner, repo) = slug.split_once('/').ok_or_else(|| {
-            ApiError::with_code(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "repository must be an owner/repo slug",
-                "project_repository_invalid",
-            )
-        })?;
         let token = fabro_github::create_installation_access_token_with_permissions(
             client,
             jwt,
-            owner,
-            repo,
+            slug.owner(),
+            slug.repo(),
             &self.base_url,
             serde_json::json!({ "contents": "read" }),
         )

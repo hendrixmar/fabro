@@ -985,7 +985,7 @@ impl RunPort for LiveRunPort {
                     },
                 )
                 .await
-                .map_err(|err| anyhow::anyhow!("{}", err.detail()))?;
+                .map_err(anyhow::Error::new)?;
                 return Ok(run_id);
             }
             Err(fabro_store::Error::RunNotFound(_)) => {}
@@ -1000,7 +1000,7 @@ impl RunPort for LiveRunPort {
             automation.environment_id.as_deref(),
             StatusCode::CONFLICT,
         )
-        .map_err(|err| anyhow::anyhow!("{}", err.detail()))?;
+        .map_err(anyhow::Error::new)?;
         let materialized = self
             .state
             .materialize_automation_run(AutomationRunMaterializeInput {
@@ -1041,7 +1041,7 @@ impl RunPort for LiveRunPort {
         }
         super::handler::lifecycle::queue_run_start(self.state.as_ref(), run_id, false, actor)
             .await
-            .map_err(|err| anyhow::anyhow!("{}", err.detail()))?;
+            .map_err(anyhow::Error::new)?;
         Ok(run_id)
     }
 
@@ -1065,7 +1065,7 @@ impl RunPort for LiveRunPort {
         {
             super::handler::pull_requests::verified_draft_for_run(&self.state, run_id)
                 .await
-                .map_err(|err| anyhow::anyhow!("{}", err.detail()))?
+                .map_err(anyhow::Error::new)?
         } else {
             None
         };
@@ -1414,7 +1414,7 @@ mod tests {
         database.migrate().await.unwrap();
         fabro_environment::seed_default_environment(
             database.pool(),
-            fabro_types::settings::run::EnvironmentProvider::Docker,
+            fabro_types::SandboxProviderKind::DOCKER,
         )
         .await
         .unwrap();
@@ -1435,7 +1435,7 @@ mod tests {
                 workflow_source:       None,
                 project_id:            None,
                 available_to_projects: false,
-                source_automation_id: None,
+                source_automation_id:  None,
                 triggers:              vec![AutomationTrigger::Plane(sample_trigger())],
             })
             .await

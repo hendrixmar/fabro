@@ -85,11 +85,11 @@ pub(crate) fn emit_stage_prompt(
     let prompt_provider = node
         .provider()
         .map(String::from)
-        .or_else(|| Some(services.run.provider_id.to_string()));
+        .or_else(|| services.run.provider_id.as_ref().map(ToString::to_string));
     let prompt_model = node
         .model()
         .map(String::from)
-        .or_else(|| Some(services.run.model.clone()));
+        .or_else(|| services.run.model.clone());
     let stage_scope = StageScope::for_handler(context, &node.id);
     let request_controls = backend
         .map(|b| b.effective_request_controls(node))
@@ -349,10 +349,11 @@ impl Handler for AgentHandler {
             .map(|usage| usage.model_id().to_string())
             .or_else(|| node.model().map(String::from))
             .unwrap_or_default();
-        let response_provider = node
-            .provider()
-            .map(String::from)
-            .or_else(|| Some(services.run.provider_id.to_string()))
+        let response_provider = stage_usage
+            .as_ref()
+            .map(|usage| usage.model().provider.to_string())
+            .or_else(|| node.provider().map(String::from))
+            .or_else(|| services.run.provider_id.as_ref().map(ToString::to_string))
             .unwrap_or_default();
         services.run.emitter.emit_scoped(
             &Event::PromptCompleted {
@@ -541,6 +542,64 @@ mod tests {
                 timing:            StageTiming::default(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn reported_usage_controls_completed_provider_model_and_cost() {
+        struct ReportedBackend(BilledModelUsage);
+        #[async_trait]
+        impl CodergenBackend for ReportedBackend {
+            async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
+                Ok(CodergenResult::Text {
+                    text:              "external answer".to_string(),
+                    usage:             Some(self.0.clone()),
+                    files_touched:     Vec::new(),
+                    last_file_touched: None,
+                    timing:            StageTiming::default(),
+                })
+            }
+        }
+        let usage = crate::outcome::reported_model_usage(
+            fabro_types::ModelRef::new(
+                lithos_llm::catalog::ProviderId::new("omp"),
+                lithos_llm::catalog::ModelId::new("external-model"),
+            ),
+            lithos_llm::types::TokenCounts {
+                input: 7,
+                output: 2,
+                ..Default::default()
+            },
+            Some(fabro_types::UsdMicros(42)),
+        );
+        let handler = AgentHandler::new(Some(Box::new(ReportedBackend(usage.clone()))));
+        let services = make_services();
+        let (event_tx, events) = std::sync::mpsc::channel();
+        services
+            .run
+            .emitter
+            .on_event(move |event| event_tx.send(event.clone()).unwrap());
+        let run_dir = TempDir::new().unwrap();
+        let outcome = handler
+            .execute(
+                &Node::new("work"),
+                &test_context(),
+                &Graph::new("test"),
+                run_dir.path(),
+                &services,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.usage.as_ref(), Some(&usage));
+        let completed = events
+            .try_iter()
+            .find_map(|event| match event.body {
+                fabro_types::EventBody::PromptCompleted(props) => Some(props),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(completed.provider, "omp");
+        assert_eq!(completed.model, "external-model");
+        assert_eq!(completed.billing.as_ref(), Some(&usage));
     }
 
     async fn sandbox_with_file(path: &str, contents: &str) -> (TempDir, Arc<RunSandbox>) {

@@ -140,13 +140,13 @@ struct ListRunsParams {
 impl ListRunsParams {
     fn summary_query(&self) -> RunSummaryListQuery {
         RunSummaryListQuery {
-            parent_id: self.parent_id,
-            visibility: summary_visibility(&self.status, self.include_archived),
-            sort: self.sort,
-            direction: self.direction,
-            limit: clamp_page_limit(self.limit),
-            offset: clamp_page_offset(self.offset),
-            project: self.project_id.as_deref().map(|id| {
+            parent_id:     self.parent_id,
+            visibility:    summary_visibility(&self.status, self.include_archived),
+            sort:          self.sort,
+            direction:     self.direction,
+            limit:         clamp_page_limit(self.limit),
+            offset:        clamp_page_offset(self.offset),
+            project:       self.project_id.as_deref().map(|id| {
                 if id == "none" {
                     RunProjectFilter::Unassigned
                 } else {
@@ -154,9 +154,9 @@ impl ListRunsParams {
                 }
             }),
             automation_id: self.automation_id.clone(),
-            workflow: self.workflow.clone(),
-            activity: self.activity,
-            roots_only: self.roots_only,
+            workflow:      self.workflow.clone(),
+            activity:      self.activity,
+            roots_only:    self.roots_only,
         }
     }
 }

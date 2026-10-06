@@ -9561,7 +9561,7 @@ components:
         codex_oauth_profile:
           type: ["string", "null"]
           pattern: "^[a-z0-9][a-z0-9_-]*$"
-          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
+          description: Server-owned, Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock as writable files; cannot be combined with CODEX_AUTH_B64, OPENAI_API_KEY, or CODEX_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentApiImageSettings"
         resources:
@@ -9604,7 +9604,7 @@ components:
         codex_oauth_profile:
           type: ["string", "null"]
           pattern: "^[a-z0-9][a-z0-9_-]*$"
-          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
+          description: Server-owned, Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock as writable files; cannot be combined with CODEX_AUTH_B64, OPENAI_API_KEY, or CODEX_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentApiImageSettings"
         resources:
@@ -9642,7 +9642,7 @@ components:
         codex_oauth_profile:
           type: ["string", "null"]
           pattern: "^[a-z0-9][a-z0-9_-]*$"
-          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
+          description: Server-owned, Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock as writable files; cannot be combined with CODEX_AUTH_B64, OPENAI_API_KEY, or CODEX_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentApiImageSettings"
         resources:
@@ -17446,7 +17446,7 @@ components:
         codex_oauth_profile:
           type: ["string", "null"]
           pattern: "^[a-z0-9][a-z0-9_-]*$"
-          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
+          description: Server-owned, Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock as writable files; cannot be combined with CODEX_AUTH_B64, OPENAI_API_KEY, or CODEX_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentImageSettings"
         resources:
@@ -17475,7 +17475,7 @@ components:
         codex_oauth_profile:
           type: ["string", "null"]
           pattern: "^[a-z0-9][a-z0-9_-]*$"
-          description: Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock; cannot be combined with CODEX_AUTH_B64 or OPENAI_API_KEY. No host paths are accepted.
+          description: Server-owned, Docker-only named private host profile under FABRO_HOME/codex-oauth. Mounts only pre-existing auth.json and auth.lock as writable files; cannot be combined with CODEX_AUTH_B64, OPENAI_API_KEY, or CODEX_API_KEY. No host paths are accepted.
         image:
           $ref: "#/components/schemas/EnvironmentImageSettings"
         resources:

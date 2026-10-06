@@ -21,6 +21,7 @@ use fabro_llm::types::ResponseFormat;
 use fabro_llm::{Client, ClientOptions, Request, Response};
 use fabro_mcp::config::McpServerSettings;
 use fabro_mcp::pebble::pebble_servers;
+use fabro_mcp::sandbox::ManagedMcpServers;
 use fabro_sandbox::{RunSandbox, SecretRedactor};
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{
@@ -40,9 +41,10 @@ use pebble_coding_agent::subagents::SubagentOptions;
 use pebble_coding_agent::tools::{RegisteredTool, ToolEnvProvider};
 use pebble_coding_agent::{
     CodingAgent, CodingAgentBuilder, CodingAgentControlHandle, CodingAgentExport,
-    CodingAgentOptions, CodingInput, InterruptReason, MemoryDiscovery, ShutdownReason,
+    CodingAgentOptions, CodingInput, InterruptReason, MemoryDiscovery, ResumeMode, ShutdownReason,
     SkillDiscovery,
 };
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use super::super::agent::{
@@ -57,6 +59,7 @@ use super::controls::{
 use super::fabro_tools::register_fabro_run_tools;
 use super::fallback::{self, FallbackPlan, LlmRoute};
 use super::routing::{self, ProviderContext};
+use super::skills_injection::{self, SkillTarget};
 use crate::context::WorkflowContext;
 use crate::context::keys::Fidelity;
 use crate::error::Error;
@@ -101,8 +104,9 @@ pub struct PebbleBackend {
 /// successor starts the stage's MCP servers again; the same settings give
 /// the same tool names, so the conversation's earlier calls stay valid.
 struct CachedThread {
-    export:        CodingAgentExport,
-    fallback_plan: FallbackPlan,
+    export:          CodingAgentExport,
+    fallback_plan:   FallbackPlan,
+    selected_skills: bool,
 }
 
 /// How the backend reports a failed prompt.
@@ -394,6 +398,9 @@ struct StageBindings<'a> {
     stage_scope:     &'a StageScope,
     emitter:         &'a Arc<Emitter>,
     sandbox:         &'a Arc<RunSandbox>,
+    sandbox_home:    &'a str,
+    skill_dirs:      Option<&'a [String]>,
+    mcp_servers:     &'a [McpServerSettings],
     tool_middleware: Option<&'a Arc<dyn ToolMiddleware>>,
     human_input:     Option<&'a Arc<dyn HumanInputProvider>>,
 }
@@ -541,23 +548,38 @@ impl PebbleBackend {
         build_llm_client(&self.catalog, Arc::clone(&self.source)).await
     }
 
-    /// Where a stage's skills come from: the directories the backend was
-    /// given, else fabro's convention — the user's skills directory, then
-    /// `.fabro/skills` and `skills` under the repository root — which pebble
-    /// resolves and searches.
-    fn skill_options(&self, options: CodingAgentOptions) -> CodingAgentOptions {
+    /// A node selection replaces every discovery root, even when no requested
+    /// skill materialized. Pebble has no allowlist knob: an isolated directory
+    /// gives its native loader exactly the selected skills and nothing else.
+    fn skill_options(
+        &self,
+        options: CodingAgentOptions,
+        selected: Option<&[String]>,
+        home: &str,
+    ) -> CodingAgentOptions {
+        if let Some(dirs) = selected {
+            return options.with_skill_dirs(dirs.iter().cloned());
+        }
         match &self.skill_dirs {
             Some(dirs) => options.with_skill_dirs(dirs.clone()),
             None => options.with_skill_discovery(
                 SkillDiscovery::new()
-                    .search(Home::from_env().skills_dir().to_string_lossy().into_owned())
+                    .search(skills_injection::skill_target_base(
+                        home,
+                        SkillTarget::ApiDiscovery,
+                    ))
                     .search_under_git_root(".fabro/skills")
                     .search_under_git_root("skills"),
             ),
         }
     }
 
-    fn agent_options(&self, node: &Node, controls: EffectiveRequestControls) -> CodingAgentOptions {
+    fn agent_options(
+        &self,
+        node: &Node,
+        controls: EffectiveRequestControls,
+        bindings: &StageBindings<'_>,
+    ) -> CodingAgentOptions {
         // The profile's own instruction files, from the repository root down
         // to the working directory: pebble knows the files and does the walk.
         let options = CodingAgentOptions::default()
@@ -565,7 +587,7 @@ impl PebbleBackend {
             .with_speed(controls.speed)
             .with_max_tokens(node_max_output_tokens(node).map(i64::from))
             .with_memory_discovery(MemoryDiscovery::from_git_root());
-        self.skill_options(options)
+        self.skill_options(options, bindings.skill_dirs, bindings.sandbox_home)
             .with_recorded_permission_level(PermissionLevel::Full)
             .with_context_compaction(true)
             .with_compaction_threshold_percent(COMPACTION_THRESHOLD_PERCENT)
@@ -595,9 +617,9 @@ impl PebbleBackend {
         let max_tokens = node_max_output_tokens(node).map(i64::from);
         builder = builder
             .tools(self.stage_tools())
-            .mcp_servers(pebble_servers(&self.mcp_servers))
+            .mcp_servers(pebble_servers(bindings.mcp_servers))
             .permission_level(PermissionLevel::Full)
-            .options(self.agent_options(node, route.controls))
+            .options(self.agent_options(node, route.controls, bindings))
             .fallback_routes(plan.pebble_routes(max_tokens))
             .event_sink(Arc::new(WorkflowEventSink {
                 emitter: Arc::clone(bindings.emitter),
@@ -640,10 +662,12 @@ impl PebbleBackend {
         let environment: Arc<dyn Environment> =
             Arc::clone(bindings.sandbox) as Arc<dyn Environment>;
         let builder = CodingAgent::builder(client, environment).model(plan.current().selector());
-        self.bind_builder(builder, node, plan, provider, bindings)
+        let agent = self
+            .bind_builder(builder, node, plan, provider, bindings)
             .build()
             .await
-            .map_err(|error| Error::handler_with_source("Failed to start agent session", error))
+            .map_err(|error| Error::handler_with_source("Failed to start agent session", error))?;
+        self.validate_stage_agent(agent, node).await
     }
 
     /// The exported conversation of an earlier stage, continued on the
@@ -651,6 +675,7 @@ impl PebbleBackend {
     async fn resume_exported_agent(
         &self,
         export: CodingAgentExport,
+        previous_selected_skills: bool,
         node: &Node,
         plan: &FallbackPlan,
         provider: &ProviderContext,
@@ -659,11 +684,60 @@ impl PebbleBackend {
         let client = self.build_llm_client().await?;
         let environment: Arc<dyn Environment> =
             Arc::clone(bindings.sandbox) as Arc<dyn Environment>;
-        let builder = CodingAgent::resume_from_export(client, environment, export);
-        self.bind_builder(builder, node, plan, provider, bindings)
+        // Warm exports retain the predecessor's skills. A node selection must
+        // rediscover through its own isolated roots, including a cleared selection.
+        let builder = if previous_selected_skills || bindings.skill_dirs.is_some() {
+            CodingAgent::resume(
+                client,
+                environment,
+                export.record().clone(),
+                ResumeMode::RecordedModel,
+            )
+        } else {
+            CodingAgent::resume_from_export(client, environment, export)
+        };
+        let agent = self
+            .bind_builder(builder, node, plan, provider, bindings)
             .build()
             .await
-            .map_err(|error| Error::handler_with_source("Failed to resume agent session", error))
+            .map_err(|error| Error::handler_with_source("Failed to resume agent session", error))?;
+        self.validate_stage_agent(agent, node).await
+    }
+
+    async fn validate_stage_agent(
+        &self,
+        mut agent: CodingAgent,
+        node: &Node,
+    ) -> Result<CodingAgent, Error> {
+        let snapshot = agent.snapshot();
+        let mut failure = None;
+        if let Some(selected) = node.skills_attr() {
+            if snapshot
+                .skills()
+                .iter()
+                .any(|skill| !selected.contains(&skill.name))
+            {
+                failure = Some("Selected skill declares an unselected name".to_string());
+            }
+        }
+        for config in &self.mcp_servers {
+            if !snapshot
+                .mcp_servers()
+                .iter()
+                .any(|server| server.server == config.name && server.error.is_none())
+            {
+                failure = Some(format!(
+                    "Required MCP server '{}' did not initialize",
+                    config.name
+                ));
+                break;
+            }
+        }
+        if let Some(failure) = failure {
+            let _ = agent.shutdown(ShutdownReason::Error).await;
+            return Err(Error::handler(failure));
+        }
+        Ok(agent)
     }
 
     /// Register `live` with the steering hub so steers reach it, and tell
@@ -1001,219 +1075,294 @@ impl CodergenBackend for PebbleBackend {
     }
 
     async fn run(&self, request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
-        let node = request.node;
-        let emitter = request.emitter;
-        let cancel_token = &request.cancel_token;
-        let output_schema = structured_output::parse_node_output_schema(node)?;
-
-        let fidelity = request.context.fidelity();
-        let reuse_key = if fidelity == Fidelity::Full {
-            request.thread_id.map(String::from)
-        } else {
-            None
-        };
-
-        if cancel_token.is_cancelled() {
+        if request.cancel_token.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let stage_scope = StageScope::for_handler(request.context, &node.id);
-        let stage_id = stage_scope.stage_id();
-        let bindings = StageBindings {
-            node_id: &node.id,
-            stage_scope: &stage_scope,
-            emitter,
-            sandbox: request.sandbox,
-            tool_middleware: request.tool_middleware.as_ref(),
-            human_input: request.human_input.as_ref(),
-        };
-
-        let cached = reuse_key.as_ref().and_then(|key| self.take_thread(key));
-        let is_reused = cached.is_some();
-        let (agent, mut fallback_plan) = if let Some(thread) = cached {
-            let route = thread.fallback_plan.current().clone();
-            let provider = self.resolve_provider_context(
-                route.target.model.as_str(),
-                Some(route.target.provider.as_str()),
-            )?;
-            let agent = self
-                .resume_exported_agent(
-                    thread.export,
-                    node,
-                    &thread.fallback_plan,
-                    &provider,
-                    &bindings,
-                )
-                .await?;
-            (agent, thread.fallback_plan)
-        } else {
-            let model = node.model().unwrap_or(&self.model);
-            let provider = routing::resolve_node_provider_context(
-                self.catalog.as_ref(),
-                &self.provider_id,
-                &self.model,
-                node,
-            )?;
-            let controls = self.resolve_effective_request_controls(node)?;
-            let (fallback_plan, notices) =
-                self.fallback_plan(model, &provider.provider_id, controls);
-            self.emit_fallback_plan_notices(&notices, emitter, &stage_scope);
-            let route = fallback_plan.current().clone();
-            let route_provider = self.resolve_provider_context(
-                route.target.model.as_str(),
-                Some(route.target.provider.as_str()),
-            )?;
-            let agent = self
-                .build_agent(node, &fallback_plan, &route_provider, &bindings)
-                .await?;
-            (agent, fallback_plan)
-        };
-        if cancel_token.is_cancelled() {
-            let mut agent = agent;
-            let _ = agent.shutdown(ShutdownReason::Cancelled).await;
-            return Err(Error::Cancelled);
+        let sandbox = Arc::clone(request.sandbox);
+        let home = skills_injection::resolve_sandbox_home(sandbox.as_ref()).await;
+        let mut managed = ManagedMcpServers::start(
+            &self.mcp_servers,
+            Arc::clone(&sandbox),
+            &request.cancel_token,
+            false,
+        )
+        .await
+        .map_err(|error| {
+            if request.cancel_token.is_cancelled() {
+                Error::Cancelled
+            } else {
+                Error::handler_with_anyhow("Failed to start sandbox MCP servers", error)
+            }
+        })?;
+        let selected_names = request.node.skills_attr();
+        let selection = selected_names
+            .as_ref()
+            .map(|_| format!("{home}/.fabro/skill-selections/{}", uuid::Uuid::new_v4()));
+        let cleanup_sandbox = Arc::clone(&sandbox);
+        let selection = scopeguard::guard(selection, move |directory| {
+            if let (Some(directory), Ok(handle)) = (directory, Handle::try_current()) {
+                handle.spawn(async move {
+                    let _ = skills_injection::remove_skill_selection(
+                        cleanup_sandbox.as_ref(),
+                        &directory,
+                    )
+                    .await;
+                });
+            }
+        });
+        if let (Some(names), Some(directory)) = (selected_names.as_ref(), selection.as_ref()) {
+            let materialized = skills_injection::materialize_skills_into(
+                sandbox.as_ref(),
+                names,
+                &Home::from_env().skills_dir(),
+                directory,
+            )
+            .await;
+            if !materialized.is_empty() {
+                let scope = StageScope::for_handler(request.context, &request.node.id);
+                request.emitter.emit_scoped(
+                    &Event::AgentSkillsMaterialized {
+                        node_id:    request.node.id.clone(),
+                        visit:      scope.visit,
+                        names:      materialized,
+                        target_dir: directory.clone(),
+                        harness:    SkillTarget::ApiDiscovery.harness_label().to_string(),
+                    },
+                    &scope,
+                );
+            }
         }
-
-        tracing::info!(
-            node = %node.id,
-            fidelity = %fidelity,
-            reused = is_reused,
-            "Agent session ready"
-        );
-
-        let handle = agent.control_handle();
-        let mut live = LiveAgent::new(agent, handle);
-        let route = fallback_plan.current().clone();
-        if let Err(error) =
-            self.activate(&mut live, &route, &stage_id, request.thread_id, &bindings)
-        {
-            live.discard(ShutdownReason::Error).await;
-            return Err(error);
-        }
-
+        let selected_dirs = selection.as_ref().map(|directory| vec![directory.clone()]);
         let result = async {
-            let mut response = self
-                .prompt_live(
+            let node = request.node;
+            let emitter = request.emitter;
+            let cancel_token = &request.cancel_token;
+            let output_schema = structured_output::parse_node_output_schema(node)?;
+
+            let fidelity = request.context.fidelity();
+            let reuse_key = if fidelity == Fidelity::Full {
+                request.thread_id.map(String::from)
+            } else {
+                None
+            };
+
+            if cancel_token.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let stage_scope = StageScope::for_handler(request.context, &node.id);
+            let stage_id = stage_scope.stage_id();
+            let bindings = StageBindings {
+                node_id: &node.id,
+                stage_scope: &stage_scope,
+                emitter,
+                sandbox: request.sandbox,
+                sandbox_home: &home,
+                skill_dirs: selected_dirs.as_deref(),
+                mcp_servers: managed.servers(),
+                tool_middleware: request.tool_middleware.as_ref(),
+                human_input: request.human_input.as_ref(),
+            };
+
+            let cached = reuse_key.as_ref().and_then(|key| self.take_thread(key));
+            let is_reused = cached.is_some();
+            let (agent, mut fallback_plan) = if let Some(thread) = cached {
+                let route = thread.fallback_plan.current().clone();
+                let provider = self.resolve_provider_context(
+                    route.target.model.as_str(),
+                    Some(route.target.provider.as_str()),
+                )?;
+                let agent = self
+                    .resume_exported_agent(
+                        thread.export,
+                        thread.selected_skills,
+                        node,
+                        &thread.fallback_plan,
+                        &provider,
+                        &bindings,
+                    )
+                    .await?;
+                (agent, thread.fallback_plan)
+            } else {
+                let model = node.model().unwrap_or(&self.model);
+                let provider = routing::resolve_node_provider_context(
+                    self.catalog.as_ref(),
+                    &self.provider_id,
+                    &self.model,
+                    node,
+                )?;
+                let controls = self.resolve_effective_request_controls(node)?;
+                let (fallback_plan, notices) =
+                    self.fallback_plan(model, &provider.provider_id, controls);
+                self.emit_fallback_plan_notices(&notices, emitter, &stage_scope);
+                let route = fallback_plan.current().clone();
+                let route_provider = self.resolve_provider_context(
+                    route.target.model.as_str(),
+                    Some(route.target.provider.as_str()),
+                )?;
+                let agent = self
+                    .build_agent(node, &fallback_plan, &route_provider, &bindings)
+                    .await?;
+                (agent, fallback_plan)
+            };
+            if cancel_token.is_cancelled() {
+                let mut agent = agent;
+                let _ = agent.shutdown(ShutdownReason::Cancelled).await;
+                return Err(Error::Cancelled);
+            }
+
+            tracing::info!(
+                node = %node.id,
+                fidelity = %fidelity,
+                reused = is_reused,
+                "Agent session ready"
+            );
+
+            let handle = agent.control_handle();
+            let mut live = LiveAgent::new(agent, handle);
+            let route = fallback_plan.current().clone();
+            if let Err(error) =
+                self.activate(&mut live, &route, &stage_id, request.thread_id, &bindings)
+            {
+                live.discard(ShutdownReason::Error).await;
+                return Err(error);
+            }
+
+            let result = async {
+                let mut response = self
+                    .prompt_live(
+                        &mut live,
+                        CodingInput::text(request.prompt),
+                        &mut fallback_plan,
+                        &stage_id,
+                        request.thread_id,
+                        &bindings,
+                        cancel_token,
+                    )
+                    .await?;
+
+                if let Some(schema) = &output_schema {
+                    let mut repair_attempts = 0_i64;
+                    let mut previous_validation_error = None;
+                    loop {
+                        let last_file_touched = live.last_file_touched.clone();
+                        match validate_agent_output_sources(
+                            schema,
+                            &response,
+                            request.sandbox,
+                            last_file_touched.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(_) => break,
+                            Err(error) => {
+                                if repair_attempts >= node.output_retries() {
+                                    return Err(Error::OutputSchemaValidation(
+                                        structured_output::exhausted_failure_reason(
+                                            node.output_retries(),
+                                        ),
+                                    ));
+                                }
+                                let repair_message = error
+                                    .repair_message(schema, previous_validation_error.as_ref());
+                                // Only once the model has seen the repair can a later
+                                // identical failure mean it ignored the correction.
+                                previous_validation_error = Some(error);
+                                response = self
+                                    .prompt_live(
+                                        &mut live,
+                                        CodingInput::text(repair_message),
+                                        &mut fallback_plan,
+                                        &stage_id,
+                                        request.thread_id,
+                                        &bindings,
+                                        cancel_token,
+                                    )
+                                    .await?;
+                                repair_attempts += 1;
+                            }
+                        }
+                    }
+                }
+
+                self.drain_late_steering(
                     &mut live,
-                    CodingInput::text(request.prompt),
                     &mut fallback_plan,
                     &stage_id,
                     request.thread_id,
                     &bindings,
                     cancel_token,
+                    response,
                 )
-                .await?;
+                .await
+            }
+            .await;
 
-            if let Some(schema) = &output_schema {
-                let mut repair_attempts = 0_i64;
-                let mut previous_validation_error = None;
-                loop {
-                    let last_file_touched = live.last_file_touched.clone();
-                    match validate_agent_output_sources(
-                        schema,
-                        &response,
-                        request.sandbox,
-                        last_file_touched.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(_) => break,
-                        Err(error) => {
-                            if repair_attempts >= node.output_retries() {
-                                return Err(Error::OutputSchemaValidation(
-                                    structured_output::exhausted_failure_reason(
-                                        node.output_retries(),
-                                    ),
-                                ));
-                            }
-                            let repair_message =
-                                error.repair_message(schema, previous_validation_error.as_ref());
-                            // Only once the model has seen the repair can a later
-                            // identical failure mean it ignored the correction.
-                            previous_validation_error = Some(error);
-                            response = self
-                                .prompt_live(
-                                    &mut live,
-                                    CodingInput::text(repair_message),
-                                    &mut fallback_plan,
-                                    &stage_id,
-                                    request.thread_id,
-                                    &bindings,
-                                    cancel_token,
-                                )
-                                .await?;
-                            repair_attempts += 1;
-                        }
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    let reason = if matches!(error, Error::Cancelled) {
+                        ShutdownReason::Cancelled
+                    } else {
+                        ShutdownReason::Error
+                    };
+                    live.discard(reason).await;
+                    return Err(error);
+                }
+            };
+
+            let route = fallback_plan.current().clone();
+            let stage_usage = billed_model_usage_from_llm(
+                self.catalog.as_ref(),
+                &ModelRef::new(
+                    route.target.provider.clone(),
+                    ModelId::new(route.target.model.as_str()),
+                )
+                .with_speed(route.controls.speed),
+                live.total_usage,
+            )?
+            .with_reported_cost(live.total_cost);
+
+            live.release_lease();
+            match reuse_key {
+                // The thread's successor continues from an export whose cursor is
+                // already past this session's close.
+                Some(key) => match live.agent.export_for_reuse(ShutdownReason::Completed).await {
+                    Ok(export) => self.store_thread(key, CachedThread {
+                        export,
+                        fallback_plan: fallback_plan.clone(),
+                        selected_skills: bindings.skill_dirs.is_some(),
+                    }),
+                    Err(error) => {
+                        tracing::debug!(error = %error, "agent session did not shut down cleanly");
+                    }
+                },
+                None => {
+                    if let Err(error) = live.agent.shutdown(ShutdownReason::Completed).await {
+                        tracing::debug!(error = %error, "agent session did not shut down cleanly");
                     }
                 }
             }
 
-            self.drain_late_steering(
-                &mut live,
-                &mut fallback_plan,
-                &stage_id,
-                request.thread_id,
-                &bindings,
-                cancel_token,
-                response,
-            )
-            .await
+            Ok(CodergenResult::Text {
+                text:              response,
+                usage:             Some(stage_usage),
+                files_touched:     live.files_touched.into_iter().collect(),
+                last_file_touched: live.last_file_touched,
+                timing:            StageTiming::active_only(
+                    crate::millis_u64(live.inference_duration),
+                    crate::millis_u64(live.tool_duration),
+                ),
+            })
         }
         .await;
-
-        let response = match result {
-            Ok(response) => response,
-            Err(error) => {
-                let reason = if matches!(error, Error::Cancelled) {
-                    ShutdownReason::Cancelled
-                } else {
-                    ShutdownReason::Error
-                };
-                live.discard(reason).await;
-                return Err(error);
-            }
-        };
-
-        let route = fallback_plan.current().clone();
-        let stage_usage = billed_model_usage_from_llm(
-            self.catalog.as_ref(),
-            &ModelRef::new(
-                route.target.provider.clone(),
-                ModelId::new(route.target.model.as_str()),
-            )
-            .with_speed(route.controls.speed),
-            live.total_usage,
-        )?
-        .with_reported_cost(live.total_cost);
-
-        live.release_lease();
-        match reuse_key {
-            // The thread's successor continues from an export whose cursor is
-            // already past this session's close.
-            Some(key) => match live.agent.export_for_reuse(ShutdownReason::Completed).await {
-                Ok(export) => self.store_thread(key, CachedThread {
-                    export,
-                    fallback_plan: fallback_plan.clone(),
-                }),
-                Err(error) => {
-                    tracing::debug!(error = %error, "agent session did not shut down cleanly");
-                }
-            },
-            None => {
-                if let Err(error) = live.agent.shutdown(ShutdownReason::Completed).await {
-                    tracing::debug!(error = %error, "agent session did not shut down cleanly");
-                }
+        managed.shutdown().await;
+        if let Some(directory) = scopeguard::ScopeGuard::into_inner(selection) {
+            if let Err(error) =
+                skills_injection::remove_skill_selection(sandbox.as_ref(), &directory).await
+            {
+                tracing::warn!(%error, "stage skill selection cleanup failed");
             }
         }
-
-        Ok(CodergenResult::Text {
-            text:              response,
-            usage:             Some(stage_usage),
-            files_touched:     live.files_touched.into_iter().collect(),
-            last_file_touched: live.last_file_touched,
-            timing:            StageTiming::active_only(
-                crate::millis_u64(live.inference_duration),
-                crate::millis_u64(live.tool_duration),
-            ),
-        })
+        result
     }
 }

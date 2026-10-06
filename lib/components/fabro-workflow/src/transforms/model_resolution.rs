@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use fabro_graphviz::graph::{AttrValue, Graph};
+use fabro_graphviz::graph::{self, AttrValue, Graph};
 use fabro_llm::lithos_catalog::Catalog;
 use fabro_llm::selection;
 use lithos_llm::catalog::ProviderId;
@@ -98,21 +98,23 @@ impl Transform for ModelResolutionTransform {
             .default_provider
             .as_ref()
             .or(graph_default_provider.as_ref());
-        if let Some(default_model) = graph
-            .attrs
-            .get("default_model")
-            .and_then(AttrValue::as_str)
-            .map(str::to_string)
-        {
-            let (model, provider) =
-                self.resolve_model(&default_model, requested_default_provider)?;
-            graph
+        if graph::graph_needs_api_backend(&graph) {
+            if let Some(default_model) = graph
                 .attrs
-                .insert("default_model".to_string(), AttrValue::String(model));
-            graph.attrs.insert(
-                "default_provider".to_string(),
-                AttrValue::String(provider.to_string()),
-            );
+                .get("default_model")
+                .and_then(AttrValue::as_str)
+                .map(str::to_string)
+            {
+                let (model, provider) =
+                    self.resolve_model(&default_model, requested_default_provider)?;
+                graph
+                    .attrs
+                    .insert("default_model".to_string(), AttrValue::String(model));
+                graph.attrs.insert(
+                    "default_provider".to_string(),
+                    AttrValue::String(provider.to_string()),
+                );
+            }
         }
         let default_provider = self.default_provider.clone().or_else(|| {
             graph
@@ -123,10 +125,7 @@ impl Transform for ModelResolutionTransform {
                 .map(ProviderId::new)
         });
         for node in graph.nodes.values_mut() {
-            // ACP-backed nodes carry `model` as a harness hint (translated to
-            // harness env, e.g. CODEX_CONFIG/PI_MODEL), not an API route —
-            // stamping `provider` here would make the node invalid.
-            if node.backend() == Some("acp") {
+            if !graph::node_needs_api_backend(node) {
                 continue;
             }
             let model = node
@@ -403,6 +402,7 @@ capabilities = { text = true, tools = true }
             "default_model".to_string(),
             AttrValue::String("vl".to_string()),
         );
+        graph.nodes.insert("api".to_string(), Node::new("api"));
 
         let graph = ModelResolutionTransform::new(custom_catalog())
             .apply(graph)
@@ -418,6 +418,71 @@ capabilities = { text = true, tools = true }
                 .get("default_provider")
                 .and_then(AttrValue::as_str),
             Some("acme-venice")
+        );
+    }
+
+    #[test]
+    fn acp_only_model_hints_and_defaults_remain_opaque() {
+        let mut graph = Graph::new("test");
+        graph.attrs.insert(
+            "default_model".to_string(),
+            AttrValue::String("harness-default-model".to_string()),
+        );
+        let mut acp = Node::new("external");
+        for (key, value) in [
+            ("backend", "acp"),
+            ("model", "harness-only-model"),
+            ("provider", "external-harness"),
+            ("acp.command", "native-agent"),
+        ] {
+            acp.attrs
+                .insert(key.to_string(), AttrValue::String(value.to_string()));
+        }
+        graph.nodes.insert(acp.id.clone(), acp);
+
+        let graph =
+            ModelResolutionTransform::for_eligible(Arc::new(test_catalog()), HashSet::new())
+                .apply(graph)
+                .unwrap();
+
+        assert_eq!(
+            graph.attrs.get("default_model").and_then(AttrValue::as_str),
+            Some("harness-default-model")
+        );
+        assert_eq!(graph.attrs.get("default_provider"), None);
+        assert_eq!(graph.nodes["external"].model(), Some("harness-only-model"));
+        assert_eq!(graph.nodes["external"].provider(), Some("external-harness"));
+        assert_eq!(
+            graph.nodes["external"]
+                .attrs
+                .get("acp.command")
+                .and_then(AttrValue::as_str),
+            Some("native-agent")
+        );
+    }
+
+    #[test]
+    fn mixed_graph_still_requires_an_eligible_api_model_provider() {
+        let mut graph = Graph::new("test");
+        let mut acp = Node::new("external");
+        acp.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        acp.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("harness-only-model".to_string()),
+        );
+        graph.nodes.insert(acp.id.clone(), acp);
+        let mut api = Node::new("api");
+        api.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("gpt-5.4".to_string()),
+        );
+        graph.nodes.insert(api.id.clone(), api);
+
+        assert!(
+            ModelResolutionTransform::for_eligible(Arc::new(test_catalog()), HashSet::new(),)
+                .apply(graph)
+                .is_err()
         );
     }
 }

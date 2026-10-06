@@ -15,6 +15,7 @@
 //! Every page request is bounded to [`REPOSITORIES_PER_PAGE`] repositories and
 //! follows only the configured GitHub API origin supplied by the caller.
 
+use fabro_types::GitHubRepositorySlug;
 use serde::{Deserialize, Serialize};
 
 use crate::{HttpClient, HttpMethod};
@@ -113,7 +114,7 @@ struct ApiInstallationRepositories {
 pub async fn fetch_repository(
     client: &impl HttpClient,
     token: &str,
-    slug: &str,
+    slug: &GitHubRepositorySlug,
     base_url: &str,
 ) -> Result<RepositorySummary, RepositoryEnumerationError> {
     let response = get(client, &format!("{base_url}/repos/{slug}"), token, 1).await?;
@@ -296,12 +297,13 @@ fn rate_limited_or_forbidden(response: &crate::HttpResponse) -> RepositoryEnumer
 mod tests {
     use std::collections::HashMap;
 
+    use fabro_types::GitHubRepositorySlug;
     use futures::executor::block_on;
     use parking_lot::Mutex;
 
     use super::{
-        RepositoryEnumerationError, list_app_installations, list_installation_repositories,
-        list_user_repositories,
+        RepositoryEnumerationError, fetch_repository, list_app_installations,
+        list_installation_repositories, list_user_repositories,
     };
     use crate::{HttpClient, HttpMethod, HttpResponse};
 
@@ -350,6 +352,25 @@ mod tests {
         format!(
             "{{\"id\":{id},\"full_name\":\"{name}\",\"default_branch\":\"main\",\"private\":true,\"archived\":false,\"disabled\":false}}"
         )
+    }
+
+    #[test]
+    fn repository_fetch_uses_a_validated_owner_repo_coordinate() {
+        let http = FakeHttp::default().with("/repos/Octo/Hello", 200, &repo(7, "Octo/Hello"));
+        let slug = GitHubRepositorySlug::try_new("Octo/Hello").expect("valid slug");
+
+        let repository = block_on(fetch_repository(
+            &http,
+            "token",
+            &slug,
+            "https://api.github.com",
+        ))
+        .expect("repository metadata should load");
+
+        assert_eq!(repository.id, 7);
+        assert_eq!(http.requested(), vec![
+            "https://api.github.com/repos/Octo/Hello".to_string()
+        ]);
     }
 
     #[test]

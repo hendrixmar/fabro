@@ -35,7 +35,7 @@ use crate::credentials::{self, RepoCredentials};
 use crate::environment::CloneRequest;
 use crate::exec::SandboxExec;
 use crate::sandbox::{self, PushError, PushReport, SandboxFile, SandboxWorkspaceLayout};
-use crate::{GitRunInfo, GitSetupIntent};
+use crate::{GitRunInfo, GitSetupIntent, docker};
 
 /// Where a clone-based provider puts its files: the run works under
 /// `workspace_root`, and repositories check out under `repos_root`.
@@ -433,6 +433,7 @@ impl RunSandbox {
         let Some(pending) = &self.pending else {
             return self.handle().map(|_| ());
         };
+        docker::validate_codex_oauth_profile_spec(&self.kind, &pending.spec)?;
         let handle = pending
             .provider
             .create(&pending.spec, self.events.clone())
@@ -973,14 +974,16 @@ impl RunSandbox {
     #[tracing::instrument(name = "git_op", skip_all, fields(op = "refresh-credentials"))]
     pub async fn refresh_ambient_credentials(&self) -> crate::Result<Option<TokenSnapshot>> {
         let workspace = &self.workspace;
+        if !workspace.credentials.managed() {
+            return Ok(None);
+        }
         let Some(checkout) = workspace.checkout_path.get() else {
             return Ok(None);
         };
-        let Some(token) = workspace.credentials.resolve().await? else {
-            return Ok(None);
-        };
-        RepoCredentials::install(&self.git()?, checkout, &token).await?;
-        Ok(Some(token.snapshot))
+        workspace
+            .credentials
+            .refresh_ambient(&self.git()?, checkout)
+            .await
     }
 
     /// The local command that opens a shell in the sandbox, from the

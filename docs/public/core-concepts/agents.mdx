@@ -33,7 +33,11 @@ Fabro manages the agent loop directly — it calls the LLM provider's API, execu
 
 Fabro can run Agent Client Protocol (ACP) stdio agents with `backend="acp"`. ACP agents run inside the active Fabro sandbox, so local and Docker runs keep the same workspace isolation, cancellation, and file-change tracking behavior as other agent stages.
 
-ACP stages do not use Fabro model/provider credentials. The ACP process owns its auth, tools, and model behavior. Configure the process with exactly one of:
+ACP stages do not use Fabro model/provider credentials. The ACP process owns its auth, tools, and model behavior.
+
+ACP-only and command-only workflows need neither Fabro API credentials nor a default API model. ACP model/provider hints are not validated against the API catalog. Mixed workflows still require eligible API credentials for API agents, prompt nodes, and prompted `parallel.fan_in` joins.
+
+Configure the process with exactly one of:
 
 - `acp.command`: a shell command string
 - `acp.config`: a JSON stdio ACP config

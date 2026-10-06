@@ -55,7 +55,9 @@ pub fn validate_collected_workflow(
     if let Some(layer) = lowered.workflow_layer {
         builder = builder.workflow_layer(layer);
     }
-    let mut settings = builder.build().map_err(anyhow::Error::new)?;
+    let mut settings = builder
+        .build_manifest_metadata()
+        .map_err(anyhow::Error::new)?;
     settings.run.inputs.extend(input_overrides.clone());
     let validated = validate(ValidateInput {
         workflow: WorkflowInput::Bundled(workflow),
@@ -199,6 +201,39 @@ dockerfile = { path = "Dockerfile" }
         assert_eq!(
             serde_json::to_value(collected).unwrap(),
             serde_json::to_value(legacy).unwrap(),
+        );
+    }
+
+    #[test]
+    fn collected_validation_defers_environment_and_mcp_catalogs_to_server() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            temp.path(),
+            "workflow.toml",
+            r#"_version = 1
+[workflow]
+graph = "workflow.fabro"
+[run.environment]
+id = "server-only-environment"
+[run.agent.mcps.tracker]
+id = "server-only-mcp"
+"#,
+        );
+        write(
+            temp.path(),
+            "workflow.fabro",
+            "digraph Demo { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+        );
+        let package = fabro_manifest::resolve_local_workflow_package(
+            &temp.path().join("workflow.toml"),
+            temp.path(),
+            Some(temp.path()),
+        )
+        .unwrap();
+        assert!(
+            validate_collected_workflow(package.closure(), None, &HashMap::new())
+                .expect("client validation must leave catalog resolution to the server")
+                .ok
         );
     }
 
